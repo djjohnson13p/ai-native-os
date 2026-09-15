@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/placement-decision.schema.json",
+  "title": "AIOS Resource Placement Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision_id", "task_id", "program_hash", "node_id", "capability", "selected", "candidates", "policy_context_ref", "decided_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "decision_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "program_hash": {"type": "string", "minLength": 1},
+    "node_id": {"type": "string", "minLength": 1},
+    "capability": {"type": "string", "minLength": 1},
+    "policy_context_ref": {"type": "string", "minLength": 1},
+    "resource_snapshot_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "selected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "placement_class", "provider_id", "reason_codes"],
+      "properties": {
+        "candidate_id": {"type": "string", "minLength": 1},
+        "placement_class": {
+          "type": "string",
+          "enum": ["local-current-device", "local-sandbox", "local-accelerator", "trusted-peer", "managed-edge", "remote-provider", "deferred", "unavailable"]
+        },
+        "provider_id": {"type": ["string", "null"]},
+        "device_or_endpoint_ref": {"type": ["string", "null"]},
+        "reason_codes": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
+        "estimated": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start_delay_ms": {"type": ["integer", "null"], "minimum": 0},
+            "execution_ms": {"type": ["integer", "null"], "minimum": 0},
+            "input_transfer_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "output_transfer_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "monetary_cost_microunits": {"type": ["integer", "null"], "minimum": 0},
+            "energy_millijoules": {"type": ["integer", "null"], "minimum": 0}
+          }
+        }
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["candidate_id", "placement_class", "eligible", "reason_codes"],
+        "properties": {
+          "candidate_id": {"type": "string", "minLength": 1},
+          "placement_class": {
+            "type": "string",
+            "enum": ["local-current-device", "local-sandbox", "local-accelerator", "trusted-peer", "managed-edge", "remote-provider", "deferred", "unavailable"]
+          },
+          "provider_id": {"type": ["string", "null"]},
+          "device_or_endpoint_ref": {"type": ["string", "null"]},
+          "eligible": {"type": "boolean"},
+          "hard_rejection": {"type": "boolean", "default": false},
+          "reason_codes": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "score": {"type": ["number", "null"]},
+          "dimensions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "quality": {"type": ["number", "null"]},
+              "latency": {"type": ["number", "null"]},
+              "cost": {"type": ["number", "null"]},
+              "energy": {"type": ["number", "null"]},
+              "data_movement": {"type": ["number", "null"]},
+              "thermal": {"type": ["number", "null"]},
+              "locality": {"type": ["number", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "algorithm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": ["string", "null"]},
+        "version": {"type": ["string", "null"]},
+        "objective_profile": {"type": ["string", "null"]}
+      }
+    },
+    "decided_at": {"type": "string", "format": "date-time"}
+  }
+}
