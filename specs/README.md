@@ -10,14 +10,16 @@ All schemas are **pre-v1 architecture drafts**. Breaking changes are expected wh
 
 A schema being present here does not mean the implementation exists yet.
 
+Contract maturity/change rules are documented in `docs/65-contract-maturity-and-architecture-change-control.md`.
+
 ## Contract principles
 
 1. **Provider-neutral** — no OpenAI-, Anthropic-, Google-, Microsoft-, Apple-, cloud-, database-, storage-, package-catalog-, or application-specific field is a mandatory core semantic concept.
-2. **Task-scoped** — machine-actionable operations retain task identity and authority context.
+2. **Task-scoped** — machine-actionable operations retain task identity and authority context outside reusable semantic-program identity where appropriate.
 3. **Handles over arbitrary paths** — contracts prefer artifact/resource/object identifiers rather than unrestricted host paths.
 4. **Plans are not authority** — planner/IR schemas describe proposed work; policy/grant schemas govern permission.
 5. **Semantic contracts precede providers** — a capability/type/object has provider-independent meaning before an implementation claims to provide it.
-6. **Semantic IR is separate from execution binding** — providers, hardware placement, grant references, network paths, and sandbox instances are bound after IR validation.
+6. **Semantic IR is separate from execution binding** — providers, Task ID, hardware placement, grant references, network paths, namespace paths, and sandbox instances are outside AIOS IR semantic identity.
 7. **Versioned meaning** — successful semantic validation records the exact registry snapshot of type/capability contracts used to interpret a program.
 8. **Presentation is separate from identity** — display/View schemas describe projections of Tasks/objects rather than redefining them.
 9. **Network/cloud are runtime fabrics** — service endpoints, network paths, cloud regions, and remote workers do not become semantic Task/object identity.
@@ -29,6 +31,7 @@ A schema being present here does not mean the implementation exists yet.
 15. **Explicit versions** — contracts carry schema/interface versions as implementation stabilizes.
 16. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
 17. **Portable serialization first** — JSON Schema is the first interchange notation because it is inspectable and easy to fixture-test. It is not a permanent requirement for all hot-path runtime communication.
+18. **Hash executable meaning, not labels/runtime state** — AIOS IR v0.1 semantic hashing follows ADR 0029 and `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md`.
 
 ## Current schemas
 
@@ -36,12 +39,13 @@ A schema being present here does not mean the implementation exists yet.
 
 | Schema | Purpose |
 | --- | --- |
-| `aios-ir.schema.json` | provider-independent AI-native semantic execution graph |
-| `ir-validation-result.schema.json` | deterministic structural/semantic validation result, diagnostics, semantic hash, and registry identity |
+| `aios-ir.schema.json` | provider-independent AI-native semantic execution graph; excludes Task/runtime binding identity |
+| `ir-validation-result.schema.json` | deterministic structural/semantic result, diagnostics, semantic hash/profile, validator/registry identity |
+| `validator-output.schema.json` | top-level validator bundle: validation result plus derived effect summary for valid programs |
 | `registry-snapshot.schema.json` | immutable/content-addressed set of semantic type/capability contracts used for validation |
 | `capability-contract.schema.json` | stable semantic meaning of a capability independent of providers |
 | `type-contract.schema.json` | semantic type identity/representation/equality contract |
-| `execution-binding.schema.json` | concrete attempt-specific provider/authority/resource binding for one IR node |
+| `execution-binding.schema.json` | concrete attempt-specific Task/provider/authority/resource binding for one IR node |
 | `execution-profile.schema.json` | effective process/container/VM isolation profile |
 | `effect-summary.schema.json` | deterministic summary of semantic effects/authority classes/verification boundaries |
 | `compiled-target.schema.json` | compiled deterministic target identity linked to semantic source without carrying authority |
@@ -129,15 +133,18 @@ Planner proposal
 AIOS IR
     ↓ validated against
 Semantic Type + Capability Registry Snapshot
-    ↓ implemented by
-Provider Manifests
-    ↓ selected/bound through
-Policy + Resource Broker
+    ↓ emits
+Validation Result + Derived Effect Summary + Semantic Hash
+    ↓ then evaluated/bound through
+Policy + Provider/Resource Broker
     ↓ creates
 Execution Binding + Execution Profile
+    ↓ executes Provider
     ↓ emits
 Artifacts + Provenance
 ```
+
+Task identity links to the semantic hash/control-plane records; it is not embedded into reusable AIOS IR.
 
 The broader platform adds orthogonal runtime context:
 
@@ -157,7 +164,24 @@ Those runtime fabrics may change without silently changing semantic program/obje
 
 No layer below AIOS IR may reinterpret the program as carrying authority simply because it passed schema validation.
 
-A successful IR validation identifies both the semantic program hash and the registry snapshot used to give that program meaning.
+A successful IR validation identifies the semantic program hash/profile and the registry snapshot used to give that program meaning.
+
+## AIOS IR v0.1 identity rule
+
+For the Issue #17 spike:
+
+```text
+Task ID          outside AIOS IR
+program_id       logical identifier; excluded from semantic hash
+metadata         excluded
+description      excluded
+authority reason excluded
+runtime binding  excluded
+```
+
+Executable semantics such as capability/data flow/types/effects/authority action+resource/egress/verification/failure/cache/constraints are included.
+
+See ADR 0029 / `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md` for exact ordering/default/canonicalization rules.
 
 ## Schema IDs
 
@@ -169,14 +193,16 @@ https://ai-native-os.example/specs/...
 
 No software should attempt to fetch that URL at runtime.
 
+Cross-schema `$ref` values using those IDs must be resolved from the locally bundled schema set during validation/testing rather than by network fetch.
+
 When the project gains a stable domain, schema IDs can move through an explicit compatibility/versioning ADR.
 
 ## Versioning approach
 
 Before v1.0:
 
-- breaking changes are allowed;
-- every breaking change should update fixtures/tests in the same change;
+- breaking changes are allowed under `docs/65-contract-maturity-and-architecture-change-control.md`;
+- every breaking semantic/security change should update fixtures/tests in the same change;
 - consumers should reject schema versions they cannot interpret safely;
 - optional fields should be preferred for additive compatible evolution;
 - authority/security semantics must not change accidentally through a schema-only edit.
@@ -189,21 +215,22 @@ minor — additive compatible fields/capabilities
 patch — documentation/constraint clarification that does not change valid semantics
 ```
 
-The exact version-string placement is still being standardized.
-
 ## Fixtures
 
 ### AIOS IR
 
 `examples/aios-ir/` contains:
 
-- a complete Demonstration A AIOS IR program;
+- complete Demonstration A semantic IR;
 - semantic capability/type fixtures;
-- a bootstrap registry snapshot;
-- validation/effect/binding fixtures;
-- a candidate reusable Skill manifest;
+- bootstrap registry snapshot;
+- validation/effect/binding/validator-output fixtures;
+- candidate reusable Skill manifest;
 - valid compact IR programs;
-- invalid/adversarial IR programs with expected reason codes.
+- invalid/adversarial IR programs with expected reason codes;
+- semantic-hash equivalence/difference fixtures under `canonicalization-cases.json`.
+
+Placeholder hashes are architecture/test placeholders until the reference implementation computes canonical identities. They are not cryptographic evidence.
 
 ### Platform fabrics
 
