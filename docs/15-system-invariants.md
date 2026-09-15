@@ -10,7 +10,7 @@ Every side-effecting action must be attributable to a task and authorized throug
 
 ## I2 — Plans are proposals, not permissions
 
-A planner may produce any syntactically valid plan. Execution occurs only after every step resolves to known capabilities and passes policy checks.
+A planner may produce any syntactically valid plan. Execution occurs only after every step resolves to known capabilities and passes deterministic semantic validation and policy checks.
 
 Generated shell commands, code, SQL, scripts, or UI actions do not receive privileged execution merely because a model produced them.
 
@@ -24,13 +24,13 @@ Data does not leave the local trust boundary by implication. Remote execution re
 
 ## I5 — Every external side effect is attributable
 
-The system must be able to identify the task, principal, provider, capability, authority grant, input references, and timestamp associated with an external communication or persistent change.
+The system must be able to identify the task, semantic program/node, principal, provider, capability, authority grant, input references, and timestamp associated with an external communication or persistent change.
 
 ## I6 — Repeated reasoning should become cheaper when safe
 
-The system should not repeatedly spend large-model reasoning on stable deterministic work. Validated repeated plans should be eligible for compilation into versioned skills or deterministic providers.
+The system should not repeatedly spend large-model reasoning on stable deterministic work. Validated repeated plans should be eligible for reuse/compilation into versioned Skills or deterministic providers.
 
-Optimization must not weaken authorization, verification, or provenance.
+Optimization must not weaken authorization, verification, provenance, data isolation, or current-input correctness.
 
 ## I7 — Compatibility cannot weaken isolation
 
@@ -44,7 +44,9 @@ Examples include Markdown, PDF, ODF/OOXML, PNG/JPEG, CSV/Parquet, glTF, source c
 
 ## I9 — Provider substitution is an architectural requirement
 
-A capability should be replaceable by another conforming provider without changing the task model. A model provider should likewise be replaceable behind a stable runtime interface.
+A semantic capability should be replaceable by another conforming provider without changing the task's semantic program. A model provider should likewise be replaceable behind a stable runtime interface when policy and capability requirements permit.
+
+Provider selection may change an execution binding. It should not silently rewrite semantic meaning.
 
 ## I10 — AI uncertainty cannot silently change authority
 
@@ -56,11 +58,11 @@ The same task/capability model should operate across high-end workstations, ordi
 
 ## I12 — Failure must be a normal state
 
-Tasks, providers, models, devices, networks, and compatibility habitats will fail. The task model must represent partial completion, retries, alternative providers, compensation/rollback, and durable recovery.
+Tasks, providers, models, devices, networks, and compatibility habitats will fail. The task model must represent partial completion, bounded retries, alternative providers, compensation/rollback, and durable recovery.
 
 ## I13 — Observability is part of the product
 
-A user must be able to inspect what the system is doing without understanding process IDs or application internals. Task state, pending approvals, provider selection, data egress, cost, and failures are user-facing operating-system concepts.
+A user must be able to inspect what the system is doing without understanding process IDs or application internals. Task state, pending approvals, semantic steps, provider selection, data egress, cost, and failures are user-facing operating-system concepts.
 
 ## I14 — Security policy is independent of model policy
 
@@ -72,15 +74,57 @@ Hardware adaptation should select from known, signed, testable kernels, drivers,
 
 ## I16 — The OS remains useful when offline
 
-Offline capability will vary with hardware, but core files, installed deterministic providers, task history, policy, recovery, and locally available models/capabilities must remain usable without cloud access.
+Offline capability will vary with hardware, but core files, installed deterministic providers, task history, policy, recovery, local semantic registries, and locally available models/capabilities must remain usable without cloud access.
 
 ## I17 — A task can cross providers without losing identity
 
-When work moves between local execution, remote services, peer devices, legacy habitats, or different models, the task identity, authority boundaries, artifact lineage, and provenance chain must remain intact.
+When work moves between local execution, remote services, peer devices, legacy habitats, or different models, the task identity, semantic program identity, authority boundaries, artifact lineage, and provenance chain must remain intact.
 
 ## I18 — User intent outranks provider convenience
 
 The architecture should not force a user to care which application, model, framework, or device performs an ordinary task unless that choice materially affects quality, privacy, cost, compatibility, or control.
+
+## I19 — Semantic programs are separate from runtime bindings
+
+AIOS IR defines what the task means. Provider IDs, model instances, hardware placement, sandbox instances, process IDs, credentials, capability grants, and attempt-specific state belong to runtime bindings.
+
+A runtime binding may vary without changing semantic program identity.
+
+## I20 — Semantic validation does not depend on AI judgment
+
+The trusted parser/normalizer/validator must be able to accept or reject executable AIOS IR without asking a model whether malformed, ambiguous, or hostile program structure is safe.
+
+A model may propose repairs, but every repaired proposal is validated again from the beginning.
+
+## I21 — Meaning belongs to semantic contracts, not provider claims
+
+A provider does not define the meaning of a capability merely by claiming its name.
+
+Stable semantic capability and type contracts define the interface; provider implementations must conform to them before interchangeable-provider claims are made.
+
+## I22 — Meaningful type conversions are explicit
+
+For v0.1, the system does not rely on implicit host-language coercions to connect semantic capability ports.
+
+A meaningful conversion between semantic types must be represented explicitly so it can be validated, authorized where necessary, optimized safely, and reconstructed in provenance.
+
+## I23 — Verification survives optimization
+
+A compiler, optimizer, cached result, Skill, provider substitution, or legacy adapter may not silently remove a verification requirement that is part of the validated semantic program.
+
+A transformation that weakens verification is a semantic change and must be treated as such.
+
+## I24 — Learned or compiled Skills never inherit old authority
+
+Skills can reuse validated structure and compiled computation. They cannot reuse a prior task's approval, capability token, bearer credential, secret value, or authority grant.
+
+Every invocation receives a new task context and current policy evaluation.
+
+## I25 — Adaptive efficiency must be measurable
+
+The project may claim that repeated work becomes cheaper only when measurements support the claim.
+
+Benchmarking should distinguish model/planning cost, validation/policy overhead, provider execution, memory/data movement, network/egress, compilation cost, and correctness/verification.
 
 ## How to use these invariants
 
