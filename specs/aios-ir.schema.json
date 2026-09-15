@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/aios-ir.schema.json",
+  "title": "AIOS Semantic Intermediate Representation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ir_version", "program_id", "kind", "inputs", "nodes", "outputs"],
+  "properties": {
+    "ir_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "program_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["task_graph", "skill_graph"]
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/programInput"
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/valueRef"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Non-authoritative descriptive metadata. It must not grant execution authority.",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "typeRef": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.-]*(?:@[0-9]+(?:\\.[0-9]+)*)?$"
+    },
+    "capabilityRef": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 160,
+      "pattern": "^[a-z][a-z0-9_.-]*(?:@[0-9]+(?:\\.[0-9]+)*)?$"
+    },
+    "programInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/typeRef"
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "media_types": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "valueRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "name"],
+          "properties": {
+            "source": {
+              "const": "input"
+            },
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "node", "port"],
+          "properties": {
+            "source": {
+              "const": "node"
+            },
+            "node": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+            },
+            "port": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          }
+        }
+      ]
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "capability"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["invoke", "verify"]
+        },
+        "capability": {
+          "$ref": "#/$defs/capabilityRef"
+        }
+      }
+    },
+    "authorityRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "resource"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_.:-]*$"
+        },
+        "resource": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["deny", "policy"]
+        },
+        "destination_classes": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      }
+    },
+    "acceleratorConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["gpu", "npu", "dsp", "fpga", "other"]
+        },
+        "min_memory_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "locality": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["local", "peer", "remote", "hybrid"]
+          }
+        },
+        "max_latency_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_cost_microusd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_memory_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "accelerator": {
+          "$ref": "#/$defs/acceleratorConstraint"
+        }
+      }
+    },
+    "failurePolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_error"],
+          "properties": {
+            "on_error": {
+              "const": "stop"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_error", "max_attempts"],
+          "properties": {
+            "on_error": {
+              "const": "retry"
+            },
+            "max_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_error", "fallback_capabilities"],
+          "properties": {
+            "on_error": {
+              "const": "fallback"
+            },
+            "fallback_capabilities": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/capabilityRef"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_error", "max_replans"],
+          "properties": {
+            "on_error": {
+              "const": "replan"
+            },
+            "max_replans": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2
+            }
+          }
+        }
+      ]
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "operation",
+        "execution_class",
+        "inputs",
+        "outputs",
+        "authority_requests",
+        "egress",
+        "failure",
+        "cache"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "execution_class": {
+          "type": "string",
+          "enum": [
+            "deterministic",
+            "bounded_nondeterministic",
+            "probabilistic",
+            "opaque_external"
+          ]
+        },
+        "inputs": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/valueRef"
+          }
+        },
+        "outputs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/typeRef"
+          }
+        },
+        "authority_requests": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/authorityRequest"
+          }
+        },
+        "egress": {
+          "$ref": "#/$defs/egress"
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "failure": {
+          "$ref": "#/$defs/failurePolicy"
+        },
+        "cache": {
+          "type": "string",
+          "enum": ["never", "deterministic_only", "content_addressed"]
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Non-authoritative metadata excluded from permission decisions.",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}
