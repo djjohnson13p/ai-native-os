@@ -82,8 +82,33 @@
         "revision": {"type": "integer", "minimum": 1}
       }
     },
+    "active_program": {
+      "type": ["object", "null"],
+      "description": "Validated semantic AIOS IR program selected for execution. Runtime provider/grant bindings are stored separately.",
+      "additionalProperties": false,
+      "required": ["ir_version", "program_id", "semantic_hash", "registry_snapshot_id"],
+      "properties": {
+        "ir_version": {"type": "string", "minLength": 1},
+        "program_id": {"type": "string", "minLength": 1},
+        "semantic_hash": {
+          "type": "string",
+          "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+        },
+        "registry_snapshot_id": {"type": "string", "minLength": 1},
+        "validation_result_id": {"type": ["string", "null"]},
+        "validated_at": {"type": ["string", "null"], "format": "date-time"},
+        "validator_id": {"type": ["string", "null"]},
+        "validator_version": {"type": ["string", "null"]}
+      }
+    },
     "active_step_ids": {
       "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "active_execution_binding_ids": {
+      "type": "array",
+      "description": "Attempt-specific runtime bindings currently active. These do not define semantic program identity.",
       "items": {"type": "string"},
       "uniqueItems": true
     },
@@ -94,7 +119,7 @@
         "additionalProperties": false,
         "required": ["kind", "id"],
         "properties": {
-          "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider"]},
+          "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider", "validation"]},
           "id": {"type": "string", "minLength": 1},
           "message": {"type": ["string", "null"]}
         }
@@ -118,6 +143,7 @@
         "summary": {"type": "string"},
         "step_id": {"type": ["string", "null"]},
         "provider_id": {"type": ["string", "null"]},
+        "execution_binding_id": {"type": ["string", "null"]},
         "retryable": {"type": "boolean"},
         "safe_to_replan": {"type": "boolean"},
         "unknown_side_effects": {"type": "boolean"},
