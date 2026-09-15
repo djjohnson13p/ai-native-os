@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/relationship-contract.schema.json",
+  "title": "AIOS Semantic Relationship Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "predicate", "version", "source_types", "target_types", "source_cardinality", "target_cardinality"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "predicate": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]+$"},
+    "version": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "description": {"type": ["string", "null"]},
+    "source_types": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "target_types": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "source_cardinality": {"type": "string", "enum": ["one", "zero-or-one", "many"]},
+    "target_cardinality": {"type": "string", "enum": ["one", "zero-or-one", "many"]},
+    "inverse_predicate": {"type": ["string", "null"]},
+    "symmetric": {"type": "boolean", "default": false},
+    "transitive": {"type": "boolean", "default": false},
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "precondition_required": {"type": "boolean", "default": true},
+        "append_only": {"type": "boolean", "default": false},
+        "deletion_semantics": {"type": "string", "enum": ["unlink", "tombstone", "forbidden", "domain-defined"]}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "read_class": {"type": ["string", "null"]},
+        "create_class": {"type": ["string", "null"]},
+        "delete_class": {"type": ["string", "null"]}
+      }
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain_pack": {"type": ["string", "null"]},
+        "maintainers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "metadata": {"type": "object", "additionalProperties": true}
+  }
+}
