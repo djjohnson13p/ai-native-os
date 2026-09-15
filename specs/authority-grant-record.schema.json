@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/authority-grant-record.schema.json",
+  "title": "AIOS v0.1 Runtime Authority Grant Record",
+  "description": "Server-side durable record behind an opaque runtime grant/token handle. Raw bearer token value is never stored in provenance output.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "grant_id",
+    "token_id",
+    "task_id",
+    "semantic_program_hash",
+    "node_id",
+    "capability",
+    "principal",
+    "execution_binding_id",
+    "grants",
+    "policy_decision_id",
+    "policy_snapshot_id",
+    "state",
+    "issued_at",
+    "expires_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "grant_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "token_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["agent", "provider", "legacy-app", "system-service", "peer-node"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": ["string", "null"], "maxLength": 128},
+        "package_or_build_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "execution_binding_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "attempt_id": {"type": ["string", "null"], "maxLength": 256},
+    "grants": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "resource_kind", "resource_id"],
+        "properties": {
+          "action": {"type": "string", "pattern": "^[a-z][a-z0-9_.:-]*$", "maxLength": 128},
+          "resource_kind": {"type": "string", "minLength": 1, "maxLength": 128},
+          "resource_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "semantic_selector": {"type": ["string", "null"], "maxLength": 512},
+          "destination_class": {"type": ["string", "null"], "maxLength": 128},
+          "service_id": {"type": ["string", "null"], "maxLength": 512}
+        }
+      }
+    },
+    "policy_decision_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "policy_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "approval_id": {"type": ["string", "null"], "maxLength": 256},
+    "scope": {"type": "string", "enum": ["ONE_SHOT", "TASK", "TIME_LIMITED"]},
+    "max_uses": {"type": ["integer", "null"], "minimum": 1},
+    "uses_consumed": {"type": "integer", "minimum": 0, "default": 0},
+    "state": {"type": "string", "enum": ["ACTIVE", "CONSUMED", "EXPIRED", "REVOKED"]},
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delegable", "max_depth"],
+      "properties": {
+        "delegable": {"type": "boolean", "const": false},
+        "max_depth": {"type": "integer", "const": 0}
+      }
+    },
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "revoked_at": {"type": ["string", "null"], "format": "date-time"},
+    "revocation_reason_code": {"type": ["string", "null"], "maxLength": 128}
+  }
+}
