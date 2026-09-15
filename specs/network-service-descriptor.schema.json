@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/network-service-descriptor.schema.json",
+  "title": "AIOS Network Service Descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "service_id", "service_class", "trust_state", "endpoints"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "service_id": {"type": "string", "pattern": "^service://"},
+    "service_class": {
+      "type": "string",
+      "enum": ["LOCAL_SERVICE", "PEER_SERVICE", "ORG_SERVICE", "REMOTE_PROVIDER", "MODEL_PROVIDER", "OBJECT_STORAGE", "SYNC_SERVICE", "RELAY", "DIRECTORY", "REMOTE_SURFACE", "OTHER"]
+    },
+    "provider_id": {"type": ["string", "null"]},
+    "peer_id": {"type": ["string", "null"]},
+    "trust_state": {"type": "string", "enum": ["UNTRUSTED", "PAIRED", "MANAGED", "VERIFIED_PROVIDER", "SYSTEM", "UNKNOWN"]},
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "endpoints": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["endpoint_id", "network_class", "transport"],
+        "properties": {
+          "endpoint_id": {"type": "string", "minLength": 1},
+          "address": {"type": ["string", "null"]},
+          "network_class": {"type": "string", "enum": ["LOOPBACK", "LOCAL_TRUSTED", "LOCAL_UNTRUSTED", "PERSONAL_PEER", "ORG_MANAGED", "PUBLIC_INTERNET", "METERED_WAN", "RESTRICTED_WAN"]},
+          "transport": {"type": "string", "minLength": 1},
+          "authenticated": {"type": "boolean"},
+          "encrypted": {"type": "boolean"},
+          "region": {"type": ["string", "null"]},
+          "metered": {"type": ["boolean", "null"]}
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "issuer": {"type": ["string", "null"]},
+        "fingerprint": {"type": ["string", "null"]},
+        "expires_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "discovered_at": {"type": ["string", "null"], "format": "date-time"},
+    "last_verified_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
