@@ -1,0 +1,108 @@
+{
+  "profile": "aios-step-execution-v0.1",
+  "description": "Synthetic attempt/outcome-certainty cases for recovery and safe rebinding.",
+  "cases": [
+    {
+      "name": "deterministic-provider-success",
+      "record": {
+        "schema_version": "0.1",
+        "attempt_id": "attempt-hash-1",
+        "task_id": "T-task-fixture-1",
+        "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "registry_snapshot_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "node_id": "hash_source",
+        "binding_id": "binding-hash-1",
+        "provider_id": "provider:artifact-hash-fixture",
+        "provider_version": "0.1.0",
+        "attempt_number": 1,
+        "revision": 4,
+        "state": "SUCCEEDED",
+        "operation_id": null,
+        "idempotency_key": null,
+        "outcome_certainty": "COMPLETED",
+        "input_artifacts": ["artifact:fixture-source"],
+        "output_artifacts": ["artifact:fixture-hash"],
+        "failure": null,
+        "started_at": "2026-09-15T22:00:00Z",
+        "finished_at": "2026-09-15T22:00:01Z",
+        "created_at": "2026-09-15T21:59:59Z",
+        "updated_at": "2026-09-15T22:00:01Z"
+      },
+      "expected_recovery_action": "no retry; output remains eligible for downstream verification/use"
+    },
+    {
+      "name": "provider-failed-before-effect-can-rebind",
+      "record_mutation": {
+        "state": "FAILED",
+        "outcome_certainty": "FAILED_NO_EFFECT",
+        "failure": {
+          "code": "PROVIDER_CRASH",
+          "summary": "Provider exited before committing any effect.",
+          "retryable": true,
+          "safe_to_rebind": true,
+          "unknown_side_effects": false
+        }
+      },
+      "expected_recovery_action": "new attempt/binding may be created under current policy; prior attempt remains immutable"
+    },
+    {
+      "name": "irreversible-external-outcome-unknown-do-not-retry",
+      "record": {
+        "schema_version": "0.1",
+        "attempt_id": "attempt-send-1",
+        "task_id": "T-task-fixture-2",
+        "semantic_program_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "registry_snapshot_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "node_id": "send_confirmation",
+        "binding_id": "binding-send-1",
+        "provider_id": "provider:message-send-fixture",
+        "provider_version": "0.1.0",
+        "attempt_number": 1,
+        "revision": 5,
+        "state": "UNKNOWN",
+        "operation_id": "operation:T-task-fixture-2:send_confirmation:v1",
+        "idempotency_key": "operation:T-task-fixture-2:send_confirmation:v1",
+        "outcome_certainty": "OUTCOME_UNKNOWN",
+        "input_artifacts": ["artifact:confirmation-message"],
+        "output_artifacts": [],
+        "failure": {
+          "code": "NETWORK_LOST_AFTER_SEND_REQUEST",
+          "summary": "Transport disconnected after submission; provider result is unknown.",
+          "retryable": false,
+          "safe_to_rebind": false,
+          "unknown_side_effects": true
+        },
+        "started_at": "2026-09-15T22:10:00Z",
+        "finished_at": null,
+        "created_at": "2026-09-15T22:09:59Z",
+        "updated_at": "2026-09-15T22:10:03Z"
+      },
+      "expected_recovery_action": "Task enters/reconciles through RECOVERING; no blind retry until provider/external system establishes outcome or explicit resolution policy applies"
+    },
+    {
+      "name": "partial-effect-requires-compensation-decision",
+      "record_mutation": {
+        "state": "FAILED",
+        "outcome_certainty": "FAILED_PARTIAL_EFFECT",
+        "failure": {
+          "code": "PARTIAL_EXTERNAL_UPDATE",
+          "summary": "Provider reports some external state changed before failure.",
+          "retryable": false,
+          "safe_to_rebind": false,
+          "unknown_side_effects": true
+        }
+      },
+      "expected_recovery_action": "do not retry as ordinary attempt; evaluate declared compensation/reconciliation path"
+    },
+    {
+      "name": "new-attempt-does-not-overwrite-failed-attempt",
+      "prior_attempt": "attempt-hash-1 remains FAILED/FAILED_NO_EFFECT",
+      "new_attempt": {
+        "attempt_id": "attempt-hash-2",
+        "attempt_number": 2,
+        "binding_id": "binding-hash-2"
+      },
+      "expected": "two durable attempt records; provenance links both; Task/node result chooses successful current attempt without rewriting attempt 1"
+    }
+  ]
+}
