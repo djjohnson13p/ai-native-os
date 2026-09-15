@@ -1,0 +1,35 @@
+{
+  "schema_version": "0.1",
+  "id": "org.ainative.domain.business-foundation",
+  "version": "0.1.0",
+  "name": "Business Foundation",
+  "description": "Synthetic bootstrap Domain Pack demonstrating cross-domain semantic objects and capabilities.",
+  "semantic_objects": [
+    {"type_id": "party.organization", "version": "1", "contract_ref": "registry://types/party.organization@1"},
+    {"type_id": "party.person", "version": "1", "contract_ref": "registry://types/party.person@1"},
+    {"type_id": "business.product", "version": "1", "contract_ref": "registry://types/business.product@1"},
+    {"type_id": "sales.quote", "version": "1", "contract_ref": "registry://types/sales.quote@1"},
+    {"type_id": "billing.invoice", "version": "1", "contract_ref": "registry://types/billing.invoice@1"},
+    {"type_id": "billing.payment", "version": "1", "contract_ref": "registry://types/billing.payment@1"}
+  ],
+  "capabilities": [
+    {"capability_id": "party.organization.create", "version": "1", "contract_ref": "registry://capabilities/party.organization.create@1", "conformance_suite": "party.organization.create/1"},
+    {"capability_id": "sales.quote.calculate", "version": "1", "contract_ref": "registry://capabilities/sales.quote.calculate@1", "conformance_suite": "sales.quote.calculate/1"},
+    {"capability_id": "billing.invoice.issue", "version": "1", "contract_ref": "registry://capabilities/billing.invoice.issue@1", "conformance_suite": "billing.invoice.issue/1"}
+  ],
+  "views": [
+    {"id": "business.relationships", "view_kind": "relationship-board", "object_types": ["party.organization", "party.person", "sales.quote", "billing.invoice"], "provider_requirement": null}
+  ],
+  "adapters": [
+    {"id": "generic.csv-import", "kind": "import", "formats_or_systems": ["text/csv"]},
+    {"id": "generic.federation-placeholder", "kind": "federation", "formats_or_systems": ["external-crm", "external-billing"]}
+  ],
+  "policy_profiles": ["business.default-private"],
+  "skills": [],
+  "dependencies": [],
+  "publisher": {
+    "id": "org.ainative.project",
+    "signature": null,
+    "source_url": "https://example.invalid/ai-native-os"
+  }
+}
