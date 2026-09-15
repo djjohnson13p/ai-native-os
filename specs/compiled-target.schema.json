@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/compiled-target.schema.json",
+  "title": "AIOS Compiled Target Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "target_id",
+    "source",
+    "compiler",
+    "target",
+    "artifact_hash",
+    "runtime_abi",
+    "semantic_dependencies",
+    "effect_upper_bound",
+    "validation"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "target_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ir_version", "semantic_hash", "node_ids"],
+      "properties": {
+        "ir_version": {"type": "string", "minLength": 1},
+        "semantic_hash": {
+          "type": "string",
+          "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+        },
+        "node_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
+        "skill_id": {"type": ["string", "null"]},
+        "skill_version": {"type": ["string", "null"]}
+      }
+    },
+    "compiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "build_hash": {"type": ["string", "null"], "maxLength": 256},
+        "optimization_profile": {"type": ["string", "null"], "maxLength": 128}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format"],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": ["wasm", "native", "provider_pipeline", "query_plan", "gpu_graph", "other"]
+        },
+        "platform": {"type": ["string", "null"], "maxLength": 160},
+        "architecture": {"type": ["string", "null"], "maxLength": 64},
+        "provider_requirement": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "artifact_hash": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+    },
+    "artifact_ref": {
+      "type": ["string", "null"],
+      "maxLength": 1024
+    },
+    "runtime_abi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    },
+    "semantic_dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id", "version", "content_hash"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["capability", "type"]},
+          "id": {"type": "string", "minLength": 3, "maxLength": 160},
+          "version": {"type": "string", "minLength": 1, "maxLength": 64},
+          "content_hash": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+          }
+        }
+      }
+    },
+    "effect_upper_bound": {
+      "type": "object",
+      "description": "Static semantic effect/authority envelope of the compiled region. This does not grant authority.",
+      "additionalProperties": false,
+      "required": ["effects", "authority_classes", "egress_modes"],
+      "properties": {
+        "effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "none",
+              "artifact_read",
+              "artifact_write",
+              "network",
+              "external_message",
+              "secret_access",
+              "persistent_state",
+              "device_access",
+              "system_change"
+            ]
+          }
+        },
+        "authority_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 3, "maxLength": 128}
+        },
+        "egress_modes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["deny", "policy"]}
+        }
+      }
+    },
+    "verification_barriers": {
+      "type": "array",
+      "description": "Verifier node IDs/barriers covered or preserved by this target.",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 128}
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "validated_at", "suite"],
+      "properties": {
+        "status": {"type": "string", "enum": ["candidate", "tested", "rejected", "invalidated"]},
+        "validated_at": {"type": "string", "format": "date-time"},
+        "suite": {"type": "string", "minLength": 1, "maxLength": 512},
+        "suite_hash": {"type": ["string", "null"], "maxLength": 256},
+        "reference_equivalence_passed": {"type": "boolean"}
+      }
+    },
+    "created_at": {"type": ["string", "null"], "format": "date-time"},
+    "invalidated_at": {"type": ["string", "null"], "format": "date-time"},
+    "invalidation_reason": {"type": ["string", "null"], "maxLength": 2048}
+  }
+}
