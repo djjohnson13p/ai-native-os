@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/namespace-projection.schema.json",
+  "title": "AIOS Namespace Projection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "projection_id", "target", "namespace", "access_mode", "materialization_state", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "projection_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "workspace_id": {"type": ["string", "null"], "maxLength": 512},
+    "task_id": {"type": ["string", "null"], "maxLength": 512},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["artifact", "object", "stream", "external-resource"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "revision": {"type": ["integer", "null"], "minimum": 1},
+        "content_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "locator"],
+      "properties": {
+        "provider_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "locator": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "display_path": {"type": ["string", "null"], "maxLength": 4096},
+        "service_id": {"type": ["string", "null"], "maxLength": 512}
+      }
+    },
+    "representation_role": {"type": ["string", "null"], "enum": [null, "native", "portable", "preview", "source", "derived", "archive", "exchange"]},
+    "semantic_equivalence": {"type": ["string", "null"], "enum": [null, "authoritative", "lossless", "lossy", "view-only", "unknown"]},
+    "access_mode": {"type": "string", "enum": ["READ_ONLY", "READ_WRITE", "WRITE_ONCE", "TASK_OUTPUT", "LEGACY_EXCHANGE"]},
+    "materialization_state": {"type": "string", "enum": ["METADATA_ONLY", "PLACEHOLDER", "PARTIAL", "MATERIALIZED", "DIRTY_LOCAL", "SYNC_PENDING", "CONFLICTED", "OFFLINE_UNAVAILABLE"]},
+    "source_replica_id": {"type": ["string", "null"], "maxLength": 256},
+    "sync_policy": {"type": ["string", "null"], "enum": [null, "NONE", "ON_DEMAND", "MIRROR", "EXPORT_ONLY", "EXTERNAL_SOURCE_MANAGED"]},
+    "legacy_habitat_id": {"type": ["string", "null"], "maxLength": 512},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}
