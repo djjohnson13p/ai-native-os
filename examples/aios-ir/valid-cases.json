@@ -1,0 +1,179 @@
+[
+  {
+    "name": "minimal-deterministic-copy",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "fixture.minimal_copy",
+      "kind": "task_graph",
+      "inputs": {
+        "source": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [
+            {"action": "artifact.read", "resource": "input:source"},
+            {"action": "artifact.write", "resource": "task.output"}
+          ],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {
+        "copy": {"source": "node", "node": "copy", "port": "copy"}
+      }
+    }
+  },
+  {
+    "name": "parallel-independent-hashes",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "fixture.parallel_hash",
+      "kind": "task_graph",
+      "inputs": {
+        "left": {"type": "artifact.file@1", "required": true},
+        "right": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "hash_left",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "left"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [{"action": "artifact.read", "resource": "input:left"}],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        },
+        {
+          "id": "hash_right",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "right"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [{"action": "artifact.read", "resource": "input:right"}],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {
+        "left_hash": {"source": "node", "node": "hash_left", "port": "hash"},
+        "right_hash": {"source": "node", "node": "hash_right", "port": "hash"}
+      }
+    }
+  },
+  {
+    "name": "probabilistic-output-with-explicit-verifier",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "fixture.probabilistic_verify",
+      "kind": "task_graph",
+      "inputs": {
+        "metrics": {"type": "data.metrics@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "draft",
+          "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+          "execution_class": "probabilistic",
+          "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+          "outputs": {"narrative": "text.narrative@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "constraints": {"locality": ["local"]},
+          "failure": {"on_error": "replan", "max_replans": 1},
+          "cache": "never"
+        },
+        {
+          "id": "verify",
+          "operation": {"kind": "verify", "capability": "verify.numeric_claims@1"},
+          "execution_class": "deterministic",
+          "inputs": {
+            "narrative": {"source": "node", "node": "draft", "port": "narrative"},
+            "metrics": {"source": "input", "name": "metrics"}
+          },
+          "outputs": {"verified_narrative": "text.narrative@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "deterministic_only"
+        }
+      ],
+      "outputs": {
+        "narrative": {"source": "node", "node": "verify", "port": "verified_narrative"}
+      }
+    }
+  },
+  {
+    "name": "bounded-provider-fallback",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "fixture.bounded_fallback",
+      "kind": "task_graph",
+      "inputs": {
+        "source": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [
+            {"action": "artifact.read", "resource": "input:source"},
+            {"action": "artifact.write", "resource": "task.output"}
+          ],
+          "egress": {"mode": "deny"},
+          "failure": {
+            "on_error": "fallback",
+            "fallback_capabilities": ["artifact.copy.compat@1"]
+          },
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {
+        "copy": {"source": "node", "node": "copy", "port": "copy"}
+      }
+    }
+  },
+  {
+    "name": "parameterized-skill-graph",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "skill.uppercase_text.v1",
+      "kind": "skill_graph",
+      "inputs": {
+        "text": {"type": "text.plain@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "uppercase",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "input", "name": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {
+        "text": {"source": "node", "node": "uppercase", "port": "text"}
+      }
+    }
+  }
+]
