@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/approval-request.schema.json",
+  "title": "AIOS v0.1 Approval Request",
+  "description": "Structured security-sensitive approval data rendered by trusted system UI. Provider prose cannot replace these fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "approval_id",
+    "authority_request_id",
+    "task_id",
+    "semantic_program_hash",
+    "node_id",
+    "action",
+    "resource",
+    "principal",
+    "scope",
+    "effect_classes",
+    "status",
+    "created_at",
+    "expires_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "approval_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "authority_request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "action": {"type": "string", "pattern": "^[a-z][a-z0-9_.:-]*$", "maxLength": 128},
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "display_class"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+        "id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "display_class": {"type": "string", "minLength": 1, "maxLength": 256},
+        "sensitivity": {"type": ["string", "null"], "enum": [null, "public", "local", "private", "confidential", "secret"]}
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["agent", "provider", "legacy-app", "system-service", "peer-node"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": ["string", "null"], "maxLength": 128}
+      }
+    },
+    "destination": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["class", "service_id"],
+      "properties": {
+        "class": {"type": "string", "minLength": 1, "maxLength": 128},
+        "service_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "region_or_jurisdiction": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "effect_classes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["ARTIFACT_READ", "ARTIFACT_WRITE", "NETWORK", "DATA_EGRESS", "EXTERNAL_MESSAGE", "SECRET_ACCESS", "PERSISTENT_STATE", "DEVICE_ACCESS", "SYSTEM_CHANGE", "LEGACY_OPAQUE"]
+      }
+    },
+    "irreversibility": {
+      "type": "string",
+      "enum": ["reversible", "compensatable", "irreversible_external", "unknown"]
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["ONE_SHOT", "TASK", "TIME_LIMITED"]
+    },
+    "requested_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_uses": {"type": ["integer", "null"], "minimum": 1},
+        "max_cost_microusd": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "policy_reason_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {"type": "string", "maxLength": 128}
+    },
+    "trusted_summary": {"type": ["string", "null"], "maxLength": 4096},
+    "provider_context": {"type": ["string", "null"], "maxLength": 4096},
+    "status": {"type": "string", "enum": ["PENDING", "APPROVED", "DENIED", "EXPIRED", "REVOKED", "STALE"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"}
+  }
+}
