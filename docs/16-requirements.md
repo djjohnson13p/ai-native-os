@@ -30,6 +30,86 @@ Material plan changes SHOULD be preserved in provenance so that users and develo
 
 The task model MUST support work that survives shell/UI restarts and, eventually, device reboot.
 
+## AIOS intermediate representation
+
+### R-IR-001 — Provider-independent semantic program
+
+Runnable task semantics MUST be representable without requiring a concrete provider, model vendor, executable path, process ID, or hardware device identity.
+
+### R-IR-002 — No embedded authority
+
+Semantic IR MUST NOT contain reusable authority grants, bearer tokens, passwords, secret values, approval bypasses, or other values that grant execution permission merely by appearing in the program.
+
+### R-IR-003 — Deterministic validation
+
+Before execution, AIOS IR MUST pass structural and semantic validation performed by deterministic code without requiring a model judgment for correctness.
+
+### R-IR-004 — Explicit typed data flow
+
+Every executable IR node MUST use named typed input/output ports and all data-flow references MUST resolve before a task becomes runnable.
+
+### R-IR-005 — Explicit execution class
+
+Every executable node MUST declare or resolve to an execution class sufficient for caching, verification, provenance, and skill-compilation decisions: deterministic, bounded nondeterministic, probabilistic, or opaque external.
+
+### R-IR-006 — Bounded control behavior
+
+AIOS IR v0.1 MUST NOT permit unbounded retry, fallback, replan, or general loop behavior. Any repeated execution behavior MUST have a finite machine-verifiable budget.
+
+### R-IR-007 — Explicit authority and egress intent
+
+IR nodes that require side effects MUST explicitly request the relevant authority classes, and external data egress MUST be declared as denied or policy-controlled before runtime binding.
+
+### R-IR-008 — Verification preservation
+
+Required verification gates MUST be represented in the semantic graph such that optimizers/compilers cannot remove them without creating a semantically different program requiring revalidation.
+
+### R-IR-009 — Stable semantic identity
+
+Normalized IR SHOULD have a canonical serialization/content hash so equivalent executable meaning can be identified independently of formatting and runtime provider bindings.
+
+### R-IR-010 — Execution binding separation
+
+Concrete provider identity, grant references, sandbox profile, hardware placement, attempt number, and other runtime bindings MUST be represented outside the semantic IR.
+
+### R-IR-011 — Non-escalating transformation
+
+Optimization/compilation MUST NOT broaden authority, egress, or side effects; weaken verification; or replace deterministic behavior with probabilistic behavior without semantic revalidation.
+
+### R-IR-012 — Stable validation reason codes
+
+The validator SHOULD emit stable machine-readable reason-code families for schema, reference, graph, type, capability, effect, authority, egress, failure-policy, and version errors.
+
+## Semantic type and capability contracts
+
+### R-CONTRACT-001 — Capability semantics independent of provider
+
+The meaning of a stable semantic capability MUST be defined independently from any provider implementation.
+
+### R-CONTRACT-002 — Named typed ports
+
+Capability contracts MUST declare named semantic input and output ports and their type versions.
+
+### R-CONTRACT-003 — Provider conformance
+
+A provider claiming interchangeability SHOULD be evaluated against the same referenced conformance suite as other providers implementing that semantic capability.
+
+### R-CONTRACT-004 — Allowed effects and authority classes
+
+Semantic capability contracts MUST declare the effect/authority classes an implementation is permitted to require. A provider requesting undeclared authority MUST fail closed.
+
+### R-CONTRACT-005 — Semantic types independent of representation
+
+Semantic type identity MUST NOT be defined solely by a host-language class, library object, file extension, or one physical encoding.
+
+### R-CONTRACT-006 — Explicit conversion
+
+AIOS IR v0.1 SHOULD require exact compatible semantic types and represent meaningful semantic conversion through explicit capabilities rather than implicit language-style casts.
+
+### R-CONTRACT-007 — Registry snapshot reproducibility
+
+IR semantic validation SHOULD be reproducible against identifiable capability/type registry snapshots.
+
 ## Capability system
 
 ### R-CAP-001 — Stable capability identity
@@ -210,6 +290,18 @@ Probabilistic workflows SHOULD only be compiled into deterministic procedures af
 
 Skills intended for sharing MUST NOT include private context merely because that context appeared in the task from which the skill was learned.
 
+### R-SKILL-005 — No inherited grants
+
+A reusable or compiled Skill MUST NOT carry forward task-specific approvals, capability tokens, bearer credentials, or other prior execution authority.
+
+### R-SKILL-006 — Source traceability
+
+Compiled Skill targets SHOULD remain traceable to a source AIOS IR hash/template and validation evidence.
+
+### R-SKILL-007 — Measurable efficiency
+
+Claims that Skill reuse improves efficiency SHOULD be supported by measurements such as reduced model invocations/tokens, latency, memory, network, energy, or monetary cost.
+
 ## Base system
 
 ### R-BASE-001 — Mature kernel/driver ecosystem first
@@ -250,7 +342,7 @@ The default interface SHOULD hide unnecessary implementation detail while making
 
 ### R-OSS-001 — Open contracts
 
-Core task, capability, policy, provenance, artifact, and provider contracts MUST be publicly documented if the project is released as open source.
+Core task, capability, policy, provenance, artifact, provider, type, and IR contracts MUST be publicly documented if the project is released as open source.
 
 ### R-OSS-002 — Conformance over branding
 
