@@ -1,0 +1,137 @@
+[
+  {
+    "type_id": "artifact.file",
+    "version": "1.0",
+    "kind": "artifact",
+    "description": "Generic durable file-like artifact referenced by an Artifact Handle.",
+    "nullable": false,
+    "representations": [
+      {"id": "artifact-handle", "media_type": null, "schema_ref": "../specs/artifact-handle.schema.json", "zero_copy_candidate": true}
+    ],
+    "equality": {"mode": "byte_identical", "canonicalizer": "content-hash"},
+    "conversion_capabilities": ["artifact.copy@1"],
+    "conformance": {"suite_id": "conformance://type/artifact.file/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "artifact.table",
+    "version": "1.0",
+    "kind": "artifact",
+    "description": "Durable user-facing artifact intended to be interpreted as tabular data by an explicit import capability.",
+    "nullable": false,
+    "representations": [
+      {"id": "csv", "media_type": "text/csv", "schema_ref": null, "zero_copy_candidate": false},
+      {"id": "xlsx", "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "byte_identical", "canonicalizer": "content-hash"},
+    "conversion_capabilities": ["table.import@1"],
+    "conformance": {"suite_id": "conformance://type/artifact.table/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "artifact.image",
+    "version": "1.0",
+    "kind": "artifact",
+    "description": "Durable rendered image/vector artifact.",
+    "nullable": false,
+    "representations": [
+      {"id": "png", "media_type": "image/png", "schema_ref": null, "zero_copy_candidate": false},
+      {"id": "svg", "media_type": "image/svg+xml", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "semantic", "canonicalizer": null},
+    "conversion_capabilities": [],
+    "conformance": {"suite_id": "conformance://type/artifact.image/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "artifact.report",
+    "version": "1.0",
+    "kind": "artifact",
+    "description": "Durable human-readable report artifact.",
+    "nullable": false,
+    "representations": [
+      {"id": "pdf", "media_type": "application/pdf", "schema_ref": null, "zero_copy_candidate": false},
+      {"id": "html", "media_type": "text/html", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "semantic", "canonicalizer": null},
+    "conversion_capabilities": [],
+    "conformance": {"suite_id": "conformance://type/artifact.report/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "data.table",
+    "version": "1.0",
+    "kind": "structured",
+    "description": "Normalized typed tabular value with ordered named columns and explicit missing-value semantics.",
+    "nullable": false,
+    "representations": [
+      {"id": "arrow-ipc", "media_type": "application/vnd.apache.arrow.file", "schema_ref": null, "zero_copy_candidate": true},
+      {"id": "canonical-json-table", "media_type": "application/json", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "canonical_value", "canonicalizer": "aios.data.table.v1"},
+    "conversion_capabilities": ["table.normalize@1", "stats.compare_periods@1"],
+    "conformance": {"suite_id": "conformance://type/data.table/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "data.metrics",
+    "version": "1.0",
+    "kind": "structured",
+    "description": "Machine-verifiable metric collection with value, unit, source, and computation method metadata.",
+    "nullable": false,
+    "representations": [
+      {"id": "canonical-json", "media_type": "application/json", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "numeric_tolerance", "canonicalizer": "aios.data.metrics.v1", "numeric_absolute_tolerance": 0.000000001, "numeric_relative_tolerance": 0.000000001},
+    "conversion_capabilities": ["chart.render@1", "report.summarize@1"],
+    "conformance": {"suite_id": "conformance://type/data.metrics/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "data.hash",
+    "version": "1.0",
+    "kind": "scalar",
+    "description": "Algorithm-tagged cryptographic content digest.",
+    "nullable": false,
+    "representations": [
+      {"id": "tagged-string", "media_type": "text/plain", "schema_ref": null, "zero_copy_candidate": true}
+    ],
+    "equality": {"mode": "byte_identical", "canonicalizer": "lowercase-algorithm-tag"},
+    "conversion_capabilities": [],
+    "conformance": {"suite_id": "conformance://type/data.hash/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "text.plain",
+    "version": "1.0",
+    "kind": "scalar",
+    "description": "Unicode plain text without narrative claim annotations.",
+    "nullable": false,
+    "representations": [
+      {"id": "utf8", "media_type": "text/plain;charset=utf-8", "schema_ref": null, "zero_copy_candidate": true}
+    ],
+    "equality": {"mode": "canonical_value", "canonicalizer": "unicode-normalized-text"},
+    "conversion_capabilities": ["text.uppercase@1"],
+    "conformance": {"suite_id": "conformance://type/text.plain/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "text.narrative",
+    "version": "1.0",
+    "kind": "structured",
+    "description": "Human-readable narrative text that may carry claim annotations for deterministic verification.",
+    "nullable": false,
+    "representations": [
+      {"id": "narrative-json", "media_type": "application/json", "schema_ref": null, "zero_copy_candidate": false},
+      {"id": "plain-text-lossy", "media_type": "text/plain;charset=utf-8", "schema_ref": null, "zero_copy_candidate": true}
+    ],
+    "equality": {"mode": "not_defined", "canonicalizer": null},
+    "conversion_capabilities": ["verify.numeric_claims@1", "document.compose@1"],
+    "conformance": {"suite_id": "conformance://type/text.narrative/1", "suite_version": "0.1"}
+  },
+  {
+    "type_id": "verification.result",
+    "version": "1.0",
+    "kind": "structured",
+    "description": "Machine-readable pass/fail/indeterminate verification result with stable reason codes.",
+    "nullable": false,
+    "representations": [
+      {"id": "canonical-json", "media_type": "application/json", "schema_ref": null, "zero_copy_candidate": false}
+    ],
+    "equality": {"mode": "canonical_value", "canonicalizer": "aios.verification.result.v1"},
+    "conversion_capabilities": [],
+    "conformance": {"suite_id": "conformance://type/verification.result/1", "suite_version": "0.1"}
+  }
+]
