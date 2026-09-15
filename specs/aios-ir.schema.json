@@ -160,8 +160,10 @@
         },
         "resource": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 512
+          "minLength": 3,
+          "maxLength": 512,
+          "description": "Symbolic semantic resource selector, never a host path/URL/runtime handle. Contextual meaning is validated against program/capability contracts.",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]*(?::[A-Za-z][A-Za-z0-9_.-]*)*$"
         },
         "reason": {
           "type": "string",
@@ -186,10 +188,36 @@
           "items": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128
+            "maxLength": 128,
+            "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"mode": {"const": "deny"}},
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "destination_classes": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"mode": {"const": "policy"}},
+            "required": ["mode"]
+          },
+          "then": {
+            "required": ["destination_classes"],
+            "properties": {
+              "destination_classes": {"minItems": 1}
+            }
+          }
+        }
+      ]
     },
     "acceleratorConstraint": {
       "type": "object",
