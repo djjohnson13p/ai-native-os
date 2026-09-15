@@ -1,0 +1,37 @@
+package aios:artifact-hash-provider@0.1.0;
+
+/// Concrete Component Model ABI experiment for the semantic capability
+/// `artifact.hash@1`.
+///
+/// The Semantic Capability Contract remains authoritative for operation meaning;
+/// this WIT interface is only one cross-language invocation ABI.
+interface hash {
+    use aios:provider-host/artifacts@0.1.0.{input-artifact};
+
+    record digest {
+        algorithm: string,
+        value: string,
+    }
+
+    variant hash-error {
+        read-failed(string),
+        unsupported-algorithm(string),
+        invalid-input(string),
+        internal(string),
+    }
+
+    hash: func(
+        source: borrow<input-artifact>,
+        algorithm: string,
+    ) -> result<digest, hash-error>;
+}
+
+/// A provider component can hash only artifacts handed to it by the host.
+/// There is intentionally no generic filesystem/network/environment import.
+world provider {
+    import aios:provider-host/artifacts@0.1.0;
+    import aios:provider-host/progress@0.1.0;
+    import aios:provider-host/structured-log@0.1.0;
+
+    export hash;
+}
