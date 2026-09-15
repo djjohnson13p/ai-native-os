@@ -2,7 +2,6 @@
   "ir_version": "0.1",
   "program_id": "demo.analyze_numbers.v1",
   "kind": "task_graph",
-  "task_id": null,
   "inputs": {
     "source": {
       "type": "artifact.table@1",
