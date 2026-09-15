@@ -1,0 +1,50 @@
+{
+  "profile_id": "COMPAT-FIXTURE-WIN64-DEMO",
+  "version": "0.1",
+  "application": {
+    "name": "Reference Windows Demo App",
+    "publisher": "fixture-publisher",
+    "version": "1.0.0",
+    "package_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "package_format": "pe32+",
+    "guest_os_family": "windows",
+    "guest_architectures": ["x86_64"]
+  },
+  "target_class": "windows.wine",
+  "habitat": {
+    "runtime": "wine",
+    "runtime_version": "11.x-fixture",
+    "image_or_rootfs": "habitat://wine/reference-win64",
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "architecture_translator": null,
+    "graphics_backend": "wayland-or-xwayland",
+    "environment": {
+      "WINEARCH": "win64"
+    }
+  },
+  "integrations": {
+    "filesystem": ["artifact:selected-input", "task-output:current"],
+    "network": [],
+    "devices": [],
+    "clipboard": false,
+    "audio_output": false,
+    "audio_input": false,
+    "camera": false,
+    "gpu": false
+  },
+  "isolation_class": "P4",
+  "status": "verified",
+  "limitations": [
+    "Fixture profile only; not a real compatibility claim."
+  ],
+  "tested_on": [
+    {
+      "hardware_profile": "HW-FIXTURE-LAPTOP",
+      "host_os": "Fedora reference fixture",
+      "tested_at": "2026-09-15T20:31:00Z",
+      "result": "fixture-pass"
+    }
+  ],
+  "publisher_identity": "org.ainative.project",
+  "signature": null
+}
