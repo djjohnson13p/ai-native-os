@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/artifact-handle.schema.json",
+  "title": "Artifact Handle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["artifact_id", "uri", "media_type", "origin", "sensitivity"],
+  "properties": {
+    "artifact_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "uri": {
+      "type": "string",
+      "pattern": "^(artifact|data|stream|model|secret)://"
+    },
+    "media_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "format": {
+      "type": ["string", "null"]
+    },
+    "size_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "content_hash": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["sha256", "sha512", "blake3"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["user", "task", "provider", "system", "remote", "legacy"]
+        },
+        "task_id": {
+          "type": ["string", "null"]
+        },
+        "step_id": {
+          "type": ["string", "null"]
+        },
+        "provider_id": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["public", "local", "private", "confidential", "secret"]
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": ["ephemeral", "task", "persistent", "user-managed"]
+        },
+        "expires_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      }
+    },
+    "labels": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    }
+  }
+}
