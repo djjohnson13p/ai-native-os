@@ -1,0 +1,30 @@
+{
+  "schema_version": "0.1",
+  "identity_id": "principal://device/home-workstation",
+  "kind": "DEVICE",
+  "trust_domain": "PERSONAL_FABRIC",
+  "status": "ACTIVE",
+  "key_version": 3,
+  "public_identity": {
+    "algorithm": "ed25519",
+    "fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "public_key_ref": "trust-key://device/home-workstation/v3",
+    "certificate_chain_ref": null
+  },
+  "owner": {
+    "kind": "user",
+    "id": "principal://user/example"
+  },
+  "issuer_identity_id": "principal://user/example",
+  "attestation_refs": ["attestation://device/home-workstation/boot-state/latest"],
+  "allowed_roles": ["peer-compute", "peer-storage", "remote-surface"],
+  "valid_from": "2026-09-01T00:00:00Z",
+  "valid_until": null,
+  "revocation": null,
+  "metadata": {
+    "display_name": "Home Workstation",
+    "pairing_method": "interactive-fingerprint-confirmation"
+  },
+  "created_at": "2026-09-01T00:00:00Z",
+  "updated_at": "2026-09-15T22:40:00Z"
+}
