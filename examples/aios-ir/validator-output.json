@@ -1,0 +1,101 @@
+{
+  "schema_version": "0.1",
+  "validation": {
+    "schema_version": "0.1",
+    "valid": true,
+    "ir_version": "0.1",
+    "program_id": "demo.analyze_numbers.v1",
+    "semantic_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "semantic_hash_profile": "aios-ir-v0.1",
+    "validator": {
+      "id": "org.ainative.aios-ir-validator",
+      "version": "0.0.0-fixture",
+      "build_hash": null
+    },
+    "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "diagnostics": [],
+    "diagnostics_truncated": false,
+    "validated_at": "2026-09-15T00:00:00Z"
+  },
+  "effect_summary": {
+    "schema_version": "0.1",
+    "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "effects": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+    "authority_classes": ["artifact.read", "artifact.write"],
+    "egress_modes": ["deny"],
+    "contains_probabilistic": true,
+    "contains_opaque_external": false,
+    "nodes": [
+      {
+        "node_id": "import_table",
+        "capability": "table.import@1",
+        "execution_class": "deterministic",
+        "effects": ["ARTIFACT_READ"],
+        "authority_classes": ["artifact.read"],
+        "egress_mode": "deny",
+        "verification_gate": false
+      },
+      {
+        "node_id": "normalize_table",
+        "capability": "table.normalize@1",
+        "execution_class": "deterministic",
+        "effects": ["PURE"],
+        "authority_classes": [],
+        "egress_mode": "deny",
+        "verification_gate": false
+      },
+      {
+        "node_id": "compute_metrics",
+        "capability": "stats.compare_periods@1",
+        "execution_class": "deterministic",
+        "effects": ["PURE"],
+        "authority_classes": [],
+        "egress_mode": "deny",
+        "verification_gate": false
+      },
+      {
+        "node_id": "render_chart",
+        "capability": "chart.render@1",
+        "execution_class": "deterministic",
+        "effects": ["ARTIFACT_WRITE"],
+        "authority_classes": ["artifact.write"],
+        "egress_mode": "deny",
+        "verification_gate": false
+      },
+      {
+        "node_id": "draft_narrative",
+        "capability": "report.summarize@1",
+        "execution_class": "probabilistic",
+        "effects": ["PURE"],
+        "authority_classes": [],
+        "egress_mode": "deny",
+        "verification_gate": false
+      },
+      {
+        "node_id": "verify_narrative",
+        "capability": "verify.numeric_claims@1",
+        "execution_class": "deterministic",
+        "effects": ["PURE"],
+        "authority_classes": [],
+        "egress_mode": "deny",
+        "verification_gate": true
+      },
+      {
+        "node_id": "compose_report",
+        "capability": "document.compose@1",
+        "execution_class": "deterministic",
+        "effects": ["ARTIFACT_WRITE"],
+        "authority_classes": ["artifact.write"],
+        "egress_mode": "deny",
+        "verification_gate": false
+      }
+    ],
+    "verification_barriers": ["verify_narrative"],
+    "generated_by": {
+      "id": "org.ainative.aios-ir-validator",
+      "version": "0.0.0-fixture"
+    },
+    "generated_at": "2026-09-15T00:00:00Z"
+  }
+}
