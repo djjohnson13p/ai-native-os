@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/model-result.schema.json",
+  "title": "Model Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "task_id", "step_id", "provider", "status", "created_at"],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "step_id": {"type": "string", "minLength": 1},
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "model_id", "runtime"],
+      "properties": {
+        "provider_id": {"type": "string", "minLength": 1},
+        "model_id": {"type": "string", "minLength": 1},
+        "model_version_or_hash": {"type": ["string", "null"]},
+        "runtime": {"type": "string", "minLength": 1},
+        "runtime_version": {"type": ["string", "null"]},
+        "locality": {"type": "string", "enum": ["local", "peer", "remote"]}
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "failure", "cancelled", "timeout", "invalid-output"]
+    },
+    "output": {
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "structured_output_valid": {"type": ["boolean", "null"]},
+    "output_artifacts": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "wall_time_ms": {"type": ["integer", "null"], "minimum": 0},
+        "cost_microunits": {"type": ["integer", "null"], "minimum": 0},
+        "energy_millijoules": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "egress": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["destination", "data_refs"],
+        "properties": {
+          "destination": {"type": "string", "minLength": 1},
+          "data_refs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": ["string", "null"]},
+        "message": {"type": ["string", "null"]},
+        "retryable": {"type": ["boolean", "null"]}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
