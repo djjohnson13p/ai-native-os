@@ -4,6 +4,7 @@
   "ir_version": "0.1",
   "program_id": "demo.analyze_numbers.v1",
   "semantic_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "semantic_hash_profile": "aios-ir-v0.1",
   "validator": {
     "id": "org.ainative.aios-ir-validator",
     "version": "0.0.0-fixture",
@@ -11,5 +12,6 @@
   },
   "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "diagnostics": [],
+  "diagnostics_truncated": false,
   "validated_at": "2026-09-15T00:00:00Z"
 }
