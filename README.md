@@ -23,7 +23,29 @@ The initial implementation should **not** begin with a new kernel. It should use
 9. **Reason once, compile when stable, reuse thereafter** — repeated reasoning should become cheaper deterministic procedures when safe.
 10. **Open-source by design** — architecture, interfaces, policy formats, capability manifests, and conformance tests should be publicly inspectable.
 
+## Architecture shorthand
+
+The current working model is:
+
+```text
+Human intent
+    ↓
+Task / intent layer
+    ↓
+Planner + capability broker + policy engine
+    ↓
+Resource broker + Universal App Broker
+    ↓
+Deterministic providers · AI models · containers · VMs · legacy software
+    ↓
+Deterministic Linux-based system foundation
+```
+
+AI may propose what to do. **Deterministic policy decides what is allowed.**
+
 ## Repository map
+
+### Foundation
 
 - [`docs/00-charter.md`](docs/00-charter.md) — project charter and definition
 - [`docs/01-design-principles.md`](docs/01-design-principles.md) — non-negotiable design principles
@@ -39,8 +61,18 @@ The initial implementation should **not** begin with a new kernel. It should use
 - [`docs/11-v0.1-prototype.md`](docs/11-v0.1-prototype.md) — narrow proof-of-concept target
 - [`docs/12-roadmap.md`](docs/12-roadmap.md) — staged development roadmap
 - [`docs/13-open-questions.md`](docs/13-open-questions.md) — decisions intentionally left open
-- [`docs/adr/`](docs/adr/) — early architecture decision records
-- [`specs/`](specs/) — draft machine-readable interfaces
+
+### Architecture hardening
+
+- [`docs/14-terminology.md`](docs/14-terminology.md) — canonical vocabulary and core abstractions
+- [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — rules that should survive implementation changes
+- [`docs/16-requirements.md`](docs/16-requirements.md) — testable architecture requirements with stable IDs
+- [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md) — acceptance, recovery, compatibility, and adversarial test plan
+
+### Decisions and machine-readable contracts
+
+- [`docs/adr/`](docs/adr/) — architecture decision records
+- [`specs/`](specs/) — draft machine-readable interfaces, including task plans, capability manifests, hardware profiles, artifact handles, capability tokens, and provenance events
 - [`prototypes/README.md`](prototypes/README.md) — implementation boundaries for the first prototype
 
 ## v0.1 success criterion
@@ -52,12 +84,14 @@ A user should be able to give a high-level task such as:
 The prototype should:
 
 - inspect the available data;
-- derive an execution plan;
+- derive a typed execution plan;
 - select calculation, table, chart, and document capabilities without the user opening applications;
 - request only the minimum permissions needed;
 - execute locally where practical;
+- verify important deterministic results;
 - produce inspectable provenance showing what happened;
 - save normal portable files;
+- learn/reuse at least one repeated task pattern;
 - and transparently launch at least one legacy application through a compatibility habitat as a separate proof of the transition strategy.
 
 That is intentionally much narrower than “build a universal operating system.” The goal of v0.1 is to prove that the architecture is meaningfully different from a conventional desktop with a chatbot attached.
@@ -72,6 +106,8 @@ That is intentionally much narrower than “build a universal operating system.�
 - Training a foundation model
 - Locking the project to any AI provider
 
-## Status
+## Current phase
 
-**Architecture draft. No implementation claim is made yet.**
+**Architecture and pre-implementation hardening. No implementation claim is made yet.**
+
+The immediate work is to make the contracts precise enough that implementation can be divided into bounded workstreams without allowing convenience decisions to silently redefine the system.
