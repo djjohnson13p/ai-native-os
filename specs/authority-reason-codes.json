@@ -1,0 +1,30 @@
+{
+  "schema_version": "0.1",
+  "profile": "aios-authority-v0.1",
+  "codes": [
+    {"code": "AUTH_ALLOW", "severity": "info", "meaning": "deterministic policy allows the bounded authority request without additional approval"},
+    {"code": "AUTH_DENY_DEFAULT", "severity": "error", "meaning": "no policy permits the protected action; default deny applies"},
+    {"code": "AUTH_DENY_POLICY", "severity": "error", "meaning": "explicit deterministic policy denies the action"},
+    {"code": "AUTH_UNKNOWN_PRINCIPAL", "severity": "error", "meaning": "requesting principal cannot be resolved to a trusted policy entity"},
+    {"code": "AUTH_UNKNOWN_ACTION", "severity": "error", "meaning": "authority action is unknown/unsupported in current policy schema"},
+    {"code": "AUTH_UNKNOWN_RESOURCE", "severity": "error", "meaning": "semantic resource selector cannot resolve to an exact permitted concrete resource"},
+    {"code": "AUTH_SEMANTIC_REQUEST_MISMATCH", "severity": "error", "meaning": "runtime action/resource is not contained in the validated semantic node's authority envelope"},
+    {"code": "AUTH_PROVIDER_BINDING_MISMATCH", "severity": "error", "meaning": "principal/provider/workload does not match the Execution Binding for this authority request"},
+    {"code": "AUTH_REQUIRE_APPROVAL", "severity": "warning", "meaning": "policy permits the operation only after a current structured approval condition is satisfied"},
+    {"code": "AUTH_APPROVAL_NOT_FOUND", "severity": "error", "meaning": "required approval record is absent"},
+    {"code": "AUTH_APPROVAL_STALE", "severity": "error", "meaning": "approval no longer matches current semantic/resource/provider/scope facts"},
+    {"code": "AUTH_APPROVAL_DENIED", "severity": "error", "meaning": "required approval was explicitly denied/revoked"},
+    {"code": "AUTH_GRANT_CREATED", "severity": "info", "meaning": "scoped runtime authority grant was created"},
+    {"code": "AUTH_GRANT_EXPIRED", "severity": "error", "meaning": "grant is past its expiry"},
+    {"code": "AUTH_GRANT_REVOKED", "severity": "error", "meaning": "grant was explicitly revoked"},
+    {"code": "AUTH_GRANT_SCOPE_MISMATCH", "severity": "error", "meaning": "attempted action/resource/destination exceeds grant scope"},
+    {"code": "AUTH_GRANT_PRINCIPAL_MISMATCH", "severity": "error", "meaning": "grant is presented by a different principal/provider/workload"},
+    {"code": "AUTH_GRANT_TASK_MISMATCH", "severity": "error", "meaning": "grant is presented for a different Task/semantic execution context"},
+    {"code": "AUTH_GRANT_BINDING_MISMATCH", "severity": "error", "meaning": "grant is presented under a different Execution Binding/attempt scope"},
+    {"code": "AUTH_GRANT_USAGE_EXHAUSTED", "severity": "error", "meaning": "one-shot/usage-limited grant has no remaining uses"},
+    {"code": "AUTH_POLICY_ENGINE_UNAVAILABLE", "severity": "error", "meaning": "deterministic policy engine is unavailable/failed; protected action is not newly granted"},
+    {"code": "AUTH_POLICY_SNAPSHOT_INVALID", "severity": "error", "meaning": "policy snapshot/schema/content identity cannot be verified/loaded safely"},
+    {"code": "AUTH_EGRESS_SCOPE_MISMATCH", "severity": "error", "meaning": "network/data egress destination/data refs exceed semantic/policy/grant scope"},
+    {"code": "AUTH_CREDENTIAL_SCOPE_MISMATCH", "severity": "error", "meaning": "credential handle/use exceeds policy/action/provider/service scope"}
+  ]
+}
