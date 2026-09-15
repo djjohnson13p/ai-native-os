@@ -35,14 +35,14 @@ then provider substitution is not real.
 
 The semantic contract is the stable interface that the AIOS IR validator reasons about.
 
-## Contract identity
+## Contract identity and v0.1 references
 
-A capability has:
+A capability contract record has:
 
-- semantic identifier;
-- semantic version;
-- named typed input ports;
-- named typed output ports;
+- semantic identifier, e.g. `stats.compare_periods`;
+- full contract version, e.g. `1.0` or `1.1.2`;
+- immutable contract content identity/hash once generated;
+- named typed input/output ports;
 - execution-class constraints;
 - allowed effect categories;
 - allowed authority classes;
@@ -51,13 +51,35 @@ A capability has:
 - conformance suite identity;
 - optional verifier semantics.
 
-Example:
+AIOS IR v0.1 does **not** embed the full contract version. It references a semantic compatibility family using exactly:
 
 ```text
-stats.compare_periods@1.0
+stats.compare_periods@1
 ```
 
-Major version changes represent incompatible semantic changes.
+The immutable Registry Snapshot selects the exact full contract version/content for `(stats.compare_periods, major 1)`.
+
+Unversioned references and selectors such as `@1.0` are invalid in AIOS IR v0.1.
+
+The controlling rules are ADR 0030 and `docs/67-v0.1-semantic-reference-and-version-resolution.md`.
+
+## Why the reference and contract version are separate
+
+The IR says:
+
+> I require semantic capability family `stats.compare_periods` major 1.
+
+The validation result says exactly which Registry Snapshot supplied that meaning.
+
+Therefore reproducible validation is attributable through:
+
+```text
+semantic program hash
++ registry snapshot ID
++ IR/hash profile
+```
+
+The validator does not run a package-manager-style "highest compatible version" solver while validating IR.
 
 ## Named ports
 
@@ -77,6 +99,8 @@ outputs:
 
 This improves model generation, inspection, schema validation, and future additive evolution.
 
+Port type references use the same v0.1 semantic major-selector rule.
+
 ## Effects and authority
 
 The contract declares **categories the capability is allowed to require**, not actual permission grants.
@@ -91,7 +115,9 @@ allowed_authority_classes:
 
 A provider claiming `table.import@1` cannot legitimately request `system.install_kernel_module` merely because its implementation wants to.
 
-The semantic validator can reject such a provider/request mismatch before asking user policy.
+The semantic validator/provider-conformance boundary can reject such a mismatch before user policy considers execution.
+
+Actual runtime permission is still decided later by deterministic policy/current grants.
 
 ## Execution class constraints
 
@@ -109,13 +135,13 @@ A provider may offer a stronger guarantee than required if the semantics permit 
 
 ## Egress semantics
 
-Capabilities should declare allowed egress modes.
+Capabilities declare allowed egress modes.
 
 Examples:
 
 - a pure local hash capability may permit only `deny`;
 - a web-research capability necessarily permits `policy`;
-- a model reasoning capability may permit both, depending on whether local and remote providers exist.
+- a model reasoning capability may permit both when local and remote providers exist.
 
 Concrete external destinations remain runtime/policy concerns.
 
@@ -133,7 +159,7 @@ TABLE_PARSE_SIZE_LIMIT
 
 Provider-specific errors may appear in diagnostics, but the provider adapter should map them to the semantic contract where possible.
 
-This is important for bounded fallback and skill portability.
+This is important for bounded fallback and Skill portability.
 
 ## Conformance suites
 
@@ -192,32 +218,35 @@ Their contract may instead validate:
 
 - output schema;
 - prohibited behavior;
-- maximum authority;
+- maximum authority/effects;
 - egress behavior;
 - bounded resource usage;
 - required evidence/citations fields where applicable;
 - quality benchmark thresholds;
 - verification compatibility.
 
-Quality scoring should not become hidden authority.
+Quality scoring must not become hidden authority.
 
 ## Contract registry
 
-The runtime should maintain a versioned registry of semantic capability contracts.
+The runtime maintains a versioned registry of semantic capability contracts.
 
-The IR validator reads a fixed registry snapshot so validation is reproducible.
+The IR validator reads one immutable Registry Snapshot so validation is reproducible.
 
-A registry record should be content-addressable/signed once the architecture reaches that stage.
+For v0.1, one snapshot contains at most one active full contract version for each `(semantic capability ID, major version)` pair.
 
-Changing a contract after publication must create a new version rather than mutating history invisibly.
+Changing a contract after publication creates a new contract content identity/version/snapshot rather than mutating historical meaning invisibly.
+
+See `docs/31-semantic-registry-snapshots.md`.
 
 ## Provider implementation declaration
 
-A provider manifest should eventually identify:
+A provider manifest/registration should eventually identify the exact semantic contract it was tested against, conceptually:
 
 ```text
 implements:
-  capability: stats.compare_periods@1
+  semantic_ref: stats.compare_periods@1
+  contract_version: 1.1
   contract_hash: sha256:...
   conformance_suite: conformance://stats.compare_periods/1
   conformance_status: tested
@@ -231,11 +260,13 @@ The runtime can then distinguish:
 - provider conformance;
 - runtime resource suitability.
 
+A provider cannot privately redefine what major family `@1` means.
+
 ## Type contracts
 
 Capability contracts depend on semantic types.
 
-Initially, type identifiers can be simple versioned names such as:
+Type IDs are referenced in v0.1 by major family, for example:
 
 ```text
 data.table@1
@@ -244,9 +275,9 @@ text.narrative@1
 artifact.report@1
 ```
 
-As the project matures, important types should gain their own schemas/semantic definitions so two providers agree on what `data.metrics@1` actually means.
+The exact full type-contract version is selected by the same immutable Registry Snapshot.
 
-The type registry should remain separate from language-specific Rust/Python classes.
+The type registry remains separate from language-specific Rust/Python classes.
 
 ## Universal App Broker relationship
 
@@ -260,7 +291,7 @@ legacy.launch@1
 
 may be an honest opaque capability.
 
-A Photoshop adapter could later expose narrower capabilities such as:
+A legacy image editor adapter could later expose narrower capabilities such as:
 
 ```text
 image.resize@1
@@ -282,7 +313,7 @@ cpu.add_two_ints
 is too low-level for most orchestration, while:
 
 ```text
-do_everything_photoshop_can_do
+do_everything_an_image_editor_can_do
 ```
 
 is too broad to type, authorize, substitute, and verify.
@@ -305,25 +336,26 @@ Exact ontology will evolve through real workloads.
 
 ## Capability discovery
 
-The planner may discover available capability semantics, but should generally plan against semantic needs rather than provider inventory.
+The planner may discover available capability semantics, but should generally plan against semantic needs rather than concrete provider inventory.
 
-The broker later determines whether the current machine can satisfy them.
+The broker later determines whether the current machine/fabric can satisfy them.
 
-This helps preserve a task across hardware changes.
+This preserves a Task across hardware/provider changes.
 
 ## Security rules
 
 1. A capability contract does not grant authority.
 2. A provider manifest does not grant authority.
 3. Passing conformance does not grant authority.
-4. Publisher reputation does not grant authority.
+4. Publisher reputation/signature does not grant authority.
 5. Runtime policy/grants govern each concrete side effect.
-6. A provider cannot extend a contract's allowed authority classes through undocumented behavior.
+6. A provider cannot extend a contract's allowed authority/effect classes through undocumented behavior.
 7. A provider requesting undeclared authority fails closed.
+8. A missing semantic reference never means "fetch/latest/execute something with this name."
 
 ## v0.1 minimum registry
 
-The initial Demonstration A registry should define at least:
+The initial Demonstration A/test registry defines families including:
 
 ```text
 table.import@1
@@ -341,14 +373,18 @@ Each should have synthetic fixtures and explicit port types.
 
 ## Architectural result
 
-The system now has three clean layers:
+The system has clean layers:
 
 ```text
-AIOS IR node
-   ↓ invokes
+AIOS IR semantic reference
+   ↓ resolved by immutable snapshot
 Semantic Capability Contract
    ↓ implemented by
 One of N Provider Implementations
 ```
 
-This is the mechanism that lets the operating environment remain applicationless/provider-neutral while still using existing software underneath.
+This is the mechanism that lets the operating environment remain application/provider-neutral while still using existing software underneath.
+
+## Principle
+
+> **Programs name stable semantic families; immutable registry snapshots pin the exact meaning; providers conform rather than redefine.**
