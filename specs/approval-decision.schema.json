@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/approval-decision.schema.json",
+  "title": "AIOS v0.1 Approval Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "approval_id",
+    "task_id",
+    "decision",
+    "decided_by",
+    "decided_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "decision_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "approval_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "decision": {"type": "string", "enum": ["APPROVE", "DENY", "REVOKE"]},
+    "decided_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["user", "organization", "system-service"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "scope": {
+      "type": ["string", "null"],
+      "enum": [null, "ONE_SHOT", "TASK", "TIME_LIMITED"]
+    },
+    "approved_until": {"type": ["string", "null"], "format": "date-time"},
+    "reason_code": {"type": ["string", "null"], "maxLength": 128},
+    "human_note": {"type": ["string", "null"], "maxLength": 4096},
+    "decided_at": {"type": "string", "format": "date-time"}
+  }
+}
