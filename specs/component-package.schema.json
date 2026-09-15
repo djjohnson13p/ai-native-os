@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/component-package.schema.json",
+  "title": "AIOS Component Package Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "package_id", "version", "component_class", "content_digest", "publisher_identity_id", "signatures", "authority_requests", "created_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "package_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]+$", "maxLength": 256},
+    "version": {"type": "string", "minLength": 1, "maxLength": 128},
+    "component_class": {"type": "string", "enum": ["CAPABILITY_PROVIDER", "DOMAIN_PACK", "VIEW_PROVIDER", "SKILL", "MODEL_RUNTIME", "MODEL_ASSET", "COMPATIBILITY_ADAPTER", "POLICY_BUNDLE", "SEMANTIC_REGISTRY_BUNDLE", "COMPILED_TARGET", "SYSTEM_EXTENSION", "DEVELOPMENT_TOOL"]},
+    "content_digest": {"type": "string", "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"},
+    "publisher_identity_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "channel": {"type": ["string", "null"], "enum": [null, "development", "nightly", "testing", "stable", "lts", "emergency-security"]},
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signer_identity_id", "algorithm", "signature_ref"],
+        "properties": {
+          "signer_identity_id": {"type": "string", "minLength": 1, "maxLength": 512},
+          "algorithm": {"type": "string", "minLength": 1, "maxLength": 128},
+          "signature_ref": {"type": "string", "minLength": 1, "maxLength": 2048}
+        }
+      }
+    },
+    "component_manifest_refs": {"type": "array", "items": {"type": "string", "maxLength": 2048}, "uniqueItems": true},
+    "semantic_dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id", "version_range"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["capability", "type", "domain-pack", "registry"]},
+          "id": {"type": "string", "minLength": 1, "maxLength": 512},
+          "version_range": {"type": "string", "minLength": 1, "maxLength": 128}
+        }
+      }
+    },
+    "package_dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["package_id", "version_range", "dependency_kind"],
+        "properties": {
+          "package_id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "version_range": {"type": "string", "minLength": 1, "maxLength": 128},
+          "dependency_kind": {"type": "string", "enum": ["runtime", "optional", "build-only"]}
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "architectures": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "runtime_kinds": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "minimum_system_version": {"type": ["string", "null"]}
+      }
+    },
+    "authority_requests": {"type": "array", "items": {"type": "string", "maxLength": 256}, "uniqueItems": true},
+    "effect_classes": {"type": "array", "items": {"type": "string", "maxLength": 256}, "uniqueItems": true},
+    "network_requirements": {"type": "array", "items": {"type": "string", "maxLength": 512}, "uniqueItems": true},
+    "minimum_isolation": {"type": ["string", "null"], "enum": [null, "P0", "P1", "P2", "P3", "P4", "P5"]},
+    "conformance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "suite_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "status": {"type": ["string", "null"], "enum": [null, "DECLARED", "TESTED", "CERTIFIED", "FAILED", "NOT_APPLICABLE"]}
+      }
+    },
+    "supply_chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_revision": {"type": ["string", "null"]},
+        "build_provenance_ref": {"type": ["string", "null"]},
+        "sbom_ref": {"type": ["string", "null"]},
+        "reproducible_build": {"type": ["boolean", "null"]}
+      }
+    },
+    "licenses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "scope": {"type": ["string", "null"], "maxLength": 512},
+          "notice_ref": {"type": ["string", "null"], "maxLength": 2048}
+        }
+      }
+    },
+    "upgrade": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rollback_compatible": {"type": "boolean", "default": true},
+        "migration_required": {"type": "boolean", "default": false},
+        "migration_ref": {"type": ["string", "null"]}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
