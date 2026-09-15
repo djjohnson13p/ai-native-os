@@ -4,50 +4,55 @@
   "title": "Provenance Event",
   "type": "object",
   "additionalProperties": false,
-  "required": ["event_id", "task_id", "event_type", "timestamp", "actor"],
+  "required": ["schema_version", "event_id", "task_id", "event_type", "timestamp", "actor"],
   "properties": {
-    "event_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "task_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "step_id": {
-      "type": ["string", "null"]
-    },
+    "schema_version": {"type": "string", "const": "0.1"},
+    "event_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "step_id": {"type": ["string", "null"]},
     "event_type": {
       "type": "string",
       "enum": [
         "task.created",
+        "task.paused",
+        "task.resumed",
+        "task.cancelled",
+        "task.completed",
+        "task.failed",
         "intent.normalized",
         "plan.created",
         "plan.revised",
+        "capability.resolved",
         "authorization.requested",
         "authorization.granted",
         "authorization.denied",
+        "approval.requested",
+        "approval.granted",
+        "approval.denied",
         "provider.selected",
+        "placement.selected",
         "execution.started",
         "execution.completed",
         "execution.failed",
         "model.invoked",
+        "model.completed",
         "egress.started",
         "egress.completed",
+        "artifact.imported",
         "artifact.created",
         "artifact.verified",
+        "artifact.integrity-failed",
+        "verification.started",
+        "verification.completed",
         "verification.failed",
         "rollback.started",
         "rollback.completed",
-        "task.paused",
-        "task.completed",
-        "task.failed"
+        "skill.proposed",
+        "skill.created",
+        "skill.executed"
       ]
     },
-    "timestamp": {
-      "type": "string",
-      "format": "date-time"
-    },
+    "timestamp": {"type": "string", "format": "date-time"},
     "actor": {
       "type": "object",
       "additionalProperties": false,
@@ -55,23 +60,16 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["user", "agent", "provider", "model", "system-service", "legacy-app", "policy-engine"]
+          "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "peer-node"]
         },
-        "id": {
-          "type": "string",
-          "minLength": 1
-        }
+        "id": {"type": "string", "minLength": 1}
       }
     },
-    "provider_id": {
-      "type": ["string", "null"]
-    },
-    "capability": {
-      "type": ["string", "null"]
-    },
-    "authority_token_id": {
-      "type": ["string", "null"]
-    },
+    "provider_id": {"type": ["string", "null"]},
+    "capability": {"type": ["string", "null"]},
+    "authority_token_id": {"type": ["string", "null"]},
+    "policy_decision_id": {"type": ["string", "null"]},
+    "approval_id": {"type": ["string", "null"]},
     "input_artifacts": {
       "type": "array",
       "items": {"type": "string"},
@@ -99,17 +97,13 @@
     },
     "status": {
       "type": ["string", "null"],
-      "enum": [null, "success", "failure", "denied", "partial", "pending"]
+      "enum": [null, "success", "failure", "denied", "partial", "pending", "cancelled"]
     },
     "details": {
       "type": "object",
       "additionalProperties": true
     },
-    "previous_event_hash": {
-      "type": ["string", "null"]
-    },
-    "event_hash": {
-      "type": ["string", "null"]
-    }
+    "previous_event_hash": {"type": ["string", "null"]},
+    "event_hash": {"type": ["string", "null"]}
   }
 }
