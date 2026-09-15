@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/step-execution-record.schema.json",
+  "title": "AIOS v0.1 Step Execution Record",
+  "description": "Durable state of one semantic-node provider attempt. Separate from coarse Task state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "task_id",
+    "semantic_program_hash",
+    "node_id",
+    "attempt_number",
+    "state",
+    "revision",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "attempt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "registry_snapshot_id": {"type": ["string", "null"], "maxLength": 256},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "binding_id": {"type": ["string", "null"], "maxLength": 256},
+    "provider_id": {"type": ["string", "null"], "maxLength": 256},
+    "provider_version": {"type": ["string", "null"], "maxLength": 128},
+    "attempt_number": {"type": "integer", "minimum": 1, "maximum": 100},
+    "revision": {"type": "integer", "minimum": 1},
+    "state": {
+      "type": "string",
+      "enum": ["PENDING", "BLOCKED", "READY", "STARTING", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED", "UNKNOWN"]
+    },
+    "operation_id": {"type": ["string", "null"], "maxLength": 512},
+    "idempotency_key": {"type": ["string", "null"], "maxLength": 512},
+    "outcome_certainty": {
+      "type": ["string", "null"],
+      "enum": [null, "NOT_STARTED", "STARTED_NO_EFFECT", "COMPLETED", "FAILED_NO_EFFECT", "FAILED_PARTIAL_EFFECT", "OUTCOME_UNKNOWN"]
+    },
+    "input_artifacts": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {"type": "string", "maxLength": 512}
+    },
+    "output_artifacts": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {"type": "string", "maxLength": 512}
+    },
+    "failure": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "retryable": {"type": "boolean"},
+        "safe_to_rebind": {"type": "boolean"},
+        "unknown_side_effects": {"type": "boolean"}
+      }
+    },
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
+    "finished_at": {"type": ["string", "null"], "format": "date-time"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}
