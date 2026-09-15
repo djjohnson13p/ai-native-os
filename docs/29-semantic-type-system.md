@@ -7,7 +7,7 @@ AIOS IR and semantic capability contracts depend on types that mean the same thi
 The type system therefore distinguishes **semantic type** from **physical representation**.
 
 ```text
-Semantic type: data.table@1
+Semantic type family: data.table@1
 
 Possible representations:
 - Arrow IPC
@@ -16,7 +16,7 @@ Possible representations:
 - provider-private representation behind an adapter
 ```
 
-A capability plans against the semantic type. The runtime negotiates an eligible physical representation.
+A capability plans against the semantic type family. The runtime negotiates an eligible physical representation.
 
 ## Core rule
 
@@ -24,13 +24,31 @@ A capability plans against the semantic type. The runtime negotiates an eligible
 
 This is especially important when AI generates the program: silent coercions make execution harder to reason about, verify, and secure.
 
-## Type identity
+## Type identity and v0.1 references
 
-Working form:
+A semantic type contract has two related identities:
 
 ```text
-namespace.name@major[.minor]
+semantic ID: data.table
+full contract version: 1.0 (or later compatible 1.x)
 ```
+
+AIOS IR v0.1 references the major semantic family exactly as:
+
+```text
+data.table@1
+```
+
+The immutable Registry Snapshot selects the exact full contract version/content for `(data.table, major 1)`.
+
+For v0.1 IR:
+
+- `data.table@1` is valid;
+- unversioned `data.table` is invalid;
+- `data.table@1.0` is invalid as an IR reference even though `1.0` is a valid full type-contract version;
+- a major change is referenced as a new family, e.g. `data.table@2`.
+
+ADR 0030 and `docs/67-v0.1-semantic-reference-and-version-resolution.md` are controlling.
 
 Examples:
 
@@ -47,13 +65,28 @@ text.narrative@1
 verification.result@1
 ```
 
-The exact namespace governance can evolve, but semantic versions must not be silently redefined.
+## Why full contract version is separate from IR reference
+
+IR needs a durable compatibility family while validation/provenance needs the exact contract content.
+
+Therefore the validation evidence combines:
+
+```text
+semantic program hash
+registry snapshot ID
+IR/hash profile
+```
+
+The snapshot pins the exact type contract version/hash that gave `data.table@1` meaning for one validation.
+
+A later compatible snapshot may select `data.table` contract 1.1 while the IR still says `data.table@1`; revalidation records the new snapshot rather than rewriting source IR.
 
 ## Type contract
 
-A semantic type contract should describe:
+A semantic type contract describes:
 
-- type ID/version;
+- semantic type ID;
+- full contract version;
 - kind;
 - semantic description;
 - optional machine-readable logical schema;
@@ -64,7 +97,7 @@ A semantic type contract should describe:
 - explicit conversion relationships;
 - conformance suite.
 
-`specs/type-contract.schema.json` is the first draft.
+`specs/type-contract.schema.json` is the bootstrap machine contract.
 
 ## Type kinds
 
@@ -158,14 +191,14 @@ The semantic type must not assume every XLSX is a clean table.
 
 ## Artifact boundary
 
-An artifact handle carries instance metadata such as:
+An Artifact Handle carries instance metadata such as:
 
 - artifact identity;
 - content hash;
 - media type;
 - sensitivity;
 - lineage;
-- storage/locality;
+- storage/replica/locality state;
 - retention.
 
 The semantic type contract does not carry instance sensitivity or user ownership.
@@ -181,13 +214,15 @@ The broker may:
 1. choose compatible providers that already share a representation;
 2. use zero-copy/shared-memory transport when policy/sandbox boundaries permit;
 3. insert an explicit representation conversion capability;
-4. reject the route if conversion would violate cost/privacy/resource constraints.
+4. reject the route if conversion violates cost/privacy/resource constraints.
 
 Representation negotiation should be visible in execution/provenance when it materially affects performance or data movement.
 
+Physical representation choice does not change the semantic type family merely because one provider uses a different library/encoding.
+
 ## No implicit semantic casts in v0.1
 
-The v0.1 validator should require exact compatible semantic types.
+The v0.1 validator requires exact compatible semantic major families.
 
 Examples:
 
@@ -217,9 +252,11 @@ table.import@1
 
 This makes the task graph honest about computation and side effects.
 
+Compatibility inside one major family is pinned/defined by the exact type contract selected in the Registry Snapshot; the validator does not silently coerce between different semantic families or majors.
+
 ## Explicit conversion capabilities
 
-Representation/type transformations should be named capabilities.
+Representation/type transformations should be named semantic capabilities.
 
 Examples:
 
@@ -231,7 +268,9 @@ document.extract_text@1
 metrics.to_table@1
 ```
 
-A conversion can itself have authority, resource, and verification requirements.
+A conversion can itself have authority, resource, effect, and verification requirements.
+
+Type-contract `conversion_capabilities` references use the same major-family syntax in v0.1.
 
 ## Optional values and nullability
 
@@ -239,10 +278,10 @@ Avoid language-specific nullable behavior.
 
 In v0.1:
 
-- a capability port is either required or optional at the contract level;
-- if `null` is a semantically valid value, the type contract must say so explicitly;
+- a capability port is required/optional at the capability-contract level;
+- if `null` is a semantically valid value, the type contract says so explicitly;
 - missing and null are distinct;
-- providers may not substitute language-specific sentinel values such as NaN, None, null pointer, empty string, or -1 unless the semantic contract explicitly defines that mapping.
+- providers may not substitute language-specific sentinels such as NaN, None, null pointer, empty string, or -1 unless the semantic contract explicitly defines that mapping.
 
 ## Numbers and units
 
@@ -250,11 +289,11 @@ The type system should avoid ambiguous naked floating-point values for consequen
 
 Examples:
 
-- currency should carry currency and use decimal/fixed-point or integer minor/micro units;
-- durations should declare canonical units;
-- timestamps should declare timezone/offset semantics;
-- distances should declare units;
-- percentages should distinguish ratio `0..1` from human percentage `0..100`.
+- currency carries currency and uses decimal/fixed-point or integer minor/micro units;
+- durations declare canonical units;
+- timestamps declare timezone/offset semantics;
+- distances declare units;
+- percentages distinguish ratio `0..1` from human percentage `0..100`.
 
 The runtime should prefer exact integer/decimal representations for identifiers, money, counts, and permission-relevant limits.
 
@@ -262,7 +301,7 @@ The runtime should prefer exact integer/decimal representations for identifiers,
 
 `data.table@1` should not mean "whatever a dataframe library happens to store."
 
-A future type contract should define at least:
+A stable type contract should define at least:
 
 - ordered named columns;
 - column semantic/logical types;
@@ -271,7 +310,7 @@ A future type contract should define at least:
 - missing-value representation;
 - stable schema identity;
 - optional column metadata such as units;
-- deterministic serialization/canonicalization rules for conformance fixtures.
+- deterministic serialization/canonicalization rules for conformance fixtures where required.
 
 The implementation may use Arrow, Polars, pandas, native Rust structures, or another engine behind the contract.
 
@@ -336,18 +375,22 @@ Examples:
 
 - `data.hash@1` may require byte equality;
 - `data.metrics@1` may require exact decimal equality or declared tolerance;
-- `artifact.image@1` may allow semantic/image equivalence rather than byte equality depending on the capability contract;
+- `artifact.image@1` may allow semantic/image equivalence rather than byte equality depending on capability contract;
 - narratives generally do not have useful exact semantic equality.
 
 Type contracts can define equality/canonicalization hooks used by conformance, caching, and verification.
 
+A type's equality/canonicalization rule is part of its full semantic contract content. An incompatible change requires a new major version.
+
 ## Type registry
 
-The runtime should maintain a versioned semantic type registry alongside the capability registry.
+The runtime maintains a versioned semantic type registry alongside the capability registry.
 
-A fixed type-registry snapshot should be part of reproducible IR validation.
+A fixed type/capability Registry Snapshot is part of reproducible IR validation.
 
-A type contract should eventually be content-addressable and signed under the project registry/governance model.
+For v0.1 the snapshot contains at most one active full type contract per `(type ID, major)` pair.
+
+A type contract should eventually be content-addressable and signed under registry/governance rules, but v0.1 only needs deterministic local content identity/snapshot construction.
 
 ## Evolution rules
 
@@ -362,9 +405,19 @@ Examples:
 - null behavior changes;
 - equality/canonicalization changes that invalidate old consumers.
 
+IR then references the new family, e.g. `data.metrics@2`.
+
 ### Minor version
 
-May add backward-compatible optional information where consumers can safely ignore it.
+May add backward-compatible optional information where consumers can safely ignore it according to the published compatibility contract.
+
+The immutable Registry Snapshot selects the exact active minor/patch within one major for a validation.
+
+### Patch version
+
+Compatible correction/clarification that does not intentionally redefine semantic meaning.
+
+The contract bytes/hash still change and are attributable in the new snapshot.
 
 ### Conversion rather than mutation
 
@@ -390,13 +443,14 @@ A small explicit type system gives an AI planner strong constraints:
 
 - it cannot feed an image directly into a statistics capability unless a declared conversion exists;
 - it cannot treat prose as a capability token;
-- it cannot silently turn an artifact handle into a host path;
+- it cannot silently turn an Artifact Handle into a host path;
+- it cannot use an unversioned semantic type and hope the runtime selects latest;
 - validator errors can identify exact incompatible ports;
 - repair can be local rather than regenerating arbitrary code.
 
 ## v0.1 scope
 
-The first implementation should define only the types needed for Demonstration A plus control-plane verification primitives.
+The first implementation defines only the types needed for Demonstration A plus control-plane verification fixtures.
 
 Do not build an enormous universal ontology before workloads demand it.
 
@@ -417,4 +471,4 @@ verification.result@1
 
 ## Architectural principle
 
-> **Semantic meaning belongs above implementation representation, and every meaningful conversion should be visible to the system.**
+> **Semantic meaning belongs above implementation representation; AIOS IR names the semantic major family, and the immutable Registry Snapshot pins the exact contract that interpreted it.**
