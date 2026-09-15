@@ -2,7 +2,7 @@
 
 ## Purpose
 
-AIOS now spans more than an operating-system shell. The architecture needs one map that shows how the AI-native language/runtime, software capabilities, semantic data, presentation, networking, compute placement, cloud/edge services, and legacy compatibility fit together without collapsing into one monolith.
+AIOS spans more than an operating-system shell. The architecture needs one map that shows how the AI-native language/runtime, software capabilities, semantic data, presentation, networking, compute placement, storage, trust, package distribution, cloud/edge services, and legacy compatibility fit together without collapsing into one monolith.
 
 ## The platform as coordinated fabrics
 
@@ -40,6 +40,11 @@ AIOS now spans more than an operating-system shell. The architecture needs one m
               └──────────┬───────────┘              └──────────┬──────────┘
                          └──────────────┬───────────────────────┘
                                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Storage / Namespace + Trust / Distribution Fabrics         │
+│ replicas · paths · credentials · identities · packages     │
+└──────────────────────────────┬──────────────────────────────┘
+                               ▼
               ┌───────────────────────────────────────────────┐
               │ Compatibility + Provider Engines              │
               │ Rust/Python/C++/Wasm · legacy · SaaS · models │
@@ -51,7 +56,9 @@ AIOS now spans more than an operating-system shell. The architecture needs one m
               └───────────────────────────────────────────────┘
 ```
 
-No lower layer is allowed to redefine the semantic meaning established above it merely because its implementation is convenient.
+No lower layer is allowed to redefine semantic meaning established above it merely because its implementation is convenient.
+
+Several fabrics are cross-cutting rather than strictly layered. Trust/identity, storage, provenance, and package versioning attach to many runtime decisions at once.
 
 ## Fabric 1 — Task and authority
 
@@ -196,7 +203,61 @@ Examples:
 
 Cloud service identity is runtime/provider state, not semantic Task/object identity.
 
-## Fabric 9 — Compatibility
+## Fabric 9 — Storage / Replica / Namespace
+
+Owns where durable bytes/state are stored and how semantic objects/artifacts are projected into familiar namespaces.
+
+Includes:
+
+- authoritative/mirror/cache/archive replicas;
+- content-addressed artifact storage;
+- source-of-truth synchronization state;
+- backup/archive retention;
+- offline pinning;
+- namespace/file projections;
+- legacy habitat exchange paths;
+- materialization/eviction;
+- storage failover.
+
+A path, bucket key, mount, replica, or database record is not semantic identity.
+
+## Fabric 10 — Identity / Trust / Credential
+
+Owns cryptographic/runtime identity evidence and mediated secret use.
+
+Includes:
+
+- user/device/service/workload/provider/publisher identity;
+- peer pairing/enrollment;
+- key rotation/revocation/recovery;
+- credential handles;
+- attestation evidence;
+- identity federation adapters.
+
+Authentication/trust evidence feeds policy but does not itself grant authority.
+
+## Fabric 11 — Component Distribution / Supply Chain
+
+Owns the lifecycle of distributable platform components.
+
+Includes:
+
+- provider packages;
+- Domain Packs;
+- Views;
+- Skills/compiled targets;
+- model runtimes/assets;
+- compatibility adapters;
+- policy/registry bundles;
+- publisher signatures;
+- SBOM/build provenance/license metadata;
+- staged activation;
+- authority/semantic diff gates;
+- rollback/quarantine/revocation.
+
+A catalog/store is a discovery source, not an automatic root of trust.
+
+## Fabric 12 — Compatibility
 
 Owns transition from the existing software world.
 
@@ -212,18 +273,18 @@ Includes:
 
 Compatibility is a coverage path, not the final semantic architecture.
 
-## Fabric 10 — Deterministic base
+## Fabric 13 — Deterministic base
 
 Owns the critical mechanisms that cannot depend on unconstrained model reasoning for correctness:
 
 - boot/recovery;
 - kernel/drivers;
-- storage/filesystems;
+- physical filesystems/storage primitives;
 - network primitives;
 - graphics/input primitives;
 - process isolation;
 - cryptography/key stores;
-- update/rollback;
+- update/rollback primitives;
 - clocks/randomness primitives;
 - trusted system UI primitives.
 
@@ -232,15 +293,19 @@ Owns the critical mechanisms that cannot depend on unconstrained model reasoning
 Several identifiers intentionally coexist:
 
 ```text
-Task ID              what unit of work is happening?
+Task ID               what unit of work is happening?
 Semantic program hash what does the computation mean?
-Object ID            what thing is being worked on?
-Capability ID        what semantic operation is requested?
-Provider ID          which implementation performs it?
-Execution Binding ID which concrete attempt/resources/grants?
-Service ID           which network/remote service identity?
-Artifact ID          which durable content/representation?
-View ID              which presentation contract?
+Object ID             what thing is being worked on?
+Capability ID         what semantic operation is requested?
+Provider ID           which implementation performs it?
+Execution Binding ID  which concrete attempt/resources/grants?
+Service ID            which network/remote service identity?
+Artifact ID           which durable content/representation?
+Replica ID            which physical/logical stored copy?
+Projection ID         which path/workspace materialization?
+Trust identity ID     which authenticated user/device/service/publisher?
+Package ID + digest   which distributable component bytes/version?
+View ID               which presentation contract?
 ```
 
 These identifiers must not be collapsed into one another.
@@ -283,7 +348,17 @@ CRM update -> federated remote provider
 report compose -> local provider
 ```
 
+Storage Fabric might keep:
+
+```text
+CAD source authoritative -> workstation/local store
+BOM/quote object revisions -> business object store
+PDF confirmation -> local artifact + peer backup mirror
+```
+
 Network Fabric moves only authorized artifacts/object projections.
+
+Trust Fabric authenticates the peer/service/provider but policy still decides what each may access.
 
 Presentation Fabric might show:
 
@@ -305,6 +380,8 @@ A future contributor could improve:
 - a phone View;
 - a peer transport;
 - a cloud model adapter;
+- a storage backend;
+- a package/signing tool;
 - an accounting Domain Pack;
 - the AIOS compiler;
 - a Windows compatibility habitat;
@@ -315,21 +392,21 @@ without redefining the entire operating model.
 
 "Everything" should mean:
 
-> a common semantic and policy architecture capable of absorbing, composing, or interoperating with nearly any useful computing capability.
+> a common semantic, authority, identity, storage, and policy architecture capable of absorbing, composing, or interoperating with nearly any useful computing capability.
 
 It should **not** mean:
 
-> one binary, one database, one AI model, one cloud, one GUI, one programming implementation, or one team directly maintaining every algorithm.
+> one binary, one database, one model, one cloud, one GUI, one filesystem, one package store, one programming implementation, or one team directly maintaining every algorithm.
 
 ## Current implementation priority
 
 The priority remains bottom-up by dependency leverage:
 
 ```text
-trusted semantic substrate
+trusted semantic substrate + local persistence/identity/version attribution
 → adaptive orchestration/resource placement
 → task-first presentation
-→ peer/network fabric
+→ peer/network/storage fabric
 → Tier-0 Object/Software Fabric
 → broad domain coverage
 → cloud/org/edge scale
