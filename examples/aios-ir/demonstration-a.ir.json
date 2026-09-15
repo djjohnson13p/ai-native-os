@@ -1,0 +1,282 @@
+{
+  "ir_version": "0.1",
+  "program_id": "demo.analyze_numbers.v1",
+  "kind": "task_graph",
+  "task_id": null,
+  "inputs": {
+    "source": {
+      "type": "artifact.table@1",
+      "required": true,
+      "media_types": [
+        "text/csv",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      ],
+      "description": "User-selected tabular input artifact"
+    }
+  },
+  "nodes": [
+    {
+      "id": "import_table",
+      "operation": {
+        "kind": "invoke",
+        "capability": "table.import@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "source": {
+          "source": "input",
+          "name": "source"
+        }
+      },
+      "outputs": {
+        "table": "data.table@1"
+      },
+      "authority_requests": [
+        {
+          "action": "artifact.read",
+          "resource": "input:source",
+          "reason": "Read the user-selected table"
+        }
+      ],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local"]
+      },
+      "failure": {
+        "on_error": "stop"
+      },
+      "cache": "content_addressed",
+      "description": "Parse the source artifact into a typed table"
+    },
+    {
+      "id": "normalize_table",
+      "operation": {
+        "kind": "invoke",
+        "capability": "table.normalize@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "table": {
+          "source": "node",
+          "node": "import_table",
+          "port": "table"
+        }
+      },
+      "outputs": {
+        "table": "data.table@1"
+      },
+      "authority_requests": [],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local"]
+      },
+      "failure": {
+        "on_error": "stop"
+      },
+      "cache": "content_addressed"
+    },
+    {
+      "id": "compute_metrics",
+      "operation": {
+        "kind": "invoke",
+        "capability": "stats.compare_periods@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "table": {
+          "source": "node",
+          "node": "normalize_table",
+          "port": "table"
+        }
+      },
+      "outputs": {
+        "metrics": "data.metrics@1"
+      },
+      "authority_requests": [],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local", "peer"],
+        "max_latency_ms": 5000
+      },
+      "failure": {
+        "on_error": "stop"
+      },
+      "cache": "content_addressed"
+    },
+    {
+      "id": "render_chart",
+      "operation": {
+        "kind": "invoke",
+        "capability": "chart.render@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "metrics": {
+          "source": "node",
+          "node": "compute_metrics",
+          "port": "metrics"
+        }
+      },
+      "outputs": {
+        "chart": "artifact.image@1"
+      },
+      "authority_requests": [
+        {
+          "action": "artifact.write",
+          "resource": "task.output",
+          "reason": "Create the chart artifact"
+        }
+      ],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local", "peer"]
+      },
+      "failure": {
+        "on_error": "retry",
+        "max_attempts": 2
+      },
+      "cache": "content_addressed"
+    },
+    {
+      "id": "draft_narrative",
+      "operation": {
+        "kind": "invoke",
+        "capability": "report.summarize@1"
+      },
+      "execution_class": "probabilistic",
+      "inputs": {
+        "metrics": {
+          "source": "node",
+          "node": "compute_metrics",
+          "port": "metrics"
+        }
+      },
+      "outputs": {
+        "narrative": "text.narrative@1"
+      },
+      "authority_requests": [],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local"],
+        "max_latency_ms": 15000
+      },
+      "failure": {
+        "on_error": "replan",
+        "max_replans": 1
+      },
+      "cache": "never",
+      "description": "Generate a concise interpretation of deterministic metrics"
+    },
+    {
+      "id": "verify_narrative",
+      "operation": {
+        "kind": "verify",
+        "capability": "verify.numeric_claims@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "narrative": {
+          "source": "node",
+          "node": "draft_narrative",
+          "port": "narrative"
+        },
+        "metrics": {
+          "source": "node",
+          "node": "compute_metrics",
+          "port": "metrics"
+        }
+      },
+      "outputs": {
+        "verified_narrative": "text.narrative@1"
+      },
+      "authority_requests": [],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local"]
+      },
+      "failure": {
+        "on_error": "stop"
+      },
+      "cache": "deterministic_only",
+      "description": "Reject or repair unsupported numeric claims before composition"
+    },
+    {
+      "id": "compose_report",
+      "operation": {
+        "kind": "invoke",
+        "capability": "document.compose@1"
+      },
+      "execution_class": "deterministic",
+      "inputs": {
+        "chart": {
+          "source": "node",
+          "node": "render_chart",
+          "port": "chart"
+        },
+        "narrative": {
+          "source": "node",
+          "node": "verify_narrative",
+          "port": "verified_narrative"
+        },
+        "metrics": {
+          "source": "node",
+          "node": "compute_metrics",
+          "port": "metrics"
+        }
+      },
+      "outputs": {
+        "report": "artifact.report@1"
+      },
+      "authority_requests": [
+        {
+          "action": "artifact.write",
+          "resource": "task.output",
+          "reason": "Create the final report artifact"
+        }
+      ],
+      "egress": {
+        "mode": "deny"
+      },
+      "constraints": {
+        "locality": ["local", "peer"]
+      },
+      "failure": {
+        "on_error": "stop"
+      },
+      "cache": "content_addressed"
+    }
+  ],
+  "outputs": {
+    "analysis": {
+      "source": "node",
+      "node": "compute_metrics",
+      "port": "metrics"
+    },
+    "chart": {
+      "source": "node",
+      "node": "render_chart",
+      "port": "chart"
+    },
+    "report": {
+      "source": "node",
+      "node": "compose_report",
+      "port": "report"
+    }
+  },
+  "metadata": {
+    "purpose": "Canonical v0.1 AIOS IR example for Demonstration A",
+    "authority_note": "Authority declarations are requests only; no grants are embedded in the program."
+  }
+}
