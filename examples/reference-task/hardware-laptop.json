@@ -1,0 +1,59 @@
+{
+  "schema_version": "0.1",
+  "profile_id": "HW-FIXTURE-LAPTOP",
+  "architecture": "x86_64",
+  "cpu": {
+    "vendor": "fixture-vendor",
+    "model": "fixture-8core-cpu",
+    "physical_cores": 8,
+    "logical_cores": 16,
+    "features": ["avx2"]
+  },
+  "memory": {
+    "total_bytes": 17179869184,
+    "available_bytes": 10737418240,
+    "swap_total_bytes": 8589934592
+  },
+  "accelerators": [
+    {
+      "id": "gpu0",
+      "kind": "gpu",
+      "vendor": "fixture-vendor",
+      "model": "integrated-gpu",
+      "dedicated_memory_bytes": 0,
+      "shared_memory_bytes": 4294967296,
+      "backends": ["vulkan"],
+      "devices": ["render"]
+    }
+  ],
+  "storage": [
+    {
+      "id": "system0",
+      "kind": "nvme",
+      "total_bytes": 1000204886016,
+      "available_bytes": 600000000000,
+      "system": true,
+      "removable": false
+    }
+  ],
+  "network": {
+    "online": true,
+    "metered": false,
+    "estimated_down_mbps": 300,
+    "estimated_up_mbps": 30
+  },
+  "power": {
+    "source": "ac",
+    "battery_percent": 82,
+    "power_saver": false
+  },
+  "security": {
+    "secure_boot": true,
+    "tpm": true,
+    "virtualization": true,
+    "user_namespaces": true,
+    "landlock_abi": 7
+  },
+  "peer_compute": [],
+  "measured_at": "2026-09-15T20:31:00Z"
+}
