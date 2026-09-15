@@ -43,6 +43,19 @@ Deterministic Linux-based system foundation
 
 AI may propose what to do. **Deterministic policy decides what is allowed.**
 
+## Native object model
+
+The current draft separates the concepts that conventional operating systems often collapse into applications/windows:
+
+```text
+Task         = intent + authorization + execution + provenance
+Artifact     = durable content/data and lineage
+Workspace    = optional organizational/context container
+Conversation = interaction channel/history
+Application  = legacy/provider/UI entity
+Window/View  = presentation of an object, not its lifetime
+```
+
 ## Repository map
 
 ### Foundation
@@ -68,12 +81,30 @@ AI may propose what to do. **Deterministic policy decides what is allowed.**
 - [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — rules that should survive implementation changes
 - [`docs/16-requirements.md`](docs/16-requirements.md) — testable architecture requirements with stable IDs
 - [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md) — acceptance, recovery, compatibility, and adversarial test plan
+- [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md) — implementation dependency graph and Codex-readiness criteria
+- [`docs/19-principal-and-authority-model.md`](docs/19-principal-and-authority-model.md) — principals, resources, grants, approval, delegation, revocation, and egress semantics
+- [`docs/20-user-object-model.md`](docs/20-user-object-model.md) — task/artifact/workspace/conversation/application/view object model
+- [`docs/21-trust-boundaries.md`](docs/21-trust-boundaries.md) — trusted base, providers, legacy habitats, external systems, and boundary-crossing rules
+- [`docs/22-end-to-end-reference-flow.md`](docs/22-end-to-end-reference-flow.md) — complete Demonstration A flow through planning, policy, execution, verification, and learning
+
+### Research
+
+- [`docs/research/01-linux-base-and-updates.md`](docs/research/01-linux-base-and-updates.md) — reference Linux, image-mode, update, and rollback evaluation
+- [`docs/research/02-sandboxing-and-execution-isolation.md`](docs/research/02-sandboxing-and-execution-isolation.md) — Landlock/namespaces/container/VM isolation strategy
+- [`docs/research/03-legacy-compatibility-fabric.md`](docs/research/03-legacy-compatibility-fabric.md) — Wine, Android, CPU translation, VM, and experimental macOS routing model
+- [`docs/research/04-model-runtime-and-routing.md`](docs/research/04-model-runtime-and-routing.md) — provider-neutral model routing and local-runtime strategy
+- [`docs/research/05-service-ipc-and-language.md`](docs/research/05-service-ipc-and-language.md) — process boundaries, Varlink/D-Bus/gRPC roles, Rust/Python split, and persistence
 
 ### Decisions and machine-readable contracts
 
 - [`docs/adr/`](docs/adr/) — architecture decision records
-- [`specs/`](specs/) — draft machine-readable interfaces, including task plans, capability manifests, hardware profiles, artifact handles, capability tokens, and provenance events
+- [`specs/README.md`](specs/README.md) — contract principles and versioning rules
+- [`specs/`](specs/) — draft task, capability, hardware, artifact, authority, provenance, execution-isolation, model, policy, and compatibility contracts
 - [`prototypes/README.md`](prototypes/README.md) — implementation boundaries for the first prototype
+
+### Implementation backlog
+
+GitHub Issues contain bounded v0.1 workstreams with acceptance criteria. The implementation dependency order is documented in [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md).
 
 ## v0.1 success criterion
 
