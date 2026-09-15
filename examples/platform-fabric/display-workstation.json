@@ -1,0 +1,61 @@
+{
+  "schema_version": "0.1",
+  "profile_id": "display-profile:workstation-demo",
+  "presentation_classes": ["STANDARD_DESKTOP", "LARGE_DESKTOP", "MULTI_DISPLAY"],
+  "surfaces": [
+    {
+      "surface_id": "surface:workstation-primary",
+      "kind": "display",
+      "logical_width": 2560,
+      "logical_height": 1440,
+      "physical_width_mm": 600,
+      "physical_height_mm": 340,
+      "scale_factor": 1.0,
+      "orientation": "landscape",
+      "refresh_hz": 165,
+      "hdr": true,
+      "trusted_for_sensitive_output": true,
+      "remote_peer_id": null
+    },
+    {
+      "surface_id": "surface:workstation-secondary",
+      "kind": "display",
+      "logical_width": 1920,
+      "logical_height": 1200,
+      "physical_width_mm": 520,
+      "physical_height_mm": 325,
+      "scale_factor": 1.0,
+      "orientation": "landscape",
+      "refresh_hz": 60,
+      "hdr": false,
+      "trusted_for_sensitive_output": true,
+      "remote_peer_id": null
+    }
+  ],
+  "inputs": {
+    "keyboard": true,
+    "pointer": true,
+    "touch": false,
+    "stylus": true,
+    "voice": true,
+    "camera": true,
+    "gamepad": false,
+    "switch_access": false
+  },
+  "audio": {
+    "input": true,
+    "output": true,
+    "private_output": true
+  },
+  "accessibility": {
+    "screen_reader": false,
+    "high_contrast": false,
+    "reduced_motion": false,
+    "large_text": false,
+    "caption_preferred": false,
+    "keyboard_only": false,
+    "voice_first": false
+  },
+  "power_constrained": false,
+  "measured_at": "2026-09-15T22:30:00Z"
+}
