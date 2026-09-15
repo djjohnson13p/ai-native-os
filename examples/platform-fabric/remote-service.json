@@ -1,0 +1,33 @@
+{
+  "schema_version": "0.1",
+  "service_id": "service://remote/demo-compute",
+  "service_classes": ["REMOTE_COMPUTE", "REMOTE_MODEL"],
+  "provider_id": "org.example.demo-remote-provider",
+  "trust": {
+    "state": "USER_APPROVED",
+    "attestation_supported": false,
+    "retention_class": "ephemeral-request",
+    "training_use": "PROHIBITED"
+  },
+  "regions": [
+    {
+      "id": "demo-us-west",
+      "jurisdiction": "US",
+      "data_residency_tags": ["US"]
+    }
+  ],
+  "capabilities": [
+    "model.reasoning.remote@1",
+    "render.batch.remote@1"
+  ],
+  "resource_classes": ["cpu-large", "gpu-medium"],
+  "cost": {
+    "currency": "USD",
+    "pricing_model": "MIXED",
+    "estimate_endpoint_or_class": "estimate:demo"
+  },
+  "lifecycle": "READY",
+  "self_hostable": false,
+  "network_service_ref": "service://remote/demo-compute",
+  "updated_at": "2026-09-15T22:30:00Z"
+}
