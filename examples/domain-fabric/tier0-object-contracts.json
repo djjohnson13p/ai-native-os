@@ -1,0 +1,177 @@
+[
+  {
+    "schema_version": "0.1",
+    "type_id": "core.party",
+    "version": "1",
+    "name": "Party",
+    "description": "A person, organization, team, household, government entity, or other actor identity.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "party_kind", "semantic_type": "core.party-kind@1", "cardinality": "one", "required": true, "sensitivity_hint": "private", "description": "Actor class."},
+      {"name": "display_name", "semantic_type": "core.text@1", "cardinality": "one", "required": true, "sensitivity_hint": "private", "description": "Human-facing name."},
+      {"name": "identifiers", "semantic_type": "core.external-identifier@1", "cardinality": "many", "required": false, "sensitivity_hint": "confidential", "description": "External/provider identifiers."},
+      {"name": "contact_points", "semantic_type": "core.contact-point@1", "cardinality": "many", "required": false, "sensitivity_hint": "confidential", "description": "Email/phone/address or equivalent contact endpoints."}
+    ],
+    "relationships": [],
+    "representations": [],
+    "invariants": [
+      {"id": "party.kind.required", "description": "Every Party has an explicit party kind.", "enforcement": "schema"}
+    ],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": [], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "core.document",
+    "version": "1",
+    "name": "Document",
+    "description": "A logical document identity independent of one file representation.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "title", "semantic_type": "core.text@1", "cardinality": "zero-or-one", "required": false, "sensitivity_hint": null, "description": "Document title."},
+      {"name": "document_kind", "semantic_type": "knowledge.document-kind@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Semantic document category."}
+    ],
+    "relationships": [],
+    "representations": [
+      {"semantic_type": "artifact.document-portable@1", "role": "portable", "equivalence": "unknown"},
+      {"semantic_type": "artifact.document-preview@1", "role": "preview", "equivalence": "view-only"}
+    ],
+    "invariants": [],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": [], "allowed_source_states": ["native", "federated", "mirrored", "derived"]},
+    "ownership": {"domain_pack": "org.ainative.domain.foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "core.dataset",
+    "version": "1",
+    "name": "Dataset",
+    "description": "A logical structured dataset/table independent of storage engine or serialization.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "name", "semantic_type": "core.text@1", "cardinality": "zero-or-one", "required": false, "sensitivity_hint": null, "description": "Dataset name."},
+      {"name": "schema_ref", "semantic_type": "data.schema-ref@1", "cardinality": "zero-or-one", "required": false, "sensitivity_hint": null, "description": "Logical schema identity."}
+    ],
+    "relationships": [],
+    "representations": [
+      {"semantic_type": "data.table@1", "role": "native", "equivalence": "authoritative"}
+    ],
+    "invariants": [],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": [], "allowed_source_states": ["native", "federated", "mirrored", "derived", "ephemeral"]},
+    "ownership": {"domain_pack": "org.ainative.domain.foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "core.project",
+    "version": "1",
+    "name": "Project",
+    "description": "A durable coordination object for an objective, related work, people, and artifacts.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "name", "semantic_type": "core.text@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Project name."},
+      {"name": "status", "semantic_type": "project.status@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Project lifecycle status."}
+    ],
+    "relationships": [
+      {"predicate": "project.has_member", "contract_ref": "relationship://project.has_member@1", "required": false},
+      {"predicate": "project.has_work_item", "contract_ref": "relationship://project.has_work_item@1", "required": false}
+    ],
+    "representations": [],
+    "invariants": [],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": [], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "commerce.product",
+    "version": "1",
+    "name": "Product",
+    "description": "A product/service or commercially/operationally tracked offering.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "name", "semantic_type": "core.text@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Product/service name."},
+      {"name": "sku", "semantic_type": "commerce.sku@1", "cardinality": "zero-or-one", "required": false, "sensitivity_hint": null, "description": "Commercial stock/service identifier."},
+      {"name": "status", "semantic_type": "commerce.product-status@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Commercial lifecycle state."}
+    ],
+    "relationships": [
+      {"predicate": "product.has_design", "contract_ref": "relationship://product.has_design@1", "required": false}
+    ],
+    "representations": [],
+    "invariants": [],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": [], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.commerce-foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "commerce.quote",
+    "version": "1",
+    "name": "Quote",
+    "description": "A proposed commercial offer containing priced line items and terms.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "currency", "semantic_type": "commerce.currency-code@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Currency used for monetary values."},
+      {"name": "status", "semantic_type": "commerce.quote-status@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Quote lifecycle state."},
+      {"name": "total", "semantic_type": "commerce.money@1", "cardinality": "one", "required": true, "sensitivity_hint": "private", "description": "Verified quote total."}
+    ],
+    "relationships": [
+      {"predicate": "quote.for_party", "contract_ref": "relationship://quote.for_party@1", "required": true},
+      {"predicate": "quote.contains", "contract_ref": "relationship://quote.contains@1", "required": true}
+    ],
+    "representations": [],
+    "invariants": [
+      {"id": "quote.total.verified", "description": "Quote total must equal deterministic line/tax/discount calculation under the active pricing rules.", "enforcement": "deterministic-validator"}
+    ],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": ["accepted", "expired", "withdrawn"], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.commerce-foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "commerce.invoice",
+    "version": "1",
+    "name": "Invoice",
+    "description": "A commercial payment request/record with issuance and revision constraints.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "currency", "semantic_type": "commerce.currency-code@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Invoice currency."},
+      {"name": "status", "semantic_type": "commerce.invoice-status@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Invoice lifecycle state."},
+      {"name": "total", "semantic_type": "commerce.money@1", "cardinality": "one", "required": true, "sensitivity_hint": "private", "description": "Verified invoice total."}
+    ],
+    "relationships": [
+      {"predicate": "invoice.for_party", "contract_ref": "relationship://invoice.for_party@1", "required": true},
+      {"predicate": "invoice.derived_from", "contract_ref": "relationship://invoice.derived_from@1", "required": false}
+    ],
+    "representations": [],
+    "invariants": [
+      {"id": "invoice.total.verified", "description": "Invoice totals must pass deterministic billing rules before issue.", "enforcement": "deterministic-validator"},
+      {"id": "invoice.issued.mutation", "description": "Issued invoice mutation is restricted by billing policy; correction may require void/credit/reissue semantics.", "enforcement": "policy"}
+    ],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": ["issued", "paid", "void"], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.commerce-foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  },
+  {
+    "schema_version": "0.1",
+    "type_id": "core.message",
+    "version": "1",
+    "name": "Message",
+    "description": "A communication unit independent of transport/channel/vendor.",
+    "stability": "draft",
+    "attributes": [
+      {"name": "channel", "semantic_type": "communication.channel@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Communication channel."},
+      {"name": "body", "semantic_type": "core.content-ref@1", "cardinality": "one", "required": true, "sensitivity_hint": "private", "description": "Message content reference."},
+      {"name": "delivery_state", "semantic_type": "communication.delivery-state@1", "cardinality": "one", "required": true, "sensitivity_hint": null, "description": "Delivery lifecycle state."}
+    ],
+    "relationships": [
+      {"predicate": "message.about", "contract_ref": "relationship://message.about@1", "required": false}
+    ],
+    "representations": [],
+    "invariants": [],
+    "mutation": {"revisioned": true, "precondition_required": true, "immutable_after_states": ["sent", "delivered"], "allowed_source_states": ["native", "federated", "mirrored"]},
+    "ownership": {"domain_pack": "org.ainative.domain.foundation", "maintainers": ["org.ainative.project"]},
+    "metadata": {}
+  }
+]
