@@ -18,34 +18,37 @@ A schema being present here does not mean the implementation exists yet.
 4. **Plans are not authority** — planner/IR schemas describe proposed work; policy/grant schemas govern permission.
 5. **Semantic contracts precede providers** — a capability/type has provider-independent meaning before an implementation claims to provide it.
 6. **Semantic IR is separate from execution binding** — providers, hardware placement, grant references, and sandbox instances are bound after IR validation.
-7. **Bulk data out-of-band** — large files/media/model weights should not be embedded in ordinary control-plane JSON messages.
-8. **Explicit versions** — contracts should carry a schema/interface version once implementation begins.
-9. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
-10. **Portable serialization first** — JSON Schema is the first interchange notation because it is easy to inspect and generate fixtures for. It is not a permanent requirement for all hot-path runtime communication.
+7. **Versioned meaning** — successful semantic validation records the exact registry snapshot of type/capability contracts used to interpret a program.
+8. **Bulk data out-of-band** — large files/media/model weights should not be embedded in ordinary control-plane JSON messages.
+9. **Explicit versions** — contracts should carry a schema/interface version once implementation begins.
+10. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
+11. **Portable serialization first** — JSON Schema is the first interchange notation because it is easy to inspect and generate fixtures for. It is not a permanent requirement for all hot-path runtime communication.
 
 ## Current schemas
 
 | Schema | Purpose |
 | --- | --- |
 | `aios-ir.schema.json` | provider-independent AI-native semantic execution graph |
+| `ir-validation-result.schema.json` | deterministic structural/semantic validation result, diagnostics, semantic hash, and registry identity |
+| `registry-snapshot.schema.json` | immutable/content-addressed set of semantic type and capability contracts used for validation |
 | `capability-contract.schema.json` | stable semantic meaning of a capability independent of providers |
 | `type-contract.schema.json` | semantic type identity/representation/equality contract |
 | `execution-binding.schema.json` | concrete attempt-specific provider/authority/resource binding for one IR node |
 | `skill-manifest.schema.json` | versioned reusable/compiled procedure metadata |
 | `task-plan.schema.json` | planner-facing typed capability proposal graph during v0.1 transition |
-| `task-record.schema.json` | durable task identity/state record |
-| `capability-manifest.schema.json` | provider declaration of implemented capabilities and runtime requirements |
+| `task-record.schema.json` | durable task identity/state plus validated semantic-program identity |
+| `capability-manifest.schema.json` | provider declaration of semantic contracts implemented, conformance status, and runtime requirements |
 | `hardware-profile.schema.json` | normalized local hardware/resource profile |
 | `artifact-handle.schema.json` | stable identity and metadata for task data/output |
 | `capability-token.schema.json` | task/principal-scoped authority grant representation |
 | `policy-decision.schema.json` | deterministic authorization decision record |
-| `provenance-event.schema.json` | append-oriented execution/audit event |
+| `provenance-event.schema.json` | append-oriented execution/audit event linked to semantic program and runtime binding identities |
 | `execution-profile.schema.json` | effective process/container/VM isolation profile |
 | `model-request.schema.json` | provider-neutral AI/model invocation request |
 | `model-result.schema.json` | provider-neutral model invocation result |
 | `compatibility-profile.schema.json` | known legacy-app habitat/translation profile |
 
-Planned contracts may include provider health, semantic registry snapshots, skill package signatures, model descriptors, and richer stream/device contracts as required by implementation.
+Planned contracts may include provider health, Skill package signatures, model descriptors, richer stream/device contracts, and registry-signing metadata as required by implementation.
 
 ## Semantic layers
 
@@ -55,8 +58,8 @@ The intended relationship is:
 Planner proposal
     ↓
 AIOS IR
-    ↓ references
-Semantic Type + Capability Contracts
+    ↓ validated against
+Semantic Type + Capability Registry Snapshot
     ↓ implemented by
 Provider Manifests
     ↓ selected/bound through
@@ -68,6 +71,8 @@ Artifacts + Provenance
 ```
 
 No layer below AIOS IR may reinterpret the program as carrying authority simply because it passed schema validation.
+
+A successful IR validation identifies both the semantic program hash and the registry snapshot used to give that program meaning.
 
 ## Schema IDs
 
@@ -108,8 +113,14 @@ The exact version-string placement is still being standardized.
 - a complete Demonstration A AIOS IR program;
 - semantic capability-contract fixtures;
 - semantic type-contract fixtures;
+- a bootstrap semantic registry snapshot;
+- a validation-result fixture;
+- an attempt-specific execution-binding fixture;
+- a candidate reusable Skill manifest;
 - five valid compact IR programs;
 - more than ten invalid/adversarial IR programs with expected reason codes.
+
+The placeholder hashes in bootstrap fixtures are explicitly not cryptographic evidence. The reference canonicalizer/validator must replace them with generated content hashes once implementation begins.
 
 These fixtures distinguish structural JSON Schema errors from semantic graph/registry/security errors.
 
@@ -134,6 +145,7 @@ It does not prove:
 - the requested action is authorized;
 - the AIOS IR graph is semantically valid;
 - a capability provider conforms to its semantic contract;
+- a registry publisher should be trusted;
 - a compatibility profile is safe;
 - model output is factually correct;
 - the artifact is non-malicious;
