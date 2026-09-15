@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/effect-summary.schema.json",
+  "title": "AIOS Derived Semantic Effect Summary",
+  "description": "Trusted derived effect/authority upper-bound analysis for a validated semantic program. This record never grants authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantic_program_hash",
+    "registry_snapshot_id",
+    "effects",
+    "authority_classes",
+    "egress_modes",
+    "contains_probabilistic",
+    "contains_opaque_external",
+    "nodes",
+    "verification_barriers"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "semantic_program_hash": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+    },
+    "registry_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "effects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/effect"}
+    },
+    "authority_classes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 3, "maxLength": 128}
+    },
+    "egress_modes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "enum": ["deny", "policy"]}
+    },
+    "contains_probabilistic": {"type": "boolean"},
+    "contains_opaque_external": {"type": "boolean"},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "capability", "execution_class", "effects", "authority_classes", "egress_mode"],
+        "properties": {
+          "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+          "capability": {"type": "string", "minLength": 3, "maxLength": 160},
+          "execution_class": {
+            "type": "string",
+            "enum": ["deterministic", "bounded_nondeterministic", "probabilistic", "opaque_external"]
+          },
+          "effects": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"$ref": "#/$defs/effect"}
+          },
+          "authority_classes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 3, "maxLength": 128}
+          },
+          "egress_mode": {"type": "string", "enum": ["deny", "policy"]},
+          "verification_gate": {"type": "boolean", "default": false}
+        }
+      }
+    },
+    "verification_barriers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 128}
+    },
+    "generated_by": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    },
+    "generated_at": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "$defs": {
+    "effect": {
+      "type": "string",
+      "enum": [
+        "PURE",
+        "ARTIFACT_READ",
+        "ARTIFACT_WRITE",
+        "NETWORK",
+        "DATA_EGRESS",
+        "EXTERNAL_MESSAGE",
+        "SECRET_ACCESS",
+        "PERSISTENT_STATE",
+        "DEVICE_ACCESS",
+        "SYSTEM_CHANGE",
+        "LEGACY_OPAQUE"
+      ]
+    }
+  }
+}
