@@ -1,0 +1,32 @@
+{
+  "decision_id": "PD-T91-S1-READ",
+  "task_id": "T91",
+  "principal": {
+    "kind": "provider",
+    "id": "org.ainative.provider.table-import"
+  },
+  "request": {
+    "capability": "table.import",
+    "actions": ["read"],
+    "resources": ["artifact:A17"],
+    "constraints": {
+      "network": "denied",
+      "task_local_only": true
+    },
+    "impact_level": 0
+  },
+  "decision": "allow",
+  "effective_scope": {
+    "actions": ["read"],
+    "resources": ["artifact:A17"],
+    "constraints": {
+      "network": "denied",
+      "task_local_only": true
+    }
+  },
+  "reason_codes": ["USER_SELECTED_INPUT", "LOCAL_PROVIDER", "LOW_IMPACT_READ"],
+  "human_explanation": "Allow the table-import provider to read only the spreadsheet selected for this task.",
+  "approval_request_id": null,
+  "policy_version": "fixture-policy-0.1",
+  "decided_at": "2026-09-15T20:31:10Z"
+}
