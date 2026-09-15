@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/remote-service-descriptor.schema.json",
+  "title": "AIOS Remote Service Descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "service_id", "service_classes", "provider_id", "trust", "regions", "capabilities"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "service_id": {"type": "string", "pattern": "^service://"},
+    "service_classes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["REMOTE_COMPUTE", "REMOTE_MODEL", "OBJECT_STORAGE", "SYNC_REPLICA", "DATABASE_SERVICE", "DOMAIN_PROVIDER", "RENDER_BUILD_FARM", "MANAGED_EDGE", "RELAY", "DIRECTORY_REGISTRY", "BACKUP_ARCHIVE", "COLLABORATION_SERVICE"]
+      }
+    },
+    "provider_id": {"type": "string", "minLength": 1},
+    "trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {"type": "string", "enum": ["UNTRUSTED", "USER_APPROVED", "ORG_APPROVED", "PROJECT_VERIFIED", "UNKNOWN"]},
+        "attestation_supported": {"type": ["boolean", "null"]},
+        "retention_class": {"type": ["string", "null"]},
+        "training_use": {"type": ["string", "null"], "enum": [null, "PROHIBITED", "OPT_IN_ONLY", "PROVIDER_TERMS", "UNKNOWN"]}
+      }
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "jurisdiction": {"type": ["string", "null"]},
+          "data_residency_tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "resource_classes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "currency": {"type": ["string", "null"]},
+        "pricing_model": {"type": ["string", "null"], "enum": [null, "FREE", "FIXED", "PER_REQUEST", "TIME", "TOKENS", "BYTES", "COMPUTE_UNITS", "MIXED"]},
+        "estimate_endpoint_or_class": {"type": ["string", "null"]}
+      }
+    },
+    "lifecycle": {"type": "string", "enum": ["DECLARED", "PROVISIONING", "READY", "DEGRADED", "DRAINING", "OFFLINE", "FAILED", "REVOKED"]},
+    "self_hostable": {"type": "boolean"},
+    "network_service_ref": {"type": ["string", "null"]},
+    "updated_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
