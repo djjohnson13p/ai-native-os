@@ -1,0 +1,133 @@
+[
+  {
+    "schema_version": "0.1",
+    "object_id": "object://party/acme-industries",
+    "semantic_type": "core.party",
+    "semantic_version": "1",
+    "revision": 4,
+    "source_state": "federated",
+    "source_of_truth": {
+      "provider_id": "org.example.crm-adapter",
+      "external_system": "synthetic-crm",
+      "external_id": "acct-99881",
+      "expected_version": "crm-rev-42"
+    },
+    "owner": {"kind": "organization", "id": "org://example-owner"},
+    "sensitivity": "private",
+    "labels": ["customer", "synthetic-fixture"],
+    "relationships": [],
+    "representations": [],
+    "attributes": {
+      "party_kind": "organization",
+      "display_name": "Acme Industries",
+      "identifiers": [
+        {"namespace": "synthetic-crm", "value": "acct-99881"},
+        {"namespace": "synthetic-billing", "value": "customer-31002"}
+      ],
+      "contact_points": [
+        {"kind": "email", "value": "approvals@acme.example"}
+      ]
+    },
+    "lineage": {"created_by_task": null, "last_modified_by_task": "task://fixture/customer-sync", "provenance_event_ids": ["event://fixture/party-sync-4"]},
+    "retention": {"class": "external-system-managed", "expires_at": null},
+    "created_at": "2026-09-01T12:00:00Z",
+    "updated_at": "2026-09-15T20:00:00Z"
+  },
+  {
+    "schema_version": "0.1",
+    "object_id": "object://product/enclosure",
+    "semantic_type": "commerce.product",
+    "semantic_version": "1",
+    "revision": 7,
+    "source_state": "native",
+    "source_of_truth": null,
+    "owner": {"kind": "organization", "id": "org://example-owner"},
+    "sensitivity": "private",
+    "labels": ["synthetic-fixture"],
+    "relationships": [
+      {
+        "predicate": "product.has_design",
+        "target": "object://engineering/enclosure-r7",
+        "metadata": {"relationship_version": "1", "authoritative": true}
+      }
+    ],
+    "representations": [],
+    "attributes": {"name": "Control Enclosure", "sku": "ENC-001", "status": "active"},
+    "lineage": {"created_by_task": "task://fixture/product-create", "last_modified_by_task": "task://fixture/design-link-r7", "provenance_event_ids": ["event://fixture/product-r7"]},
+    "retention": {"class": "persistent", "expires_at": null},
+    "created_at": "2026-08-01T12:00:00Z",
+    "updated_at": "2026-09-15T20:02:00Z"
+  },
+  {
+    "schema_version": "0.1",
+    "object_id": "object://engineering/enclosure-r7",
+    "semantic_type": "engineering.design",
+    "semantic_version": "1",
+    "revision": 7,
+    "source_state": "federated",
+    "source_of_truth": {
+      "provider_id": "org.example.cad-adapter",
+      "external_system": "synthetic-cad",
+      "external_id": "design-enclosure",
+      "expected_version": "R7"
+    },
+    "owner": {"kind": "organization", "id": "org://example-owner"},
+    "sensitivity": "confidential",
+    "labels": ["approved-revision", "synthetic-fixture"],
+    "relationships": [],
+    "representations": [
+      {"artifact_id": "artifact://fixture/enclosure-r7/source", "role": "source", "semantic_equivalence": "authoritative"},
+      {"artifact_id": "artifact://fixture/enclosure-r7/drawing-pdf", "role": "preview", "semantic_equivalence": "view-only"}
+    ],
+    "attributes": {"revision_label": "R7", "approval_state": "customer-approved", "unit_system": "mm"},
+    "lineage": {"created_by_task": null, "last_modified_by_task": "task://fixture/design-r7", "provenance_event_ids": ["event://fixture/design-r7-approved"]},
+    "retention": {"class": "external-system-managed", "expires_at": null},
+    "created_at": "2026-09-10T10:00:00Z",
+    "updated_at": "2026-09-15T19:45:00Z"
+  },
+  {
+    "schema_version": "0.1",
+    "object_id": "object://quote/acme-enclosure-q12",
+    "semantic_type": "commerce.quote",
+    "semantic_version": "1",
+    "revision": 12,
+    "source_state": "native",
+    "source_of_truth": null,
+    "owner": {"kind": "organization", "id": "org://example-owner"},
+    "sensitivity": "confidential",
+    "labels": ["synthetic-fixture"],
+    "relationships": [
+      {"predicate": "quote.for_party", "target": "object://party/acme-industries", "metadata": {"relationship_version": "1"}}
+    ],
+    "representations": [
+      {"artifact_id": "artifact://fixture/quote-q12/pdf", "role": "portable", "semantic_equivalence": "lossless"}
+    ],
+    "attributes": {"currency": "USD", "status": "draft", "total": {"minor_units": 125000, "currency": "USD"}, "design_ref": "object://engineering/enclosure-r7"},
+    "lineage": {"created_by_task": "task://fixture/quote-create", "last_modified_by_task": "task://fixture/quote-r12", "provenance_event_ids": ["event://fixture/quote-r12"]},
+    "retention": {"class": "persistent", "expires_at": null},
+    "created_at": "2026-09-12T14:00:00Z",
+    "updated_at": "2026-09-15T20:10:00Z"
+  },
+  {
+    "schema_version": "0.1",
+    "object_id": "object://invoice/acme-enclosure-draft-1",
+    "semantic_type": "commerce.invoice",
+    "semantic_version": "1",
+    "revision": 1,
+    "source_state": "native",
+    "source_of_truth": null,
+    "owner": {"kind": "organization", "id": "org://example-owner"},
+    "sensitivity": "confidential",
+    "labels": ["draft", "synthetic-fixture"],
+    "relationships": [
+      {"predicate": "invoice.for_party", "target": "object://party/acme-industries", "metadata": {"relationship_version": "1"}},
+      {"predicate": "invoice.derived_from", "target": "object://quote/acme-enclosure-q12", "metadata": {"relationship_version": "1"}}
+    ],
+    "representations": [],
+    "attributes": {"currency": "USD", "status": "draft", "total": {"minor_units": 125000, "currency": "USD"}},
+    "lineage": {"created_by_task": "task://fixture/acme-enclosure-reference-flow", "last_modified_by_task": "task://fixture/acme-enclosure-reference-flow", "provenance_event_ids": ["event://fixture/invoice-draft-created"]},
+    "retention": {"class": "persistent", "expires_at": null},
+    "created_at": "2026-09-15T20:20:00Z",
+    "updated_at": "2026-09-15T20:20:00Z"
+  }
+]
