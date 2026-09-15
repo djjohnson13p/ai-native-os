@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/storage-replica.schema.json",
+  "title": "AIOS Storage Replica Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "replica_id", "subject", "storage_class", "role", "state", "location", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "replica_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["artifact", "object-state", "chunk-manifest", "registry-bundle", "package", "model-asset"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "revision": {"type": ["integer", "null"], "minimum": 1},
+        "content_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "storage_class": {
+      "type": "string",
+      "enum": ["LOCAL_DURABLE", "LOCAL_CACHE", "REMOVABLE", "TRUSTED_PEER", "SELF_HOSTED", "ORGANIZATION_MANAGED", "PUBLIC_CLOUD", "ARCHIVE", "EXTERNAL_AUTHORITATIVE"]
+    },
+    "role": {
+      "type": "string",
+      "enum": ["AUTHORITATIVE", "MIRROR", "CACHE", "ARCHIVE", "EXPORT", "DERIVED"]
+    },
+    "state": {
+      "type": "string",
+      "enum": ["CURRENT", "STALE", "SYNCING", "DIRTY_LOCAL", "CONFLICTED", "UNAVAILABLE", "TOMBSTONED", "QUARANTINED"]
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id"],
+      "properties": {
+        "provider_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "service_id": {"type": ["string", "null"], "maxLength": 512},
+        "device_id": {"type": ["string", "null"], "maxLength": 512},
+        "locator": {"type": ["string", "null"], "maxLength": 2048},
+        "region": {"type": ["string", "null"], "maxLength": 128},
+        "jurisdiction": {"type": ["string", "null"], "maxLength": 128}
+      }
+    },
+    "sync": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "consistency_class": {"type": ["string", "null"], "enum": [null, "AUTHORITATIVE_SINGLE_WRITER", "OPTIMISTIC_VERSIONED", "APPEND_ONLY", "MERGEABLE", "COLLABORATIVE_REALTIME", "EXTERNAL_SOURCE_MANAGED"]},
+        "source_replica_id": {"type": ["string", "null"], "maxLength": 256},
+        "source_revision": {"type": ["integer", "null"], "minimum": 1},
+        "external_version": {"type": ["string", "null"], "maxLength": 512},
+        "last_synced_at": {"type": ["string", "null"], "format": "date-time"},
+        "pending_operation_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"type": ["string", "null"], "enum": [null, "NONE", "PROVIDER_MANAGED", "DEVICE_MANAGED", "USER_MANAGED", "ORGANIZATION_MANAGED", "OBJECT_LEVEL"]},
+        "key_handle_ref": {"type": ["string", "null"], "maxLength": 512}
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": {"type": ["string", "null"], "enum": [null, "EPHEMERAL", "CACHE", "TASK", "PERSISTENT", "ARCHIVE", "LEGAL_HOLD", "USER_MANAGED"]},
+        "expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "pinned_offline": {"type": "boolean", "default": false}
+      }
+    },
+    "verified_at": {"type": ["string", "null"], "format": "date-time"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}
