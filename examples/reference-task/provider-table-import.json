@@ -1,0 +1,48 @@
+{
+  "schema_version": "0.1",
+  "id": "org.ainative.provider.table-import",
+  "version": "0.1.0",
+  "publisher": {
+    "id": "org.ainative.project",
+    "name": "AI-Native OS Project",
+    "source_url": "https://example.com/ai-native-os/table-import",
+    "signature": null
+  },
+  "runtime": {
+    "kind": "varlink",
+    "entrypoint": "aios-provider-table-import",
+    "interface": "org.ainative.provider.TableImport",
+    "image": null,
+    "digest": null
+  },
+  "provides": [
+    {
+      "capability": "table.import",
+      "version": "0.1",
+      "input_types": ["table/csv", "table/xlsx"],
+      "output_types": ["table/normalized"],
+      "side_effects": ["read", "write"],
+      "execution": {
+        "locality": ["local"],
+        "determinism": "deterministic",
+        "minimum_isolation": "P2",
+        "network_default": "none"
+      },
+      "authority": {
+        "actions": ["read", "create", "write"],
+        "resource_classes": ["artifact", "task-output"]
+      },
+      "resource_requirements": {
+        "min_memory_bytes": 134217728,
+        "preferred_accelerators": [],
+        "requires_gpu": false
+      },
+      "conformance_suite": "table.import/0.1"
+    }
+  ],
+  "trust": {
+    "source_hash": null,
+    "build_provenance": null,
+    "review_status": "project-reviewed"
+  }
+}
