@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1",
+  "profile": "aios-provenance-v0.1",
+  "codes": [
+    {"code": "PROVENANCE_EVENT_HASH_MISMATCH", "severity": "error", "meaning": "recomputed journal-record hash does not match stored event_hash"},
+    {"code": "PROVENANCE_PREVIOUS_HASH_MISMATCH", "severity": "error", "meaning": "journal record previous_event_hash does not match prior computed/stored head"},
+    {"code": "PROVENANCE_SEQUENCE_GAP", "severity": "error", "meaning": "stream sequence is missing one or more required records"},
+    {"code": "PROVENANCE_SEQUENCE_ORDER_INVALID", "severity": "error", "meaning": "records are not presented/committed in strictly increasing expected sequence"},
+    {"code": "PROVENANCE_STREAM_ID_MISMATCH", "severity": "error", "meaning": "record/event Task identity does not match the verified provenance stream"},
+    {"code": "PROVENANCE_CHECKPOINT_HEAD_MISMATCH", "severity": "error", "meaning": "computed stream head does not match the supplied checkpoint"},
+    {"code": "PROVENANCE_SCHEMA_INVALID", "severity": "error", "meaning": "event, journal record, or checkpoint is structurally invalid"},
+    {"code": "PROVENANCE_HASH_PROFILE_UNSUPPORTED", "severity": "error", "meaning": "record/checkpoint uses an unsupported provenance hash profile"},
+    {"code": "PROVENANCE_HASH_ALGORITHM_UNSUPPORTED", "severity": "error", "meaning": "record/checkpoint names an unsupported hash algorithm"},
+    {"code": "PROVENANCE_CHECKPOINT_SIGNATURE_INVALID", "severity": "error", "meaning": "signed checkpoint cryptographic verification failed"},
+    {"code": "PROVENANCE_CHECKPOINT_SIGNER_UNTRUSTED", "severity": "warning", "meaning": "checkpoint signature may be cryptographically valid but signer is not trusted for the requested policy context"},
+    {"code": "PROVENANCE_DIAGNOSTICS_TRUNCATED", "severity": "warning", "meaning": "additional verification diagnostics were suppressed after configured maximum"}
+  ]
+}
