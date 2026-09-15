@@ -1,0 +1,250 @@
+{
+  "profile": "aios-task-manager-v0.1",
+  "description": "Synthetic deterministic Task transition cases. Task/provenance transaction behavior is asserted by expected result/state/revision relationships.",
+  "base_task": {
+    "task_id": "T-task-fixture-1",
+    "revision": 1,
+    "state": "CREATED",
+    "principal": {"kind": "user", "id": "user:fixture"},
+    "original_intent": "Hash the selected fixture artifact.",
+    "input_artifacts": ["artifact:fixture-source"],
+    "output_artifacts": [],
+    "active_plan": null,
+    "active_step_ids": [],
+    "waiting_on": [],
+    "created_at": "2026-09-15T22:00:00Z",
+    "updated_at": "2026-09-15T22:00:00Z",
+    "completed_at": null
+  },
+  "cases": [
+    {
+      "name": "created-to-planning-applies",
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-001",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 1,
+        "expected_state": "CREATED",
+        "to_state": "PLANNING",
+        "requested_by": {"kind": "system-service", "id": "service:task-manager"},
+        "reason": {"code": "PLANNING_REQUESTED", "message": "Begin deterministic planning lifecycle."}
+      },
+      "expected": {
+        "applied": true,
+        "reason_code": "TASK_TRANSITION_APPLIED",
+        "previous_revision": 1,
+        "current_revision": 2,
+        "previous_state": "CREATED",
+        "current_state": "PLANNING",
+        "provenance_append_count": 1
+      }
+    },
+    {
+      "name": "illegal-created-to-completed-rejected",
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-002",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 1,
+        "expected_state": "CREATED",
+        "to_state": "COMPLETED",
+        "requested_by": {"kind": "agent", "id": "agent:planner-fixture"},
+        "reason": {"code": "MODEL_SAYS_DONE", "message": "This prose is not authoritative."}
+      },
+      "expected": {
+        "applied": false,
+        "reason_code": "TASK_ILLEGAL_TRANSITION",
+        "observed_revision": 1,
+        "observed_state": "CREATED",
+        "provenance_append_count": 0
+      }
+    },
+    {
+      "name": "stale-revision-rejected",
+      "starting_state": {"revision": 4, "state": "RUNNABLE"},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-003",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 3,
+        "expected_state": "RUNNABLE",
+        "to_state": "RUNNING",
+        "requested_by": {"kind": "system-service", "id": "service:executor"},
+        "reason": {"code": "EXECUTION_START"}
+      },
+      "expected": {
+        "applied": false,
+        "reason_code": "TASK_REVISION_CONFLICT",
+        "observed_revision": 4,
+        "observed_state": "RUNNABLE",
+        "provenance_append_count": 0
+      }
+    },
+    {
+      "name": "wrong-expected-state-rejected",
+      "starting_state": {"revision": 4, "state": "RUNNABLE"},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-004",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 4,
+        "expected_state": "PLANNING",
+        "to_state": "RUNNING",
+        "requested_by": {"kind": "system-service", "id": "service:executor"},
+        "reason": {"code": "EXECUTION_START"}
+      },
+      "expected": {
+        "applied": false,
+        "reason_code": "TASK_STATE_CONFLICT",
+        "observed_revision": 4,
+        "observed_state": "RUNNABLE",
+        "provenance_append_count": 0
+      }
+    },
+    {
+      "name": "exact-transition-id-retry-is-idempotent",
+      "starting_state": {"revision": 4, "state": "RUNNABLE"},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-idempotent-1",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 4,
+        "expected_state": "RUNNABLE",
+        "to_state": "RUNNING",
+        "requested_by": {"kind": "system-service", "id": "service:executor"},
+        "reason": {"code": "EXECUTION_START"}
+      },
+      "sequence": [
+        {"call": 1, "expected_applied": true, "expected_current_revision": 5, "expected_provenance_append_count_total": 1},
+        {"call": 2, "same_request": true, "expected_applied": true, "expected_current_revision": 5, "expected_provenance_append_count_total": 1, "expected_same_result_identity": true}
+      ]
+    },
+    {
+      "name": "transition-id-reuse-with-different-payload-rejected",
+      "starting_state": {"revision": 4, "state": "RUNNABLE"},
+      "first_request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-id-reuse",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 4,
+        "expected_state": "RUNNABLE",
+        "to_state": "RUNNING",
+        "requested_by": {"kind": "system-service", "id": "service:executor"},
+        "reason": {"code": "EXECUTION_START"}
+      },
+      "second_request_mutation": "reuse transition_id but change to_state to PAUSED",
+      "expected_second_reason_code": "TASK_TRANSITION_ID_REUSE_CONFLICT"
+    },
+    {
+      "name": "runnable-guard-requires-validated-program",
+      "starting_state": {"revision": 6, "state": "PLANNING", "active_validated_program": null},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-guard-runnable",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 6,
+        "expected_state": "PLANNING",
+        "to_state": "RUNNABLE",
+        "requested_by": {"kind": "agent", "id": "agent:planner-fixture"},
+        "reason": {"code": "PLANNER_CLAIMS_READY"}
+      },
+      "expected": {
+        "applied": false,
+        "reason_code": "TASK_PROGRAM_NOT_RUNNABLE"
+      }
+    },
+    {
+      "name": "completion-guard-rejects-pending-verification",
+      "starting_state": {
+        "revision": 12,
+        "state": "VERIFYING",
+        "required_verification": "pending",
+        "required_outputs_published": true
+      },
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-complete-pending-verify",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 12,
+        "expected_state": "VERIFYING",
+        "to_state": "COMPLETED",
+        "requested_by": {"kind": "agent", "id": "agent:planner-fixture"},
+        "reason": {"code": "MODEL_SAYS_COMPLETE"}
+      },
+      "expected": {"applied": false, "reason_code": "TASK_COMPLETION_GATE_FAILED"}
+    },
+    {
+      "name": "completion-guard-rejects-unknown-external-outcome",
+      "starting_state": {
+        "revision": 12,
+        "state": "VERIFYING",
+        "required_verification": "passed",
+        "required_outputs_published": true,
+        "required_external_operations": [{"operation_id": "op-send-1", "outcome_certainty": "OUTCOME_UNKNOWN"}]
+      },
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-complete-unknown-effect",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 12,
+        "expected_state": "VERIFYING",
+        "to_state": "COMPLETED",
+        "requested_by": {"kind": "system-service", "id": "service:task-manager"},
+        "reason": {"code": "COMPLETION_EVALUATION"}
+      },
+      "expected": {"applied": false, "reason_code": "TASK_UNKNOWN_EXTERNAL_OUTCOME"}
+    },
+    {
+      "name": "terminal-completed-cannot-reopen",
+      "starting_state": {"revision": 20, "state": "COMPLETED"},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-reopen-completed",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 20,
+        "expected_state": "COMPLETED",
+        "to_state": "PLANNING",
+        "requested_by": {"kind": "user", "id": "user:fixture"},
+        "reason": {"code": "TRY_AGAIN"}
+      },
+      "expected": {"applied": false, "reason_code": "TASK_TERMINAL_STATE"}
+    },
+    {
+      "name": "failed-to-rolling-back-requires-compensation-guard",
+      "starting_state": {"revision": 18, "state": "FAILED", "rollback_available": false},
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-failed-rollback-no-guard",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 18,
+        "expected_state": "FAILED",
+        "to_state": "ROLLING_BACK",
+        "requested_by": {"kind": "system-service", "id": "service:recovery"},
+        "reason": {"code": "ROLLBACK_REQUESTED"}
+      },
+      "expected": {"applied": false, "reason_code": "TASK_TRANSITION_GUARD_FAILED"}
+    },
+    {
+      "name": "provenance-append-failure-rolls-back-transition",
+      "starting_state": {"revision": 4, "state": "RUNNABLE"},
+      "fault_injection": "provenance journal insert fails after transition guards but before commit",
+      "request": {
+        "schema_version": "0.1",
+        "transition_id": "tr-provenance-fail",
+        "task_id": "T-task-fixture-1",
+        "expected_revision": 4,
+        "expected_state": "RUNNABLE",
+        "to_state": "RUNNING",
+        "requested_by": {"kind": "system-service", "id": "service:executor"},
+        "reason": {"code": "EXECUTION_START"}
+      },
+      "expected": {
+        "applied": false,
+        "reason_code": "TASK_PROVENANCE_APPEND_FAILED",
+        "observed_revision": 4,
+        "observed_state": "RUNNABLE",
+        "provenance_append_count": 0
+      }
+    }
+  ]
+}
