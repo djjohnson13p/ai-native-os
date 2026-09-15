@@ -1,0 +1,75 @@
+package aios:provider-host@0.1.0;
+
+/// Narrow task-scoped artifact access supplied by the AIOS host.
+///
+/// This package intentionally does not expose arbitrary host paths, generic
+/// filesystem access, networking, environment variables, or secrets.
+interface artifacts {
+    enum artifact-error {
+        not-found,
+        access-denied,
+        integrity-failed,
+        out-of-range,
+        io-error,
+        invalid-output,
+    }
+
+    record artifact-metadata {
+        artifact-id: string,
+        semantic-type: string,
+        media-type: string,
+        size-bytes: option<u64>,
+    }
+
+    /// Host-owned reference to a task-scoped readable artifact.
+    resource input-artifact {
+        metadata: func() -> artifact-metadata;
+        read: func(offset: u64, max-bytes: u32) -> result<list<u8>, artifact-error>;
+    }
+
+    /// Host-owned allocation for one task-scoped output artifact.
+    resource output-artifact {
+        write: func(bytes: list<u8>) -> result<_, artifact-error>;
+        finish: func() -> result<artifact-metadata, artifact-error>;
+    }
+
+    /// Ask the host for a task-scoped output allocation.
+    /// The host may deny this when the current Execution Binding does not
+    /// authorize an artifact write or the semantic/media type is disallowed.
+    allocate-output: func(
+        semantic-type: string,
+        media-type: string,
+    ) -> result<output-artifact, artifact-error>;
+}
+
+/// Optional non-authoritative progress reporting.
+interface progress {
+    report: func(percent: option<u8>, message: string);
+}
+
+/// Structured diagnostic logging. This interface must not be used to smuggle
+/// secrets or authoritative task state; the host applies retention/redaction.
+interface structured-log {
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    record field {
+        name: string,
+        value: string,
+    }
+
+    emit: func(level: level, message: string, fields: list<field>);
+}
+
+/// Describes the host interfaces made available to a basic local provider.
+/// Capability-specific provider worlds import the interfaces they actually use.
+world basic-provider-host {
+    export artifacts;
+    export progress;
+    export structured-log;
+}
