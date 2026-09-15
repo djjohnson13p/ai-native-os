@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/execution-profile.schema.json",
+  "title": "Execution Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile_id", "version", "task_id", "principal", "isolation_class", "network", "limits"],
+  "properties": {
+    "profile_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "principal": {"type": "string", "minLength": 1},
+    "isolation_class": {
+      "type": "string",
+      "enum": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    },
+    "filesystem": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resource", "target", "mode"],
+        "properties": {
+          "resource": {"type": "string", "minLength": 1},
+          "target": {"type": "string", "minLength": 1},
+          "mode": {"type": "string", "enum": ["read-only", "read-write"]},
+          "required": {"type": "boolean", "default": true}
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["none", "loopback", "allowlist", "internet"]
+        },
+        "allowed_destinations": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "devices": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "pids_max": {"type": ["integer", "null"], "minimum": 1},
+        "cpu_quota_percent": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "wall_time_seconds": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "kernel_controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "no_new_privileges": {"type": "boolean", "default": true},
+        "user_namespace": {"type": "boolean"},
+        "pid_namespace": {"type": "boolean"},
+        "ipc_namespace": {"type": "boolean"},
+        "mount_namespace": {"type": "boolean"},
+        "seccomp_profile": {"type": ["string", "null"]},
+        "landlock_required": {"type": "boolean", "default": false}
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["process", "bubblewrap", "oci", "legacy-habitat", "vm"]
+        },
+        "image_or_habitat": {"type": ["string", "null"]},
+        "digest": {"type": ["string", "null"]}
+      }
+    },
+    "authority_token_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    }
+  }
+}
