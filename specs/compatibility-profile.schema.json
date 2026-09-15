@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/compatibility-profile.schema.json",
+  "title": "Legacy Compatibility Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile_id", "version", "application", "target_class", "habitat", "status"],
+  "properties": {
+    "profile_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "publisher": {"type": ["string", "null"]},
+        "version": {"type": ["string", "null"]},
+        "package_hash": {"type": ["string", "null"]},
+        "package_format": {"type": ["string", "null"]},
+        "guest_os_family": {"type": ["string", "null"]},
+        "guest_architectures": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "target_class": {
+      "type": "string",
+      "enum": [
+        "linux.native",
+        "linux.foreign-arch",
+        "windows.wine",
+        "windows.wine+arch-translation",
+        "android.waydroid",
+        "macos.darling.experimental",
+        "web.browser-habitat",
+        "vm.full-system",
+        "unsupported"
+      ]
+    },
+    "habitat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "runtime_version"],
+      "properties": {
+        "runtime": {"type": "string", "minLength": 1},
+        "runtime_version": {"type": "string", "minLength": 1},
+        "image_or_rootfs": {"type": ["string", "null"]},
+        "digest": {"type": ["string", "null"]},
+        "architecture_translator": {"type": ["string", "null"]},
+        "graphics_backend": {"type": ["string", "null"]},
+        "environment": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "integrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filesystem": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "network": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "devices": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "clipboard": {"type": "boolean"},
+        "audio_output": {"type": "boolean"},
+        "audio_input": {"type": "boolean"},
+        "camera": {"type": "boolean"},
+        "gpu": {"type": "boolean"}
+      }
+    },
+    "isolation_class": {
+      "type": "string",
+      "enum": ["P1", "P2", "P3", "P4", "P5"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["verified", "works-with-limitations", "experimental", "blocked", "unsupported", "unknown"]
+    },
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "tested_on": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hardware_profile": {"type": ["string", "null"]},
+          "host_os": {"type": ["string", "null"]},
+          "tested_at": {"type": ["string", "null"], "format": "date-time"},
+          "result": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "publisher_identity": {"type": ["string", "null"]},
+    "signature": {"type": ["string", "null"]}
+  }
+}
