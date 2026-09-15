@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provenance-checkpoint.schema.json",
+  "title": "AIOS Provenance Stream Checkpoint",
+  "description": "Checkpoint/head statement for one provenance stream. A local checkpoint accelerates recovery; a signed checkpoint can later add independent evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "checkpoint_id",
+    "stream_id",
+    "sequence",
+    "event_hash",
+    "checkpoint_kind",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "checkpoint_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "stream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sequence": {"type": "integer", "minimum": 1},
+    "event_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "checkpoint_kind": {
+      "type": "string",
+      "enum": ["local_head", "export_manifest", "signed"]
+    },
+    "signer": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["principal_ref", "key_id", "signature_profile", "signature"],
+      "properties": {
+        "principal_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "key_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "signature_profile": {"type": "string", "minLength": 1, "maxLength": 128},
+        "signature": {"type": "string", "minLength": 1, "maxLength": 8192}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "metadata": {
+      "type": "object",
+      "description": "Non-authoritative checkpoint distribution/export metadata.",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"checkpoint_kind": {"const": "signed"}},
+        "required": ["checkpoint_kind"]
+      },
+      "then": {
+        "required": ["signer"],
+        "properties": {"signer": {"type": "object"}}
+      }
+    }
+  ]
+}
