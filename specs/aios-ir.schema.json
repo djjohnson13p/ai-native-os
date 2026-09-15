@@ -20,10 +20,6 @@
       "type": "string",
       "enum": ["task_graph", "skill_graph"]
     },
-    "task_id": {
-      "type": ["string", "null"],
-      "minLength": 1
-    },
     "inputs": {
       "type": "object",
       "propertyNames": {
@@ -53,7 +49,7 @@
     },
     "metadata": {
       "type": "object",
-      "description": "Non-authoritative descriptive metadata. It must not grant execution authority.",
+      "description": "Non-authoritative descriptive metadata excluded from semantic hashing and permission decisions.",
       "additionalProperties": true
     }
   },
@@ -94,6 +90,7 @@
         },
         "description": {
           "type": "string",
+          "description": "Non-semantic explanatory prose excluded from semantic hashing.",
           "maxLength": 1024
         }
       }
@@ -166,6 +163,7 @@
         },
         "reason": {
           "type": "string",
+          "description": "Non-semantic explanatory prose excluded from semantic hashing.",
           "maxLength": 1024
         }
       }
@@ -378,11 +376,12 @@
         },
         "description": {
           "type": "string",
+          "description": "Non-semantic explanatory prose excluded from semantic hashing.",
           "maxLength": 2048
         },
         "metadata": {
           "type": "object",
-          "description": "Non-authoritative metadata excluded from permission decisions.",
+          "description": "Non-authoritative metadata excluded from semantic hashing and permission decisions.",
           "additionalProperties": true
         }
       }
