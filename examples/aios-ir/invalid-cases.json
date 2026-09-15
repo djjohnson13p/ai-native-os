@@ -1,0 +1,341 @@
+[
+  {
+    "name": "missing-ir-version",
+    "expected": "invalid",
+    "validation_stage": "schema",
+    "reason_code": "IR_SCHEMA_REQUIRED",
+    "program": {
+      "program_id": "invalid.missing_version",
+      "kind": "task_graph",
+      "inputs": {},
+      "nodes": [],
+      "outputs": {"result": {"source": "input", "name": "missing"}}
+    }
+  },
+  {
+    "name": "provider-pinned-inside-semantic-node",
+    "expected": "invalid",
+    "validation_stage": "schema",
+    "reason_code": "IR_SCHEMA_ADDITIONAL_PROPERTY",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.provider_pin",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "provider_id": "vendor.magic-provider",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+    }
+  },
+  {
+    "name": "grant-token-embedded-in-semantic-node",
+    "expected": "invalid",
+    "validation_stage": "schema",
+    "reason_code": "IR_SCHEMA_ADDITIONAL_PROPERTY",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.embedded_grant",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "capability_token": "grant:pretend-admin",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+    }
+  },
+  {
+    "name": "retry-without-finite-budget",
+    "expected": "invalid",
+    "validation_stage": "schema",
+    "reason_code": "IR_FAILURE_POLICY_UNBOUNDED",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.unbounded_retry",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "retry"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+    }
+  },
+  {
+    "name": "unknown-execution-class",
+    "expected": "invalid",
+    "validation_stage": "schema",
+    "reason_code": "IR_SCHEMA_ENUM",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.execution_class",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "magical_ai",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+    }
+  },
+  {
+    "name": "dangling-node-reference",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_REFERENCE_NODE_NOT_FOUND",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.dangling_ref",
+      "kind": "task_graph",
+      "inputs": {},
+      "nodes": [
+        {
+          "id": "uppercase",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "node", "node": "missing", "port": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "uppercase", "port": "text"}}
+    }
+  },
+  {
+    "name": "missing-output-port-reference",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_REFERENCE_PORT_NOT_FOUND",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.missing_port",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "hash",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        },
+        {
+          "id": "consume",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "node", "node": "hash", "port": "not_a_port"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "consume", "port": "text"}}
+    }
+  },
+  {
+    "name": "duplicate-node-identifiers",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_GRAPH_DUPLICATE_NODE_ID",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.duplicate_ids",
+      "kind": "task_graph",
+      "inputs": {"text": {"type": "text.plain@1"}},
+      "nodes": [
+        {
+          "id": "same",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "input", "name": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        },
+        {
+          "id": "same",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "input", "name": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "same", "port": "text"}}
+    }
+  },
+  {
+    "name": "data-flow-cycle",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_GRAPH_CYCLE",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.cycle",
+      "kind": "task_graph",
+      "inputs": {},
+      "nodes": [
+        {
+          "id": "a",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "node", "node": "b", "port": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        },
+        {
+          "id": "b",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "node", "node": "a", "port": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "a", "port": "text"}}
+    }
+  },
+  {
+    "name": "network-authority-contradicts-egress-deny",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_EGRESS_CONTRADICTION",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.egress_contradiction",
+      "kind": "task_graph",
+      "inputs": {"text": {"type": "text.plain@1"}},
+      "nodes": [
+        {
+          "id": "uppercase",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "input", "name": "text"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [
+            {"action": "network.connect", "resource": "https://example.invalid"}
+          ],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "uppercase", "port": "text"}}
+    }
+  },
+  {
+    "name": "unknown-capability-fails-closed",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_CAPABILITY_NOT_FOUND",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.unknown_capability",
+      "kind": "task_graph",
+      "inputs": {"text": {"type": "text.plain@1"}},
+      "nodes": [
+        {
+          "id": "execute",
+          "operation": {"kind": "invoke", "capability": "unknown.execute_everything@1"},
+          "execution_class": "opaque_external",
+          "inputs": {"text": {"source": "input", "name": "text"}},
+          "outputs": {"result": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"result": {"source": "node", "node": "execute", "port": "result"}}
+    }
+  },
+  {
+    "name": "fallback-recurses-to-primary-capability",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_FAILURE_POLICY_RECURSIVE_FALLBACK",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.recursive_fallback",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1"}},
+      "nodes": [
+        {
+          "id": "copy",
+          "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"copy": "artifact.file@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {
+            "on_error": "fallback",
+            "fallback_capabilities": ["artifact.copy@1"]
+          },
+          "cache": "never"
+        }
+      ],
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+    }
+  }
+]
