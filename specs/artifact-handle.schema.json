@@ -14,6 +14,11 @@
       "type": "string",
       "pattern": "^(artifact|data|stream|model|secret)://"
     },
+    "semantic_type": {
+      "type": ["string", "null"],
+      "description": "Verified/declared AIOS semantic type of the artifact instance when known, independent of physical media type.",
+      "pattern": "^(?:[a-z][a-z0-9_.-]*(?:@[0-9]+(?:\\.[0-9]+)*)?)?$"
+    },
     "media_type": {
       "type": "string",
       "minLength": 1
@@ -52,7 +57,14 @@
         "task_id": {
           "type": ["string", "null"]
         },
+        "semantic_program_hash": {
+          "type": ["string", "null"],
+          "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
+        },
         "step_id": {
+          "type": ["string", "null"]
+        },
+        "execution_binding_id": {
           "type": ["string", "null"]
         },
         "provider_id": {
@@ -75,6 +87,23 @@
         "expires_at": {
           "type": ["string", "null"],
           "format": "date-time"
+        }
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["unknown", "pending", "verified", "failed"]
+        },
+        "verified_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "verifier": {
+          "type": ["string", "null"]
         }
       }
     },
