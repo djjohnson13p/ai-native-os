@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/semantic-object-contract.schema.json",
+  "title": "AIOS Semantic Object Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "type_id", "version", "name", "attributes", "relationships", "mutation"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "type_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]+$"},
+    "version": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "name": {"type": "string", "minLength": 1},
+    "description": {"type": ["string", "null"]},
+    "stability": {
+      "type": "string",
+      "enum": ["experimental", "draft", "candidate", "stable", "deprecated", "retired", "revoked"]
+    },
+    "attributes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "semantic_type", "cardinality"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+          "semantic_type": {"type": "string", "minLength": 1},
+          "cardinality": {"type": "string", "enum": ["one", "zero-or-one", "many"]},
+          "required": {"type": "boolean", "default": false},
+          "sensitivity_hint": {
+            "type": ["string", "null"],
+            "enum": [null, "public", "local", "private", "confidential", "secret"]
+          },
+          "description": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["predicate", "contract_ref"],
+        "properties": {
+          "predicate": {"type": "string", "minLength": 1},
+          "contract_ref": {"type": "string", "minLength": 1},
+          "required": {"type": "boolean", "default": false}
+        }
+      }
+    },
+    "representations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["semantic_type", "role"],
+        "properties": {
+          "semantic_type": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "enum": ["native", "portable", "preview", "source", "derived", "archive"]},
+          "equivalence": {"type": "string", "enum": ["authoritative", "lossless", "lossy", "view-only", "unknown"]}
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "enforcement"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "enforcement": {"type": "string", "enum": ["schema", "deterministic-validator", "provider", "policy", "external-source", "manual"]}
+        }
+      }
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revisioned", "precondition_required"],
+      "properties": {
+        "revisioned": {"type": "boolean"},
+        "precondition_required": {"type": "boolean"},
+        "immutable_after_states": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "allowed_source_states": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["native", "federated", "mirrored", "derived", "ephemeral"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain_pack": {"type": ["string", "null"]},
+        "maintainers": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "metadata": {"type": "object", "additionalProperties": true}
+  }
+}
