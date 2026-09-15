@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/artifact-publication-request.schema.json",
+  "title": "AIOS v0.1 Artifact Publication Request",
+  "description": "Idempotent finalize request for one Task-scoped output allocation. The store computes trusted byte hash/size; caller cannot assert them as authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "publication_id",
+    "allocation_id",
+    "task_id",
+    "expected_allocation_state",
+    "media_type",
+    "lineage"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "publication_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "allocation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "expected_allocation_state": {"type": "string", "enum": ["WRITING", "FINALIZING"]},
+    "semantic_type": {
+      "type": ["string", "null"],
+      "pattern": "^(?:[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*))?$"
+    },
+    "media_type": {"type": "string", "minLength": 1, "maxLength": 160},
+    "format": {"type": ["string", "null"], "maxLength": 160},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_artifact_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 512}
+        },
+        "derived_from_artifact_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 512}
+        },
+        "representation_of_object_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^object://", "maxLength": 1024}
+        }
+      }
+    },
+    "labels": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "maxLength": 256}
+    }
+  }
+}
