@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/network-transfer.schema.json",
+  "title": "AIOS Network Transfer Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "transfer_id", "task_id", "source_refs", "destination_service", "purpose", "policy_decision_id", "state"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "transfer_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "semantic_node_id": {"type": ["string", "null"]},
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "destination_service": {"type": "string", "pattern": "^service://"},
+    "purpose": {"type": "string", "minLength": 1},
+    "sensitivity": {"type": "string", "enum": ["public", "local", "private", "confidential", "secret"]},
+    "content_hashes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "estimated_bytes": {"type": ["integer", "null"], "minimum": 0},
+    "actual_bytes": {"type": ["integer", "null"], "minimum": 0},
+    "resumable": {"type": "boolean"},
+    "cache_policy": {"type": "string", "enum": ["NO_CACHE", "TASK_CACHE", "PEER_CACHE", "PERSISTENT_REPLICA", "DESTINATION_MANAGED"]},
+    "policy_decision_id": {"type": "string", "minLength": 1},
+    "path": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "network_class": {"type": ["string", "null"]},
+        "transport": {"type": ["string", "null"]},
+        "endpoint_id": {"type": ["string", "null"]},
+        "encrypted": {"type": ["boolean", "null"]},
+        "authenticated": {"type": ["boolean", "null"]}
+      }
+    },
+    "state": {"type": "string", "enum": ["PLANNED", "AUTHORIZED", "TRANSFERRING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED"]},
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "error_code": {"type": ["string", "null"]}
+  }
+}
