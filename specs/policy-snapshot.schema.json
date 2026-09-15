@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/policy-snapshot.schema.json",
+  "title": "AIOS v0.1 Policy Snapshot",
+  "description": "Immutable attribution record for the exact deterministic policy set/schema/engine profile used by runtime authority evaluation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "scope",
+    "policy_language",
+    "policy_language_version",
+    "policy_set_hash",
+    "entity_schema_hash",
+    "engine",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "snapshot_id": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["device", "user", "organization", "system"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "policy_language": {"type": "string", "enum": ["cedar", "builtin", "other"]},
+    "policy_language_version": {"type": "string", "minLength": 1, "maxLength": 128},
+    "policy_set_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "entity_schema_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "configuration_hash": {"type": ["string", "null"], "pattern": "^(?:sha256:[a-f0-9]{64})?$"},
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "build_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "publisher_or_admin_ref": {"type": ["string", "null"], "maxLength": 512},
+    "signature_ref": {"type": ["string", "null"], "maxLength": 512},
+    "created_at": {"type": "string", "format": "date-time"},
+    "metadata": {
+      "type": "object",
+      "description": "Non-authoritative distribution/display metadata.",
+      "additionalProperties": true
+    }
+  }
+}
