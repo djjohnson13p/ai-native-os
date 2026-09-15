@@ -1,0 +1,47 @@
+{
+  "schema_version": "0.1",
+  "profile_id": "display-profile:phone-compact-demo",
+  "presentation_classes": ["COMPACT_TOUCH", "VOICE_FIRST"],
+  "surfaces": [
+    {
+      "surface_id": "surface:phone-main",
+      "kind": "display",
+      "logical_width": 412,
+      "logical_height": 915,
+      "physical_width_mm": 70,
+      "physical_height_mm": 155,
+      "scale_factor": 2.75,
+      "orientation": "variable",
+      "refresh_hz": 120,
+      "hdr": true,
+      "trusted_for_sensitive_output": true,
+      "remote_peer_id": null
+    }
+  ],
+  "inputs": {
+    "keyboard": false,
+    "pointer": false,
+    "touch": true,
+    "stylus": false,
+    "voice": true,
+    "camera": true,
+    "gamepad": false,
+    "switch_access": false
+  },
+  "audio": {
+    "input": true,
+    "output": true,
+    "private_output": false
+  },
+  "accessibility": {
+    "screen_reader": false,
+    "high_contrast": false,
+    "reduced_motion": false,
+    "large_text": false,
+    "caption_preferred": false,
+    "keyboard_only": false,
+    "voice_first": false
+  },
+  "power_constrained": true,
+  "measured_at": "2026-09-15T22:30:00Z"
+}
