@@ -20,8 +20,10 @@ This directory exercises the semantic IR and adaptive-execution model described 
 - `validation-result.json` — example of a successful deterministic IR validation result.
 - `execution-binding-import-table.json` — example showing how one semantic IR node becomes bound to a provider, authority grants, sandbox, and hardware only after validation/policy.
 - `skill-manifest-analyze-numbers.json` — candidate reusable Skill derived from the Demonstration A semantic graph without carrying old grants.
-- `valid-cases.json` — compact programs that should pass structural validation and the stated semantic checks.
-- `invalid-cases.json` — structural and semantic adversarial cases with expected validator reason codes.
+- `valid-cases.json` — compact structurally/semantically valid IR programs.
+- `invalid-cases.json` — parser/schema/graph/reference/egress/failure adversarial IR cases.
+- `invalid-semantic-cases.json` — registry-aware type/capability/execution-class/authority/egress failure cases.
+- `provider-conformance-cases.json` — provider declarations tested against provider-independent semantic capability contracts.
 
 ## Placeholder hashes
 
@@ -50,9 +52,9 @@ The reference validator must also perform semantic checks such as:
 - provider declarations that exceed their semantic capability contracts;
 - registry snapshot compatibility.
 
-## Test convention
+## Test convention — IR cases
 
-Each case in the fixture collections contains:
+A valid case contains:
 
 ```json
 {
@@ -62,7 +64,7 @@ Each case in the fixture collections contains:
 }
 ```
 
-or:
+An invalid IR case contains:
 
 ```json
 {
@@ -74,7 +76,22 @@ or:
 }
 ```
 
-The program objects are intended to be fed individually to the schema/semantic validator.
+`invalid-semantic-cases.json` may additionally state a `registry_assumption` explaining which fixture contract makes the case invalid.
+
+## Test convention — provider cases
+
+Provider conformance cases use:
+
+```json
+{
+  "name": "provider-authority-exceeds-contract",
+  "expected": "invalid",
+  "reason_code": "PROVIDER_AUTHORITY_NOT_ALLOWED",
+  "provider": {}
+}
+```
+
+Provider validation is separate from task authorization. A conforming provider can still be denied by task policy, and an allowed task operation cannot make a non-conforming provider acceptable.
 
 ## Registry assumptions for fixtures
 
