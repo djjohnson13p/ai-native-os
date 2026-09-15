@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.1",
+  "profile": "aios-artifact-store-v0.1",
+  "codes": [
+    {"code": "ARTIFACT_PUBLICATION_APPLIED", "severity": "info", "meaning": "output allocation finalized and published successfully"},
+    {"code": "ARTIFACT_NOT_FOUND", "severity": "error", "meaning": "Artifact ID does not exist or is unavailable under current store state"},
+    {"code": "ARTIFACT_AUTHORITY_DENIED", "severity": "error", "meaning": "caller/provider lacks current authority for the requested Artifact operation"},
+    {"code": "ARTIFACT_ALLOCATION_NOT_FOUND", "severity": "error", "meaning": "output allocation ID does not exist"},
+    {"code": "ARTIFACT_ALLOCATION_EXPIRED", "severity": "error", "meaning": "output allocation lease expired before publication"},
+    {"code": "ARTIFACT_ALLOCATION_STATE_CONFLICT", "severity": "error", "meaning": "allocation is not in an allowed expected state for the operation"},
+    {"code": "ARTIFACT_SIZE_LIMIT", "severity": "error", "meaning": "candidate content exceeds allocation/store limit"},
+    {"code": "ARTIFACT_HASH_MISMATCH", "severity": "error", "meaning": "content bytes do not match expected/recorded digest"},
+    {"code": "ARTIFACT_MEDIA_TYPE_MISMATCH", "severity": "error", "meaning": "published media type violates allocation/capability output contract"},
+    {"code": "ARTIFACT_SEMANTIC_TYPE_MISMATCH", "severity": "error", "meaning": "published semantic type violates allocation/capability output contract"},
+    {"code": "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT", "severity": "error", "meaning": "publication ID was previously used for a non-equivalent allocation/content finalize request"},
+    {"code": "ARTIFACT_BLOB_DURABILITY_FAILED", "severity": "error", "meaning": "staged/immutable blob could not be made durably available before metadata publication"},
+    {"code": "ARTIFACT_METADATA_COMMIT_FAILED", "severity": "error", "meaning": "Artifact metadata/lineage/provenance transaction failed"},
+    {"code": "ARTIFACT_INTEGRITY_FAILED", "severity": "error", "meaning": "published Artifact metadata exists but referenced immutable content is missing/corrupt"},
+    {"code": "ARTIFACT_STAGING_ORPHANED", "severity": "warning", "meaning": "unpublished staging bytes remain after interrupted/expired allocation and require cleanup/quarantine"},
+    {"code": "ARTIFACT_BLOB_ORPHANED", "severity": "warning", "meaning": "immutable blob exists without a retained published Artifact reference"},
+    {"code": "ARTIFACT_EXPORT_FAILED", "severity": "error", "meaning": "authorized export to user/external destination failed"}
+  ]
+}
