@@ -1,0 +1,336 @@
+{
+  "profile": "aios-ir-v0.1",
+  "description": "Paired valid AIOS IR programs for ADR 0029/docs 66 semantic-hash tests. Each left/right program must validate against the fixture registry before hash comparison.",
+  "cases": [
+    {
+      "name": "program-id-metadata-description-and-reason-are-nonsemantic",
+      "expected_relation": "equal",
+      "left": {
+        "ir_version": "0.1",
+        "program_id": "fixture.copy.left",
+        "kind": "task_graph",
+        "inputs": {
+          "source": {
+            "type": "artifact.file@1",
+            "required": true,
+            "description": "Left description"
+          }
+        },
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source", "reason": "Left reason"},
+              {"action": "artifact.write", "resource": "task.output", "reason": "Create output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed",
+            "description": "Left node prose",
+            "metadata": {"planner": "left", "debug": 1}
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}},
+        "metadata": {"source": "left", "note": "non-semantic"}
+      },
+      "right": {
+        "ir_version": "0.1",
+        "program_id": "renamed.program.with.same.meaning",
+        "kind": "task_graph",
+        "inputs": {
+          "source": {
+            "type": "artifact.file@1",
+            "required": true,
+            "description": "Completely different human prose"
+          }
+        },
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.write", "resource": "task.output", "reason": "Different write explanation"},
+              {"action": "artifact.read", "resource": "input:source", "reason": "Different read explanation"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed",
+            "description": "Different node prose",
+            "metadata": {"planner": "right", "nested": {"anything": true}}
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}},
+        "metadata": {"source": "right", "another": [1, 2, 3]}
+      }
+    },
+    {
+      "name": "node-order-media-type-order-and-default-spelling-are-nonsemantic",
+      "expected_relation": "equal",
+      "left": {
+        "ir_version": "0.1",
+        "program_id": "fixture.parallel.left",
+        "kind": "task_graph",
+        "inputs": {
+          "left": {
+            "type": "artifact.file@1",
+            "media_types": ["text/plain", "application/octet-stream"]
+          },
+          "right": {
+            "type": "artifact.file@1",
+            "required": true,
+            "media_types": ["application/octet-stream", "text/plain"]
+          }
+        },
+        "nodes": [
+          {
+            "id": "hash_left",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "left"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:left"}],
+            "egress": {"mode": "deny"},
+            "constraints": {"locality": ["peer", "local"]},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          },
+          {
+            "id": "hash_right",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "right"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:right"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {
+          "left_hash": {"source": "node", "node": "hash_left", "port": "hash"},
+          "right_hash": {"source": "node", "node": "hash_right", "port": "hash"}
+        }
+      },
+      "right": {
+        "ir_version": "0.1",
+        "program_id": "fixture.parallel.right",
+        "kind": "task_graph",
+        "inputs": {
+          "right": {
+            "type": "artifact.file@1",
+            "required": true,
+            "media_types": ["text/plain", "application/octet-stream"]
+          },
+          "left": {
+            "type": "artifact.file@1",
+            "required": true,
+            "media_types": ["application/octet-stream", "text/plain"]
+          }
+        },
+        "nodes": [
+          {
+            "id": "hash_right",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "right"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:right"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          },
+          {
+            "id": "hash_left",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "left"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:left"}],
+            "egress": {"mode": "deny"},
+            "constraints": {"locality": ["local", "peer"]},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {
+          "right_hash": {"source": "node", "node": "hash_right", "port": "hash"},
+          "left_hash": {"source": "node", "node": "hash_left", "port": "hash"}
+        }
+      }
+    },
+    {
+      "name": "cache-policy-is-semantic",
+      "expected_relation": "different",
+      "left": {
+        "ir_version": "0.1",
+        "program_id": "fixture.cache.left",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      },
+      "right": {
+        "ir_version": "0.1",
+        "program_id": "fixture.cache.right",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "never"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "retry-budget-is-semantic",
+      "expected_relation": "different",
+      "left": {
+        "ir_version": "0.1",
+        "program_id": "fixture.retry.left",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "retry", "max_attempts": 1},
+            "cache": "never"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      },
+      "right": {
+        "ir_version": "0.1",
+        "program_id": "fixture.retry.right",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "retry", "max_attempts": 2},
+            "cache": "never"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      }
+    },
+    {
+      "name": "kind-is-semantic",
+      "expected_relation": "different",
+      "left": {
+        "ir_version": "0.1",
+        "program_id": "fixture.kind.task",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      },
+      "right": {
+        "ir_version": "0.1",
+        "program_id": "fixture.kind.skill",
+        "kind": "skill_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "task-id-is-not-semantic-ir",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_ADDITIONAL_PROPERTY",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "invalid.task_id",
+        "kind": "task_graph",
+        "task_id": "T-91",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    }
+  ]
+}
