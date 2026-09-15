@@ -1,0 +1,158 @@
+[
+  {
+    "name": "semantic-type-mismatch",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_TYPE_MISMATCH",
+    "registry_assumption": "text.uppercase@1 consumes text.plain@1; artifact.hash@1 produces data.hash@1",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.type_mismatch",
+      "kind": "task_graph",
+      "inputs": {
+        "source": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "hash",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        },
+        {
+          "id": "uppercase",
+          "operation": {"kind": "invoke", "capability": "text.uppercase@1"},
+          "execution_class": "deterministic",
+          "inputs": {"text": {"source": "node", "node": "hash", "port": "hash"}},
+          "outputs": {"text": "text.plain@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"text": {"source": "node", "node": "uppercase", "port": "text"}}
+    }
+  },
+  {
+    "name": "capability-execution-class-downgrade",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_EXECUTION_CLASS_INCOMPATIBLE",
+    "registry_assumption": "artifact.hash@1 permits deterministic only",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.execution_class_contract",
+      "kind": "task_graph",
+      "inputs": {
+        "source": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "hash",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "probabilistic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+    }
+  },
+  {
+    "name": "authority-class-exceeds-capability-contract",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_AUTHORITY_CLASS_NOT_ALLOWED",
+    "registry_assumption": "table.normalize@1 allows no authority classes",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.authority_exceeds_contract",
+      "kind": "task_graph",
+      "inputs": {
+        "table": {"type": "data.table@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "normalize",
+          "operation": {"kind": "invoke", "capability": "table.normalize@1"},
+          "execution_class": "deterministic",
+          "inputs": {"table": {"source": "input", "name": "table"}},
+          "outputs": {"table": "data.table@1"},
+          "authority_requests": [{"action": "network.connect", "resource": "https://example.invalid"}],
+          "egress": {"mode": "policy", "destination_classes": ["internet"]},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"table": {"source": "node", "node": "normalize", "port": "table"}}
+    }
+  },
+  {
+    "name": "declared-output-type-conflicts-with-contract",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_CAPABILITY_PORT_MISMATCH",
+    "registry_assumption": "stats.compare_periods@1 outputs metrics:data.metrics@1",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.output_contract",
+      "kind": "task_graph",
+      "inputs": {
+        "table": {"type": "data.table@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "metrics",
+          "operation": {"kind": "invoke", "capability": "stats.compare_periods@1"},
+          "execution_class": "deterministic",
+          "inputs": {"table": {"source": "input", "name": "table"}},
+          "outputs": {"metrics": "text.narrative@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"metrics": {"source": "node", "node": "metrics", "port": "metrics"}}
+    }
+  },
+  {
+    "name": "egress-mode-not-allowed-by-capability",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_EGRESS_NOT_ALLOWED",
+    "registry_assumption": "artifact.hash@1 allows egress deny only",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.egress_contract",
+      "kind": "task_graph",
+      "inputs": {
+        "source": {"type": "artifact.file@1", "required": true}
+      },
+      "nodes": [
+        {
+          "id": "hash",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+          "egress": {"mode": "policy", "destination_classes": ["internet"]},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+    }
+  }
+]
