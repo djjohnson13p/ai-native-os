@@ -1,0 +1,62 @@
+{
+  "schema_version": "0.1",
+  "package_id": "org.ainative.provider.table-import",
+  "version": "0.3.1",
+  "component_class": "CAPABILITY_PROVIDER",
+  "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "publisher_identity_id": "publisher://org/ainative-project",
+  "channel": "development",
+  "signatures": [
+    {
+      "signer_identity_id": "publisher://org/ainative-project",
+      "algorithm": "ed25519",
+      "signature_ref": "signature://fixture/table-import/0.3.1"
+    }
+  ],
+  "component_manifest_refs": ["manifest://provider/table-import/0.3.1"],
+  "semantic_dependencies": [
+    {
+      "kind": "capability",
+      "id": "table.import",
+      "version_range": "^0.1"
+    },
+    {
+      "kind": "type",
+      "id": "data.table",
+      "version_range": "^1"
+    }
+  ],
+  "package_dependencies": [],
+  "platform": {
+    "architectures": ["x86_64", "aarch64"],
+    "runtime_kinds": ["varlink", "wasm-component"],
+    "minimum_system_version": "0.1"
+  },
+  "authority_requests": ["artifact.read", "artifact.write"],
+  "effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+  "network_requirements": [],
+  "minimum_isolation": "P2",
+  "conformance": {
+    "suite_refs": ["conformance://table.import/0.1"],
+    "status": "TESTED"
+  },
+  "supply_chain": {
+    "source_revision": "fixture-source-revision",
+    "build_provenance_ref": "provenance://build/table-import/0.3.1",
+    "sbom_ref": "sbom://table-import/0.3.1",
+    "reproducible_build": null
+  },
+  "licenses": [
+    {
+      "id": "Apache-2.0",
+      "scope": "package",
+      "notice_ref": null
+    }
+  ],
+  "upgrade": {
+    "rollback_compatible": true,
+    "migration_required": false,
+    "migration_ref": null
+  },
+  "created_at": "2026-09-15T22:40:00Z"
+}
