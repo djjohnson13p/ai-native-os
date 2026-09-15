@@ -22,7 +22,8 @@
     },
     "version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+      "description": "Full semantic contract version. AIOS IR references the semantic type by ID + major selector through an immutable registry snapshot.",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*))?$"
     },
     "kind": {
       "type": "string",
@@ -106,8 +107,10 @@
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "minLength": 3,
-        "maxLength": 160
+        "minLength": 5,
+        "maxLength": 160,
+        "description": "Semantic conversion capability major selector.",
+        "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"
       }
     },
     "conformance": {
