@@ -1,0 +1,322 @@
+{
+  "profile": "aios-ir-v0.1-edge-cases",
+  "description": "Synthetic cases for ADR 0031/docs 68. Cases assume the bootstrap semantic registry plus any explicitly named test-only registry extension.",
+  "cases": [
+    {
+      "name": "duplicate-authority-request-different-reason-is-invalid",
+      "expected": "invalid",
+      "validation_stage": "effects_authority",
+      "reason_code": "IR_AUTHORITY_DUPLICATE_REQUEST",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.duplicate-authority",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source", "reason": "first"},
+              {"action": "artifact.read", "resource": "input:source", "reason": "same semantic request, different prose"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      }
+    },
+    {
+      "name": "verifier-capability-cannot-hide-as-invoke",
+      "expected": "invalid",
+      "validation_stage": "capabilities",
+      "reason_code": "IR_CAPABILITY_ROLE_MISMATCH",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.verifier-as-invoke",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "invoke", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "ordinary-capability-cannot-pretend-to-be-verifier",
+      "expected": "invalid",
+      "validation_stage": "capabilities",
+      "reason_code": "IR_CAPABILITY_ROLE_MISMATCH",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.ordinary-as-verifier",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "verify", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      }
+    },
+    {
+      "name": "host-path-authority-selector-is-structurally-invalid",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_PATTERN",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.host-path-resource",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "/home/example/private.txt"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "unknown-input-authority-selector-is-invalid",
+      "expected": "invalid",
+      "validation_stage": "references",
+      "reason_code": "IR_REFERENCE_INPUT_NOT_FOUND",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.authority-input-missing",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:missing"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "policy-egress-without-data-egress-authority-is-invalid",
+      "expected": "invalid",
+      "validation_stage": "effects_authority",
+      "reason_code": "IR_EGRESS_AUTHORITY_MISMATCH",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.egress-missing-authority",
+        "kind": "task_graph",
+        "inputs": {"metrics": {"type": "data.metrics@1"}},
+        "nodes": [
+          {
+            "id": "summarize",
+            "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+            "execution_class": "probabilistic",
+            "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+            "outputs": {"narrative": "text.narrative@1"},
+            "authority_requests": [{"action": "network.connect", "resource": "service:model"}],
+            "egress": {"mode": "policy", "destination_classes": ["remote-model"]},
+            "failure": {"on_error": "stop"},
+            "cache": "never"
+          }
+        ],
+        "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
+      }
+    },
+    {
+      "name": "explicit-policy-egress-authority-is-semantically-valid",
+      "expected": "valid",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.egress-valid",
+        "kind": "task_graph",
+        "inputs": {"metrics": {"type": "data.metrics@1"}},
+        "nodes": [
+          {
+            "id": "summarize",
+            "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+            "execution_class": "probabilistic",
+            "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+            "outputs": {"narrative": "text.narrative@1"},
+            "authority_requests": [
+              {"action": "network.connect", "resource": "service:model"},
+              {"action": "data.egress", "resource": "destination:remote-model"}
+            ],
+            "egress": {"mode": "policy", "destination_classes": ["remote-model"]},
+            "failure": {"on_error": "stop"},
+            "cache": "never"
+          }
+        ],
+        "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
+      }
+    },
+    {
+      "name": "probabilistic-content-addressed-cache-is-invalid",
+      "expected": "invalid",
+      "validation_stage": "effects_authority",
+      "reason_code": "IR_CACHE_EXECUTION_CLASS_MISMATCH",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.cache-probabilistic",
+        "kind": "task_graph",
+        "inputs": {"metrics": {"type": "data.metrics@1"}},
+        "nodes": [
+          {
+            "id": "summarize",
+            "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+            "execution_class": "probabilistic",
+            "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+            "outputs": {"narrative": "text.narrative@1"},
+            "authority_requests": [],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
+      }
+    },
+    {
+      "name": "optional-program-input-cannot-feed-required-port",
+      "expected": "invalid",
+      "validation_stage": "types",
+      "reason_code": "IR_OPTIONAL_INPUT_TO_REQUIRED_PORT",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.optional-required-port",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1", "required": false}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "unused-pure-node-is-warning-not-error",
+      "expected": "valid_with_warning",
+      "warning_code": "IR_GRAPH_UNUSED_PURE_NODE",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.unused-pure",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.table@1"}},
+        "nodes": [
+          {
+            "id": "import",
+            "operation": {"kind": "invoke", "capability": "table.import@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"table": "data.table@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          },
+          {
+            "id": "normalize_unused",
+            "operation": {"kind": "invoke", "capability": "table.normalize@1"},
+            "execution_class": "deterministic",
+            "inputs": {"table": {"source": "node", "node": "import", "port": "table"}},
+            "outputs": {"table": "data.table@1"},
+            "authority_requests": [],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"table": {"source": "node", "node": "import", "port": "table"}}
+      }
+    },
+    {
+      "name": "effectful-unconsumed-node-can-be-valid",
+      "expected": "valid",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.effectful-unconsumed",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          },
+          {
+            "id": "copy_effect",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    }
+  ]
+}
