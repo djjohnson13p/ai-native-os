@@ -17,27 +17,39 @@
   },
   "provides": [
     {
-      "capability": "table.import",
-      "version": "0.1",
-      "input_types": ["table/csv", "table/xlsx"],
-      "output_types": ["table/normalized"],
-      "side_effects": ["read", "write"],
+      "contract": {
+        "capability": "table.import",
+        "version": "1.0",
+        "contract_hash": null,
+        "contract_source": "../aios-ir/capability-contracts.json"
+      },
+      "conformance": {
+        "suite": "conformance://table.import/1",
+        "suite_hash": null,
+        "status": "declared",
+        "tested_at": null,
+        "test_environment": null
+      },
+      "side_effects": ["artifact_read"],
       "execution": {
         "locality": ["local"],
-        "determinism": "deterministic",
+        "execution_class": "deterministic",
         "minimum_isolation": "P2",
         "network_default": "none"
       },
       "authority": {
-        "actions": ["read", "create", "write"],
-        "resource_classes": ["artifact", "task-output"]
+        "actions": ["artifact.read"],
+        "resource_classes": ["artifact"]
+      },
+      "representations": {
+        "source": ["csv", "xlsx"],
+        "table": ["arrow-ipc", "canonical-json-table"]
       },
       "resource_requirements": {
         "min_memory_bytes": 134217728,
         "preferred_accelerators": [],
         "requires_gpu": false
-      },
-      "conformance_suite": "table.import/0.1"
+      }
     }
   ],
   "trust": {
