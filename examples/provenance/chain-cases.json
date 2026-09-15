@@ -1,0 +1,141 @@
+{
+  "profile": "aios-provenance-event-v0.1",
+  "hashes": "GENERATE_AT_TEST_TIME",
+  "description": "Synthetic provenance journal cases. The implementation must generate canonical event hashes; these cases specify relationships and expected verification outcomes rather than trusted precomputed digests.",
+  "base_stream": {
+    "stream_id": "task:T-provenance-fixture-1",
+    "events": [
+      {
+        "sequence": 1,
+        "previous": null,
+        "event": {
+          "schema_version": "0.1",
+          "event_id": "evt-001",
+          "task_id": "T-provenance-fixture-1",
+          "event_type": "task.created",
+          "timestamp": "2026-09-15T22:00:00Z",
+          "actor": {"kind": "user", "id": "user:fixture"},
+          "status": "success",
+          "details": {"fixture": true}
+        }
+      },
+      {
+        "sequence": 2,
+        "previous": "HASH_OF_SEQUENCE_1",
+        "event": {
+          "schema_version": "0.1",
+          "event_id": "evt-002",
+          "task_id": "T-provenance-fixture-1",
+          "event_type": "authorization.granted",
+          "timestamp": "2026-09-15T22:00:01Z",
+          "actor": {"kind": "policy-engine", "id": "policy:fixture"},
+          "capability": "artifact.hash@1",
+          "authority_token_id": "grant:fixture-read",
+          "policy_decision_id": "decision:fixture-1",
+          "status": "success",
+          "details": {"actions": ["artifact.read"], "resource": "input:source"}
+        }
+      },
+      {
+        "sequence": 3,
+        "previous": "HASH_OF_SEQUENCE_2",
+        "event": {
+          "schema_version": "0.1",
+          "event_id": "evt-003",
+          "task_id": "T-provenance-fixture-1",
+          "step_id": "hash_source",
+          "event_type": "execution.completed",
+          "timestamp": "2026-09-15T22:00:02Z",
+          "actor": {"kind": "provider", "id": "provider:artifact-hash-fixture"},
+          "provider_id": "provider:artifact-hash-fixture",
+          "capability": "artifact.hash@1",
+          "authority_token_id": "grant:fixture-read",
+          "input_artifacts": ["artifact:fixture-source"],
+          "output_artifacts": ["artifact:fixture-hash"],
+          "status": "success",
+          "details": {"attempt": 1}
+        }
+      },
+      {
+        "sequence": 4,
+        "previous": "HASH_OF_SEQUENCE_3",
+        "event": {
+          "schema_version": "0.1",
+          "event_id": "evt-004",
+          "task_id": "T-provenance-fixture-1",
+          "event_type": "task.completed",
+          "timestamp": "2026-09-15T22:00:03Z",
+          "actor": {"kind": "system-service", "id": "service:task-manager"},
+          "output_artifacts": ["artifact:fixture-hash"],
+          "status": "success",
+          "details": {"revision": 4}
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "generated-base-chain-validates",
+      "mutation": "none",
+      "expected_valid": true
+    },
+    {
+      "name": "historical-field-tamper-breaks-event-hash",
+      "mutation": "change sequence-3 capability from artifact.hash@1 to artifact.copy@1 without recomputing descendants",
+      "expected_valid": false,
+      "expected_reason_code": "PROVENANCE_EVENT_HASH_MISMATCH",
+      "expected_failure_sequence": 3
+    },
+    {
+      "name": "previous-hash-tamper-breaks-chain",
+      "mutation": "replace sequence-4 previous_event_hash with unrelated digest",
+      "expected_valid": false,
+      "expected_reason_code": "PROVENANCE_PREVIOUS_HASH_MISMATCH",
+      "expected_failure_sequence": 4
+    },
+    {
+      "name": "missing-middle-event-breaks-sequence",
+      "mutation": "delete sequence 2 without renumbering or rewriting descendants",
+      "expected_valid": false,
+      "expected_reason_code": "PROVENANCE_SEQUENCE_GAP",
+      "expected_failure_sequence": 3
+    },
+    {
+      "name": "reordered-events-break-sequence",
+      "mutation": "swap records 2 and 3",
+      "expected_valid": false,
+      "expected_reason_code": "PROVENANCE_SEQUENCE_ORDER_INVALID"
+    },
+    {
+      "name": "head-checkpoint-mismatch-detected",
+      "mutation": "verify valid generated chain against checkpoint hash from an older/different stream head",
+      "expected_valid": false,
+      "expected_reason_code": "PROVENANCE_CHECKPOINT_HEAD_MISMATCH"
+    },
+    {
+      "name": "event-correction-appends-new-record",
+      "mutation": "append sequence 5 reconciliation event referencing evt-003 rather than editing evt-003",
+      "expected_valid": true,
+      "expected_behavior": "original sequence 3 remains byte/semantic-hash identical to pre-correction chain"
+    },
+    {
+      "name": "atomic-task-transition-stale-revision",
+      "mutation": "attempt Task revision 4 -> 5 transition using expected revision 3 while also appending task.completed event",
+      "expected_valid": false,
+      "expected_behavior": "transaction commits neither Task state change nor provenance record"
+    },
+    {
+      "name": "atomic-task-transition-success",
+      "mutation": "apply allowed Task transition using current expected revision and append matching provenance record in one transaction",
+      "expected_valid": true,
+      "expected_behavior": "Task revision increments once and stream sequence/head advances once"
+    }
+  ],
+  "reason_codes_expected": [
+    "PROVENANCE_EVENT_HASH_MISMATCH",
+    "PROVENANCE_PREVIOUS_HASH_MISMATCH",
+    "PROVENANCE_SEQUENCE_GAP",
+    "PROVENANCE_SEQUENCE_ORDER_INVALID",
+    "PROVENANCE_CHECKPOINT_HEAD_MISMATCH"
+  ]
+}
