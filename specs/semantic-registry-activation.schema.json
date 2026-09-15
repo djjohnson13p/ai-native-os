@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/semantic-registry-activation.schema.json",
+  "title": "AIOS Semantic Registry Snapshot Activation",
+  "description": "Mutable local/default-selection record that points at an immutable admitted Registry Snapshot. Activation does not mutate historical Task validation evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "activation_id",
+    "scope",
+    "registry_snapshot_id",
+    "state",
+    "revision",
+    "activated_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "activation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["device", "user", "organization"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "registry_snapshot_id": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "state": {
+      "type": "string",
+      "enum": ["ADMITTED", "ACTIVE_DEFAULT", "DEPRECATED", "QUARANTINED", "REVOKED"]
+    },
+    "revision": {"type": "integer", "minimum": 1},
+    "policy_decision_id": {"type": ["string", "null"], "maxLength": 256},
+    "activated_by": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["user", "system-service", "organization"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "activated_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
