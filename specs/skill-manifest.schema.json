@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/skill-manifest.schema.json",
+  "title": "AI-Native OS Skill Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "skill_id",
+    "version",
+    "status",
+    "source_ir",
+    "inputs",
+    "outputs",
+    "authority_template",
+    "capability_dependencies",
+    "validation",
+    "privacy",
+    "compiled_targets"
+  ],
+  "properties": {
+    "skill_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["candidate", "validated", "compiled", "deprecated", "disabled"]
+    },
+    "source_ir": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ir_version", "semantic_hash"],
+      "properties": {
+        "ir_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "semantic_hash": {
+          "type": "string",
+          "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+        },
+        "template_uri": {
+          "type": ["string", "null"],
+          "maxLength": 1024
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "required"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 128
+      }
+    },
+    "authority_template": {
+      "type": "array",
+      "description": "Requests only. A skill manifest never carries reusable grants.",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "resource_expression"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128
+          },
+          "resource_expression": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "approval_may_be_required": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    "capability_dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["capability", "version_range"],
+        "properties": {
+          "capability": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 160
+          },
+          "version_range": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      }
+    },
+    "verification_requirements": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 160
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["successful_runs", "regression_suite", "last_validated_at"],
+      "properties": {
+        "successful_runs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "regression_suite": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "regression_suite_hash": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "last_validated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "validated_by": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "scrubbed_for_sharing", "contains_secret_values"],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": ["local_private", "account_private", "organization_private", "shareable"]
+        },
+        "scrubbed_for_sharing": {
+          "type": "boolean"
+        },
+        "contains_secret_values": {
+          "type": "boolean",
+          "const": false
+        },
+        "scrub_report": {
+          "type": ["string", "null"],
+          "maxLength": 1024
+        }
+      }
+    },
+    "compiled_targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_id", "format", "artifact_hash", "source_ir_hash"],
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "format": {
+            "type": "string",
+            "enum": ["wasm", "native", "provider_pipeline", "query_plan", "gpu_graph", "other"]
+          },
+          "platform": {
+            "type": ["string", "null"],
+            "maxLength": 160
+          },
+          "artifact_hash": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+          },
+          "source_ir_hash": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+          },
+          "created_at": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "invalidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capability_major_change": {
+          "type": "boolean",
+          "default": true
+        },
+        "policy_semantics_change": {
+          "type": "boolean",
+          "default": true
+        },
+        "failed_regression": {
+          "type": "boolean",
+          "default": true
+        },
+        "security_advisory": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "publisher": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "source_tasks": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        }
+      }
+    }
+  }
+}
