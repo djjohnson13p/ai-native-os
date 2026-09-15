@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provenance-journal-record.schema.json",
+  "title": "AIOS v0.1 Provenance Journal Record",
+  "description": "Append-oriented ordering/integrity envelope around one typed Provenance Event payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "hash_profile",
+    "stream_id",
+    "sequence",
+    "previous_event_hash",
+    "event",
+    "event_hash"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "hash_profile": {"type": "string", "const": "aios-provenance-event-v0.1"},
+    "stream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sequence": {"type": "integer", "minimum": 1},
+    "previous_event_hash": {
+      "type": ["string", "null"],
+      "pattern": "^(?:sha256:[a-f0-9]{64})?$"
+    },
+    "event": {
+      "$ref": "https://ai-native-os.example/specs/provenance-event.schema.json"
+    },
+    "event_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"sequence": {"const": 1}},
+        "required": ["sequence"]
+      },
+      "then": {
+        "properties": {"previous_event_hash": {"type": "null"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"sequence": {"minimum": 2}},
+        "required": ["sequence"]
+      },
+      "then": {
+        "properties": {
+          "previous_event_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  ]
+}
