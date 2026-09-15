@@ -22,6 +22,10 @@
         "intent.normalized",
         "plan.created",
         "plan.revised",
+        "ir.validation.started",
+        "ir.validation.completed",
+        "ir.validation.failed",
+        "registry.snapshot.selected",
         "capability.resolved",
         "authorization.requested",
         "authorization.granted",
@@ -31,6 +35,7 @@
         "approval.denied",
         "provider.selected",
         "placement.selected",
+        "execution.bound",
         "execution.started",
         "execution.completed",
         "execution.failed",
@@ -49,7 +54,10 @@
         "rollback.completed",
         "skill.proposed",
         "skill.created",
-        "skill.executed"
+        "skill.validated",
+        "skill.compiled",
+        "skill.executed",
+        "skill.invalidated"
       ]
     },
     "timestamp": {"type": "string", "format": "date-time"},
@@ -60,16 +68,40 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "peer-node"]
+          "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]
         },
         "id": {"type": "string", "minLength": 1}
       }
     },
+    "semantic_program_hash": {
+      "type": ["string", "null"],
+      "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
+    },
+    "ir_version": {"type": ["string", "null"]},
+    "registry_snapshot_id": {"type": ["string", "null"]},
+    "validation_result_id": {"type": ["string", "null"]},
+    "execution_binding_id": {"type": ["string", "null"]},
     "provider_id": {"type": ["string", "null"]},
+    "provider_version": {"type": ["string", "null"]},
     "capability": {"type": ["string", "null"]},
+    "capability_contract_hash": {
+      "type": ["string", "null"],
+      "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
+    },
     "authority_token_id": {"type": ["string", "null"]},
     "policy_decision_id": {"type": ["string", "null"]},
     "approval_id": {"type": ["string", "null"]},
+    "skill": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "manifest_hash": {"type": ["string", "null"]},
+        "compiled_target_id": {"type": ["string", "null"]}
+      }
+    },
     "input_artifacts": {
       "type": "array",
       "items": {"type": "string"},
@@ -101,6 +133,7 @@
     },
     "details": {
       "type": "object",
+      "description": "Diagnostic details only. Security-relevant identity should use dedicated typed fields above.",
       "additionalProperties": true
     },
     "previous_event_hash": {"type": ["string", "null"]},
