@@ -1,0 +1,42 @@
+{
+  "schema_version": "0.1",
+  "service_id": "service://personal/home-workstation",
+  "service_class": "PEER_SERVICE",
+  "provider_id": "org.ainative.peer-worker",
+  "peer_id": "peer://home-workstation",
+  "trust_state": "PAIRED",
+  "capabilities": [
+    "engineering.drawing.render@1",
+    "model.reasoning.local@1",
+    "artifact.transform@1"
+  ],
+  "endpoints": [
+    {
+      "endpoint_id": "endpoint:lan",
+      "address": "workstation.local:7443",
+      "network_class": "PERSONAL_PEER",
+      "transport": "authenticated-peer-session",
+      "authenticated": true,
+      "encrypted": true,
+      "region": null,
+      "metered": false
+    },
+    {
+      "endpoint_id": "endpoint:relay",
+      "address": "relay.example.invalid/session/home-workstation",
+      "network_class": "PUBLIC_INTERNET",
+      "transport": "authenticated-peer-relay",
+      "authenticated": true,
+      "encrypted": true,
+      "region": "demo-us-west",
+      "metered": false
+    }
+  ],
+  "identity": {
+    "issuer": "local-user-pairing",
+    "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "expires_at": null
+  },
+  "discovered_at": "2026-09-15T22:30:00Z",
+  "last_verified_at": "2026-09-15T22:30:00Z"
+}
