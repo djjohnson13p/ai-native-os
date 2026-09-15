@@ -1,0 +1,70 @@
+{
+  "skill_id": "skill://local/analyze-numbers",
+  "version": "0.1.0",
+  "status": "candidate",
+  "source_ir": {
+    "ir_version": "0.1",
+    "semantic_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "template_uri": "./demonstration-a.ir.json"
+  },
+  "inputs": {
+    "source": {
+      "type": "artifact.table@1",
+      "required": true,
+      "description": "New user-selected tabular artifact for each invocation"
+    }
+  },
+  "outputs": {
+    "analysis": "data.metrics@1",
+    "chart": "artifact.image@1",
+    "report": "artifact.report@1"
+  },
+  "authority_template": [
+    {
+      "action": "artifact.read",
+      "resource_expression": "input:source",
+      "approval_may_be_required": false
+    },
+    {
+      "action": "artifact.write",
+      "resource_expression": "task.output",
+      "approval_may_be_required": false
+    }
+  ],
+  "capability_dependencies": [
+    {"capability": "table.import", "version_range": "1.x"},
+    {"capability": "table.normalize", "version_range": "1.x"},
+    {"capability": "stats.compare_periods", "version_range": "1.x"},
+    {"capability": "chart.render", "version_range": "1.x"},
+    {"capability": "report.summarize", "version_range": "1.x"},
+    {"capability": "verify.numeric_claims", "version_range": "1.x"},
+    {"capability": "document.compose", "version_range": "1.x"}
+  ],
+  "verification_requirements": [
+    "verify.numeric_claims@1"
+  ],
+  "validation": {
+    "successful_runs": 0,
+    "regression_suite": "tests://skills/analyze-numbers/v0.1",
+    "regression_suite_hash": null,
+    "last_validated_at": "2026-09-15T00:00:00Z",
+    "validated_by": ["architecture-fixture-only"]
+  },
+  "privacy": {
+    "scope": "local_private",
+    "scrubbed_for_sharing": false,
+    "contains_secret_values": false,
+    "scrub_report": null
+  },
+  "compiled_targets": [],
+  "invalidation": {
+    "capability_major_change": true,
+    "policy_semantics_change": true,
+    "failed_regression": true,
+    "security_advisory": true
+  },
+  "origin": {
+    "publisher": null,
+    "source_tasks": []
+  }
+}
