@@ -1,0 +1,152 @@
+{
+  "schema_version": "0.1",
+  "plan_id": "P-T91-R1",
+  "task_id": "T91",
+  "revision": 1,
+  "intent": "Understand these numbers, identify important changes, create a chart and a concise report, and save the result.",
+  "constraints": {
+    "privacy": "local-first",
+    "max_cost_microunits": 0,
+    "deadline": null,
+    "preserve_inputs": true,
+    "portable_outputs": true
+  },
+  "nodes": [
+    {
+      "id": "S1",
+      "capability": "table.import",
+      "capability_version": "0.1",
+      "depends_on": [],
+      "inputs": [
+        {"name": "source", "ref": "artifact://A17", "type": "table/xlsx"}
+      ],
+      "outputs": [
+        {"name": "table", "type": "table/normalized", "artifact": true}
+      ],
+      "authority_requests": [
+        {
+          "actions": ["read"],
+          "resources": ["artifact:A17"],
+          "reason": "Read the user-selected source workbook."
+        },
+        {
+          "actions": ["create", "write"],
+          "resources": ["task-output:T91"],
+          "reason": "Create normalized task-local output."
+        }
+      ],
+      "verification": {"required": false, "capability": null, "independent_provider": false},
+      "placement": {"locality": "local", "isolation_min": "P2"}
+    },
+    {
+      "id": "S2",
+      "capability": "table.profile",
+      "capability_version": "0.1",
+      "depends_on": ["S1"],
+      "inputs": [
+        {"name": "table", "ref": "step://S1/table", "type": "table/normalized"}
+      ],
+      "outputs": [
+        {"name": "profile", "type": "analysis/table-profile", "artifact": true}
+      ],
+      "authority_requests": [],
+      "verification": {"required": false, "capability": null, "independent_provider": false},
+      "placement": {"locality": "local", "isolation_min": "P1"}
+    },
+    {
+      "id": "S3",
+      "capability": "stats.detect-changes",
+      "capability_version": "0.1",
+      "depends_on": ["S1"],
+      "inputs": [
+        {"name": "table", "ref": "step://S1/table", "type": "table/normalized"}
+      ],
+      "outputs": [
+        {"name": "findings", "type": "analysis/findings", "artifact": true}
+      ],
+      "authority_requests": [],
+      "verification": {"required": true, "capability": "analysis.verify-numeric", "independent_provider": true},
+      "placement": {"locality": "local", "isolation_min": "P1"}
+    },
+    {
+      "id": "S4",
+      "capability": "chart.render",
+      "capability_version": "0.1",
+      "depends_on": ["S1", "S3"],
+      "inputs": [
+        {"name": "table", "ref": "step://S1/table", "type": "table/normalized"},
+        {"name": "findings", "ref": "step://S3/findings", "type": "analysis/findings"}
+      ],
+      "outputs": [
+        {"name": "chart", "type": "image/png", "artifact": true}
+      ],
+      "authority_requests": [],
+      "verification": {"required": false, "capability": null, "independent_provider": false},
+      "placement": {"locality": "local", "isolation_min": "P2"}
+    },
+    {
+      "id": "S5",
+      "capability": "report.compose",
+      "capability_version": "0.1",
+      "depends_on": ["S2", "S3", "S4"],
+      "inputs": [
+        {"name": "profile", "ref": "step://S2/profile", "type": "analysis/table-profile"},
+        {"name": "findings", "ref": "step://S3/findings", "type": "analysis/findings"},
+        {"name": "chart", "ref": "step://S4/chart", "type": "image/png"}
+      ],
+      "outputs": [
+        {"name": "draft-report", "type": "document/markdown", "artifact": true}
+      ],
+      "authority_requests": [],
+      "verification": {"required": true, "capability": "analysis.verify-report", "independent_provider": true},
+      "placement": {"locality": "any", "isolation_min": "P2"}
+    },
+    {
+      "id": "S6",
+      "capability": "analysis.verify-report",
+      "capability_version": "0.1",
+      "depends_on": ["S1", "S3", "S5"],
+      "inputs": [
+        {"name": "table", "ref": "step://S1/table", "type": "table/normalized"},
+        {"name": "findings", "ref": "step://S3/findings", "type": "analysis/findings"},
+        {"name": "report", "ref": "step://S5/draft-report", "type": "document/markdown"}
+      ],
+      "outputs": [
+        {"name": "verification", "type": "analysis/verification", "artifact": true}
+      ],
+      "authority_requests": [],
+      "verification": {"required": false, "capability": null, "independent_provider": false},
+      "placement": {"locality": "local", "isolation_min": "P1"}
+    },
+    {
+      "id": "S7",
+      "capability": "artifact.export",
+      "capability_version": "0.1",
+      "depends_on": ["S4", "S5", "S6"],
+      "inputs": [
+        {"name": "chart", "ref": "step://S4/chart", "type": "image/png"},
+        {"name": "report", "ref": "step://S5/draft-report", "type": "document/markdown"},
+        {"name": "verification", "ref": "step://S6/verification", "type": "analysis/verification"}
+      ],
+      "outputs": [
+        {"name": "final-report", "type": "document/markdown", "artifact": true},
+        {"name": "final-chart", "type": "image/png", "artifact": true}
+      ],
+      "authority_requests": [
+        {
+          "actions": ["create", "write"],
+          "resources": ["task-output:T91"],
+          "reason": "Publish verified task outputs."
+        }
+      ],
+      "verification": {"required": false, "capability": null, "independent_provider": false},
+      "placement": {"locality": "local", "isolation_min": "P1"}
+    }
+  ],
+  "created_at": "2026-09-15T20:31:00Z",
+  "planner": {
+    "provider_id": "fixture-planner",
+    "model_id": null,
+    "deterministic": true
+  }
+}
