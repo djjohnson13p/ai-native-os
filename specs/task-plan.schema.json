@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/aios/task-plan.schema.json",
+  "title": "AI-Native OS Task Plan",
+  "type": "object",
+  "required": ["task_id", "intent", "nodes"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "intent": {"type": "string"},
+    "constraints": {"type": "object"},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "capability"],
+        "properties": {
+          "id": {"type": "string"},
+          "capability": {"type": "string"},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "inputs": {"type": "array", "items": {"type": "string"}},
+          "outputs": {"type": "array", "items": {"type": "string"}},
+          "authority": {"type": "array", "items": {"type": "string"}},
+          "verification": {"type": "object"},
+          "placement": {"type": "object"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
