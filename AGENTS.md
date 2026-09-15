@@ -11,7 +11,7 @@ Build an open AI-native computing platform where human intent becomes typed, ins
 1. **AI/model output is proposal, not authority.** Never add a path where a model/planner/Skill can grant itself permissions.
 2. **AIOS IR meaning is separate from runtime binding.** Provider IDs, hardware, process IDs, credentials, network endpoints, grants, and sandbox instances do not belong in semantic program identity.
 3. **Trusted validation/policy/recovery are deterministic.** Do not require a model for parser/validator correctness, authorization, privilege transitions, rollback, boot/recovery, or secret mediation.
-4. **Provider-neutral semantics.** Do not make one model vendor, cloud, application, database, programming language, or storage provider a mandatory semantic dependency.
+4. **Provider-neutral semantics.** Do not make one model vendor, cloud, application, database, programming language, storage provider, or package catalog a mandatory semantic dependency.
 5. **No ambient filesystem/network/secret authority.** Use typed Artifact/Object/resource handles, explicit network/service grants, and mediated credential handles.
 6. **Verification survives optimization.** Provider substitution, compilation, caching, or Skill reuse may not silently remove required verification.
 7. **Stable identity survives placement/presentation/storage changes.** Task/Object/Artifact/semantic-program identity is separate from GUI View, device, path, replica, cloud region, or network endpoint.
@@ -30,6 +30,8 @@ Core constitution:
 - `docs/17-v0.1-acceptance-tests.md`
 - `docs/53-system-of-everything-staged-roadmap.md`
 - `docs/59-pre-codex-foundation-closure-plan.md`
+- `docs/64-requirements-traceability-matrix.md`
+- `docs/65-contract-maturity-and-architecture-change-control.md`
 
 Architecture decisions:
 
@@ -54,6 +56,9 @@ Issue #17 / validator work additionally requires:
 - `docs/30-aios-ir-reference-validator-plan.md`
 - `docs/31-semantic-registry-snapshots.md`
 - `docs/39-static-effect-and-authority-analysis.md`
+- `docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md`
+- `docs/61-validator-test-fuzz-and-resource-limit-matrix.md`
+- `docs/62-first-codex-session-runbook.md`
 
 ## Contract-change rule
 
@@ -61,10 +66,13 @@ If you modify a security/semantic contract:
 
 1. explain why the existing contract fails;
 2. update the relevant ADR/design document;
-3. update schema(s);
-4. update positive + negative fixtures;
-5. update acceptance tests/reason codes where applicable;
-6. call out compatibility/migration impact.
+3. update requirement/traceability entries when affected;
+4. update schema(s);
+5. update positive + negative fixtures;
+6. update acceptance tests/reason codes where applicable;
+7. call out compatibility/migration impact.
+
+Follow `docs/65-contract-maturity-and-architecture-change-control.md` for maturity/version/change rules.
 
 Do not make a schema-only change that silently changes authority semantics.
 
