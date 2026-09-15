@@ -86,6 +86,8 @@ Window/View  = presentation of an object, not its lifetime
 - [`docs/20-user-object-model.md`](docs/20-user-object-model.md) — task/artifact/workspace/conversation/application/view object model
 - [`docs/21-trust-boundaries.md`](docs/21-trust-boundaries.md) — trusted base, providers, legacy habitats, external systems, and boundary-crossing rules
 - [`docs/22-end-to-end-reference-flow.md`](docs/22-end-to-end-reference-flow.md) — complete Demonstration A flow through planning, policy, execution, verification, and learning
+- [`docs/23-task-shell-ux.md`](docs/23-task-shell-ux.md) — task-first interaction, approval, progress, artifact, and compatibility-launch behavior
+- [`docs/24-task-state-machine.md`](docs/24-task-state-machine.md) — deterministic persisted lifecycle, recovery, cancellation, verification, and rollback states
 
 ### Research
 
@@ -94,12 +96,14 @@ Window/View  = presentation of an object, not its lifetime
 - [`docs/research/03-legacy-compatibility-fabric.md`](docs/research/03-legacy-compatibility-fabric.md) — Wine, Android, CPU translation, VM, and experimental macOS routing model
 - [`docs/research/04-model-runtime-and-routing.md`](docs/research/04-model-runtime-and-routing.md) — provider-neutral model routing and local-runtime strategy
 - [`docs/research/05-service-ipc-and-language.md`](docs/research/05-service-ipc-and-language.md) — process boundaries, Varlink/D-Bus/gRPC roles, Rust/Python split, and persistence
+- [`docs/research/06-authorization-policy-engine.md`](docs/research/06-authorization-policy-engine.md) — Cedar vs OPA and the proposed authority-coordinator boundary
 
 ### Decisions and machine-readable contracts
 
-- [`docs/adr/`](docs/adr/) — architecture decision records
+- [`docs/adr/`](docs/adr/) — accepted/proposed architecture decision records
 - [`specs/README.md`](specs/README.md) — contract principles and versioning rules
 - [`specs/`](specs/) — draft task, capability, hardware, artifact, authority, provenance, execution-isolation, model, policy, and compatibility contracts
+- [`examples/reference-task/`](examples/reference-task/) — concrete Demonstration A/B contract fixtures for future conformance tests
 - [`prototypes/README.md`](prototypes/README.md) — implementation boundaries for the first prototype
 
 ### Implementation backlog
