@@ -1,26 +1,132 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/aios/hardware-profile.schema.json",
+  "$id": "https://ai-native-os.example/specs/hardware-profile.schema.json",
   "title": "AI-Native OS Hardware Profile",
   "type": "object",
-  "required": ["architecture", "memory"],
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "architecture", "cpu", "memory", "storage", "accelerators"],
   "properties": {
-    "architecture": {"type": "string"},
-    "cpu": {"type": "object"},
+    "schema_version": {"type": "string", "const": "0.1"},
+    "profile_id": {"type": "string", "minLength": 1},
+    "architecture": {
+      "type": "string",
+      "enum": ["x86_64", "aarch64", "x86", "armv7", "riscv64", "unknown"]
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_cores"],
+      "properties": {
+        "vendor": {"type": ["string", "null"]},
+        "model": {"type": ["string", "null"]},
+        "physical_cores": {"type": ["integer", "null"], "minimum": 1},
+        "logical_cores": {"type": "integer", "minimum": 1},
+        "features": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    },
     "memory": {
       "type": "object",
-      "required": ["total_bytes"],
+      "additionalProperties": false,
+      "required": ["total_bytes", "available_bytes"],
       "properties": {
-        "total_bytes": {"type": "integer", "minimum": 1}
-      },
-      "additionalProperties": true
+        "total_bytes": {"type": "integer", "minimum": 1},
+        "available_bytes": {"type": "integer", "minimum": 0},
+        "swap_total_bytes": {"type": ["integer", "null"], "minimum": 0}
+      }
     },
-    "accelerators": {"type": "array", "items": {"type": "object"}},
-    "storage": {"type": "array", "items": {"type": "object"}},
-    "network": {"type": "object"},
-    "power": {"type": "object"},
-    "security": {"type": "object"},
-    "peer_compute": {"type": "array", "items": {"type": "object"}}
-  },
-  "additionalProperties": true
+    "accelerators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {
+            "type": "string",
+            "enum": ["gpu", "npu", "tpu", "fpga", "dsp", "other"]
+          },
+          "vendor": {"type": ["string", "null"]},
+          "model": {"type": ["string", "null"]},
+          "dedicated_memory_bytes": {"type": ["integer", "null"], "minimum": 0},
+          "shared_memory_bytes": {"type": ["integer", "null"], "minimum": 0},
+          "backends": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": true
+          },
+          "devices": {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "total_bytes", "available_bytes"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"type": ["string", "null"], "enum": [null, "ssd", "nvme", "hdd", "flash", "network", "other"]},
+          "total_bytes": {"type": "integer", "minimum": 1},
+          "available_bytes": {"type": "integer", "minimum": 0},
+          "system": {"type": "boolean", "default": false},
+          "removable": {"type": "boolean", "default": false}
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "online": {"type": "boolean"},
+        "metered": {"type": ["boolean", "null"]},
+        "estimated_down_mbps": {"type": ["number", "null"], "minimum": 0},
+        "estimated_up_mbps": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "power": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {"type": ["string", "null"], "enum": [null, "ac", "battery", "unknown"]},
+        "battery_percent": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "power_saver": {"type": ["boolean", "null"]}
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "secure_boot": {"type": ["boolean", "null"]},
+        "tpm": {"type": ["boolean", "null"]},
+        "virtualization": {"type": ["boolean", "null"]},
+        "user_namespaces": {"type": ["boolean", "null"]},
+        "landlock_abi": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "peer_compute": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["peer_id", "trust_state"],
+        "properties": {
+          "peer_id": {"type": "string", "minLength": 1},
+          "trust_state": {"type": "string", "enum": ["untrusted", "paired", "managed", "unknown"]},
+          "capability_summary": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "measured_at": {"type": ["string", "null"], "format": "date-time"}
+  }
 }
