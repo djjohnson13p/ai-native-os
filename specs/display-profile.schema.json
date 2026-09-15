@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/display-profile.schema.json",
+  "title": "AIOS Display and Interaction Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "presentation_classes", "surfaces", "inputs"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "profile_id": {"type": "string", "minLength": 1},
+    "presentation_classes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["GLANCE", "COMPACT_TOUCH", "STANDARD_DESKTOP", "LARGE_DESKTOP", "MULTI_DISPLAY", "IMMERSIVE", "VOICE_FIRST", "HEADLESS", "REMOTE_SURFACE", "ACCESSIBILITY_SPECIALIZED"]
+      }
+    },
+    "surfaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["surface_id", "kind", "trusted_for_sensitive_output"],
+        "properties": {
+          "surface_id": {"type": "string", "minLength": 1},
+          "kind": {"type": "string", "enum": ["display", "projector", "headset", "tv", "remote", "virtual", "none"]},
+          "logical_width": {"type": ["integer", "null"], "minimum": 1},
+          "logical_height": {"type": ["integer", "null"], "minimum": 1},
+          "physical_width_mm": {"type": ["number", "null"], "minimum": 1},
+          "physical_height_mm": {"type": ["number", "null"], "minimum": 1},
+          "scale_factor": {"type": ["number", "null"], "minimum": 0.25},
+          "orientation": {"type": ["string", "null"], "enum": [null, "landscape", "portrait", "variable"]},
+          "refresh_hz": {"type": ["number", "null"], "minimum": 1},
+          "hdr": {"type": ["boolean", "null"]},
+          "trusted_for_sensitive_output": {"type": "boolean"},
+          "remote_peer_id": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keyboard": {"type": "boolean"},
+        "pointer": {"type": "boolean"},
+        "touch": {"type": "boolean"},
+        "stylus": {"type": "boolean"},
+        "voice": {"type": "boolean"},
+        "camera": {"type": "boolean"},
+        "gamepad": {"type": "boolean"},
+        "switch_access": {"type": "boolean"}
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": {"type": "boolean"},
+        "output": {"type": "boolean"},
+        "private_output": {"type": ["boolean", "null"]}
+      }
+    },
+    "accessibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "screen_reader": {"type": "boolean"},
+        "high_contrast": {"type": "boolean"},
+        "reduced_motion": {"type": "boolean"},
+        "large_text": {"type": "boolean"},
+        "caption_preferred": {"type": "boolean"},
+        "keyboard_only": {"type": "boolean"},
+        "voice_first": {"type": "boolean"}
+      }
+    },
+    "power_constrained": {"type": ["boolean", "null"]},
+    "measured_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
