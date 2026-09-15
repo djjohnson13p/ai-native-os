@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provenance-event.schema.json",
+  "title": "Provenance Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "task_id", "event_type", "timestamp", "actor"],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "step_id": {
+      "type": ["string", "null"]
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "task.created",
+        "intent.normalized",
+        "plan.created",
+        "plan.revised",
+        "authorization.requested",
+        "authorization.granted",
+        "authorization.denied",
+        "provider.selected",
+        "execution.started",
+        "execution.completed",
+        "execution.failed",
+        "model.invoked",
+        "egress.started",
+        "egress.completed",
+        "artifact.created",
+        "artifact.verified",
+        "verification.failed",
+        "rollback.started",
+        "rollback.completed",
+        "task.paused",
+        "task.completed",
+        "task.failed"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["user", "agent", "provider", "model", "system-service", "legacy-app", "policy-engine"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "provider_id": {
+      "type": ["string", "null"]
+    },
+    "capability": {
+      "type": ["string", "null"]
+    },
+    "authority_token_id": {
+      "type": ["string", "null"]
+    },
+    "input_artifacts": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "output_artifacts": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "external_transfer": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["destination", "data_refs"],
+      "properties": {
+        "destination": {"type": "string", "minLength": 1},
+        "data_refs": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "purpose": {"type": ["string", "null"]}
+      }
+    },
+    "status": {
+      "type": ["string", "null"],
+      "enum": [null, "success", "failure", "denied", "partial", "pending"]
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "previous_event_hash": {
+      "type": ["string", "null"]
+    },
+    "event_hash": {
+      "type": ["string", "null"]
+    }
+  }
+}
