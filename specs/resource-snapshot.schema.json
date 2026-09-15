@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/resource-snapshot.schema.json",
+  "title": "AIOS Dynamic Resource Snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_id", "hardware_profile_ref", "captured_at", "memory", "compute", "network", "power"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "hardware_profile_ref": {"type": "string", "minLength": 1},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available_bytes"],
+      "properties": {
+        "available_bytes": {"type": "integer", "minimum": 0},
+        "pressure": {"type": ["string", "null"], "enum": [null, "low", "moderate", "high", "critical"]},
+        "swap_in_use_bytes": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "compute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu_utilization": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "load_1m": {"type": ["number", "null"], "minimum": 0},
+        "thermal_state": {"type": ["string", "null"], "enum": [null, "nominal", "warm", "throttled", "critical"]},
+        "accelerators": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "utilization": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "available_memory_bytes": {"type": ["integer", "null"], "minimum": 0},
+              "temperature_c": {"type": ["number", "null"]},
+              "queue_depth": {"type": ["integer", "null"], "minimum": 0},
+              "healthy": {"type": ["boolean", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["online"],
+      "properties": {
+        "online": {"type": "boolean"},
+        "metered": {"type": ["boolean", "null"]},
+        "estimated_down_mbps": {"type": ["number", "null"], "minimum": 0},
+        "estimated_up_mbps": {"type": ["number", "null"], "minimum": 0},
+        "estimated_rtt_ms": {"type": ["number", "null"], "minimum": 0},
+        "packet_loss_ratio": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      }
+    },
+    "power": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {"type": ["string", "null"], "enum": [null, "ac", "battery", "unknown"]},
+        "battery_percent": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "power_saver": {"type": ["boolean", "null"]},
+        "estimated_power_budget_watts": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "storage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "available_bytes"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "available_bytes": {"type": "integer", "minimum": 0},
+          "pressure": {"type": ["string", "null"], "enum": [null, "low", "moderate", "high", "critical"]},
+          "estimated_read_mbps": {"type": ["number", "null"], "minimum": 0},
+          "estimated_write_mbps": {"type": ["number", "null"], "minimum": 0}
+        }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider_id", "availability"],
+        "properties": {
+          "provider_id": {"type": "string", "minLength": 1},
+          "availability": {"type": "string", "enum": ["available", "busy", "degraded", "unreachable", "disabled"]},
+          "queue_depth": {"type": ["integer", "null"], "minimum": 0},
+          "estimated_start_delay_ms": {"type": ["integer", "null"], "minimum": 0}
+        }
+      }
+    },
+    "peers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["peer_id", "reachable"],
+        "properties": {
+          "peer_id": {"type": "string", "minLength": 1},
+          "reachable": {"type": "boolean"},
+          "estimated_rtt_ms": {"type": ["number", "null"], "minimum": 0},
+          "trust_state": {"type": ["string", "null"], "enum": [null, "untrusted", "paired", "managed", "unknown"]},
+          "resource_snapshot_ref": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
