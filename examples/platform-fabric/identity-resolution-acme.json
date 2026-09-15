@@ -1,0 +1,48 @@
+{
+  "schema_version": "0.1",
+  "resolution_id": "resolution:acme-crm-to-core-party",
+  "subject": {
+    "source_system": "external-crm-demo",
+    "source_id": "99881",
+    "semantic_type": "core.party@1",
+    "source_revision": "42"
+  },
+  "candidates": [
+    {
+      "object_id": "object://party/acme-industries",
+      "resolution_state": "LIKELY_MATCH",
+      "score": 0.97,
+      "evidence": [
+        {
+          "class": "VERIFIED_IDENTIFIER",
+          "source": "external-crm-demo",
+          "summary": "Verified contact domain matches canonical party domain",
+          "observed_at": "2026-09-15T22:30:00Z"
+        },
+        {
+          "class": "STRONG_STRUCTURED_MATCH",
+          "source": "billing-demo",
+          "summary": "Normalized organization name and billing postal address match",
+          "observed_at": "2026-09-15T22:30:00Z"
+        },
+        {
+          "class": "GRAPH_CONTEXT",
+          "source": "project-demo",
+          "summary": "Same project and quote relationships appear in both representations",
+          "observed_at": "2026-09-15T22:30:00Z"
+        }
+      ],
+      "contradictions": []
+    }
+  ],
+  "status": "AWAITING_CONFIRMATION",
+  "consequence_level": "HIGH",
+  "policy_decision_id": "policy-decision:identity-demo-1",
+  "approval_id": null,
+  "proposed_by": {
+    "kind": "system-service",
+    "id": "org.ainative.identity-resolver"
+  },
+  "created_at": "2026-09-15T22:30:00Z",
+  "expires_at": "2026-09-16T22:30:00Z"
+}
