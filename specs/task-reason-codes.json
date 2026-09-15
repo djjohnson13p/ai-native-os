@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1",
+  "profile": "aios-task-manager-v0.1",
+  "codes": [
+    {"code": "TASK_TRANSITION_APPLIED", "severity": "info", "meaning": "requested Task transition committed successfully"},
+    {"code": "TASK_NOT_FOUND", "severity": "error", "meaning": "Task ID does not exist"},
+    {"code": "TASK_REVISION_CONFLICT", "severity": "error", "meaning": "stored revision differs from expected_revision"},
+    {"code": "TASK_STATE_CONFLICT", "severity": "error", "meaning": "stored state differs from expected_state"},
+    {"code": "TASK_ILLEGAL_TRANSITION", "severity": "error", "meaning": "requested state edge is not allowed by the deterministic state machine"},
+    {"code": "TASK_TRANSITION_GUARD_FAILED", "severity": "error", "meaning": "state edge is allowed but target-state guard is unsatisfied"},
+    {"code": "TASK_TRANSITION_ID_REUSE_CONFLICT", "severity": "error", "meaning": "transition_id was already used for a non-equivalent request"},
+    {"code": "TASK_TERMINAL_STATE", "severity": "error", "meaning": "ordinary transition attempted from immutable terminal Task state"},
+    {"code": "TASK_BLOCKER_NOT_FOUND", "severity": "error", "meaning": "requested blocker resolution/transition references no current blocker"},
+    {"code": "TASK_PROGRAM_NOT_RUNNABLE", "severity": "error", "meaning": "Task lacks acceptable validated semantic program/eligible runnable work"},
+    {"code": "TASK_COMPLETION_GATE_FAILED", "severity": "error", "meaning": "required outputs/verification/approvals/provenance conditions for COMPLETED are not satisfied"},
+    {"code": "TASK_UNKNOWN_EXTERNAL_OUTCOME", "severity": "error", "meaning": "required external operation remains outcome-unknown and prevents safe retry/completion"},
+    {"code": "TASK_PROVENANCE_APPEND_FAILED", "severity": "error", "meaning": "required provenance append could not be committed; Task mutation is rolled back"},
+    {"code": "TASK_STORAGE_FAILURE", "severity": "error", "meaning": "durable Task transaction failed for storage/integrity reason"},
+    {"code": "TASK_RECOVERY_REQUIRED", "severity": "warning", "meaning": "durable evidence indicates Task must enter/reconcile through RECOVERING before further normal execution"}
+  ]
+}
