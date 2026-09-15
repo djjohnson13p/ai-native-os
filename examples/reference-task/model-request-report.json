@@ -1,0 +1,46 @@
+{
+  "request_id": "MR-T91-S5-001",
+  "task_id": "T91",
+  "step_id": "S5",
+  "capability": "structured-generation",
+  "inputs": ["artifact://A19", "artifact://A20", "artifact://A21"],
+  "instructions": "Compose a concise report explaining the verified significant changes. Do not invent values. Refer only to supplied findings and profile data.",
+  "structured_output": {
+    "schema_id": "report-draft/0.1",
+    "json_schema": {
+      "type": "object",
+      "required": ["title", "summary", "findings"],
+      "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "findings": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "strict": true
+  },
+  "privacy": {
+    "egress": "local-only",
+    "allowed_remote_providers": [],
+    "sensitivity": "private"
+  },
+  "constraints": {
+    "quality_class": "balanced",
+    "latency_class": "interactive",
+    "max_memory_bytes": 8589934592,
+    "max_cost_microunits": 0,
+    "deadline": null,
+    "min_context_tokens": 4096,
+    "provider_allowlist": [],
+    "provider_denylist": []
+  },
+  "generation": {
+    "temperature": 0.2,
+    "max_output_tokens": 1200,
+    "seed": 91
+  },
+  "verification_required": true
+}
