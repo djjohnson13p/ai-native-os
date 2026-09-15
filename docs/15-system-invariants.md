@@ -156,6 +156,42 @@ The long-term mission may encompass every useful software/domain/device category
 
 New work should preferentially build reusable substrate, close a security/recovery gap, unlock multiple later domains, or satisfy the current stage exit gate. Universal ambition must not justify bypassing architecture dependencies.
 
+## I31 — Storage location and namespace paths are not semantic identity
+
+Object identity, Artifact identity, content identity, replica location, and filesystem/namespace paths are distinct concepts.
+
+Moving, syncing, renaming, caching, archiving, or rematerializing work must not silently rewrite semantic identity or authority.
+
+## I32 — Replication does not silently transfer source-of-truth authority
+
+A mirror, cache, backup, export, or archive does not become authoritative merely because it is newer, reachable, or convenient.
+
+Source-of-truth promotion/failover is an explicit policy-controlled action with revision checks and provenance.
+
+## I33 — Authentication is not authorization
+
+Cryptographic identity, successful login, device pairing, service authentication, network locality, or publisher signature can provide identity/trust evidence. None independently grants a principal broad access.
+
+Every protected action remains subject to current deterministic authorization.
+
+## I34 — Signatures establish provenance/integrity, not safety
+
+A valid package/provider/Skill/Domain-Pack signature proves origin/integrity under a key. It does not prove semantic conformance, correctness, security, quality, or entitlement to runtime authority.
+
+Conformance, review, sandboxing, policy, and reputation remain separate controls.
+
+## I35 — Long-lived credentials are mediated, not ambient
+
+Providers, models, Skills, and compatibility habitats should receive opaque narrowly scoped credential/secret handles rather than raw long-lived secrets whenever practical.
+
+Credential delegation is task/policy scoped, expires/revokes independently, and cannot be smuggled through semantic IR.
+
+## I36 — Component updates cannot silently broaden meaning or authority
+
+Installing or updating a provider, Domain Pack, View, Skill, model runtime, policy bundle, compatibility adapter, or system extension is a versioned component activation event.
+
+Authority/effect/network/credential expansion and semantic-contract changes require deterministic diff/compatibility evaluation and any required approval. Publisher continuity alone is insufficient.
+
 ## How to use these invariants
 
 Every future ADR and major pull request should state whether it:
