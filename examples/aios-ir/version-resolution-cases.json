@@ -1,0 +1,185 @@
+{
+  "profile": "aios-ir-v0.1-semantic-reference-resolution",
+  "description": "Synthetic cases for ADR 0030/docs 67. Program cases test IR reference syntax/resolution. Registry cases require semantic registry validation beyond JSON Schema.",
+  "program_cases": [
+    {
+      "name": "major-reference-resolves",
+      "expected": "valid",
+      "registry_assumption": "artifact.hash major 1 resolves to exactly one active full contract version in the snapshot",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "version.major.valid",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "unversioned-capability-reference-is-structurally-invalid",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_PATTERN",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "version.capability.unversioned",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "minor-selector-is-structurally-invalid",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_PATTERN",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "version.capability.minor-selector",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1.0"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "unversioned-type-reference-is-structurally-invalid",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_PATTERN",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "version.type.unversioned",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    },
+    {
+      "name": "known-id-unknown-major-fails-registry-resolution",
+      "expected": "invalid",
+      "validation_stage": "semantic_registry",
+      "reason_code": "IR_CAPABILITY_NOT_FOUND",
+      "registry_assumption": "artifact.hash exists only for major 1",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "version.capability.unknown-major",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "hash",
+            "operation": {"kind": "verify", "capability": "artifact.hash@2"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"hash": "data.hash@1"},
+            "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+            "egress": {"mode": "deny"},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+      }
+    }
+  ],
+  "registry_cases": [
+    {
+      "name": "duplicate-capability-major-in-one-snapshot",
+      "expected": "invalid",
+      "reason_code": "REGISTRY_DUPLICATE_CAPABILITY_MAJOR",
+      "contracts": [
+        {"capability": "artifact.hash", "version": "1.0", "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"capability": "artifact.hash", "version": "1.1", "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+      ]
+    },
+    {
+      "name": "duplicate-type-major-in-one-snapshot",
+      "expected": "invalid",
+      "reason_code": "REGISTRY_DUPLICATE_TYPE_MAJOR",
+      "contracts": [
+        {"type_id": "data.table", "version": "1.0", "content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+        {"type_id": "data.table", "version": "1.2", "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+      ]
+    },
+    {
+      "name": "snapshot-entry-contract-version-major-mismatch",
+      "expected": "invalid",
+      "reason_code": "REGISTRY_CONTRACT_VERSION_MISMATCH",
+      "snapshot_entry": {
+        "kind": "capability",
+        "id": "artifact.hash",
+        "selected_major": 1,
+        "declared_version": "2.0",
+        "content_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    }
+  ],
+  "cross_snapshot_cases": [
+    {
+      "name": "compatible-minor-snapshot-change-does-not-rewrite-ir-hash",
+      "expected_semantic_hash_relation": "equal",
+      "expected_registry_snapshot_relation": "different",
+      "semantic_reference": "artifact.hash@1",
+      "snapshot_a": {"contract_version": "1.0", "snapshot_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+      "snapshot_b": {"contract_version": "1.1", "snapshot_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+      "note": "Reuse of prior validation/compiled output still requires explicit compatibility policy; semantic-hash equality alone is not sufficient."
+    },
+    {
+      "name": "major-reference-change-changes-semantic-hash",
+      "expected_semantic_hash_relation": "different",
+      "left_reference": "artifact.hash@1",
+      "right_reference": "artifact.hash@2"
+    }
+  ]
+}
