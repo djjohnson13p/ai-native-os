@@ -126,6 +126,36 @@ The project may claim that repeated work becomes cheaper only when measurements 
 
 Benchmarking should distinguish model/planning cost, validation/policy overhead, provider execution, memory/data movement, network/egress, compilation cost, and correctness/verification.
 
+## I26 — Presentation is a projection, not identity
+
+A phone View, desktop View, CAD viewport, voice interface, remote surface, or accessibility projection may present the same Task/object differently without changing the Task, semantic object, AIOS IR, or authority identity.
+
+Trusted approval semantics must not be delegated to arbitrary provider-rendered UI.
+
+## I27 — Network access is not ambient
+
+Providers, models, Skills, and legacy habitats do not receive unrestricted network connectivity merely because networking exists on the host.
+
+Material connectivity/egress must be explicitly authorized, attributable, and policy-constrained. Service discovery or reachability does not imply trust or permission.
+
+## I28 — Cloud is optional infrastructure, not semantic authority
+
+Public/private cloud, managed edge, self-hosted servers, and SaaS providers may supply storage, compute, models, sync, and domain capabilities, but they do not define Task/object/semantic-program identity.
+
+Boot/recovery and locally available core functionality must not require a proprietary cloud provider unless the requested capability is inherently remote.
+
+## I29 — Identity confidence cannot silently collapse objects
+
+Probabilistic matching may propose that two records represent the same semantic object. Durable linking/merging must pass deterministic contradiction checks, consequence policy, revision preconditions, and any required approval.
+
+Merge/split history must remain auditable so provenance is not destroyed by identity reconciliation.
+
+## I30 — Universal scope is implemented through staged substrate gates
+
+The long-term mission may encompass every useful software/domain/device category, but a current implementation milestone must remain bounded and testable.
+
+New work should preferentially build reusable substrate, close a security/recovery gap, unlock multiple later domains, or satisfy the current stage exit gate. Universal ambition must not justify bypassing architecture dependencies.
+
 ## How to use these invariants
 
 Every future ADR and major pull request should state whether it:
