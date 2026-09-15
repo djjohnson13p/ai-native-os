@@ -1,0 +1,27 @@
+{
+  "schema_version": "0.1",
+  "transfer_id": "transfer:T91:cad-input-to-workstation:1",
+  "task_id": "T91",
+  "semantic_node_id": "render_drawing",
+  "source_refs": ["artifact://task/T91/input/enclosure-model"],
+  "destination_service": "service://personal/home-workstation",
+  "purpose": "Execute engineering.drawing.render@1 on paired workstation",
+  "sensitivity": "confidential",
+  "content_hashes": ["sha256:2222222222222222222222222222222222222222222222222222222222222222"],
+  "estimated_bytes": 524288000,
+  "actual_bytes": null,
+  "resumable": true,
+  "cache_policy": "PEER_CACHE",
+  "policy_decision_id": "policy-decision:T91:peer-render",
+  "path": {
+    "network_class": "PERSONAL_PEER",
+    "transport": "authenticated-peer-session",
+    "endpoint_id": "endpoint:lan",
+    "encrypted": true,
+    "authenticated": true
+  },
+  "state": "AUTHORIZED",
+  "started_at": null,
+  "completed_at": null,
+  "error_code": null
+}
