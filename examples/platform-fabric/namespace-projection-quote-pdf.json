@@ -1,0 +1,27 @@
+{
+  "schema_version": "0.1",
+  "projection_id": "projection://workspace/customer-acme/quote-1042-pdf",
+  "workspace_id": "workspace://customer/acme",
+  "task_id": "T-91",
+  "target": {
+    "kind": "artifact",
+    "id": "artifact://quote/q-1042/pdf/r9",
+    "revision": null,
+    "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "namespace": {
+    "provider_id": "org.ainative.namespace.local-workspace",
+    "locator": "workspace://customer/acme/Exports/Quote-1042.pdf",
+    "display_path": "~/Customers/Acme/Quote-1042.pdf",
+    "service_id": null
+  },
+  "representation_role": "portable",
+  "semantic_equivalence": "view-only",
+  "access_mode": "READ_ONLY",
+  "materialization_state": "MATERIALIZED",
+  "source_replica_id": "replica://artifact/quote-1042/laptop-local",
+  "sync_policy": "EXPORT_ONLY",
+  "legacy_habitat_id": null,
+  "created_at": "2026-09-15T22:40:00Z",
+  "updated_at": "2026-09-15T22:40:00Z"
+}
