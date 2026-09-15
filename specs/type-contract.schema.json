@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/type-contract.schema.json",
+  "title": "AI-Native OS Semantic Type Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type_id",
+    "version",
+    "kind",
+    "description",
+    "representations",
+    "equality",
+    "conformance"
+  ],
+  "properties": {
+    "type_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.-]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["scalar", "structured", "artifact", "stream", "handle"]
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "logical_schema_ref": {
+      "type": ["string", "null"],
+      "maxLength": 1024
+    },
+    "nullable": {
+      "type": "boolean",
+      "default": false
+    },
+    "representations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "media_type": {
+            "type": ["string", "null"],
+            "maxLength": 160
+          },
+          "schema_ref": {
+            "type": ["string", "null"],
+            "maxLength": 1024
+          },
+          "zero_copy_candidate": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    "equality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["byte_identical", "canonical_value", "numeric_tolerance", "semantic", "not_defined"]
+        },
+        "canonicalizer": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "numeric_absolute_tolerance": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "numeric_relative_tolerance": {
+          "type": ["number", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "unit_semantics": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "unit_required": {"type": "boolean"},
+        "canonical_unit": {"type": ["string", "null"], "maxLength": 64},
+        "notes": {"type": ["string", "null"], "maxLength": 1024}
+      }
+    },
+    "conversion_capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 160
+      }
+    },
+    "conformance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["suite_id"],
+      "properties": {
+        "suite_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "suite_version": {
+          "type": ["string", "null"],
+          "maxLength": 64
+        },
+        "suite_hash": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 2048
+      }
+    }
+  }
+}
