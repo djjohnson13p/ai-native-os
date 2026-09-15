@@ -2,7 +2,7 @@
 
 This directory contains draft contracts for the AI-native operating-system control plane and its surrounding platform fabrics.
 
-They exist so architecture decisions can be tested independently of implementation language, model provider, Linux distribution, UI toolkit, network transport, database, or cloud vendor.
+They exist so architecture decisions can be tested independently of implementation language, model provider, Linux distribution, UI toolkit, network transport, database, storage backend, package catalog, or cloud vendor.
 
 ## Status
 
@@ -12,7 +12,7 @@ A schema being present here does not mean the implementation exists yet.
 
 ## Contract principles
 
-1. **Provider-neutral** — no OpenAI-, Anthropic-, Google-, Microsoft-, Apple-, cloud-, database-, or application-specific field is a mandatory core semantic concept.
+1. **Provider-neutral** — no OpenAI-, Anthropic-, Google-, Microsoft-, Apple-, cloud-, database-, storage-, package-catalog-, or application-specific field is a mandatory core semantic concept.
 2. **Task-scoped** — machine-actionable operations retain task identity and authority context.
 3. **Handles over arbitrary paths** — contracts prefer artifact/resource/object identifiers rather than unrestricted host paths.
 4. **Plans are not authority** — planner/IR schemas describe proposed work; policy/grant schemas govern permission.
@@ -22,10 +22,13 @@ A schema being present here does not mean the implementation exists yet.
 8. **Presentation is separate from identity** — display/View schemas describe projections of Tasks/objects rather than redefining them.
 9. **Network/cloud are runtime fabrics** — service endpoints, network paths, cloud regions, and remote workers do not become semantic Task/object identity.
 10. **Object identity is separate from storage/provider records** — federated/external IDs are mappings to durable AIOS object identity.
-11. **Bulk data out-of-band** — large files/media/model weights should not be embedded in ordinary control-plane JSON messages.
-12. **Explicit versions** — contracts carry schema/interface versions as implementation stabilizes.
-13. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
-14. **Portable serialization first** — JSON Schema is the first interchange notation because it is inspectable and easy to fixture-test. It is not a permanent requirement for all hot-path runtime communication.
+11. **Storage/namespace are projections** — replicas, caches, filesystem paths, mounts, and cloud object keys do not become semantic identity or authority.
+12. **Authentication is not authorization** — trust identities and credentials provide evidence/tools; deterministic policy still authorizes protected actions.
+13. **Signed is not automatically trusted** — component/package signatures establish publisher/integrity evidence, not semantic conformance or runtime authority.
+14. **Bulk data out-of-band** — large files/media/model weights should not be embedded in ordinary control-plane JSON messages.
+15. **Explicit versions** — contracts carry schema/interface versions as implementation stabilizes.
+16. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
+17. **Portable serialization first** — JSON Schema is the first interchange notation because it is inspectable and easy to fixture-test. It is not a permanent requirement for all hot-path runtime communication.
 
 ## Current schemas
 
@@ -56,12 +59,20 @@ A schema being present here does not mean the implementation exists yet.
 | `provenance-event.schema.json` | append-oriented execution/audit event linked to semantic program and runtime binding identities |
 | `persistence-v0.1.sql` | draft SQLite persistence layout for control-plane recovery/state |
 
-### Providers / models / compatibility
+### Identity / trust / credential mediation
+
+| Schema | Purpose |
+| --- | --- |
+| `trust-identity.schema.json` | stable user/device/service/workload/provider/publisher identity and key lifecycle metadata |
+| `credential-handle.schema.json` | opaque mediated credential metadata/scope/exportability without raw secret material |
+
+### Providers / models / compatibility / distribution
 
 | Schema | Purpose |
 | --- | --- |
 | `capability-manifest.schema.json` | provider declaration of semantic contracts implemented, conformance status, and runtime requirements |
 | `provider-registration.schema.json` | registration/conformance/trust state for a provider implementation |
+| `component-package.schema.json` | signed/content-addressed distributable provider/Domain-Pack/View/Skill/model/adapter package metadata |
 | `model-request.schema.json` | provider-neutral AI/model invocation request |
 | `model-result.schema.json` | provider-neutral model invocation result |
 | `compatibility-profile.schema.json` | known legacy-app habitat/translation profile |
@@ -84,6 +95,13 @@ A schema being present here does not mean the implementation exists yet.
 | `object-record.schema.json` | durable/federated semantic object identity, representations, relationships, source state, and lineage |
 | `identity-resolution.schema.json` | cross-source identity match proposal/evidence/consequence/policy state |
 
+### Storage / namespace / replica fabric
+
+| Schema | Purpose |
+| --- | --- |
+| `storage-replica.schema.json` | explicit artifact/object/package/model replica location, role, consistency, encryption, retention, and sync state |
+| `namespace-projection.schema.json` | mapping of semantic Object/Artifact/stream identity into file/path/URI/workspace materialization without redefining identity |
+
 ### Presentation Fabric
 
 | Schema | Purpose |
@@ -99,7 +117,7 @@ A schema being present here does not mean the implementation exists yet.
 | `network-transfer.schema.json` | explicit task-scoped bulk/material transfer record with policy/path/provenance state |
 | `remote-service-descriptor.schema.json` | cloud/edge/self-hosted remote service classes, trust, region, cost, lifecycle, and capabilities |
 
-Planned contracts may include provider health, Skill package signatures, richer model descriptors, peer pairing/attestation, operation-attempt/compensation records, object merge/split records, sync sessions, collaboration sessions, and registry-signing metadata as implementation requires them.
+Planned contracts may include provider health, richer model descriptors, peer pairing/attestation evidence, operation-attempt/compensation records, object merge/split records, sync sessions, collaboration sessions, package revocation metadata, update activation records, and registry-signing/transparency metadata as implementation requires them.
 
 ## Semantic/runtime relationship
 
@@ -129,6 +147,9 @@ Semantic Objects / Domain Packs
         ├──── Presentation Profile + View Contract
         ├──── Resource Snapshot + Placement Decision
         ├──── Network Service + Transfer Record
+        ├──── Storage Replica + Namespace Projection
+        ├──── Trust Identity + Credential Handle
+        ├──── Component Package + Activation State
         └──── Remote Service / Compatibility Provider
 ```
 
@@ -189,9 +210,13 @@ The exact version-string placement is still being standardized.
 `examples/platform-fabric/` contains synthetic fixtures for:
 
 - compact and workstation presentation profiles;
-- paired peer service identity;
+- paired peer service/trust identity;
 - remote service descriptor;
 - explicit peer data transfer;
+- storage replica state;
+- mediated credential handle metadata;
+- component package metadata;
+- namespace projection;
 - cross-source identity-resolution proposal.
 
 ### General fixture rule
@@ -211,17 +236,18 @@ Passing JSON Schema validation only proves structural conformance.
 
 It does not prove:
 
-- the provider/service/peer is trustworthy;
-- the requested action/transfer is authorized;
+- the provider/service/peer/publisher is trustworthy;
+- the requested action/transfer/credential use is authorized;
 - the AIOS IR graph is semantically valid;
 - a capability provider conforms to its semantic contract;
 - a registry publisher should be trusted;
 - two object records really represent the same entity;
+- a storage replica is current/authoritative merely because it exists;
+- a signed component is safe or deserves broad authority;
 - a remote display is safe for confidential output;
 - a cloud region/provider satisfies policy;
 - a compatibility profile is safe;
 - model output is factually correct;
-- an artifact is non-malicious;
-- a signed manifest deserves policy trust.
+- an artifact is non-malicious.
 
-Those decisions belong to semantic validation, policy, identity resolution, sandboxing, verification, provenance, and trust systems.
+Those decisions belong to semantic validation, policy, identity resolution, storage/source-of-truth logic, sandboxing, verification, provenance, conformance, and trust systems.
