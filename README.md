@@ -1,72 +1,129 @@
 # AI-Native Operating System — Architecture Draft v0.1
 
-> Working title. The project name, final license, implementation languages, and governance model are intentionally not fixed yet.
+> Working title. The final project name, license, implementation languages, and governance model are intentionally not fixed yet.
 
-This repository defines an open-source operating-system architecture designed **around AI from the beginning**, rather than adding an AI assistant to an application-centric desktop.
+This repository defines an open-source computing architecture designed **around AI from the beginning**, rather than adding an AI assistant to an application-centric desktop.
 
-The core premise is simple:
+The immediate project is a narrow AI-native operating-system prototype. The long-term mission is broader:
 
-> People primarily care about accomplishing tasks, not choosing applications. The system should translate human intent into safe, inspectable, reusable capabilities and execute those capabilities across local hardware, compatibility environments, remote compute, and existing software.
+> **Build a task-first semantic computing platform in which programming languages, applications, data, devices, networks, storage, cloud services, and domain software progressively converge behind one coherent system of meaning, authority, provenance, and interchangeable capabilities.**
 
-The initial implementation should **not** begin with a new kernel. It should use a mature kernel and driver ecosystem—initially Linux—and place the novel work in the userspace architecture: intent handling, AI-native execution semantics, capability discovery, agent execution, resource brokerage, compatibility routing, policy enforcement, learning, and task-first interaction.
+The user should increasingly describe outcomes rather than choose which application silo, programming language, device, or cloud service performs each step.
+
+## Core premise
+
+Traditional computing is organized roughly as:
+
+```text
+hardware
+→ operating system
+→ applications
+→ files/application databases
+→ human manually coordinates the applications
+```
+
+AIOS aims toward:
+
+```text
+human / organization intent
+        ↓
+Task + policy + provenance
+        ↓
+AIOS semantic program
+        ↓
+semantic objects + capabilities
+        ↓
+validated provider/resource binding
+        ↓
+local · peer · cloud · legacy · native execution
+```
+
+The machine organizes itself around the requested outcome.
 
 ## Foundational goals
 
-1. **Task-first computing** — the task, not the app, is the primary user-level unit of work.
-2. **Capability-oriented software** — document editing, calculation, image manipulation, 3D rendering, communication, and other functions become discoverable capabilities.
-3. **AI as an operating primitive** — intent, agents, memory, provenance, confidence, delegation, policy, and capabilities are first-class system concepts.
-4. **Universal legacy compatibility as a transition strategy** — existing Windows, Linux, Android, web, and other software should run through transparent execution habitats whenever technically and legally feasible.
-5. **Hardware-adaptive operation** — the system profiles available hardware and composes an appropriate local, hybrid, or remote execution plan.
-6. **Local-first privacy and explicit data boundaries** — private context does not leave the device merely because an AI model is involved.
-7. **Deterministic foundations** — boot, hardware detection, rollback, security policy, validation, and destructive operations remain deterministic and auditable.
-8. **Model independence** — the operating system must not depend on a single AI provider or model family.
-9. **Reason once, compile when stable, reuse thereafter** — repeated reasoning should become cheaper deterministic procedures when safe.
-10. **Open-source by design** — architecture, interfaces, policy formats, semantic contracts, and conformance tests should be publicly inspectable.
+1. **Task-first computing** — the Task, not the application, is the primary execution/audit unit.
+2. **AI-native semantics** — intent, capabilities, effects, verification, authority requests, Skills, and provenance are first-class computational concepts.
+3. **Capability-oriented software** — useful application functions become semantic capabilities that can be composed across domains.
+4. **Universal Object Graph** — durable semantic identity survives changes in application, database, storage location, file path, provider, and device.
+5. **Universal Software Fabric** — CRM, billing, office, creative, database, CAD/EDA, development, scientific, and future domains grow as Domain Packs/capabilities rather than mandatory monolithic apps.
+6. **Adaptive presentation** — the same Task/object can project appropriately to phone, desktop, multi-display workstation, voice, accessibility, or specialized expert Views.
+7. **Hardware-adaptive execution** — hardware changes placement and available providers, not the conceptual OS.
+8. **Personal Compute Fabric** — trusted user-owned devices can form one policy-bounded compute/storage pool.
+9. **Local-first privacy** — private data does not leave the local/personal trust boundary merely because AI is involved.
+10. **Deterministic enforcement** — semantic validation, policy, privilege, secret mediation, recovery, and critical base-system mechanisms do not depend on unconstrained model judgment.
+11. **Model/provider independence** — no AI model, cloud, database, application vendor, or implementation language is the semantic identity of the system.
+12. **Reason once, compile when stable, reuse thereafter** — repeated validated reasoning can become cheaper versioned Skills/deterministic computation without inheriting old authority.
+13. **Open, inspectable ecosystem** — contracts, conformance, package identity, provenance, authority changes, and compatibility claims should be inspectable rather than implicit.
 
-## Architecture shorthand
+## The governing security rule
 
-The current working model is:
+> **AI may propose what to do. Deterministic validation decides whether the proposed program has valid meaning. Deterministic policy decides what is allowed.**
+
+A model/planner/agent/Skill/provider cannot grant itself permission by generating code, JSON, shell commands, UI actions, or persuasive text.
+
+## Unified platform architecture
 
 ```text
-Human intent
-    ↓
-Task / intent layer
-    ↓
-Planner proposal
-    ↓
-AIOS IR validation + semantic capability/type contracts
-    ↓
-Deterministic policy + capability/resource brokers
-    ↓
-Execution binding
-    ↓
-Deterministic providers · AI models · compiled Skills · containers · VMs · legacy software
-    ↓
-Deterministic Linux-based system foundation
+Human / Organization Intent
+            ↓
+Task / Policy / Approval / Provenance
+            ↓
+AIOS Semantic Compute Fabric
+(AIOS IR · semantic types/capabilities · effects · verification · Skills)
+            ↓
+Universal Object Graph + Universal Software Fabric
+            ↓
+┌─────────────────────┬─────────────────────┐
+│ Presentation Fabric │ Execution Providers │
+└─────────────────────┴──────────┬──────────┘
+                                 ↓
+          Resource / Personal Compute Fabric
+          Network / Cloud / Edge Fabric
+          Storage / Namespace / Replica Fabric
+          Identity / Trust / Credential Fabric
+          Component Distribution / Supply Chain
+                                 ↓
+          Compatibility + Native Provider Engines
+                                 ↓
+                 Deterministic Linux Base
 ```
 
-AI may propose what to do. **Deterministic validation decides whether the program is well-formed; deterministic policy decides what is allowed.**
+Full architecture map: [`docs/54-unified-platform-fabric-architecture.md`](docs/54-unified-platform-fabric-architecture.md).
 
 ## Native object model
 
-The current draft separates the concepts that conventional operating systems often collapse into applications/windows:
+AIOS separates concepts that conventional desktops often collapse into an application/window/file:
 
 ```text
-Task         = intent + authorization + execution + provenance
-Artifact     = durable content/data and lineage
-Workspace    = optional organizational/context container
-Conversation = interaction channel/history
-Application  = legacy/provider/UI entity
-Window/View  = presentation of an object, not its lifetime
+Task         = intent + execution lifecycle + authority + provenance
+Object       = durable semantic identity of a thing
+Artifact     = durable content/representation + lineage
+Workspace    = optional organization/context/projection container
+Conversation = interaction/communication context
+Application  = legacy/provider/UI entity rather than universal owner
+View         = presentation/direct-manipulation projection
 ```
+
+A file path, cloud object key, database row ID, window, provider ID, or device is not automatically the semantic identity of the user's work.
 
 ## AI-native computational model
 
-The project explicitly separates the language used to **implement** the operating environment from the language/representation used to describe **what an AI-native computer should do**.
+The project separates the languages used to **implement** the bootstrap system from the semantic representation describing **what the AI-native computer should do**.
 
-Bootstrap implementation can use mature tools such as Rust, Python, C/C++, Linux APIs, existing compatibility projects, and WASM. Those are implementation mechanisms, not the semantic identity of the OS.
+Bootstrap implementation may use:
 
-The project is defining **AIOS IR**, a provider-independent typed semantic graph with first-class concepts for:
+```text
+Rust     → trusted control-plane core
+Python   → rapid model/provider/data experimentation
+C/C++    → bounded bridge to mature native ecosystems
+WASM     → portable provider / compiled-Skill target candidate
+Linux    → mature kernel/driver/filesystem/network substrate
+```
+
+Those are implementation mechanisms, not the semantic ABI of AIOS.
+
+The project is defining **AIOS IR**, a provider-independent typed semantic program with first-class concepts for:
 
 ```text
 capability invocation
@@ -81,179 +138,302 @@ provenance
 Skill compilation
 ```
 
-AIOS IR never grants itself authority. Provider identities, capability grants, sandbox instances, and hardware placement are bound only after deterministic validation and policy evaluation.
-
-The design principle is:
+The design rule is:
 
 > **Own the semantics before owning the syntax.**
 
-A new human-facing/general-purpose language may emerge later if real measurements show that it improves correctness, AI generation reliability, optimization, security, or efficiency. The project will not build one merely for novelty.
+A human/AI-oriented general-purpose language may grow from AIOS IR later if measurements show real benefit. The project will not build a new language/compiler merely for novelty.
 
-## Bootstrap language boundary
+## Semantic capability model
 
-Current proposed roles:
-
-```text
-Rust     → trusted control-plane core
-Python   → rapid model/provider/data experimentation
-C/C++    → bounded bridge to mature native ecosystems
-WASM     → portable provider / compiled-Skill target candidate
-Shell    → build/dev/maintenance glue, not runtime escape hatch
-```
-
-The stable architecture lives above those choices in AIOS IR, semantic contracts, task/artifact/authority/provenance contracts, and language-neutral execution bindings.
-
-The long-term objective is not “write the OS in Rust.” It is “use mature tooling until measurements justify owning a deeper compiler/runtime.”
-
-## Semantic contract model
-
-AIOS IR invokes semantic capabilities rather than executables/applications:
+AIOS invokes semantic capabilities rather than application names:
 
 ```text
 AIOS IR node
     ↓
 Semantic Capability Contract
     ↓
-One of N Provider Implementations
+One of N conforming Provider Implementations
     ↓
-Runtime binding + sandbox + authority grant
+Execution Binding + sandbox + current grants + placement
 ```
 
-Semantic types are also separated from physical representation, so `data.table@1` can survive a change from one dataframe/library/serialization implementation to another.
-
-This gives the Resource/Capability Brokers room to adapt execution to available hardware without changing task meaning.
-
-## Adaptive compilation model
-
-Stable repeated work may progressively move from expensive reasoning to reusable validated computation:
+Example:
 
 ```text
-fresh intent
-   ↓
-model-assisted plan
-   ↓
-validated AIOS IR
-   ↓ repeated success
-parameterized Skill
-   ↓
-compiled deterministic subgraphs
-   ↓
-WASM / native / provider-pipeline / query / accelerator targets
+cad.feature.extrude@1
 ```
 
-Compiled targets contain computation, **not reusable authority**. Every invocation gets fresh policy evaluation and execution binding.
+could eventually be satisfied by:
 
-The benchmark plan explicitly compares fresh planning, IR reuse, Skill reuse, and compiled execution before the project claims efficiency gains.
+- an AIOS-native geometry provider;
+- an adapted open-source engine;
+- a bridged legacy CAD application;
+- a trusted peer workstation provider;
+- a policy-approved remote engineering service.
 
-## Repository map
+Changing the eligible provider does not change the semantic operation.
 
-### Foundation
+## Universal Software Fabric
 
-- [`docs/00-charter.md`](docs/00-charter.md) — project charter and definition
-- [`docs/01-design-principles.md`](docs/01-design-principles.md) — non-negotiable design principles
-- [`docs/02-system-architecture.md`](docs/02-system-architecture.md) — layered architecture
-- [`docs/03-task-intent-model.md`](docs/03-task-intent-model.md) — tasks, intents, plans, and provenance
-- [`docs/04-capability-model.md`](docs/04-capability-model.md) — capability providers and composition
-- [`docs/05-agent-runtime.md`](docs/05-agent-runtime.md) — agent lifecycle and execution model
-- [`docs/06-resource-broker.md`](docs/06-resource-broker.md) — hardware- and cost-aware scheduling
-- [`docs/07-universal-app-broker.md`](docs/07-universal-app-broker.md) — legacy software compatibility fabric
-- [`docs/08-security-threat-model.md`](docs/08-security-threat-model.md) — capability security and threat model
-- [`docs/09-memory-learning-privacy.md`](docs/09-memory-learning-privacy.md) — local memory and reusable learning
-- [`docs/10-hardware-adaptation.md`](docs/10-hardware-adaptation.md) — installation and graceful degradation
-- [`docs/11-v0.1-prototype.md`](docs/11-v0.1-prototype.md) — narrow proof-of-concept target
-- [`docs/12-roadmap.md`](docs/12-roadmap.md) — staged development roadmap
-- [`docs/13-open-questions.md`](docs/13-open-questions.md) — current open/narrowed/proposed decision status
+The long-term goal is not to ship separate AIOS clones of every existing application.
 
-### Architecture hardening
+Instead, applications are decomposed into reusable semantic objects, capabilities, invariants, engines, adapters, and Views.
 
-- [`docs/14-terminology.md`](docs/14-terminology.md) — canonical vocabulary and core abstractions
-- [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — 25 architecture invariants that implementation must preserve
-- [`docs/16-requirements.md`](docs/16-requirements.md) — testable architecture requirements with stable IDs
-- [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md) — acceptance, IR, recovery, compatibility, and adversarial test plan
-- [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md) — implementation dependency graph and Codex-readiness criteria
-- [`docs/19-principal-and-authority-model.md`](docs/19-principal-and-authority-model.md) — principals, resources, grants, approval, delegation, revocation, and egress semantics
-- [`docs/20-user-object-model.md`](docs/20-user-object-model.md) — task/artifact/workspace/conversation/application/view object model
-- [`docs/21-trust-boundaries.md`](docs/21-trust-boundaries.md) — trusted base, providers, legacy habitats, external systems, and boundary-crossing rules
-- [`docs/22-end-to-end-reference-flow.md`](docs/22-end-to-end-reference-flow.md) — complete Demonstration A flow through planning, policy, execution, verification, and learning
-- [`docs/23-task-shell-ux.md`](docs/23-task-shell-ux.md) — task-first interaction, approval, progress, artifact, and compatibility-launch behavior
-- [`docs/24-task-state-machine.md`](docs/24-task-state-machine.md) — deterministic persisted lifecycle, recovery, cancellation, verification, and rollback states
-- [`docs/34-task-ir-lifecycle.md`](docs/34-task-ir-lifecycle.md) — relationship between durable Task identity, planner revisions, validated semantic programs, and execution bindings
-- [`docs/35-v0.1-persistence-model.md`](docs/35-v0.1-persistence-model.md) — proposed SQLite control-plane durability/transaction/recovery model
+A CRM becomes concepts such as:
 
-### AI-native language / execution semantics
+```text
+Party · Organization · Contact · Lead · Opportunity · Quote · Order · Invoice · Payment
+```
 
-- [`docs/23-ai-native-language-and-ir.md`](docs/23-ai-native-language-and-ir.md) — why the project owns AI-native semantics before inventing a new general-purpose language
-- [`docs/25-aios-ir-semantics.md`](docs/25-aios-ir-semantics.md) — formal semantic graph model
-- [`docs/26-aios-ir-validation-and-lowering.md`](docs/26-aios-ir-validation-and-lowering.md) — deterministic validation, runtime binding, and lowering pipeline
-- [`docs/27-skill-compilation-and-adaptive-optimization.md`](docs/27-skill-compilation-and-adaptive-optimization.md) — reason-once/compile/reuse lifecycle
-- [`docs/28-capability-contracts-and-conformance.md`](docs/28-capability-contracts-and-conformance.md) — provider-independent capability semantics and provider conformance
-- [`docs/29-semantic-type-system.md`](docs/29-semantic-type-system.md) — semantic types vs physical representations and explicit conversion rules
-- [`docs/30-aios-ir-reference-validator-plan.md`](docs/30-aios-ir-reference-validator-plan.md) — bounded Rust validator implementation plan for the first Codex spike
-- [`docs/31-semantic-registry-snapshots.md`](docs/31-semantic-registry-snapshots.md) — immutable/content-addressed semantic meaning used for reproducible validation
-- [`docs/32-aios-ir-and-skill-benchmark-plan.md`](docs/32-aios-ir-and-skill-benchmark-plan.md) — M0–M4 efficiency/correctness benchmark framework
-- [`docs/33-bootstrap-language-boundary.md`](docs/33-bootstrap-language-boundary.md) — existing-language bootstrap and evidence threshold for deeper custom language/runtime work
-- [`docs/36-aios-ir-compiler-and-lowering-boundary.md`](docs/36-aios-ir-compiler-and-lowering-boundary.md) — how validated deterministic subgraphs may lower to efficient targets without carrying authority
+with capabilities such as:
 
-### Research
+```text
+crm.create_opportunity
+crm.merge_contacts
+commerce.quote.revise
+billing.issue_invoice
+```
 
-- [`docs/research/01-linux-base-and-updates.md`](docs/research/01-linux-base-and-updates.md) — reference Linux, image-mode, update, and rollback evaluation
-- [`docs/research/02-sandboxing-and-execution-isolation.md`](docs/research/02-sandboxing-and-execution-isolation.md) — Landlock/namespaces/container/VM isolation strategy
-- [`docs/research/03-legacy-compatibility-fabric.md`](docs/research/03-legacy-compatibility-fabric.md) — Wine, Android, CPU translation, VM, and experimental macOS routing model
-- [`docs/research/04-model-runtime-and-routing.md`](docs/research/04-model-runtime-and-routing.md) — provider-neutral model routing and local-runtime strategy
-- [`docs/research/05-service-ipc-and-language.md`](docs/research/05-service-ipc-and-language.md) — process boundaries, Varlink/D-Bus/gRPC roles, Rust/Python split, and persistence
-- [`docs/research/06-authorization-policy-engine.md`](docs/research/06-authorization-policy-engine.md) — Cedar vs OPA and the proposed authority-coordinator boundary
+Engineering software similarly decomposes into Parts, Assemblies, Constraints, Schematics, Nets, PCB objects, simulation capabilities, renderers/solvers, and specialized direct-manipulation Views.
 
-### Decisions and machine-readable contracts
+See:
 
-- [`docs/adr/`](docs/adr/) — architecture decisions, including AIOS IR, semantic contracts, bootstrap-language, validator, and compiled-authority boundaries
-- [`specs/README.md`](specs/README.md) — contract principles, semantic layers, registry snapshots, and versioning rules
-- [`specs/`](specs/) — task, AIOS IR, validation, semantic registry/type/capability, hardware, artifact, authority, provenance, execution-binding/isolation, compiled target, Skill, model, policy, compatibility, and persistence contracts
-- [`specs/persistence-v0.1.sql`](specs/persistence-v0.1.sql) — draft SQLite schema for task/program/binding/artifact/policy/provenance recovery
-- [`examples/aios-ir/`](examples/aios-ir/) — Demonstration A IR, semantic registries, validation/binding/Skill examples, and positive/adversarial fixtures
-- [`examples/reference-task/`](examples/reference-task/) — broader Demonstration A/B control-plane fixtures
-- [`prototypes/README.md`](prototypes/README.md) — implementation boundaries for the first prototype
+- [`docs/40-universal-software-fabric.md`](docs/40-universal-software-fabric.md)
+- [`docs/41-domain-capability-architecture.md`](docs/41-domain-capability-architecture.md)
+- [`docs/43-software-coverage-expansion-strategy.md`](docs/43-software-coverage-expansion-strategy.md)
 
-### Implementation backlog
+## Capability coverage grows progressively
 
-GitHub Issues contain bounded v0.1 workstreams with acceptance criteria. The implementation dependency order is documented in [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md).
+AIOS does not need to rewrite the world's software before becoming useful.
 
-Issue #17 is the proposed first major semantic-boundary implementation spike: deterministic AIOS IR parsing/validation/normalization/hashing without a model planner.
+A capability can mature through:
 
-## v0.1 success criterion
+```text
+UNAVAILABLE
+→ LEGACY-LAUNCH
+→ LEGACY-BRIDGED
+→ EXTERNAL/REMOTE PROVIDER
+→ OPEN-SOURCE ENGINE ADAPTER
+→ AIOS-NATIVE PROVIDER
+→ OPTIMIZED/COMPILED PROVIDER
+→ MULTIPLE CONFORMING PROVIDERS
+```
 
-A user should be able to give a high-level task such as:
+The user-facing semantic capability can remain stable while the implementation underneath improves.
+
+## Universal Object Graph
+
+The same real-world thing should retain one durable AIOS identity whenever practical even if many systems represent it.
+
+Example:
+
+```text
+CRM customer 99881
+billing customer C-31002
+ERP account A00941
+email contact customer@example.test
+```
+
+may be linked to one canonical semantic Party object—but probabilistic AI confidence alone cannot perform a high-consequence merge. Contradictions, source evidence, policy, revision checks, consequence level, and required approvals remain explicit.
+
+See:
+
+- [`docs/42-universal-object-graph-and-data-federation.md`](docs/42-universal-object-graph-and-data-federation.md)
+- [`docs/44-tier0-universal-object-model.md`](docs/44-tier0-universal-object-model.md)
+- [`docs/49-identity-resolution-and-object-reconciliation.md`](docs/49-identity-resolution-and-object-reconciliation.md)
+
+## Storage, networking, cloud, and devices
+
+These are runtime fabrics—not semantic authorities.
+
+A Document object can survive:
+
+- rename/move between folders;
+- local/peer/cloud replicas;
+- conversion to PDF/Markdown/DOCX;
+- provider replacement;
+- device replacement.
+
+A Task can potentially move computation from an old laptop to a trusted workstation GPU or permitted cloud provider without changing semantic program identity.
+
+Relevant architecture:
+
+- [`docs/48-resource-placement-and-personal-compute-fabric.md`](docs/48-resource-placement-and-personal-compute-fabric.md)
+- [`docs/50-adaptive-presentation-and-device-ui.md`](docs/50-adaptive-presentation-and-device-ui.md)
+- [`docs/51-network-fabric-and-service-connectivity.md`](docs/51-network-fabric-and-service-connectivity.md)
+- [`docs/52-cloud-edge-and-service-fabric.md`](docs/52-cloud-edge-and-service-fabric.md)
+- [`docs/55-storage-sync-and-replica-fabric.md`](docs/55-storage-sync-and-replica-fabric.md)
+- [`docs/56-cryptographic-identity-trust-and-credential-fabric.md`](docs/56-cryptographic-identity-trust-and-credential-fabric.md)
+- [`docs/57-component-distribution-supply-chain-and-update-trust.md`](docs/57-component-distribution-supply-chain-and-update-trust.md)
+- [`docs/58-files-namespaces-and-semantic-projection.md`](docs/58-files-namespaces-and-semantic-projection.md)
+
+## Stage discipline
+
+The end state is intentionally huge. The next implementation step is intentionally small.
+
+The staged roadmap is:
+
+```text
+architecture constitution
+→ trusted semantic substrate
+→ adaptive orchestration
+→ task-first adaptive shell
+→ personal compute/network/storage
+→ Tier-0 object/software fabric
+→ productivity/business domains
+→ creative/developer domains
+→ engineering domains
+→ cloud/org/edge collaboration
+→ physical/ambient domains
+→ continuous language/platform maturation
+```
+
+See [`docs/53-system-of-everything-staged-roadmap.md`](docs/53-system-of-everything-staged-roadmap.md).
+
+## v0.1 target
+
+The flagship user intent remains deliberately narrow:
 
 > “Understand these numbers, identify the important changes, produce a chart and a concise report, and save the result.”
 
-The prototype should:
+The eventual v0.1 prototype should:
 
-- inspect the available data;
-- derive a typed planner proposal and normalize it to valid AIOS IR;
-- select calculation, table, chart, and document capabilities without the user opening applications;
-- request only the minimum permissions needed;
-- execute locally where practical;
-- verify important deterministic results;
-- produce inspectable provenance showing what happened;
-- save normal portable files;
-- learn/reuse at least one repeated task pattern;
-- measurably reduce repeated model/planning work through Skill/IR reuse;
-- and transparently launch at least one legacy application through a compatibility habitat as a separate proof of the transition strategy.
+- create a durable Task;
+- import/reference the data as an Artifact;
+- derive/validate typed AIOS IR;
+- resolve calculation/table/chart/document capabilities;
+- request only minimum authority;
+- execute deterministic calculations/providers;
+- invoke AI only for semantic reasoning where useful;
+- independently verify consequential numeric claims;
+- produce portable output artifacts;
+- record inspectable provenance;
+- demonstrate provider substitution;
+- demonstrate repeated-work reuse/Skill optimization;
+- separately launch at least one legacy application through a compatibility habitat.
 
-That is intentionally much narrower than “build a universal operating system.” The goal of v0.1 is to prove that the architecture is meaningfully different from a conventional desktop with a chatbot attached.
+The goal is to prove an architecture that is meaningfully different from a normal desktop with a chatbot attached.
+
+## First implementation target
+
+The preferred first serious implementation assignment is **GitHub Issue #17**:
+
+> deterministic AIOS IR parser/validator/normalizer/static-effect-summary/semantic-hash boundary.
+
+It intentionally requires:
+
+- no model planner;
+- no provider execution;
+- no network/cloud;
+- no GUI;
+- no Cedar policy engine yet;
+- no custom source language.
+
+Implementation preparation:
+
+- [`AGENTS.md`](AGENTS.md) — concise instructions/map for coding agents
+- [`docs/59-pre-codex-foundation-closure-plan.md`](docs/59-pre-codex-foundation-closure-plan.md) — architecture closure classes/gates
+- [`docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md`](docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md) — initial implementation/module shape
+- [`docs/61-validator-test-fuzz-and-resource-limit-matrix.md`](docs/61-validator-test-fuzz-and-resource-limit-matrix.md) — validator security/test matrix
+- [`docs/62-first-codex-session-runbook.md`](docs/62-first-codex-session-runbook.md) — first Codex session prompt/sequence/stop conditions
+
+## Repository guide
+
+### Constitution / requirements
+
+- [`docs/00-charter.md`](docs/00-charter.md)
+- [`docs/01-design-principles.md`](docs/01-design-principles.md)
+- [`docs/14-terminology.md`](docs/14-terminology.md)
+- [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — **36 current invariants**
+- [`docs/16-requirements.md`](docs/16-requirements.md)
+- [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md)
+- [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md)
+
+### Security / state / trust
+
+- [`docs/08-security-threat-model.md`](docs/08-security-threat-model.md)
+- [`docs/19-principal-and-authority-model.md`](docs/19-principal-and-authority-model.md)
+- [`docs/21-trust-boundaries.md`](docs/21-trust-boundaries.md)
+- [`docs/24-task-state-machine.md`](docs/24-task-state-machine.md)
+- [`docs/35-v0.1-persistence-model.md`](docs/35-v0.1-persistence-model.md)
+- [`docs/45-cross-domain-transactions-and-compensation.md`](docs/45-cross-domain-transactions-and-compensation.md)
+
+### AIOS IR / language / compilation
+
+- [`docs/23-ai-native-language-and-ir.md`](docs/23-ai-native-language-and-ir.md)
+- [`docs/25-aios-ir-semantics.md`](docs/25-aios-ir-semantics.md)
+- [`docs/26-aios-ir-validation-and-lowering.md`](docs/26-aios-ir-validation-and-lowering.md)
+- [`docs/27-skill-compilation-and-adaptive-optimization.md`](docs/27-skill-compilation-and-adaptive-optimization.md)
+- [`docs/28-capability-contracts-and-conformance.md`](docs/28-capability-contracts-and-conformance.md)
+- [`docs/29-semantic-type-system.md`](docs/29-semantic-type-system.md)
+- [`docs/30-aios-ir-reference-validator-plan.md`](docs/30-aios-ir-reference-validator-plan.md)
+- [`docs/31-semantic-registry-snapshots.md`](docs/31-semantic-registry-snapshots.md)
+- [`docs/32-aios-ir-and-skill-benchmark-plan.md`](docs/32-aios-ir-and-skill-benchmark-plan.md)
+- [`docs/33-bootstrap-language-boundary.md`](docs/33-bootstrap-language-boundary.md)
+- [`docs/36-aios-ir-compiler-and-lowering-boundary.md`](docs/36-aios-ir-compiler-and-lowering-boundary.md)
+- [`docs/39-static-effect-and-authority-analysis.md`](docs/39-static-effect-and-authority-analysis.md)
+
+### Platform fabrics
+
+- [`docs/40-universal-software-fabric.md`](docs/40-universal-software-fabric.md)
+- [`docs/41-domain-capability-architecture.md`](docs/41-domain-capability-architecture.md)
+- [`docs/42-universal-object-graph-and-data-federation.md`](docs/42-universal-object-graph-and-data-federation.md)
+- [`docs/43-software-coverage-expansion-strategy.md`](docs/43-software-coverage-expansion-strategy.md)
+- [`docs/44-tier0-universal-object-model.md`](docs/44-tier0-universal-object-model.md)
+- [`docs/46-domain-pack-lifecycle-and-governance.md`](docs/46-domain-pack-lifecycle-and-governance.md)
+- [`docs/47-cross-domain-reference-workflow.md`](docs/47-cross-domain-reference-workflow.md)
+- [`docs/48-resource-placement-and-personal-compute-fabric.md`](docs/48-resource-placement-and-personal-compute-fabric.md)
+- [`docs/49-identity-resolution-and-object-reconciliation.md`](docs/49-identity-resolution-and-object-reconciliation.md)
+- [`docs/50-adaptive-presentation-and-device-ui.md`](docs/50-adaptive-presentation-and-device-ui.md)
+- [`docs/51-network-fabric-and-service-connectivity.md`](docs/51-network-fabric-and-service-connectivity.md)
+- [`docs/52-cloud-edge-and-service-fabric.md`](docs/52-cloud-edge-and-service-fabric.md)
+- [`docs/53-system-of-everything-staged-roadmap.md`](docs/53-system-of-everything-staged-roadmap.md)
+- [`docs/54-unified-platform-fabric-architecture.md`](docs/54-unified-platform-fabric-architecture.md)
+- [`docs/55-storage-sync-and-replica-fabric.md`](docs/55-storage-sync-and-replica-fabric.md)
+- [`docs/56-cryptographic-identity-trust-and-credential-fabric.md`](docs/56-cryptographic-identity-trust-and-credential-fabric.md)
+- [`docs/57-component-distribution-supply-chain-and-update-trust.md`](docs/57-component-distribution-supply-chain-and-update-trust.md)
+- [`docs/58-files-namespaces-and-semantic-projection.md`](docs/58-files-namespaces-and-semantic-projection.md)
+
+### Decisions / contracts / fixtures
+
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records
+- [`specs/README.md`](specs/README.md) — machine-contract index/principles
+- [`specs/`](specs/) — JSON Schemas + draft persistence SQL
+- [`examples/aios-ir/`](examples/aios-ir/) — semantic IR/registry/validation/adversarial fixtures
+- [`examples/reference-task/`](examples/reference-task/) — broader control-plane Demonstration A/B fixtures
+- [`examples/domain-fabric/`](examples/domain-fabric/) — synthetic Universal Object/Domain examples
+- [`examples/platform-fabric/`](examples/platform-fabric/) — presentation/network/cloud/storage/trust/package examples
+- [`interfaces/wit/`](interfaces/wit/) — early Wasm Component/WIT ABI experiments
 
 ## Non-goals for v0.1
 
-- Writing a new kernel
-- Reimplementing Windows, macOS, Android, or Linux
-- Guaranteeing that every legacy application works
-- Allowing an AI model to synthesize privileged kernel or driver code during normal boot
-- Building a full desktop replacement
-- Training a foundation model
-- Locking the project to any AI provider
-- Building a new general-purpose source language/compiler before AIOS IR evidence justifies it
+- writing a new kernel;
+- replacing every existing operating system/application;
+- guaranteeing universal legacy compatibility;
+- building a full desktop/mobile shell;
+- building production distributed storage/network/cloud infrastructure;
+- launching a public package marketplace;
+- training a foundation model;
+- locking to one AI/cloud/vendor;
+- building a new general-purpose source language/compiler before AIOS IR evidence justifies it.
 
 ## Current phase
 
-**Architecture and pre-implementation hardening. No implementation claim is made yet.**
+**Stage 0 architecture constitution is nearing the point where the first trusted-core spike can begin. No implementation claim is made yet.**
 
-The immediate work is to make the semantic/contracts boundary precise enough that the first implementation tasks are constrained engineering problems rather than opportunities for implementation convenience to redefine the OS.
+The immediate engineering objective is intentionally small:
+
+```text
+untrusted candidate AIOS IR
+        ↓
+strict deterministic parser/validator
+        ↓
+semantic registry/type/capability/effect checks
+        ↓
+canonical semantic identity/hash
+        ↓
+VALID or REJECTED
+```
+
+Once that boundary works, the project can safely begin building Task persistence, Artifact/provenance stores, deterministic policy, provider binding, and eventually model-assisted orchestration on top.
