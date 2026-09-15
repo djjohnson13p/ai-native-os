@@ -1,0 +1,41 @@
+{
+  "schema_version": "0.1",
+  "replica_id": "replica://artifact/report-91/peer-home-server",
+  "subject": {
+    "kind": "artifact",
+    "id": "artifact://task/T91/report/final",
+    "revision": null,
+    "content_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "storage_class": "TRUSTED_PEER",
+  "role": "MIRROR",
+  "state": "CURRENT",
+  "location": {
+    "provider_id": "org.ainative.storage.peer-content",
+    "service_id": "service://personal/home-server/content-store",
+    "device_id": "principal://device/home-server",
+    "locator": "content://sha256/1111111111111111111111111111111111111111111111111111111111111111",
+    "region": null,
+    "jurisdiction": "US"
+  },
+  "sync": {
+    "consistency_class": "AUTHORITATIVE_SINGLE_WRITER",
+    "source_replica_id": "replica://artifact/report-91/laptop-local",
+    "source_revision": null,
+    "external_version": null,
+    "last_synced_at": "2026-09-15T22:40:00Z",
+    "pending_operation_ids": []
+  },
+  "encryption": {
+    "mode": "USER_MANAGED",
+    "key_handle_ref": "credential://user/personal-fabric/storage-key"
+  },
+  "retention": {
+    "class": "PERSISTENT",
+    "expires_at": null,
+    "pinned_offline": true
+  },
+  "verified_at": "2026-09-15T22:40:01Z",
+  "created_at": "2026-09-15T22:39:00Z",
+  "updated_at": "2026-09-15T22:40:01Z"
+}
