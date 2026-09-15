@@ -1,0 +1,44 @@
+{
+  "binding_id": "binding-demo-import-table-attempt-1",
+  "task_id": "task-demo-001",
+  "program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "ir_version": "0.1",
+  "node_id": "import_table",
+  "capability": "table.import@1",
+  "capability_contract_hash": null,
+  "provider": {
+    "id": "org.ainative.provider.table-import",
+    "version": "0.1.0",
+    "manifest_hash": null,
+    "conformance_status": "declared"
+  },
+  "inputs": {
+    "source": {
+      "artifact_or_value_ref": "artifact://task/task-demo-001/input/source",
+      "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "outputs": {
+    "table": {
+      "allocation_ref": "artifact://task/task-demo-001/intermediate/import_table/table"
+    }
+  },
+  "policy_decision_id": "policy-decision-demo-import-table",
+  "authority": {
+    "grant_refs": ["grant://task/task-demo-001/artifact-read-source"],
+    "expires_at": "2026-09-15T01:00:00Z"
+  },
+  "execution_profile": {
+    "profile_ref": "profile://P2/table-import-demo",
+    "profile_hash": null
+  },
+  "placement": {
+    "locality": "local",
+    "hardware_profile_ref": "hardware://local/demo-laptop",
+    "device_class": "ordinary-laptop",
+    "remote_endpoint_class": null
+  },
+  "model_descriptor_ref": null,
+  "attempt": 1,
+  "created_at": "2026-09-15T00:10:00Z"
+}
