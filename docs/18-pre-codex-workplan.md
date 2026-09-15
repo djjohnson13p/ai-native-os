@@ -4,13 +4,15 @@ This plan distinguishes work that should be resolved through architecture/resear
 
 The goal is to arrive at implementation with **fewer ambiguous decisions**, not with more speculative code.
 
+The long-term mission is intentionally universal; the near-term implementation order is intentionally narrow. See `docs/53-system-of-everything-staged-roadmap.md` and `docs/54-unified-platform-fabric-architecture.md`.
+
 ## Track A — Architecture hardening (chat-friendly)
 
 These can be advanced substantially through design review, research, schemas, examples, and ADRs before implementation begins.
 
 ### A1 — Core vocabulary and invariants
 
-Status: initial draft complete.
+Status: substantial draft complete.
 
 Relevant files:
 
@@ -25,27 +27,29 @@ Status: substantial first drafts exist.
 Current contracts include:
 
 - AIOS semantic IR;
-- semantic capability contract;
-- semantic type contract;
+- semantic capability/type contracts;
 - execution binding;
-- Skill manifest;
-- task plan and persisted task record;
+- Skill/compiled-target manifests;
+- task plan/persisted task;
 - provider/capability manifest;
-- hardware profile;
-- artifact handle;
-- capability token;
-- policy decision;
-- provenance event;
-- execution/sandbox profile;
+- hardware/resource placement;
+- artifact handles;
+- authority/policy/provenance;
 - model request/result;
-- legacy compatibility profile.
+- legacy compatibility;
+- Universal Software Fabric Domain Packs;
+- semantic object/relationship contracts;
+- adaptive display/View contracts;
+- identity-resolution proposals;
+- network service/transfer contracts;
+- remote cloud/edge service descriptors.
 
 Before/while implementation begins:
 
 - keep positive and negative examples synchronized;
 - finalize schema versioning convention;
 - identify fields that are architecture vs prototype implementation detail;
-- ensure no contract assumes one model vendor;
+- ensure no contract assumes one model/cloud/UI vendor;
 - add automated schema/semantic fixture validation.
 
 ### A3 — Threat-model expansion
@@ -59,10 +63,14 @@ Relevant work:
 - capability-token semantics;
 - secret mediation;
 - external data egress flow;
+- network-service identity;
 - legacy habitat boundaries;
-- skill supply-chain model;
-- model/provider compromise cases;
-- adversarial IR fixtures.
+- Skill supply chain;
+- model/provider compromise;
+- adversarial IR fixtures;
+- identity-merge false-positive consequences;
+- cloud/peer trust boundaries;
+- trusted approval UI.
 
 ### A4 — Research decisions
 
@@ -71,6 +79,7 @@ Resolve or narrow:
 - Linux base / image/update/rollback strategy (#14);
 - service boundaries / IPC / languages (#15);
 - AIOS IR/language path (#16);
+- WIT/Wasm + MLIR experiment (#18);
 - Cedar authorization spike;
 - Varlink/service-boundary spike;
 - sandbox/container/VM primitives;
@@ -79,22 +88,26 @@ Resolve or narrow:
 - optional remote-model adapter shape;
 - prototype database/provenance storage.
 
-### A5 — UX specification
+### A5 — UX / Presentation Fabric
 
-Initial task-first object/shell model exists.
+Initial task-first object/shell model exists; adaptive presentation is now explicitly separated from Task/object identity.
 
-Continue wire-level/user-flow descriptions for:
+Relevant work:
 
 - task submission;
-- artifact attachment/reference;
+- artifact/object attachment;
 - clarification;
 - approvals;
 - running task inspection;
 - plan/IR/provenance detail;
 - final artifact handling;
-- traditional app launch.
+- traditional app launch;
+- compact vs desktop View projection;
+- remote surfaces;
+- accessibility;
+- specialized direct-manipulation View contracts (#22).
 
-No polished desktop design is required before v0.1.
+No polished desktop or mobile shell is required before v0.1.
 
 ### A6 — AI-native execution semantics
 
@@ -109,22 +122,71 @@ Relevant files:
 - `docs/28-capability-contracts-and-conformance.md`
 - `docs/29-semantic-type-system.md`
 - `docs/30-aios-ir-reference-validator-plan.md`
+- `docs/31-semantic-registry-snapshots.md`
+- `docs/32-aios-ir-and-skill-benchmark-plan.md`
+- `docs/33-bootstrap-language-boundary.md`
+- `docs/36-aios-ir-compiler-and-lowering-boundary.md`
 - `specs/aios-ir.schema.json`
-- `specs/capability-contract.schema.json`
-- `specs/type-contract.schema.json`
-- `specs/execution-binding.schema.json`
-- `specs/skill-manifest.schema.json`
 - `examples/aios-ir/`
 
 This track is central to ensuring the project does not become merely "AI generates Python/Rust commands for a conventional desktop."
 
-## Track B — Implementation-ready issues
+### A7 — Universal Software/Object Fabric
 
-Current issue set:
+Status: architecture scaffolding exists; implementation deferred until core substrate is proven.
 
-| Issue | Workstream | Primary dependency |
+Relevant work:
+
+- Universal Software Fabric / Domain Packs (#19);
+- Tier-0 semantic object model;
+- object federation/source-of-truth;
+- cross-domain transactions/compensation (#21);
+- identity resolution / merge/split (#25);
+- software coverage expansion ladder.
+
+The early objective is to ensure today's implementation choices do not block broad future software coverage.
+
+### A8 — Resource / Personal Compute Fabric
+
+Status: deterministic placement model drafted.
+
+Relevant work:
+
+- Resource Broker / Personal Compute Fabric (#20);
+- static hardware profile vs dynamic resource snapshot;
+- hard eligibility before objective ranking;
+- peer placement;
+- data-movement cost;
+- migration/rebinding classes.
+
+Implementation belongs after/with the v0.1 resource-broker skeleton, not before the trusted semantic substrate.
+
+### A9 — Network + Cloud/Edge Fabrics
+
+Status: architecture/scaffolding drafted; implementation is post-core.
+
+Relevant work:
+
+- bounded service identity/connectivity (#23);
+- cloud/edge/self-hosted remote service model (#24);
+- peer transfer/provenance;
+- cost/residency policy;
+- offline/reconnect semantics;
+- self-hosted core-service boundaries.
+
+Network/cloud may be researched now but must not become prerequisites for local boot/recovery or the first deterministic substrate.
+
+### A10 — Stage-gate governance
+
+Issue #26 tracks the staged "system of everything" roadmap.
+
+Universal ambition is maintained by designing reusable fabrics/contracts now while deferring broad implementation until prerequisite stage gates pass.
+
+## Track B — Current issues and workstreams
+
+| Issue | Workstream | Primary dependency / timing |
 | --- | --- | --- |
-| #1 | persisted task model/state machine | task contracts |
+| #1 | persisted task model/state machine | core contracts |
 | #2 | capability registry/conformance | semantic capability/type contracts |
 | #3 | deterministic policy/task authority | principal/token semantics |
 | #4 | artifact/data handle store | artifact contract |
@@ -135,12 +197,21 @@ Current issue set:
 | #9 | deterministic demo providers | #2 #4 |
 | #10 | Universal App Broker fixture | #3 #5 + compatibility research |
 | #11 | adversarial/recovery harness | all core boundaries |
-| #12 | skill compilation proof | successful #8/#9 path + Skill/IR contracts |
-| #13 | task-first shell | #1 #5 #8 |
+| #12 | Skill compilation proof | successful #8/#9 path + Skill/IR contracts |
+| #13 | task-first shell | #1 #5 #8; adaptive View work can follow |
 | #14 | Linux base/update research | architecture |
 | #15 | service/IPC/language research | architecture |
-| #16 | define AIOS IR / custom-language decision criteria | architecture |
-| #17 | deterministic AIOS IR validator/normalizer/hash | #16 semantic draft |
+| #16 | AIOS IR / custom-language decision criteria | architecture umbrella |
+| #17 | deterministic AIOS IR validator/normalizer/hash | first semantic implementation spike |
+| #18 | WIT/Wasm + MLIR lower-layer experiments | after/alongside #17; no semantic authority |
+| #19 | Universal Software Fabric / Domain Packs | architecture now; implementation post-core |
+| #20 | Resource Broker / Personal Compute Fabric | Phase II architecture/implementation |
+| #21 | cross-domain transactions/compensation | before consequential multi-domain mutations |
+| #22 | adaptive Presentation Broker / View contracts | architecture now; shell evolution after #13 |
+| #23 | Network Fabric | after core; peer stage after resource substrate |
+| #24 | cloud/edge/self-hosted service model | after Network/Resource basics |
+| #25 | identity resolution / merge/split | before broad federated object deployment |
+| #26 | staged system-of-everything roadmap | ongoing governance/meta |
 
 ## Recommended implementation order
 
@@ -149,62 +220,80 @@ Current issue set:
 1. Close/narrow #14 and #15 enough to create the development environment.
 2. Keep #16 open as the language/IR research umbrella while treating current v0.1 semantics as the first experiment.
 3. Implement #17 deterministic AIOS IR validator/normalizer/hash CLI/library.
-4. Run IR1–IR8 fixture gates without a model planner.
+4. Run IR fixture gates without a model planner.
+5. Only after validator semantics are stable, run bounded #18 lowering/ABI experiments.
 
 At the end of Phase 0 we should have a machine-verifiable answer to: **what does an AI-native program mean, and can untrusted generated programs be rejected deterministically?**
 
-This is intentionally before a full planner.
-
 ### Phase I — deterministic substrate
 
-5. Implement #1 task model.
-6. Implement #4 artifact handle/store.
-7. Implement #5 provenance service.
-8. Implement #2 semantic capability/type registry plus provider conformance boundary.
-9. Implement #3 policy/authority.
-10. Bind one tiny validated AIOS IR fixture to a deterministic provider through an execution binding.
+6. Implement #1 task model.
+7. Implement #4 artifact handle/store.
+8. Implement #5 provenance service.
+9. Implement #2 semantic capability/type registry plus provider conformance boundary.
+10. Implement #3 policy/authority.
+11. Bind one tiny validated AIOS IR fixture to a deterministic provider through an execution binding.
 
-At the end of Phase I, we should be able to create a task, attach an artifact, validate semantic IR, authorize a deterministic capability, bind/execute a tiny fixture, and inspect provenance **without any AI planner at all**.
-
-That is intentional: it proves the operating substrate before introducing probabilistic reasoning.
+At the end of Phase I, create/validate/authorize/bind/execute/recover a deterministic Task **without any AI planner**.
 
 ### Phase II — orchestration and adaptive execution
 
-11. Implement #6 hardware/resource broker skeleton.
-12. Implement #7 model runtime interface.
-13. Implement #8 planner/orchestrator as a producer of proposals that must lower to valid AIOS IR.
-14. Implement #9 deterministic Demonstration A providers.
+12. Implement #6 hardware profiler/Resource Broker skeleton guided by #20.
+13. Implement #7 model runtime interface.
+14. Implement #8 planner/orchestrator as proposal producer only.
+15. Implement #9 deterministic Demonstration A providers.
+16. Prove local vs alternate eligible placement without semantic-program rewrite.
 
-At the end of Phase II, Demonstration A should work through the task-first orchestration path while preserving the semantic IR/policy boundary.
+### Phase III — task-first user experience and transition
 
-### Phase III — transition strategy and user interaction
+17. Implement #13 task-first shell.
+18. Use #22 to add adaptive compact/desktop View projection after the basic shell works.
+19. Implement #10 Universal App Broker proof.
+20. Implement #12 Skill compilation/reuse proof.
 
-15. Implement #13 task-first shell.
-16. Implement #10 Universal App Broker proof.
-17. Implement #12 Skill compilation/reuse proof.
+### Phase IV — v0.1 hardening
 
-### Phase IV — hardening
+21. Expand/automate #11 adversarial/recovery harness.
+22. Run full `docs/17-v0.1-acceptance-tests.md` gate.
+23. Benchmark fresh planning vs IR/Skill/compiled execution.
+24. Update architecture to match implemented reality.
 
-18. Expand and automate #11 adversarial/recovery harness.
-19. Run full `docs/17-v0.1-acceptance-tests.md` gate, including IR1–IR8.
-20. Benchmark fresh planning vs IR reuse vs compiled Skill execution.
-21. Update architecture docs to reflect what was actually built.
-22. Use results to decide whether a human-facing/custom AI-oriented language is justified beyond structural AIOS IR.
+### Phase V — Personal Compute + Network Fabric
+
+25. Expand #20 from local placement to trusted peer placement.
+26. Implement narrow #23 peer/service identity, bounded connectivity, transfer provenance.
+27. Demonstrate one Task placed from laptop/phone-like client to paired workstation while preserving identity/policy.
+
+### Phase VI — Tier-0 Object/Software Fabric
+
+28. Implement narrow #19 Tier-0 Domain Pack/object registry subset.
+29. Implement #25 safe identity-resolution proposal/link/merge fixtures.
+30. Implement #21 cross-domain effect/compensation coordinator for the first synthetic multi-domain workflow.
+31. Demonstrate one Task spanning at least three former application categories without point-to-point app integration.
+
+### Phase VII — cloud/edge scale
+
+32. Implement minimal #24 remote-worker/service path on top of Network + Resource Fabrics.
+33. Demonstrate local, self-hosted/peer, and public-remote candidates for the same semantic node.
+34. Preserve offline/local control-plane understanding through remote outage.
+
+Broad productivity/business/creative/engineering Domain Pack expansion follows the stage gates in `docs/53-system-of-everything-staged-roadmap.md` rather than entering the v0.1 critical path.
 
 ## Codex issue sizing rule
 
 An implementation issue is ready for Codex only when it specifies:
 
 1. purpose;
-2. architecture contracts it must obey;
-3. files/modules it may reasonably create or modify;
-4. inputs/outputs;
-5. security boundary;
-6. acceptance tests;
-7. explicit non-goals;
-8. dependencies that are already merged or mocked.
+2. current roadmap stage;
+3. architecture contracts it must obey;
+4. files/modules it may reasonably create or modify;
+5. inputs/outputs;
+6. security boundary;
+7. acceptance tests;
+8. explicit non-goals;
+9. dependencies that are already merged or mocked.
 
-If an issue still contains a major architecture question, resolve the question before asking Codex to infer the answer from implementation convenience.
+If an issue still contains a major architecture question, resolve it before asking Codex to infer the answer from implementation convenience.
 
 ## Special rule for AI-generated implementation
 
@@ -217,7 +306,8 @@ Codex/agents should be instructed to:
 - add tests for validator/policy boundaries;
 - avoid arbitrary shell/eval escape hatches in core runtime paths;
 - keep provider-specific code behind provider contracts;
-- preserve reason codes and semantic hashes when refactoring.
+- preserve reason codes and semantic hashes when refactoring;
+- preserve stage boundaries instead of implementing future layers as shortcuts.
 
 ## What we should avoid before implementation
 
@@ -227,23 +317,25 @@ Do not spend pre-implementation time on:
 - a custom kernel;
 - a new general-purpose language/compiler before IR evidence;
 - a full installer image;
-- broad desktop theming;
+- polished multi-device GUI shells;
+- production mesh networking;
+- production multi-cloud orchestration;
+- broad Domain Pack feature parity;
 - dozens of legacy compatibility targets;
 - training a foundation model;
 - building equivalents of Word/Photoshop/Unreal as monolithic applications;
-- performance micro-optimization before contracts exist;
-- committing to mobile hardware support before the control-plane abstractions are proven.
+- performance micro-optimization before contracts exist.
 
 ## Definition of "ready for the first serious Codex session"
 
 We are ready when:
 
-- AIOS IR semantics and fixtures are sufficient for #17;
-- core contracts have example fixtures;
+- AIOS IR semantics/fixtures are sufficient for #17;
+- core contracts have fixtures;
 - the principal/authority model is precise;
 - v0.1 service boundaries are selected/narrowed;
-- the prototype Linux environment is selected/narrowed;
-- the task/artifact/provenance data model is settled enough for migrations;
+- prototype Linux environment is selected/narrowed;
+- task/artifact/provenance data model is settled enough for migrations;
 - the first implementation issues have acceptance tests and clear dependencies;
 - no foundational issue requires Codex to decide what the OS fundamentally means.
 
