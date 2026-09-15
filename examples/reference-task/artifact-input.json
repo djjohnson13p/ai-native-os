@@ -1,0 +1,24 @@
+{
+  "artifact_id": "A17",
+  "uri": "artifact://A17",
+  "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "format": "xlsx",
+  "size_bytes": 184320,
+  "content_hash": {
+    "algorithm": "sha256",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "origin": {
+    "kind": "user",
+    "task_id": null,
+    "step_id": null,
+    "provider_id": null
+  },
+  "sensitivity": "private",
+  "retention": {
+    "class": "user-managed",
+    "expires_at": null
+  },
+  "labels": ["reference-fixture", "tabular-data"],
+  "created_at": "2026-09-15T20:30:00Z"
+}
