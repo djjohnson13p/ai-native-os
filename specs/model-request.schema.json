@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/model-request.schema.json",
+  "title": "Model Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "task_id", "step_id", "capability", "inputs", "privacy", "constraints"],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "step_id": {"type": "string", "minLength": 1},
+    "capability": {
+      "type": "string",
+      "enum": [
+        "reasoning.text",
+        "classification",
+        "structured-generation",
+        "vision-understanding",
+        "embedding",
+        "reranking",
+        "speech-to-text"
+      ]
+    },
+    "inputs": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "instructions": {
+      "type": ["string", "null"]
+    },
+    "structured_output": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_id": {"type": ["string", "null"]},
+        "json_schema": {"type": ["object", "null"]},
+        "strict": {"type": "boolean", "default": true}
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["egress"],
+      "properties": {
+        "egress": {
+          "type": "string",
+          "enum": ["local-only", "remote-allowed", "remote-allowlist"]
+        },
+        "allowed_remote_providers": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["public", "local", "private", "confidential", "secret"]
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quality_class": {
+          "type": ["string", "null"],
+          "enum": [null, "fast", "balanced", "high"]
+        },
+        "latency_class": {
+          "type": ["string", "null"],
+          "enum": [null, "interactive", "normal", "background"]
+        },
+        "max_memory_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "max_cost_microunits": {"type": ["integer", "null"], "minimum": 0},
+        "deadline": {"type": ["string", "null"], "format": "date-time"},
+        "min_context_tokens": {"type": ["integer", "null"], "minimum": 1},
+        "provider_allowlist": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "provider_denylist": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": {"type": ["number", "null"], "minimum": 0},
+        "max_output_tokens": {"type": ["integer", "null"], "minimum": 1},
+        "seed": {"type": ["integer", "null"]}
+      }
+    },
+    "verification_required": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}
