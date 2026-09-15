@@ -1,0 +1,39 @@
+{
+  "token_id": "CT-T91-S1-001",
+  "task_id": "T91",
+  "principal": {
+    "kind": "provider",
+    "id": "org.ainative.provider.table-import"
+  },
+  "grants": [
+    {
+      "capability": "table.import",
+      "actions": ["read"],
+      "resources": ["artifact:A17"],
+      "constraints": {
+        "network": "denied",
+        "max_bytes": 50000000
+      }
+    },
+    {
+      "capability": "table.import",
+      "actions": ["create", "write"],
+      "resources": ["task-output:T91"],
+      "constraints": {
+        "task_local_only": true
+      }
+    }
+  ],
+  "issued_at": "2026-09-15T20:31:11Z",
+  "expires_at": "2026-09-15T20:36:11Z",
+  "approval": {
+    "approval_id": null,
+    "actor": null,
+    "reason": "Derived from user-selected input and low-impact task-local write policy."
+  },
+  "delegation": {
+    "delegable": false,
+    "max_depth": 0
+  },
+  "nonce": "fixture-only-not-a-real-token"
+}
