@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/validator-output.schema.json",
+  "title": "AIOS IR Validator Output Bundle",
+  "description": "Top-level output from the deterministic AIOS IR validator. Valid programs include a derived effect summary; invalid programs do not.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "validation", "effect_summary"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "validation": {
+      "$ref": "https://ai-native-os.example/specs/ir-validation-result.schema.json"
+    },
+    "effect_summary": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "https://ai-native-os.example/specs/effect-summary.schema.json"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {"valid": {"const": true}},
+            "required": ["valid"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effect_summary": {
+            "$ref": "https://ai-native-os.example/specs/effect-summary.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {"valid": {"const": false}},
+            "required": ["valid"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effect_summary": {"type": "null"}
+        }
+      }
+    }
+  ]
+}
