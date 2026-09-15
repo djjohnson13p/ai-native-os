@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/authority-evaluation-request.schema.json",
+  "title": "AIOS v0.1 Runtime Authority Evaluation Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "task_id",
+    "semantic_program_hash",
+    "registry_snapshot_id",
+    "node_id",
+    "capability",
+    "principal",
+    "action",
+    "resource",
+    "execution_binding_id",
+    "requested_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "registry_snapshot_id": {"type": "string", "maxLength": 256},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["agent", "provider", "legacy-app", "system-service", "peer-node"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": ["string", "null"], "maxLength": 128},
+        "package_or_build_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "action": {"type": "string", "pattern": "^[a-z][a-z0-9_.:-]*$", "maxLength": 128},
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic_selector", "resolved_kind", "resolved_id"],
+      "properties": {
+        "semantic_selector": {"type": "string", "minLength": 1, "maxLength": 512},
+        "resolved_kind": {
+          "type": "string",
+          "enum": ["artifact", "object", "output-allocation", "service", "credential", "device", "system-resource", "external-destination"]
+        },
+        "resolved_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "sensitivity": {"type": ["string", "null"], "enum": [null, "public", "local", "private", "confidential", "secret"]},
+        "owner_or_scope_ref": {"type": ["string", "null"], "maxLength": 512}
+      }
+    },
+    "execution_binding_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "attempt_id": {"type": ["string", "null"], "maxLength": 256},
+    "effect_classes": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "enum": ["PURE", "ARTIFACT_READ", "ARTIFACT_WRITE", "NETWORK", "DATA_EGRESS", "EXTERNAL_MESSAGE", "SECRET_ACCESS", "PERSISTENT_STATE", "DEVICE_ACCESS", "SYSTEM_CHANGE", "LEGACY_OPAQUE"]
+      }
+    },
+    "egress": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["destination_class", "service_id", "data_refs"],
+      "properties": {
+        "destination_class": {"type": "string", "minLength": 1, "maxLength": 128},
+        "service_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "data_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "maxLength": 1024}
+        },
+        "purpose": {"type": ["string", "null"], "maxLength": 1024}
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expires_after_seconds": {"type": ["integer", "null"], "minimum": 1, "maximum": 86400},
+        "max_uses": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},
+        "max_cost_microusd": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "requested_at": {"type": "string", "format": "date-time"}
+  }
+}
