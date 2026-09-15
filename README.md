@@ -40,7 +40,7 @@ Deterministic policy + capability/resource brokers
     ↓
 Execution binding
     ↓
-Deterministic providers · AI models · containers · VMs · legacy software
+Deterministic providers · AI models · compiled Skills · containers · VMs · legacy software
     ↓
 Deterministic Linux-based system foundation
 ```
@@ -62,9 +62,9 @@ Window/View  = presentation of an object, not its lifetime
 
 ## AI-native computational model
 
-The project now explicitly separates the language used to **implement** the operating environment from the language/representation used to describe **what an AI-native computer should do**.
+The project explicitly separates the language used to **implement** the operating environment from the language/representation used to describe **what an AI-native computer should do**.
 
-Bootstrap implementation can use mature tools such as Rust, Python, C/C++, Linux APIs, existing compatibility projects, and later WASM. Those are implementation mechanisms, not the semantic identity of the OS.
+Bootstrap implementation can use mature tools such as Rust, Python, C/C++, Linux APIs, existing compatibility projects, and WASM. Those are implementation mechanisms, not the semantic identity of the OS.
 
 The project is defining **AIOS IR**, a provider-independent typed semantic graph with first-class concepts for:
 
@@ -78,7 +78,7 @@ verification
 resource/locality constraints
 bounded failure/fallback
 provenance
-skill compilation
+Skill compilation
 ```
 
 AIOS IR never grants itself authority. Provider identities, capability grants, sandbox instances, and hardware placement are bound only after deterministic validation and policy evaluation.
@@ -88,6 +88,22 @@ The design principle is:
 > **Own the semantics before owning the syntax.**
 
 A new human-facing/general-purpose language may emerge later if real measurements show that it improves correctness, AI generation reliability, optimization, security, or efficiency. The project will not build one merely for novelty.
+
+## Bootstrap language boundary
+
+Current proposed roles:
+
+```text
+Rust     → trusted control-plane core
+Python   → rapid model/provider/data experimentation
+C/C++    → bounded bridge to mature native ecosystems
+WASM     → portable provider / compiled-Skill target candidate
+Shell    → build/dev/maintenance glue, not runtime escape hatch
+```
+
+The stable architecture lives above those choices in AIOS IR, semantic contracts, task/artifact/authority/provenance contracts, and language-neutral execution bindings.
+
+The long-term objective is not “write the OS in Rust.” It is “use mature tooling until measurements justify owning a deeper compiler/runtime.”
 
 ## Semantic contract model
 
@@ -107,6 +123,28 @@ Semantic types are also separated from physical representation, so `data.table@1
 
 This gives the Resource/Capability Brokers room to adapt execution to available hardware without changing task meaning.
 
+## Adaptive compilation model
+
+Stable repeated work may progressively move from expensive reasoning to reusable validated computation:
+
+```text
+fresh intent
+   ↓
+model-assisted plan
+   ↓
+validated AIOS IR
+   ↓ repeated success
+parameterized Skill
+   ↓
+compiled deterministic subgraphs
+   ↓
+WASM / native / provider-pipeline / query / accelerator targets
+```
+
+Compiled targets contain computation, **not reusable authority**. Every invocation gets fresh policy evaluation and execution binding.
+
+The benchmark plan explicitly compares fresh planning, IR reuse, Skill reuse, and compiled execution before the project claims efficiency gains.
+
 ## Repository map
 
 ### Foundation
@@ -124,12 +162,12 @@ This gives the Resource/Capability Brokers room to adapt execution to available 
 - [`docs/10-hardware-adaptation.md`](docs/10-hardware-adaptation.md) — installation and graceful degradation
 - [`docs/11-v0.1-prototype.md`](docs/11-v0.1-prototype.md) — narrow proof-of-concept target
 - [`docs/12-roadmap.md`](docs/12-roadmap.md) — staged development roadmap
-- [`docs/13-open-questions.md`](docs/13-open-questions.md) — decisions intentionally left open
+- [`docs/13-open-questions.md`](docs/13-open-questions.md) — current open/narrowed/proposed decision status
 
 ### Architecture hardening
 
 - [`docs/14-terminology.md`](docs/14-terminology.md) — canonical vocabulary and core abstractions
-- [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — rules that should survive implementation changes
+- [`docs/15-system-invariants.md`](docs/15-system-invariants.md) — 25 architecture invariants that implementation must preserve
 - [`docs/16-requirements.md`](docs/16-requirements.md) — testable architecture requirements with stable IDs
 - [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md) — acceptance, IR, recovery, compatibility, and adversarial test plan
 - [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md) — implementation dependency graph and Codex-readiness criteria
@@ -139,16 +177,22 @@ This gives the Resource/Capability Brokers room to adapt execution to available 
 - [`docs/22-end-to-end-reference-flow.md`](docs/22-end-to-end-reference-flow.md) — complete Demonstration A flow through planning, policy, execution, verification, and learning
 - [`docs/23-task-shell-ux.md`](docs/23-task-shell-ux.md) — task-first interaction, approval, progress, artifact, and compatibility-launch behavior
 - [`docs/24-task-state-machine.md`](docs/24-task-state-machine.md) — deterministic persisted lifecycle, recovery, cancellation, verification, and rollback states
+- [`docs/34-task-ir-lifecycle.md`](docs/34-task-ir-lifecycle.md) — relationship between durable Task identity, planner revisions, validated semantic programs, and execution bindings
+- [`docs/35-v0.1-persistence-model.md`](docs/35-v0.1-persistence-model.md) — proposed SQLite control-plane durability/transaction/recovery model
 
 ### AI-native language / execution semantics
 
 - [`docs/23-ai-native-language-and-ir.md`](docs/23-ai-native-language-and-ir.md) — why the project owns AI-native semantics before inventing a new general-purpose language
 - [`docs/25-aios-ir-semantics.md`](docs/25-aios-ir-semantics.md) — formal semantic graph model
 - [`docs/26-aios-ir-validation-and-lowering.md`](docs/26-aios-ir-validation-and-lowering.md) — deterministic validation, runtime binding, and lowering pipeline
-- [`docs/27-skill-compilation-and-adaptive-optimization.md`](docs/27-skill-compilation-and-adaptive-optimization.md) — reason-once/compile/reuse lifecycle and benchmarks
+- [`docs/27-skill-compilation-and-adaptive-optimization.md`](docs/27-skill-compilation-and-adaptive-optimization.md) — reason-once/compile/reuse lifecycle
 - [`docs/28-capability-contracts-and-conformance.md`](docs/28-capability-contracts-and-conformance.md) — provider-independent capability semantics and provider conformance
 - [`docs/29-semantic-type-system.md`](docs/29-semantic-type-system.md) — semantic types vs physical representations and explicit conversion rules
 - [`docs/30-aios-ir-reference-validator-plan.md`](docs/30-aios-ir-reference-validator-plan.md) — bounded Rust validator implementation plan for the first Codex spike
+- [`docs/31-semantic-registry-snapshots.md`](docs/31-semantic-registry-snapshots.md) — immutable/content-addressed semantic meaning used for reproducible validation
+- [`docs/32-aios-ir-and-skill-benchmark-plan.md`](docs/32-aios-ir-and-skill-benchmark-plan.md) — M0–M4 efficiency/correctness benchmark framework
+- [`docs/33-bootstrap-language-boundary.md`](docs/33-bootstrap-language-boundary.md) — existing-language bootstrap and evidence threshold for deeper custom language/runtime work
+- [`docs/36-aios-ir-compiler-and-lowering-boundary.md`](docs/36-aios-ir-compiler-and-lowering-boundary.md) — how validated deterministic subgraphs may lower to efficient targets without carrying authority
 
 ### Research
 
@@ -161,10 +205,11 @@ This gives the Resource/Capability Brokers room to adapt execution to available 
 
 ### Decisions and machine-readable contracts
 
-- [`docs/adr/`](docs/adr/) — accepted/proposed architecture decision records, including AIOS IR/type/capability decisions
-- [`specs/README.md`](specs/README.md) — contract principles, semantic layers, and versioning rules
-- [`specs/`](specs/) — task, AIOS IR, semantic capability/type, hardware, artifact, authority, provenance, execution-binding/isolation, Skill, model, policy, and compatibility contracts
-- [`examples/aios-ir/`](examples/aios-ir/) — Demonstration A IR plus valid/invalid semantic fixtures and registry contracts
+- [`docs/adr/`](docs/adr/) — architecture decisions, including AIOS IR, semantic contracts, bootstrap-language, validator, and compiled-authority boundaries
+- [`specs/README.md`](specs/README.md) — contract principles, semantic layers, registry snapshots, and versioning rules
+- [`specs/`](specs/) — task, AIOS IR, validation, semantic registry/type/capability, hardware, artifact, authority, provenance, execution-binding/isolation, compiled target, Skill, model, policy, compatibility, and persistence contracts
+- [`specs/persistence-v0.1.sql`](specs/persistence-v0.1.sql) — draft SQLite schema for task/program/binding/artifact/policy/provenance recovery
+- [`examples/aios-ir/`](examples/aios-ir/) — Demonstration A IR, semantic registries, validation/binding/Skill examples, and positive/adversarial fixtures
 - [`examples/reference-task/`](examples/reference-task/) — broader Demonstration A/B control-plane fixtures
 - [`prototypes/README.md`](prototypes/README.md) — implementation boundaries for the first prototype
 
@@ -172,7 +217,7 @@ This gives the Resource/Capability Brokers room to adapt execution to available 
 
 GitHub Issues contain bounded v0.1 workstreams with acceptance criteria. The implementation dependency order is documented in [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md).
 
-Issue #17 is now the proposed first major semantic-boundary implementation spike: deterministic AIOS IR parsing/validation/normalization/hashing without a model planner.
+Issue #17 is the proposed first major semantic-boundary implementation spike: deterministic AIOS IR parsing/validation/normalization/hashing without a model planner.
 
 ## v0.1 success criterion
 
@@ -211,4 +256,4 @@ That is intentionally much narrower than “build a universal operating system.�
 
 **Architecture and pre-implementation hardening. No implementation claim is made yet.**
 
-The immediate work is to make the semantic/contracts boundary precise enough that implementation can be divided into bounded workstreams without allowing convenience decisions to silently redefine the system.
+The immediate work is to make the semantic/contracts boundary precise enough that the first implementation tasks are constrained engineering problems rather than opportunities for implementation convenience to redefine the OS.
