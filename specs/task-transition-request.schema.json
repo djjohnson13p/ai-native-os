@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/task-transition-request.schema.json",
+  "title": "AIOS v0.1 Task Transition Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "transition_id",
+    "task_id",
+    "expected_revision",
+    "expected_state",
+    "to_state",
+    "requested_by",
+    "reason"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "transition_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "expected_revision": {"type": "integer", "minimum": 1},
+    "expected_state": {"$ref": "#/$defs/taskState"},
+    "to_state": {"$ref": "#/$defs/taskState"},
+    "requested_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["user", "agent", "provider", "system-service", "policy-engine", "peer-node"]
+        },
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
+        "message": {"type": ["string", "null"], "maxLength": 2048},
+        "related_ids": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {"type": "string", "maxLength": 512}
+        }
+      }
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "active_plan": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["plan_id", "revision"],
+          "properties": {
+            "plan_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "revision": {"type": "integer", "minimum": 1}
+          }
+        },
+        "active_step_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 512,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
+        "waiting_on": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id"],
+            "properties": {
+              "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider"]},
+              "id": {"type": "string", "minLength": 1, "maxLength": 256},
+              "message": {"type": ["string", "null"], "maxLength": 2048}
+            }
+          }
+        },
+        "failure": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "code": {"type": "string", "minLength": 1, "maxLength": 128},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "step_id": {"type": ["string", "null"], "maxLength": 128},
+            "provider_id": {"type": ["string", "null"], "maxLength": 256},
+            "retryable": {"type": "boolean"},
+            "safe_to_replan": {"type": "boolean"},
+            "unknown_side_effects": {"type": "boolean"},
+            "rollback_available": {"type": "boolean"},
+            "provenance_event_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 64,
+              "items": {"type": "string", "maxLength": 256}
+            }
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unknown_operation_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 128,
+              "items": {"type": "string", "maxLength": 256}
+            },
+            "last_known_daemon_instance": {"type": ["string", "null"], "maxLength": 256}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "taskState": {
+      "type": "string",
+      "enum": [
+        "CREATED",
+        "PLANNING",
+        "WAITING_FOR_INPUT",
+        "WAITING_FOR_AUTH",
+        "RUNNABLE",
+        "RUNNING",
+        "VERIFYING",
+        "PAUSED",
+        "RECOVERING",
+        "ROLLING_BACK",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "ROLLED_BACK"
+      ]
+    }
+  }
+}
