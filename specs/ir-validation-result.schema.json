@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/ir-validation-result.schema.json",
+  "title": "AIOS IR Validation Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "valid",
+    "ir_version",
+    "program_id",
+    "validator",
+    "registry_snapshot_id",
+    "diagnostics",
+    "validated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "valid": {
+      "type": "boolean"
+    },
+    "ir_version": {
+      "type": ["string", "null"]
+    },
+    "program_id": {
+      "type": ["string", "null"]
+    },
+    "semantic_hash": {
+      "type": ["string", "null"],
+      "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
+    },
+    "validator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "build_hash": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        }
+      }
+    },
+    "registry_snapshot_id": {
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "validated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"valid": {"const": true}},
+        "required": ["valid"]
+      },
+      "then": {
+        "required": ["semantic_hash"],
+        "properties": {
+          "semantic_hash": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
+          },
+          "registry_snapshot_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"valid": {"const": false}},
+        "required": ["valid"]
+      },
+      "then": {
+        "properties": {
+          "semantic_hash": {"type": "null"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "code", "message"],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning"]
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^IR_[A-Z0-9_]+$"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "node_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "port": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "capability": {
+          "type": ["string", "null"],
+          "maxLength": 160
+        },
+        "json_pointer": {
+          "type": ["string", "null"],
+          "maxLength": 1024
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        }
+      }
+    }
+  }
+}
