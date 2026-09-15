@@ -17,27 +17,39 @@
   },
   "provides": [
     {
-      "capability": "chart.render",
-      "version": "0.1",
-      "input_types": ["table/normalized", "analysis/findings"],
-      "output_types": ["image/png"],
-      "side_effects": ["read", "write"],
+      "contract": {
+        "capability": "chart.render",
+        "version": "1.0",
+        "contract_hash": null,
+        "contract_source": "../aios-ir/capability-contracts.json"
+      },
+      "conformance": {
+        "suite": "conformance://chart.render/1",
+        "suite_hash": null,
+        "status": "declared",
+        "tested_at": null,
+        "test_environment": null
+      },
+      "side_effects": ["artifact_write"],
       "execution": {
         "locality": ["local"],
-        "determinism": "deterministic",
+        "execution_class": "deterministic",
         "minimum_isolation": "P2",
         "network_default": "none"
       },
       "authority": {
-        "actions": ["read", "create", "write"],
-        "resource_classes": ["artifact", "task-output"]
+        "actions": ["artifact.write"],
+        "resource_classes": ["task-output"]
+      },
+      "representations": {
+        "metrics": ["canonical-json"],
+        "chart": ["svg", "png"]
       },
       "resource_requirements": {
         "min_memory_bytes": 268435456,
         "preferred_accelerators": [],
         "requires_gpu": false
-      },
-      "conformance_suite": "chart.render/0.1"
+      }
     }
   ],
   "trust": {
