@@ -1,0 +1,33 @@
+{
+  "schema_version": "0.1",
+  "request_id": "AR-T91-import-table-read",
+  "task_id": "T91",
+  "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "node_id": "import_table",
+  "capability": "table.import@1",
+  "principal": {
+    "kind": "provider",
+    "id": "org.ainative.provider.table-import",
+    "version": "0.1.0",
+    "package_or_build_hash": null
+  },
+  "action": "artifact.read",
+  "resource": {
+    "semantic_selector": "input:source",
+    "resolved_kind": "artifact",
+    "resolved_id": "artifact://A17",
+    "sensitivity": "private",
+    "owner_or_scope_ref": "task://T91"
+  },
+  "execution_binding_id": "XB-T91-import-table-1",
+  "attempt_id": "ATT-T91-import-table-1",
+  "effect_classes": ["ARTIFACT_READ"],
+  "egress": null,
+  "constraints": {
+    "expires_after_seconds": 300,
+    "max_uses": 1,
+    "max_cost_microusd": null
+  },
+  "requested_at": "2026-09-15T20:31:00Z"
+}
