@@ -16,8 +16,26 @@ Build an open AI-native computing platform where human intent becomes typed, ins
 6. **Verification survives optimization.** Provider substitution, compilation, caching, or Skill reuse may not silently remove required verification.
 7. **Stable identity survives placement/presentation/storage changes.** Task/Object/Artifact/semantic-program identity is separate from GUI View, device, path, replica, cloud region, or network endpoint.
 8. **Signed does not mean safe.** Package/provider signatures establish provenance/integrity evidence, not semantic conformance or runtime authority.
-9. **Do not silently change architecture contracts to make implementation easier.** If a contract is unimplementable, stop at that boundary and propose an ADR/schema/fixture change.
-10. **Stage discipline matters.** Do not build broad GUI/cloud/network/domain suites to solve a trusted-core issue.
+9. **Execution Bindings are immutable attempt receipts.** Retry, provider substitution, changed placement, or changed authority creates a new attempt/binding rather than rewriting history.
+10. **Authorize credential use, not secret possession.** Long-lived secret material stays behind the Credential Broker whenever the ecosystem permits mediation.
+11. **Unknown outcome stays unknown.** Do not convert uncertain irreversible/opaque effects into ordinary retryable failure without deterministic reconciliation evidence.
+12. **Do not silently change architecture contracts to make implementation easier.** If a contract is unimplementable, stop at that boundary and propose an ADR/schema/fixture change.
+13. **Stage discipline matters.** Do not build broad GUI/cloud/network/domain suites to solve a trusted-core issue.
+
+## Current project stage
+
+Stage 0 architecture is **closed enough for bounded trusted-core implementation**, not globally stable.
+
+Read:
+
+- `docs/81-stage0-architecture-closure-audit.md`
+- `specs/contract-maturity.json`
+
+`SPIKE_READY` means a bounded prototype may rely on the contract under change-control rules. It does **not** mean third-party compatibility is frozen.
+
+The first implementation task remains **Issue #17**.
+
+After #17, follow `docs/82-stage1-core-substrate-codex-runbook.md`; do not jump directly to planner/model/GUI/cloud work.
 
 ## Read before changing code/contracts
 
@@ -32,6 +50,7 @@ Core constitution:
 - `docs/59-pre-codex-foundation-closure-plan.md`
 - `docs/64-requirements-traceability-matrix.md`
 - `docs/65-contract-maturity-and-architecture-change-control.md`
+- `docs/81-stage0-architecture-closure-audit.md`
 
 Architecture decisions:
 
@@ -40,25 +59,65 @@ Architecture decisions:
 Machine contracts:
 
 - `specs/README.md`
-- relevant schema(s) in `specs/`
+- `specs/contract-maturity.json`
+- relevant schema(s)/reason-code registries in `specs/`
 
 Executable/test fixtures:
 
 - `examples/aios-ir/`
+- `examples/task-manager/`
+- `examples/artifact-store/`
+- `examples/provenance/`
+- `examples/registry-lifecycle/`
+- `examples/authority/`
+- `examples/credentials/`
+- `examples/provider-runtime/`
+- `examples/recovery/`
 - `examples/reference-task/`
 - `examples/domain-fabric/`
 - `examples/platform-fabric/`
 
-Issue #17 / validator work additionally requires:
+## Issue #17 / validator work
+
+Additionally read:
 
 - `docs/25-aios-ir-semantics.md`
 - `docs/26-aios-ir-validation-and-lowering.md`
+- `docs/28-capability-contracts-and-conformance.md`
+- `docs/29-semantic-type-system.md`
 - `docs/30-aios-ir-reference-validator-plan.md`
 - `docs/31-semantic-registry-snapshots.md`
 - `docs/39-static-effect-and-authority-analysis.md`
 - `docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md`
 - `docs/61-validator-test-fuzz-and-resource-limit-matrix.md`
 - `docs/62-first-codex-session-runbook.md`
+- `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md`
+- `docs/67-v0.1-semantic-reference-and-version-resolution.md`
+- `docs/68-aios-ir-v0.1-edge-case-semantics.md`
+- `docs/69-v0.1-capability-effect-and-authority-contract-profile.md`
+- `docs/70-validator-and-registry-reason-code-catalog.md`
+- `docs/71-validator-spike-readiness-checklist.md`
+- `docs/72-v0.1-semantic-contract-and-registry-hash-profile.md`
+
+## Stage-1 deterministic core work
+
+For post-validator work, start with:
+
+- `docs/73-v0.1-provenance-journal-and-hash-chain.md`
+- `docs/74-v0.1-task-manager-transition-and-cas-contract.md`
+- `docs/75-v0.1-artifact-store-content-identity-and-publication.md`
+- `docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md`
+- `docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md`
+- `docs/78-v0.1-execution-binding-and-provider-supervisor.md`
+- `docs/79-v0.1-credential-broker-and-secret-mediation.md`
+- `docs/80-v0.1-crash-consistency-recovery-and-commit-protocol.md`
+- `docs/82-stage1-core-substrate-codex-runbook.md`
+
+## Independent architecture review
+
+`docs/83-pre-implementation-red-team-and-astra-review-packet.md` is the adversarial review packet.
+
+A reviewer should try to falsify the architecture rather than continue it. Do not treat a positive review as a substitute for tests.
 
 ## Contract-change rule
 
@@ -66,11 +125,12 @@ If you modify a security/semantic contract:
 
 1. explain why the existing contract fails;
 2. update the relevant ADR/design document;
-3. update requirement/traceability entries when affected;
+3. update requirement/traceability/maturity entries when affected;
 4. update schema(s);
 5. update positive + negative fixtures;
 6. update acceptance tests/reason codes where applicable;
-7. call out compatibility/migration impact.
+7. update persistence mapping if the durable shape changes;
+8. call out compatibility/migration impact.
 
 Follow `docs/65-contract-maturity-and-architecture-change-control.md` for maturity/version/change rules.
 
@@ -82,15 +142,19 @@ Trusted-core code should prefer strongly typed data and explicit enums over gene
 
 Untrusted/provider/model/legacy execution must stay behind bounded process/component/container/VM interfaces appropriate to the issue.
 
-Avoid arbitrary `eval`, shell execution, dynamic code loading, unrestricted host paths, unrestricted sockets, environment-secret inheritance, or blanket user permissions in core runtime paths.
+Avoid arbitrary `eval`, shell execution, dynamic code loading, unrestricted host paths, unrestricted sockets, environment-secret inheritance, raw credential propagation, or blanket user permissions in core runtime paths.
+
+Providers never open the control-plane database directly.
 
 ## Testing expectations
 
 For any implementation task, run every repository-defined formatter/linter/unit/fixture/integration check that applies after changes.
 
-Security-sensitive code should include negative/adversarial tests, not success-path tests only.
+Security-sensitive code must include negative/adversarial tests, not success-path tests only.
 
 For parser/validator code, include malformed/random-input robustness and resource-limit tests; no hostile input should panic the validator.
+
+For persistence/Artifact/provider/authority work, include crash/response-loss/idempotency/revocation tests relevant to the contract.
 
 If exact build/test commands are not yet present in the repository, do not invent architecture by choosing a permanent toolchain convention without documenting the decision.
 
@@ -99,16 +163,24 @@ If exact build/test commands are not yet present in the repository, do not inven
 A PR/task completion summary should state:
 
 - issue addressed;
+- roadmap stage;
 - architecture docs/contracts followed;
 - invariants preserved or intentionally changed;
 - files/modules changed;
 - tests/checks run and results;
+- network/model/provider/secret behavior exercised;
 - known limitations/non-goals;
 - any contract/ADR follow-up required.
 
 ## Secrets and personal data
 
-Never commit credentials, tokens, private keys, passwords, real personal documents, production provider responses, or user-private datasets. Use synthetic fixtures.
+Never commit credentials, bearer tokens, private keys, passwords, refresh tokens, session cookies, real personal documents, production provider responses, or user-private datasets. Use synthetic fixtures.
+
+Never place raw secret material into AIOS IR, Task records, provenance, provider manifests, normal logs, or ordinary fixture JSON.
+
+## Governance / licensing
+
+Until a final project license is selected, treat `docs/84-open-source-license-and-governance-decision-framework.md` as decision scaffolding only. Do not add or imply a final license without an explicit project-owner decision.
 
 ## Governing principle
 
