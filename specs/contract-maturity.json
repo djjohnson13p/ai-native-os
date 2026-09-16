@@ -1,0 +1,183 @@
+{
+  "schema_version": "0.1",
+  "generated_for": "stage-0-pre-implementation",
+  "updated_at": "2026-09-15T17:30:00-07:00",
+  "entries": [
+    {
+      "id": "aios-ir-validator-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "AIOS IR semantic validator/canonicalizer/effect analysis",
+      "issue": 17,
+      "artifacts": ["specs/aios-ir.schema.json", "specs/ir-validation-result.schema.json", "specs/effect-summary.schema.json", "specs/registry-snapshot.schema.json"],
+      "controlling_adrs": ["ADR-0011", "ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015", "ADR-0029", "ADR-0030", "ADR-0031", "ADR-0032", "ADR-0033", "ADR-0034"],
+      "fixture_paths": ["examples/aios-ir/"],
+      "blocking_questions": [],
+      "notes": "First serious Codex implementation target. Real hashes/workspace/tests are intentionally implementation work."
+    },
+    {
+      "id": "task-manager-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Persisted Task state/CAS/idempotent transitions",
+      "issue": 1,
+      "artifacts": ["specs/task-record.schema.json", "specs/task-transition-request.schema.json", "specs/task-transition-result.schema.json", "specs/task-reason-codes.json", "docs/74-v0.1-task-manager-transition-and-cas-contract.md"],
+      "controlling_adrs": ["ADR-0007", "ADR-0035", "ADR-0036", "ADR-0042"],
+      "fixture_paths": ["examples/task-manager/"],
+      "blocking_questions": [],
+      "notes": "Implement after validator; Task transitions must commit with material provenance."
+    },
+    {
+      "id": "artifact-store-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Artifact handles/content identity/output allocation/publication",
+      "issue": 4,
+      "artifacts": ["specs/artifact-handle.schema.json", "specs/artifact-output-allocation.schema.json", "specs/artifact-publication-request.schema.json", "specs/artifact-publication-result.schema.json", "specs/artifact-reason-codes.json", "docs/75-v0.1-artifact-store-content-identity-and-publication.md"],
+      "controlling_adrs": ["ADR-0037", "ADR-0042"],
+      "fixture_paths": ["examples/artifact-store/"],
+      "blocking_questions": [],
+      "notes": "Published Artifacts are immutable; staging/blob/metadata crash cases are specified."
+    },
+    {
+      "id": "provenance-journal-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Append-only Task provenance/hash-chain",
+      "issue": 5,
+      "artifacts": ["specs/provenance-event.schema.json", "specs/provenance-checkpoint.schema.json", "specs/provenance-reason-codes.json", "docs/73-v0.1-provenance-journal-and-hash-chain.md"],
+      "controlling_adrs": ["ADR-0035", "ADR-0042"],
+      "fixture_paths": ["examples/provenance/"],
+      "blocking_questions": [],
+      "notes": "Tamper-evident local journal, not tamper-proof against a privileged full-store rewrite."
+    },
+    {
+      "id": "semantic-provider-registry-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Semantic registry snapshots and provider registration/conformance",
+      "issue": 2,
+      "artifacts": ["specs/capability-contract.schema.json", "specs/type-contract.schema.json", "specs/registry-snapshot.schema.json", "specs/provider-registration.schema.json", "specs/provider-conformance-evidence.schema.json", "docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md"],
+      "controlling_adrs": ["ADR-0013", "ADR-0034", "ADR-0038"],
+      "fixture_paths": ["examples/aios-ir/", "examples/registry-lifecycle/"],
+      "blocking_questions": [],
+      "notes": "Semantic meaning registry remains separate from implementation/provider availability."
+    },
+    {
+      "id": "authority-coordinator-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Deterministic policy, approval, scoped runtime grant lifecycle",
+      "issue": 3,
+      "artifacts": ["specs/authority-evaluation-request.schema.json", "specs/policy-decision.schema.json", "specs/policy-snapshot.schema.json", "specs/approval-request.schema.json", "specs/approval-decision.schema.json", "specs/authority-grant-record.schema.json", "specs/capability-token.schema.json", "specs/authority-reason-codes.json", "docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md"],
+      "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039"],
+      "fixture_paths": ["examples/authority/", "examples/reference-task/policy-local-read.json"],
+      "blocking_questions": [],
+      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency."
+    },
+    {
+      "id": "credential-broker-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Opaque credential handles and mediated secret use",
+      "issue": 28,
+      "artifacts": ["specs/credential-handle.schema.json", "specs/credential-use-request.schema.json", "specs/credential-use-result.schema.json", "specs/credential-reason-codes.json", "docs/79-v0.1-credential-broker-and-secret-mediation.md"],
+      "controlling_adrs": ["ADR-0026", "ADR-0039", "ADR-0041"],
+      "fixture_paths": ["examples/credentials/"],
+      "blocking_questions": [],
+      "notes": "Backend-specific OS/HSM/secret-manager adapters remain implementation/future platform work."
+    },
+    {
+      "id": "provider-supervisor-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Immutable Execution Binding and bounded provider invocation",
+      "issue": null,
+      "artifacts": ["specs/execution-binding.schema.json", "specs/execution-profile.schema.json", "specs/provider-invocation-request.schema.json", "specs/provider-invocation-result.schema.json", "specs/provider-runtime-reason-codes.json", "docs/78-v0.1-execution-binding-and-provider-supervisor.md"],
+      "controlling_adrs": ["ADR-0020", "ADR-0039", "ADR-0040", "ADR-0042"],
+      "fixture_paths": ["examples/provider-runtime/"],
+      "blocking_questions": [],
+      "notes": "Implementation should initially use one deterministic local fixture provider, not a general distributed runtime."
+    },
+    {
+      "id": "crash-recovery-v0.1",
+      "maturity": "SPIKE_READY",
+      "workstream": "Crash consistency/outcome certainty/reconciliation",
+      "issue": 11,
+      "artifacts": ["specs/recovery-assessment.schema.json", "specs/recovery-reason-codes.json", "docs/80-v0.1-crash-consistency-recovery-and-commit-protocol.md"],
+      "controlling_adrs": ["ADR-0035", "ADR-0036", "ADR-0037", "ADR-0040", "ADR-0042"],
+      "fixture_paths": ["examples/recovery/"],
+      "blocking_questions": [],
+      "notes": "System preserves OUTCOME_UNKNOWN rather than universal exactly-once claims."
+    },
+    {
+      "id": "resource-personal-compute-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Hardware/resource placement and Personal Compute Fabric",
+      "issue": 20,
+      "artifacts": ["specs/hardware-profile.schema.json", "specs/resource-snapshot.schema.json", "specs/placement-decision.schema.json", "docs/48-resource-placement-and-personal-compute-fabric.md"],
+      "controlling_adrs": ["ADR-0020"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Implementation scoring/measurement and peer-runtime evidence require later spikes."],
+      "notes": "Interface-shaped now; not v0.1 trusted-core prerequisite."
+    },
+    {
+      "id": "presentation-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Adaptive device/display Views and trusted approval presentation",
+      "issue": 22,
+      "artifacts": ["specs/display-profile.schema.json", "specs/view-contract.schema.json", "docs/50-adaptive-presentation-and-device-ui.md"],
+      "controlling_adrs": ["ADR-0021"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Concrete shell toolkit and View ABI wait until basic Task shell implementation."],
+      "notes": "Presentation must remain projection, not Task/Object identity."
+    },
+    {
+      "id": "network-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Service identity/bounded connectivity/transfers",
+      "issue": 23,
+      "artifacts": ["specs/network-service-descriptor.schema.json", "specs/network-transfer.schema.json", "docs/51-network-fabric-and-service-connectivity.md"],
+      "controlling_adrs": ["ADR-0022", "ADR-0026"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Concrete peer transport/session protocol is intentionally deferred."],
+      "notes": "Network access remains explicit authority."
+    },
+    {
+      "id": "cloud-edge-service-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Cloud/edge/self-hosted remote service adapters",
+      "issue": 24,
+      "artifacts": ["specs/remote-service-descriptor.schema.json", "docs/52-cloud-edge-and-service-fabric.md"],
+      "controlling_adrs": ["ADR-0023"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Remote worker protocol and production cloud adapters depend on Network/Resource Fabric implementation."],
+      "notes": "Cloud is optional infrastructure, never semantic authority."
+    },
+    {
+      "id": "storage-replica-namespace-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Storage replicas/sync/namespace projection",
+      "issue": 27,
+      "artifacts": ["specs/storage-replica.schema.json", "specs/namespace-projection.schema.json", "docs/55-storage-sync-and-replica-fabric.md", "docs/58-files-namespaces-and-semantic-projection.md"],
+      "controlling_adrs": ["ADR-0025", "ADR-0028"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Sync engine and distributed replica protocol intentionally deferred."],
+      "notes": "Paths/locations remain runtime projections."
+    },
+    {
+      "id": "universal-object-software-fabric",
+      "maturity": "DRAFT",
+      "workstream": "Universal Object Graph, Domain Packs, identity resolution",
+      "issue": 19,
+      "artifacts": ["specs/domain-pack.schema.json", "specs/semantic-object-contract.schema.json", "specs/object-record.schema.json", "specs/identity-resolution.schema.json", "docs/40-universal-software-fabric.md", "docs/44-tier0-universal-object-model.md"],
+      "controlling_adrs": ["ADR-0018", "ADR-0019", "ADR-0024"],
+      "fixture_paths": ["examples/domain-fabric/"],
+      "blocking_questions": ["Broad domain implementation waits until trusted core and first cross-domain stage."],
+      "notes": "Long-term path for replacing application silos with semantic capabilities/objects."
+    },
+    {
+      "id": "component-distribution-supply-chain",
+      "maturity": "DRAFT",
+      "workstream": "Signed/content-addressed component distribution and staged activation",
+      "issue": 29,
+      "artifacts": ["specs/component-package.schema.json", "docs/57-component-distribution-supply-chain-and-update-trust.md"],
+      "controlling_adrs": ["ADR-0027"],
+      "fixture_paths": ["examples/platform-fabric/"],
+      "blocking_questions": ["Activation/update implementation waits for component/provider runtime and base-image prototype."],
+      "notes": "Signatures establish integrity/publisher evidence, not runtime authority."
+    }
+  ]
+}
