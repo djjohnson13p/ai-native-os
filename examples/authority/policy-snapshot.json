@@ -1,0 +1,22 @@
+{
+  "schema_version": "0.1",
+  "snapshot_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "scope": {"kind": "user", "id": "principal://user/fixture"},
+  "policy_language": "builtin",
+  "policy_language_version": "0.1",
+  "policy_set_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "entity_schema_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "configuration_hash": null,
+  "engine": {
+    "id": "org.ainative.fixture-policy",
+    "version": "0.1.0",
+    "build_hash": null
+  },
+  "publisher_or_admin_ref": "principal://user/fixture",
+  "signature_ref": null,
+  "created_at": "2026-09-15T20:30:00Z",
+  "metadata": {
+    "fixture": true,
+    "note": "Synthetic policy identity only; hashes are placeholders until canonical snapshot tooling exists."
+  }
+}
