@@ -23,7 +23,9 @@
     {"id": "verify.numeric_claims", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000106", "source": "capability-contracts.json"},
     {"id": "document.compose", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000107", "source": "capability-contracts.json"},
     {"id": "artifact.hash", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000108", "source": "capability-contracts.json"},
-    {"id": "artifact.copy", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000109", "source": "capability-contracts.json"}
+    {"id": "artifact.copy", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000109", "source": "capability-contracts.json"},
+    {"id": "artifact.copy.compat", "version": "1.0", "content_hash": "sha256:000000000000000000000000000000000000000000000000000000000000010a", "source": "capability-contracts.json"},
+    {"id": "text.uppercase", "version": "1.0", "content_hash": "sha256:000000000000000000000000000000000000000000000000000000000000010b", "source": "capability-contracts.json"}
   ],
   "created_at": "2026-09-15T00:00:00Z",
   "publisher": null,
