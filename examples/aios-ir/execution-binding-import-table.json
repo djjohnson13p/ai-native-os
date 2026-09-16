@@ -1,7 +1,10 @@
 {
+  "schema_version": "0.1",
   "binding_id": "binding-demo-import-table-attempt-1",
+  "attempt_id": "attempt-demo-import-table-1",
   "task_id": "task-demo-001",
-  "program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "ir_version": "0.1",
   "node_id": "import_table",
   "capability": "table.import@1",
@@ -10,20 +13,24 @@
     "id": "org.ainative.provider.table-import",
     "version": "0.1.0",
     "manifest_hash": null,
+    "package_or_build_hash": null,
     "conformance_status": "declared"
   },
   "inputs": {
     "source": {
+      "semantic_type": "artifact.table@1",
       "artifact_or_value_ref": "artifact://task/task-demo-001/input/source",
-      "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      "content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "revision": null
     }
   },
   "outputs": {
     "table": {
-      "allocation_ref": "artifact://task/task-demo-001/intermediate/import_table/table"
+      "semantic_type": "data.table@1",
+      "allocation_ref": "allocation://task/task-demo-001/import_table/table"
     }
   },
-  "policy_decision_id": "policy-decision-demo-import-table",
+  "policy_decision_refs": ["policy-decision-demo-import-table"],
   "authority": {
     "grant_refs": ["grant://task/task-demo-001/artifact-read-source"],
     "expires_at": "2026-09-15T01:00:00Z"
@@ -34,8 +41,10 @@
   },
   "placement": {
     "locality": "local",
+    "placement_decision_id": null,
     "hardware_profile_ref": "hardware://local/demo-laptop",
     "device_class": "ordinary-laptop",
+    "service_id": null,
     "remote_endpoint_class": null
   },
   "model_descriptor_ref": null,
