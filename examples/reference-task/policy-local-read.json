@@ -1,32 +1,41 @@
 {
+  "schema_version": "0.1",
   "decision_id": "PD-T91-S1-READ",
+  "authority_request_id": "AR-T91-import-table-read",
   "task_id": "T91",
+  "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "node_id": "import_table",
+  "capability": "table.import@1",
   "principal": {
     "kind": "provider",
-    "id": "org.ainative.provider.table-import"
+    "id": "org.ainative.provider.table-import",
+    "version": "0.1.0",
+    "package_or_build_hash": null
   },
-  "request": {
-    "capability": "table.import",
-    "actions": ["read"],
-    "resources": ["artifact:A17"],
-    "constraints": {
-      "network": "denied",
-      "task_local_only": true
-    },
-    "impact_level": 0
+  "action": "artifact.read",
+  "resource": {
+    "resolved_kind": "artifact",
+    "resolved_id": "artifact://A17",
+    "semantic_selector": "input:source",
+    "sensitivity": "private"
   },
-  "decision": "allow",
+  "decision": "ALLOW",
   "effective_scope": {
-    "actions": ["read"],
-    "resources": ["artifact:A17"],
-    "constraints": {
-      "network": "denied",
-      "task_local_only": true
-    }
+    "action": "artifact.read",
+    "resource_kind": "artifact",
+    "resource_id": "artifact://A17",
+    "expires_after_seconds": 300,
+    "max_uses": 1,
+    "max_cost_microusd": null
   },
-  "reason_codes": ["USER_SELECTED_INPUT", "LOCAL_PROVIDER", "LOW_IMPACT_READ"],
-  "human_explanation": "Allow the table-import provider to read only the spreadsheet selected for this task.",
+  "reason_codes": ["AUTH_ALLOW"],
   "approval_request_id": null,
-  "policy_version": "fixture-policy-0.1",
+  "policy_snapshot_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "engine": {
+    "id": "org.ainative.fixture-policy",
+    "version": "0.1.0"
+  },
+  "human_explanation": "Allow this provider to read only the spreadsheet selected for this task, once, without granting any other filesystem authority.",
   "decided_at": "2026-09-15T20:31:10Z"
 }
