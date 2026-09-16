@@ -1,0 +1,22 @@
+{
+  "schema_version": "0.1",
+  "namespace": "PROVIDER",
+  "profile": "provider-conformance-v0.1",
+  "codes": [
+    {"code": "PROVIDER_CONTRACT_NOT_FOUND", "meaning": "Provider claims a semantic capability/version that cannot be resolved in the selected Registry Snapshot."},
+    {"code": "PROVIDER_CONTRACT_HASH_MISMATCH", "meaning": "Provider declaration references semantic contract content that does not match the selected Registry Snapshot."},
+    {"code": "PROVIDER_EXECUTION_CLASS_INCOMPATIBLE", "meaning": "Provider execution class is outside the semantic capability contract envelope."},
+    {"code": "PROVIDER_EFFECT_NOT_ALLOWED", "meaning": "Provider implementation/runtime effect envelope exceeds the semantic capability contract allowed effects."},
+    {"code": "PROVIDER_REQUIRED_EFFECT_MISSING", "meaning": "Provider declaration omits an effect required by every valid implementation/invocation of the semantic capability."},
+    {"code": "PROVIDER_AUTHORITY_NOT_ALLOWED", "meaning": "Provider declares runtime authority classes outside the semantic capability contract allowed authority envelope."},
+    {"code": "PROVIDER_REQUIRED_AUTHORITY_MISSING", "meaning": "Provider declaration is incompatible with a semantic capability authority lower bound required for valid execution."},
+    {"code": "PROVIDER_EGRESS_NOT_ALLOWED", "meaning": "Provider runtime/network behavior requires egress mode not permitted by the semantic capability contract."},
+    {"code": "PROVIDER_PORT_OR_TYPE_MISMATCH", "meaning": "Provider-declared semantic ports/types do not conform to the referenced capability contract."},
+    {"code": "PROVIDER_ISOLATION_INCOMPATIBLE", "meaning": "Provider cannot satisfy the minimum isolation/security profile required for the claimed capability/use context."},
+    {"code": "PROVIDER_SUITE_MISMATCH", "meaning": "Provider conformance suite identity/hash is missing, stale, or does not match the semantic contract requirement."},
+    {"code": "PROVIDER_BUILD_IDENTITY_MISSING", "meaning": "Conformance evidence is not tied to an immutable provider/package/build identity."},
+    {"code": "PROVIDER_CONFORMANCE_FAILED", "meaning": "Provider implementation failed one or more required conformance tests."},
+    {"code": "PROVIDER_CONFORMANCE_EXPIRED", "meaning": "Conformance evidence is outside its accepted validity/retest policy window."},
+    {"code": "PROVIDER_DECLARATION_INVALID", "meaning": "Provider manifest/registration declaration is structurally or semantically invalid."}
+  ]
+}
