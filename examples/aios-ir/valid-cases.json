@@ -6,9 +6,7 @@
       "ir_version": "0.1",
       "program_id": "fixture.minimal_copy",
       "kind": "task_graph",
-      "inputs": {
-        "source": {"type": "artifact.file@1", "required": true}
-      },
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
       "nodes": [
         {
           "id": "copy",
@@ -25,9 +23,7 @@
           "cache": "content_addressed"
         }
       ],
-      "outputs": {
-        "copy": {"source": "node", "node": "copy", "port": "copy"}
-      }
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
     }
   },
   {
@@ -78,9 +74,7 @@
       "ir_version": "0.1",
       "program_id": "fixture.probabilistic_verify",
       "kind": "task_graph",
-      "inputs": {
-        "metrics": {"type": "data.metrics@1", "required": true}
-      },
+      "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
       "nodes": [
         {
           "id": "draft",
@@ -109,9 +103,35 @@
           "cache": "deterministic_only"
         }
       ],
-      "outputs": {
-        "narrative": {"source": "node", "node": "verify", "port": "verified_narrative"}
-      }
+      "outputs": {"narrative": {"source": "node", "node": "verify", "port": "verified_narrative"}}
+    }
+  },
+  {
+    "name": "policy-controlled-remote-summary-egress",
+    "expected": "valid",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "fixture.remote_summary",
+      "kind": "task_graph",
+      "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
+      "nodes": [
+        {
+          "id": "summarize",
+          "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+          "execution_class": "probabilistic",
+          "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+          "outputs": {"narrative": "text.narrative@1"},
+          "authority_requests": [
+            {"action": "network.connect", "resource": "service:model"},
+            {"action": "data.egress", "resource": "destination:remote-model"}
+          ],
+          "egress": {"mode": "policy", "destination_classes": ["remote-model"]},
+          "constraints": {"locality": ["remote"]},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
     }
   },
   {
@@ -121,9 +141,7 @@
       "ir_version": "0.1",
       "program_id": "fixture.bounded_fallback",
       "kind": "task_graph",
-      "inputs": {
-        "source": {"type": "artifact.file@1", "required": true}
-      },
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
       "nodes": [
         {
           "id": "copy",
@@ -136,16 +154,11 @@
             {"action": "artifact.write", "resource": "task.output"}
           ],
           "egress": {"mode": "deny"},
-          "failure": {
-            "on_error": "fallback",
-            "fallback_capabilities": ["artifact.copy.compat@1"]
-          },
+          "failure": {"on_error": "fallback", "fallback_capabilities": ["artifact.copy.compat@1"]},
           "cache": "content_addressed"
         }
       ],
-      "outputs": {
-        "copy": {"source": "node", "node": "copy", "port": "copy"}
-      }
+      "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
     }
   },
   {
@@ -155,9 +168,7 @@
       "ir_version": "0.1",
       "program_id": "skill.uppercase_text.v1",
       "kind": "skill_graph",
-      "inputs": {
-        "text": {"type": "text.plain@1", "required": true}
-      },
+      "inputs": {"text": {"type": "text.plain@1", "required": true}},
       "nodes": [
         {
           "id": "uppercase",
@@ -171,9 +182,7 @@
           "cache": "content_addressed"
         }
       ],
-      "outputs": {
-        "text": {"source": "node", "node": "uppercase", "port": "text"}
-      }
+      "outputs": {"text": {"source": "node", "node": "uppercase", "port": "text"}}
     }
   }
 ]
