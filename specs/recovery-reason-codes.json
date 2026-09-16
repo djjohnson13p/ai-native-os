@@ -1,0 +1,27 @@
+{
+  "schema_version": "0.1",
+  "namespace": "RECOVERY",
+  "codes": [
+    {"code": "RECOVERY_NOT_STARTED", "meaning": "Durable evidence shows the operation was not started."},
+    {"code": "RECOVERY_STARTED_NO_EFFECT", "meaning": "Operation started but durable evidence proves no externally published/observable effect occurred."},
+    {"code": "RECOVERY_COMPLETED", "meaning": "Durable evidence proves the operation/result completed."},
+    {"code": "RECOVERY_FAILED_NO_EFFECT", "meaning": "Operation failed with no externally published/observable effect."},
+    {"code": "RECOVERY_FAILED_PARTIAL_EFFECT", "meaning": "Operation failed after a partial effect such as staging/local partial state."},
+    {"code": "RECOVERY_OUTCOME_UNKNOWN", "meaning": "Available evidence cannot prove completion or no-effect; external reconciliation is required before unsafe retry."},
+    {"code": "RECOVERY_ARTIFACT_STAGING_ONLY", "meaning": "Output bytes exist only in staging and are not a published Artifact."},
+    {"code": "RECOVERY_ORPHAN_BLOB", "meaning": "Immutable blob exists without committed Artifact metadata/publication."},
+    {"code": "RECOVERY_ARTIFACT_PUBLISHED", "meaning": "Artifact publication is durably committed and should be reconciled rather than recomputed."},
+    {"code": "RECOVERY_ARTIFACT_INTEGRITY_FAILED", "meaning": "Published Artifact metadata references missing/corrupt content or hash verification failed."},
+    {"code": "RECOVERY_TRANSITION_ALREADY_COMMITTED", "meaning": "Stable transition ID shows the Task transition committed before response loss."},
+    {"code": "RECOVERY_PUBLICATION_ALREADY_COMMITTED", "meaning": "Stable publication ID shows Artifact publication committed before response loss."},
+    {"code": "RECOVERY_GRANT_EXPIRED_OR_REVOKED", "meaning": "Prior runtime authority is not reusable after recovery."},
+    {"code": "RECOVERY_GRANT_CONSUMED", "meaning": "One-shot/bounded grant consumption is durable and must not be reset due to response loss."},
+    {"code": "RECOVERY_APPROVAL_STALE", "meaning": "Approval no longer matches current program/provider/destination/resource facts or validity window."},
+    {"code": "RECOVERY_INPUT_REVISION_CHANGED", "meaning": "Input Artifact/Object revision/content identity no longer matches the prior attempt binding."},
+    {"code": "RECOVERY_NEW_BINDING_REQUIRED", "meaning": "Safe retry/substitution requires a fresh Execution Binding and authority evaluation."},
+    {"code": "RECOVERY_RETRY_BUDGET_EXHAUSTED", "meaning": "Validated semantic retry/fallback budget has no remaining attempt."},
+    {"code": "RECOVERY_EXTERNAL_RECONCILIATION_REQUIRED", "meaning": "External status/idempotency evidence must be obtained before another consequential operation."},
+    {"code": "RECOVERY_PROVENANCE_MISMATCH", "meaning": "Task/current-state and provenance-head evidence are inconsistent and require reconciliation/failure handling."},
+    {"code": "RECOVERY_STORAGE_INTEGRITY_FAILURE", "meaning": "Database/blob integrity evidence is insufficient for normal execution; enter maintenance/recovery path."}
+  ]
+}
