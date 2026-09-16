@@ -2,15 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ai-native-os.example/specs/capability-manifest.schema.json",
   "title": "AI-Native OS Capability Provider Manifest",
+  "description": "Provider implementation declaration. Semantic meaning comes from capability contracts; this manifest declares one implementation's runtime requirements/effect envelope and never grants Task authority.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "id", "version", "publisher", "runtime", "provides"],
   "properties": {
     "schema_version": {"type": "string", "const": "0.1"},
-    "id": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_.-]+$"
-    },
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]+$"},
     "version": {"type": "string", "minLength": 1},
     "publisher": {
       "type": "object",
@@ -28,10 +26,7 @@
       "additionalProperties": false,
       "required": ["kind"],
       "properties": {
-        "kind": {
-          "type": "string",
-          "enum": ["builtin", "process", "varlink", "oci", "wasm", "model-adapter", "legacy-adapter", "remote"]
-        },
+        "kind": {"type": "string", "enum": ["builtin", "process", "varlink", "oci", "wasm", "model-adapter", "legacy-adapter", "remote"]},
         "entrypoint": {"type": ["string", "null"]},
         "interface": {"type": ["string", "null"]},
         "image": {"type": ["string", "null"]},
@@ -44,7 +39,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["contract", "conformance", "execution", "side_effects"],
+        "required": ["contract", "conformance", "execution", "effect_classes"],
         "properties": {
           "contract": {
             "type": "object",
@@ -52,10 +47,7 @@
             "additionalProperties": false,
             "required": ["capability", "version", "contract_hash"],
             "properties": {
-              "capability": {
-                "type": "string",
-                "pattern": "^[a-z0-9_.-]+$"
-              },
+              "capability": {"type": "string", "pattern": "^[a-z0-9_.-]+$"},
               "version": {"type": "string", "minLength": 1},
               "contract_hash": {
                 "type": ["string", "null"],
@@ -72,21 +64,16 @@
             "properties": {
               "suite": {"type": "string", "minLength": 1},
               "suite_hash": {"type": ["string", "null"]},
-              "status": {
-                "type": "string",
-                "enum": ["declared", "tested", "certified"]
-              },
+              "status": {"type": "string", "enum": ["declared", "tested", "certified"]},
               "tested_at": {"type": ["string", "null"], "format": "date-time"},
               "test_environment": {"type": ["string", "null"]}
             }
           },
-          "side_effects": {
+          "effect_classes": {
             "type": "array",
-            "description": "Actual implementation effects; semantic validation must ensure these do not exceed the capability contract.",
-            "items": {
-              "type": "string",
-              "enum": ["none", "artifact_read", "artifact_write", "network", "external_message", "secret_access", "persistent_state", "device_access", "system_change"]
-            },
+            "description": "Actual implementation/runtime effect envelope using canonical AIOS effect names. It must remain within the referenced semantic contract's allowed_effect_classes.",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/effectClass"},
             "uniqueItems": true
           },
           "execution": {
@@ -100,18 +87,9 @@
                 "items": {"type": "string", "enum": ["local", "peer", "remote", "hybrid"]},
                 "uniqueItems": true
               },
-              "execution_class": {
-                "type": "string",
-                "enum": ["deterministic", "bounded_nondeterministic", "probabilistic", "opaque_external"]
-              },
-              "minimum_isolation": {
-                "type": "string",
-                "enum": ["P0", "P1", "P2", "P3", "P4", "P5"]
-              },
-              "network_default": {
-                "type": "string",
-                "enum": ["none", "allowlist", "internet"]
-              }
+              "execution_class": {"type": "string", "enum": ["deterministic", "bounded_nondeterministic", "probabilistic", "opaque_external"]},
+              "minimum_isolation": {"type": "string", "enum": ["P0", "P1", "P2", "P3", "P4", "P5"]},
+              "network_default": {"type": "string", "enum": ["none", "allowlist", "internet"]}
             }
           },
           "authority": {
@@ -119,37 +97,21 @@
             "description": "Implementation-specific authority it may request at runtime; must be a subset of semantic contract allowed authority classes.",
             "additionalProperties": false,
             "properties": {
-              "actions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "uniqueItems": true
-              },
-              "resource_classes": {
-                "type": "array",
-                "items": {"type": "string"},
-                "uniqueItems": true
-              }
+              "actions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+              "resource_classes": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
             }
           },
           "representations": {
             "type": "object",
             "description": "Optional physical representation preferences for semantic ports; these do not redefine semantic types.",
-            "additionalProperties": {
-              "type": "array",
-              "items": {"type": "string"},
-              "uniqueItems": true
-            }
+            "additionalProperties": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
           },
           "resource_requirements": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
               "min_memory_bytes": {"type": ["integer", "null"], "minimum": 1},
-              "preferred_accelerators": {
-                "type": "array",
-                "items": {"type": "string"},
-                "uniqueItems": true
-              },
+              "preferred_accelerators": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
               "requires_gpu": {"type": "boolean", "default": false}
             }
           }
@@ -162,11 +124,14 @@
       "properties": {
         "source_hash": {"type": ["string", "null"]},
         "build_provenance": {"type": ["string", "null"]},
-        "review_status": {
-          "type": ["string", "null"],
-          "enum": [null, "unreviewed", "project-reviewed", "third-party-reviewed"]
-        }
+        "review_status": {"type": ["string", "null"], "enum": [null, "unreviewed", "project-reviewed", "third-party-reviewed"]}
       }
+    }
+  },
+  "$defs": {
+    "effectClass": {
+      "type": "string",
+      "enum": ["PURE", "ARTIFACT_READ", "ARTIFACT_WRITE", "NETWORK", "DATA_EGRESS", "EXTERNAL_MESSAGE", "SECRET_ACCESS", "PERSISTENT_STATE", "DEVICE_ACCESS", "SYSTEM_CHANGE", "LEGACY_OPAQUE"]
     }
   }
 }
