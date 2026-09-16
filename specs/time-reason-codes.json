@@ -1,0 +1,14 @@
+{
+  "schema_version": "0.1",
+  "namespace": "TIME",
+  "codes": [
+    {"code": "TIME_OK", "meaning": "Current local time assessment is sufficiently trustworthy for configured security-sensitive expiry decisions."},
+    {"code": "TIME_ROLLBACK_DETECTED", "meaning": "Observed wall clock is earlier than the persisted trusted anchor beyond configured tolerance."},
+    {"code": "TIME_UNCERTAIN", "meaning": "Time confidence is insufficient for a security-sensitive expiration/not-before decision; fail closed or require trusted recovery."},
+    {"code": "TIME_SOURCE_UNAVAILABLE", "meaning": "Configured trusted time source is unavailable; local policy determines whether existing local evidence is sufficient."},
+    {"code": "TIME_EXPIRED", "meaning": "The protected record/action is past its accepted expiration boundary."},
+    {"code": "TIME_NOT_YET_VALID", "meaning": "The protected record/action is before its accepted not-before/effective boundary."},
+    {"code": "TIME_FORWARD_JUMP", "meaning": "Wall clock moved materially forward; expiry may become earlier but prior expired authority is not resurrected if time later moves back."},
+    {"code": "TIME_ADMIN_CONFIRMED", "meaning": "An authenticated trusted administrative flow explicitly restored local time confidence under policy."}
+  ]
+}
