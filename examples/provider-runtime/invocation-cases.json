@@ -1,0 +1,119 @@
+[
+  {
+    "name": "deterministic-local-provider-success",
+    "expected": "SUCCEEDED",
+    "reason_code": "PROVIDER_SUCCEEDED",
+    "facts": {
+      "binding_valid": true,
+      "provider_identity_matches": true,
+      "grants_valid": true,
+      "inputs_match": true,
+      "output_staged": true,
+      "output_finalized": true
+    }
+  },
+  {
+    "name": "provider-attempts-unbound-artifact-read",
+    "expected": "AUTHORITY_REVOKED",
+    "reason_code": "PROVIDER_GRANT_INVALID",
+    "facts": {
+      "granted_artifact": "artifact://A17",
+      "attempted_artifact": "artifact://OTHER"
+    }
+  },
+  {
+    "name": "provider-identity-does-not-match-binding",
+    "expected": "START_FAILED",
+    "reason_code": "PROVIDER_IDENTITY_MISMATCH",
+    "facts": {
+      "bound_provider": "provider-A",
+      "launch_provider": "provider-B"
+    }
+  },
+  {
+    "name": "input-mutated-after-binding",
+    "expected": "START_FAILED",
+    "reason_code": "PROVIDER_INPUT_INTEGRITY_MISMATCH",
+    "facts": {
+      "bound_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "current_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  {
+    "name": "provider-returns-declared-semantic-error",
+    "expected": "SEMANTIC_FAILURE",
+    "reason_code": "PROVIDER_SEMANTIC_FAILURE",
+    "facts": {
+      "semantic_error": "TABLE_IMPORT_MALFORMED_INPUT",
+      "process_exit": 0
+    }
+  },
+  {
+    "name": "exit-zero-with-malformed-structured-result",
+    "expected": "PROVIDER_FAILURE",
+    "reason_code": "PROVIDER_OUTPUT_RESULT_INVALID",
+    "facts": {
+      "process_exit": 0,
+      "structured_result_valid": false
+    }
+  },
+  {
+    "name": "provider-crash-before-output-finalization",
+    "expected": "PROVIDER_FAILURE",
+    "reason_code": "PROVIDER_RUNTIME_FAILURE",
+    "facts": {
+      "output_state": "STAGED",
+      "artifact_published": false,
+      "provider_crashed": true
+    }
+  },
+  {
+    "name": "artifact-finalized-before-task-transition-crash",
+    "expected": "RECOVER_RECONCILE_NO_RERUN",
+    "reason_code": "PROVIDER_SUCCEEDED",
+    "facts": {
+      "output_state": "FINALIZED",
+      "artifact_published": true,
+      "task_transition_committed": false,
+      "recovery_action": "reconcile publication/provenance then continue state machine"
+    }
+  },
+  {
+    "name": "task-cancel-revokes-runtime-access",
+    "expected": "AUTHORITY_REVOKED",
+    "reason_code": "PROVIDER_AUTHORITY_REVOKED",
+    "facts": {
+      "task_cancelled": true,
+      "provider_attempts_protected_read_after_cancel": true
+    }
+  },
+  {
+    "name": "provider-timeout",
+    "expected": "TIMED_OUT",
+    "reason_code": "PROVIDER_TIMEOUT",
+    "facts": {
+      "deadline_exceeded": true
+    }
+  },
+  {
+    "name": "provider-substitution-does-not-mutate-existing-binding",
+    "expected": "NEW_BINDING_REQUIRED",
+    "reason_code": "PROVIDER_BINDING_INVALID",
+    "facts": {
+      "original_provider": "provider-A",
+      "replacement_provider": "provider-B",
+      "reuse_original_binding": false,
+      "new_authority_evaluation_required": true
+    }
+  },
+  {
+    "name": "opaque-external-timeout-with-uncertain-effect",
+    "expected": "OUTCOME_UNKNOWN",
+    "reason_code": "PROVIDER_OUTCOME_UNKNOWN",
+    "facts": {
+      "external_side_effect_possible": true,
+      "provider_response_lost": true,
+      "blind_retry_allowed": false
+    }
+  }
+]
