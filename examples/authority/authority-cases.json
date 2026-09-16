@@ -1,0 +1,135 @@
+[
+  {
+    "name": "exact-local-artifact-read-allowed",
+    "expected": "ALLOW",
+    "reason_code": "AUTH_ALLOW",
+    "facts": {
+      "validated_semantic_request": "artifact.read input:source",
+      "principal": "org.ainative.provider.table-import",
+      "resolved_resource": "artifact://A17",
+      "binding": "XB-T91-import-table-1",
+      "policy": "allow exact selected input",
+      "approval": null
+    }
+  },
+  {
+    "name": "provider-invents-network-action-not-in-semantic-ir",
+    "expected": "DENY",
+    "reason_code": "AUTH_SEMANTIC_REQUEST_MISMATCH",
+    "facts": {
+      "validated_semantic_request": "artifact.read input:source",
+      "runtime_request": "network.connect service://unrequested",
+      "principal": "org.ainative.provider.table-import"
+    }
+  },
+  {
+    "name": "private-data-egress-requires-approval",
+    "expected": "REQUIRE_APPROVAL",
+    "reason_code": "AUTH_REQUIRE_APPROVAL",
+    "facts": {
+      "action": "data.egress",
+      "resource": "artifact://METRICS-92",
+      "destination": "service://model/fixture-remote",
+      "sensitivity": "private"
+    }
+  },
+  {
+    "name": "approval-stale-after-destination-change",
+    "expected": "DENY",
+    "reason_code": "AUTH_APPROVAL_STALE",
+    "facts": {
+      "approved_destination": "service://model/fixture-remote",
+      "runtime_destination": "service://model/other-remote"
+    }
+  },
+  {
+    "name": "approval-stale-after-semantic-program-change",
+    "expected": "DENY",
+    "reason_code": "AUTH_APPROVAL_STALE",
+    "facts": {
+      "approved_semantic_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "runtime_semantic_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  {
+    "name": "grant-used-by-wrong-provider",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_PRINCIPAL_MISMATCH",
+    "facts": {
+      "grant_principal": "org.ainative.provider.table-import",
+      "caller_principal": "org.ainative.provider.other"
+    }
+  },
+  {
+    "name": "grant-used-for-wrong-task",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_TASK_MISMATCH",
+    "facts": {
+      "grant_task": "T91",
+      "caller_task": "T999"
+    }
+  },
+  {
+    "name": "one-shot-grant-already-consumed",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_USAGE_EXHAUSTED",
+    "facts": {
+      "scope": "ONE_SHOT",
+      "max_uses": 1,
+      "uses_consumed": 1
+    }
+  },
+  {
+    "name": "expired-grant",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_EXPIRED",
+    "facts": {
+      "grant_state": "EXPIRED"
+    }
+  },
+  {
+    "name": "revoked-grant-after-task-cancel",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_REVOKED",
+    "facts": {
+      "task_state": "CANCELLED",
+      "grant_state": "REVOKED"
+    }
+  },
+  {
+    "name": "network-connect-alone-does-not-authorize-egress",
+    "expected": "DENY",
+    "reason_code": "AUTH_GRANT_SCOPE_MISMATCH",
+    "facts": {
+      "granted_action": "network.connect",
+      "attempted_action": "data.egress"
+    }
+  },
+  {
+    "name": "explicit-policy-deny-cannot-be-overridden-by-approval",
+    "expected": "DENY",
+    "reason_code": "AUTH_DENY_POLICY",
+    "facts": {
+      "policy": "hard deny",
+      "approval_record_present": true
+    }
+  },
+  {
+    "name": "policy-engine-unavailable-fails-closed",
+    "expected": "DENY",
+    "reason_code": "AUTH_POLICY_ENGINE_UNAVAILABLE",
+    "facts": {
+      "engine_available": false,
+      "protected_action": "artifact.write"
+    }
+  },
+  {
+    "name": "provider-rebinding-requires-new-grant",
+    "expected": "DENY",
+    "reason_code": "AUTH_PROVIDER_BINDING_MISMATCH",
+    "facts": {
+      "grant_binding": "XB-OLD",
+      "runtime_binding": "XB-NEW"
+    }
+  }
+]
