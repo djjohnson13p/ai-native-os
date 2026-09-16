@@ -2,7 +2,7 @@
 
 > Working title. The final project name, license, implementation languages, and governance model are intentionally not fixed yet.
 
-This repository defines an open-source computing architecture designed **around AI from the beginning**, rather than adding an AI assistant to an application-centric desktop.
+This repository defines an open computing architecture designed **around AI from the beginning**, rather than adding an AI assistant to an application-centric desktop.
 
 The immediate project is a narrow AI-native operating-system prototype. The long-term mission is broader:
 
@@ -307,7 +307,7 @@ The eventual v0.1 prototype should:
 - execute deterministic calculations/providers;
 - invoke AI only for semantic reasoning where useful;
 - independently verify consequential numeric claims;
-- produce portable output artifacts;
+- produce portable output Artifacts;
 - record inspectable provenance;
 - demonstrate provider substitution;
 - demonstrate repeated-work reuse/Skill optimization;
@@ -315,9 +315,11 @@ The eventual v0.1 prototype should:
 
 The goal is to prove an architecture that is meaningfully different from a normal desktop with a chatbot attached.
 
-## First implementation target
+## Current implementation entry point
 
-The preferred first serious implementation assignment is **GitHub Issue #17**:
+**Stage 0 is closed enough for bounded trusted-core implementation. No working AIOS implementation is claimed yet.**
+
+The first serious implementation assignment remains **GitHub Issue #17**:
 
 > deterministic AIOS IR parser/validator/normalizer/static-effect-summary/semantic-hash boundary.
 
@@ -327,16 +329,61 @@ It intentionally requires:
 - no provider execution;
 - no network/cloud;
 - no GUI;
-- no Cedar policy engine yet;
+- no policy backend yet;
 - no custom source language.
 
-Implementation preparation:
+After #17, the project builds a deterministic operating spine before introducing AI planning:
 
-- [`AGENTS.md`](AGENTS.md) — concise instructions/map for coding agents
+```text
+#17 validator
+→ #1 Task Manager
+→ #4 Artifact Store
+→ #5 Provenance
+→ #2 Semantic/Provider Registry
+→ #3 Authority Coordinator
+→ minimal Credential Broker
+→ #30 Provider Supervisor + one deterministic provider
+→ deterministic end-to-end Task with crash/recovery tests
+→ only then Resource/Model/Planner work
+```
+
+Implementation/review preparation:
+
+- [`AGENTS.md`](AGENTS.md) — coding-agent constitution/map
 - [`docs/59-pre-codex-foundation-closure-plan.md`](docs/59-pre-codex-foundation-closure-plan.md) — architecture closure classes/gates
-- [`docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md`](docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md) — initial implementation/module shape
-- [`docs/61-validator-test-fuzz-and-resource-limit-matrix.md`](docs/61-validator-test-fuzz-and-resource-limit-matrix.md) — validator security/test matrix
-- [`docs/62-first-codex-session-runbook.md`](docs/62-first-codex-session-runbook.md) — first Codex session prompt/sequence/stop conditions
+- [`docs/62-first-codex-session-runbook.md`](docs/62-first-codex-session-runbook.md) — exact first Codex session scope/stop conditions
+- [`docs/71-validator-spike-readiness-checklist.md`](docs/71-validator-spike-readiness-checklist.md) — #17 architecture readiness
+- [`docs/81-stage0-architecture-closure-audit.md`](docs/81-stage0-architecture-closure-audit.md) — Stage-0 closure assessment
+- [`docs/82-stage1-core-substrate-codex-runbook.md`](docs/82-stage1-core-substrate-codex-runbook.md) — deterministic-spine implementation sequence
+- [`docs/83-pre-implementation-red-team-and-astra-review-packet.md`](docs/83-pre-implementation-red-team-and-astra-review-packet.md) — independent adversarial architecture review packet
+- [`specs/contract-maturity.json`](specs/contract-maturity.json) — machine-readable maturity snapshot
+
+## Trusted-core architecture now specified
+
+The pre-implementation contracts cover:
+
+```text
+AIOS IR validation + semantic hashing
+Task CAS/idempotent state transitions
+Artifact content identity + staged publication
+append/hash-chain provenance
+semantic registry snapshots + provider registrations
+engine-neutral deterministic policy + trusted approvals + scoped grants
+opaque Credential Broker / secret mediation
+immutable Execution Bindings + typed Provider Supervisor invocation
+crash consistency / outcome certainty / deterministic recovery
+```
+
+Important safety rules now include:
+
+- Execution Bindings are immutable attempt receipts;
+- provider retry/substitution creates a new binding/attempt;
+- raw long-lived credentials do not live in IR/Task/provenance/provider manifests;
+- capability contracts declare required and allowed effect/authority envelopes;
+- `network.connect` and `data.egress` are distinct authority classes;
+- `OUTCOME_UNKNOWN` is not ordinary retryable failure;
+- Artifact staging bytes are not published output;
+- response loss does not imply the operation failed or should rerun.
 
 ## Repository guide
 
@@ -349,15 +396,24 @@ Implementation preparation:
 - [`docs/16-requirements.md`](docs/16-requirements.md)
 - [`docs/17-v0.1-acceptance-tests.md`](docs/17-v0.1-acceptance-tests.md)
 - [`docs/18-pre-codex-workplan.md`](docs/18-pre-codex-workplan.md)
+- [`docs/53-system-of-everything-staged-roadmap.md`](docs/53-system-of-everything-staged-roadmap.md)
+- [`docs/81-stage0-architecture-closure-audit.md`](docs/81-stage0-architecture-closure-audit.md)
 
-### Security / state / trust
+### Security / state / trusted execution
 
 - [`docs/08-security-threat-model.md`](docs/08-security-threat-model.md)
 - [`docs/19-principal-and-authority-model.md`](docs/19-principal-and-authority-model.md)
 - [`docs/21-trust-boundaries.md`](docs/21-trust-boundaries.md)
 - [`docs/24-task-state-machine.md`](docs/24-task-state-machine.md)
 - [`docs/35-v0.1-persistence-model.md`](docs/35-v0.1-persistence-model.md)
-- [`docs/45-cross-domain-transactions-and-compensation.md`](docs/45-cross-domain-transactions-and-compensation.md)
+- [`docs/73-v0.1-provenance-journal-and-hash-chain.md`](docs/73-v0.1-provenance-journal-and-hash-chain.md)
+- [`docs/74-v0.1-task-manager-transition-and-cas-contract.md`](docs/74-v0.1-task-manager-transition-and-cas-contract.md)
+- [`docs/75-v0.1-artifact-store-content-identity-and-publication.md`](docs/75-v0.1-artifact-store-content-identity-and-publication.md)
+- [`docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md`](docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md)
+- [`docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md`](docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md)
+- [`docs/78-v0.1-execution-binding-and-provider-supervisor.md`](docs/78-v0.1-execution-binding-and-provider-supervisor.md)
+- [`docs/79-v0.1-credential-broker-and-secret-mediation.md`](docs/79-v0.1-credential-broker-and-secret-mediation.md)
+- [`docs/80-v0.1-crash-consistency-recovery-and-commit-protocol.md`](docs/80-v0.1-crash-consistency-recovery-and-commit-protocol.md)
 
 ### AIOS IR / language / compilation
 
@@ -373,6 +429,10 @@ Implementation preparation:
 - [`docs/33-bootstrap-language-boundary.md`](docs/33-bootstrap-language-boundary.md)
 - [`docs/36-aios-ir-compiler-and-lowering-boundary.md`](docs/36-aios-ir-compiler-and-lowering-boundary.md)
 - [`docs/39-static-effect-and-authority-analysis.md`](docs/39-static-effect-and-authority-analysis.md)
+- [`docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md`](docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md)
+- [`docs/68-aios-ir-v0.1-edge-case-semantics.md`](docs/68-aios-ir-v0.1-edge-case-semantics.md)
+- [`docs/69-v0.1-capability-effect-and-authority-contract-profile.md`](docs/69-v0.1-capability-effect-and-authority-contract-profile.md)
+- [`docs/72-v0.1-semantic-contract-and-registry-hash-profile.md`](docs/72-v0.1-semantic-contract-and-registry-hash-profile.md)
 
 ### Platform fabrics
 
@@ -381,6 +441,7 @@ Implementation preparation:
 - [`docs/42-universal-object-graph-and-data-federation.md`](docs/42-universal-object-graph-and-data-federation.md)
 - [`docs/43-software-coverage-expansion-strategy.md`](docs/43-software-coverage-expansion-strategy.md)
 - [`docs/44-tier0-universal-object-model.md`](docs/44-tier0-universal-object-model.md)
+- [`docs/45-cross-domain-transactions-and-compensation.md`](docs/45-cross-domain-transactions-and-compensation.md)
 - [`docs/46-domain-pack-lifecycle-and-governance.md`](docs/46-domain-pack-lifecycle-and-governance.md)
 - [`docs/47-cross-domain-reference-workflow.md`](docs/47-cross-domain-reference-workflow.md)
 - [`docs/48-resource-placement-and-personal-compute-fabric.md`](docs/48-resource-placement-and-personal-compute-fabric.md)
@@ -388,23 +449,23 @@ Implementation preparation:
 - [`docs/50-adaptive-presentation-and-device-ui.md`](docs/50-adaptive-presentation-and-device-ui.md)
 - [`docs/51-network-fabric-and-service-connectivity.md`](docs/51-network-fabric-and-service-connectivity.md)
 - [`docs/52-cloud-edge-and-service-fabric.md`](docs/52-cloud-edge-and-service-fabric.md)
-- [`docs/53-system-of-everything-staged-roadmap.md`](docs/53-system-of-everything-staged-roadmap.md)
 - [`docs/54-unified-platform-fabric-architecture.md`](docs/54-unified-platform-fabric-architecture.md)
 - [`docs/55-storage-sync-and-replica-fabric.md`](docs/55-storage-sync-and-replica-fabric.md)
 - [`docs/56-cryptographic-identity-trust-and-credential-fabric.md`](docs/56-cryptographic-identity-trust-and-credential-fabric.md)
 - [`docs/57-component-distribution-supply-chain-and-update-trust.md`](docs/57-component-distribution-supply-chain-and-update-trust.md)
 - [`docs/58-files-namespaces-and-semantic-projection.md`](docs/58-files-namespaces-and-semantic-projection.md)
 
-### Decisions / contracts / fixtures
+### Decisions / contracts / fixtures / governance
 
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records
 - [`specs/README.md`](specs/README.md) — machine-contract index/principles
-- [`specs/`](specs/) — JSON Schemas + draft persistence SQL
-- [`examples/aios-ir/`](examples/aios-ir/) — semantic IR/registry/validation/adversarial fixtures
-- [`examples/reference-task/`](examples/reference-task/) — broader control-plane Demonstration A/B fixtures
-- [`examples/domain-fabric/`](examples/domain-fabric/) — synthetic Universal Object/Domain examples
-- [`examples/platform-fabric/`](examples/platform-fabric/) — presentation/network/cloud/storage/trust/package examples
+- [`specs/contract-maturity.json`](specs/contract-maturity.json) — current maturity status
+- [`specs/`](specs/) — JSON Schemas + aligned draft persistence SQL
+- [`examples/`](examples/) — synthetic positive/negative/adversarial fixtures
 - [`interfaces/wit/`](interfaces/wit/) — early Wasm Component/WIT ABI experiments
+- [`docs/82-stage1-core-substrate-codex-runbook.md`](docs/82-stage1-core-substrate-codex-runbook.md) — post-validator deterministic-core build sequence
+- [`docs/83-pre-implementation-red-team-and-astra-review-packet.md`](docs/83-pre-implementation-red-team-and-astra-review-packet.md) — independent architecture red-team packet
+- [`docs/84-open-source-license-and-governance-decision-framework.md`](docs/84-open-source-license-and-governance-decision-framework.md) — license/governance decision scaffolding; no final license chosen
 
 ## Non-goals for v0.1
 
@@ -420,20 +481,8 @@ Implementation preparation:
 
 ## Current phase
 
-**Stage 0 architecture constitution is nearing the point where the first trusted-core spike can begin. No implementation claim is made yet.**
+**Stage 0 architecture is closed enough that further progress now depends more on executable evidence than on adding broader conceptual architecture.**
 
-The immediate engineering objective is intentionally small:
+The immediate next milestone is Issue #17. Independent adversarial review can run against `docs/83-pre-implementation-red-team-and-astra-review-packet.md` before or alongside early implementation review.
 
-```text
-untrusted candidate AIOS IR
-        ↓
-strict deterministic parser/validator
-        ↓
-semantic registry/type/capability/effect checks
-        ↓
-canonical semantic identity/hash
-        ↓
-VALID or REJECTED
-```
-
-Once that boundary works, the project can safely begin building Task persistence, Artifact/provenance stores, deterministic policy, provider binding, and eventually model-assisted orchestration on top.
+No production-readiness or working-operating-system claim is made yet.
