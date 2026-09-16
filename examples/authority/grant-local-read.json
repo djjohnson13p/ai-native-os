@@ -1,0 +1,39 @@
+{
+  "schema_version": "0.1",
+  "grant_id": "GR-T91-import-table-read",
+  "token_id": "TOK-T91-import-table-read",
+  "task_id": "T91",
+  "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "node_id": "import_table",
+  "capability": "table.import@1",
+  "principal": {
+    "kind": "provider",
+    "id": "org.ainative.provider.table-import",
+    "version": "0.1.0",
+    "package_or_build_hash": null
+  },
+  "execution_binding_id": "XB-T91-import-table-1",
+  "attempt_id": "ATT-T91-import-table-1",
+  "grants": [
+    {
+      "action": "artifact.read",
+      "resource_kind": "artifact",
+      "resource_id": "artifact://A17",
+      "semantic_selector": "input:source",
+      "destination_class": null,
+      "service_id": null
+    }
+  ],
+  "policy_decision_id": "PD-T91-S1-READ",
+  "policy_snapshot_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "approval_id": null,
+  "scope": "ONE_SHOT",
+  "max_uses": 1,
+  "uses_consumed": 0,
+  "state": "ACTIVE",
+  "delegation": {"delegable": false, "max_depth": 0},
+  "issued_at": "2026-09-15T20:31:10Z",
+  "expires_at": "2026-09-15T20:36:10Z",
+  "revoked_at": null,
+  "revocation_reason_code": null
+}
