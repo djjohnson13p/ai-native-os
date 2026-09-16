@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.1",
+  "decision_id": "AD-T92-remote-summary-egress",
+  "approval_id": "APR-T92-remote-summary-egress",
+  "task_id": "T92",
+  "decision": "APPROVE",
+  "decided_by": {
+    "kind": "user",
+    "id": "principal://user/fixture"
+  },
+  "scope": "ONE_SHOT",
+  "approved_until": "2026-09-15T20:50:00Z",
+  "reason_code": "USER_APPROVED_EXACT_EGRESS",
+  "human_note": "Synthetic fixture approval for one named destination and one Task only.",
+  "decided_at": "2026-09-15T20:41:00Z"
+}
