@@ -1,0 +1,24 @@
+{
+  "schema_version": "0.1",
+  "namespace": "PROVIDER",
+  "codes": [
+    {"code": "PROVIDER_SUCCEEDED", "meaning": "Provider invocation completed and all required outputs were finalized successfully."},
+    {"code": "PROVIDER_SEMANTIC_FAILURE", "meaning": "Provider returned a declared semantic capability error."},
+    {"code": "PROVIDER_RUNTIME_FAILURE", "meaning": "Provider process/component/runtime failed outside the semantic error contract."},
+    {"code": "PROVIDER_START_FAILED", "meaning": "Provider could not be launched under the requested Execution Binding/profile."},
+    {"code": "PROVIDER_BINDING_INVALID", "meaning": "Execution Binding is incomplete, stale, inconsistent, or invalid for launch."},
+    {"code": "PROVIDER_IDENTITY_MISMATCH", "meaning": "Launched/calling provider identity does not match the binding."},
+    {"code": "PROVIDER_GRANT_INVALID", "meaning": "Required point-of-use authority grant is absent, expired, revoked, or mismatched."},
+    {"code": "PROVIDER_INPUT_INTEGRITY_MISMATCH", "meaning": "Bound input content/revision no longer matches the expected binding."},
+    {"code": "PROVIDER_OUTPUT_ALLOCATION_INVALID", "meaning": "Provider attempted to write to a missing/unbound/invalid output allocation."},
+    {"code": "PROVIDER_OUTPUT_RESULT_INVALID", "meaning": "Provider returned malformed or contract-incompatible output metadata/result."},
+    {"code": "PROVIDER_OUTPUT_FINALIZATION_FAILED", "meaning": "Trusted Artifact Store could not validate/finalize staged provider output."},
+    {"code": "PROVIDER_TIMEOUT", "meaning": "Invocation exceeded its configured deadline/resource time budget."},
+    {"code": "PROVIDER_CANCELLED", "meaning": "Invocation was cancelled by Task/runtime control."},
+    {"code": "PROVIDER_AUTHORITY_REVOKED", "meaning": "Authority was revoked during execution; subsequent protected access is blocked."},
+    {"code": "PROVIDER_RESOURCE_LIMIT", "meaning": "Invocation exceeded a memory/output/CPU or other deterministic resource limit."},
+    {"code": "PROVIDER_PROTOCOL_ERROR", "meaning": "Provider violated or could not complete the typed invocation protocol."},
+    {"code": "PROVIDER_LOG_LIMIT", "meaning": "Untrusted provider diagnostic output exceeded configured bounds."},
+    {"code": "PROVIDER_OUTCOME_UNKNOWN", "meaning": "Runtime cannot prove the externally observable outcome and must reconcile before retry."}
+  ]
+}
