@@ -1,89 +1,103 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ai-native-os.example/specs/policy-decision.schema.json",
-  "title": "Policy Decision",
+  "title": "AIOS v0.1 Policy Decision",
+  "description": "Deterministic policy-engine result for one concrete runtime Authority Evaluation Request. This record never grants authority by itself.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["decision_id", "task_id", "principal", "request", "decision", "decided_at", "policy_version"],
+  "required": [
+    "schema_version",
+    "decision_id",
+    "authority_request_id",
+    "task_id",
+    "semantic_program_hash",
+    "registry_snapshot_id",
+    "node_id",
+    "capability",
+    "principal",
+    "action",
+    "resource",
+    "decision",
+    "policy_snapshot_id",
+    "reason_codes",
+    "decided_at"
+  ],
   "properties": {
-    "decision_id": {"type": "string", "minLength": 1},
-    "task_id": {"type": "string", "minLength": 1},
+    "schema_version": {"type": "string", "const": "0.1"},
+    "decision_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "authority_request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "registry_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
     "principal": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "id"],
       "properties": {
-        "kind": {
-          "type": "string",
-          "enum": ["user", "system-service", "agent", "provider", "model-provider", "legacy-app", "peer-node"]
-        },
-        "id": {"type": "string", "minLength": 1}
+        "kind": {"type": "string", "enum": ["agent", "provider", "legacy-app", "system-service", "peer-node"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": ["string", "null"], "maxLength": 128},
+        "package_or_build_hash": {"type": ["string", "null"], "maxLength": 256}
       }
     },
-    "request": {
+    "action": {"type": "string", "pattern": "^[a-z][a-z0-9_.:-]*$", "maxLength": 128},
+    "resource": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["capability", "actions", "resources"],
+      "required": ["resolved_kind", "resolved_id"],
       "properties": {
-        "capability": {"type": "string", "minLength": 1},
-        "actions": {
-          "type": "array",
-          "minItems": 1,
-          "items": {"type": "string"},
-          "uniqueItems": true
+        "resolved_kind": {
+          "type": "string",
+          "enum": ["artifact", "object", "output-allocation", "service", "credential", "device", "system-resource", "external-destination"]
         },
-        "resources": {
-          "type": "array",
-          "minItems": 1,
-          "items": {"type": "string"},
-          "uniqueItems": true
-        },
-        "constraints": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "impact_level": {
-          "type": ["integer", "null"],
-          "minimum": 0,
-          "maximum": 4
-        }
+        "resolved_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "semantic_selector": {"type": ["string", "null"], "maxLength": 512},
+        "sensitivity": {"type": ["string", "null"], "enum": [null, "public", "local", "private", "confidential", "secret"]}
       }
     },
-    "decision": {
-      "type": "string",
-      "enum": ["allow", "deny", "require-approval", "allow-with-narrower-scope"]
-    },
+    "decision": {"type": "string", "enum": ["ALLOW", "DENY", "REQUIRE_APPROVAL"]},
     "effective_scope": {
       "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
-        "actions": {
-          "type": "array",
-          "items": {"type": "string"},
-          "uniqueItems": true
-        },
-        "resources": {
-          "type": "array",
-          "items": {"type": "string"},
-          "uniqueItems": true
-        },
-        "constraints": {
-          "type": "object",
-          "additionalProperties": true
-        }
+        "action": {"type": ["string", "null"], "pattern": "^(?:[a-z][a-z0-9_.:-]*)?$", "maxLength": 128},
+        "resource_kind": {"type": ["string", "null"], "maxLength": 128},
+        "resource_id": {"type": ["string", "null"], "maxLength": 1024},
+        "expires_after_seconds": {"type": ["integer", "null"], "minimum": 1, "maximum": 86400},
+        "max_uses": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},
+        "max_cost_microusd": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "reason_codes": {
       "type": "array",
-      "items": {
-        "type": "string",
-        "pattern": "^[A-Z0-9_.-]+$"
-      },
-      "uniqueItems": true
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$", "maxLength": 128}
     },
-    "human_explanation": {"type": ["string", "null"]},
-    "approval_request_id": {"type": ["string", "null"]},
-    "policy_version": {"type": "string", "minLength": 1},
+    "approval_request_id": {"type": ["string", "null"], "maxLength": 256},
+    "policy_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "engine": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "human_explanation": {"type": ["string", "null"], "maxLength": 4096},
     "decided_at": {"type": "string", "format": "date-time"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"const": "REQUIRE_APPROVAL"}}, "required": ["decision"]},
+      "then": {"required": ["approval_request_id"], "properties": {"approval_request_id": {"type": "string", "minLength": 1}}}
+    },
+    {
+      "if": {"properties": {"decision": {"enum": ["ALLOW", "DENY"]}}, "required": ["decision"]},
+      "then": {"properties": {"approval_request_id": {"type": ["string", "null"]}}}
+    }
+  ]
 }
