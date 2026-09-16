@@ -1,123 +1,86 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ai-native-os.example/specs/execution-binding.schema.json",
-  "title": "AI-Native OS Execution Binding",
-  "description": "Concrete attempt-specific binding of one validated AIOS IR node to provider, resources, authority, and placement. This is not semantic IR.",
+  "title": "AIOS v0.1 Execution Binding",
+  "description": "Immutable attempt-specific binding of one validated AIOS IR node to provider, inputs/outputs, authority, isolation, and placement. This is runtime state, not semantic IR.",
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schema_version",
     "binding_id",
+    "attempt_id",
     "task_id",
-    "program_hash",
+    "semantic_program_hash",
+    "registry_snapshot_id",
     "ir_version",
     "node_id",
     "capability",
     "provider",
     "inputs",
     "outputs",
-    "policy_decision_id",
+    "policy_decision_refs",
     "authority",
     "execution_profile",
     "placement",
-    "attempt"
+    "attempt",
+    "created_at"
   ],
   "properties": {
-    "binding_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 160
-    },
-    "task_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 160
-    },
-    "program_hash": {
-      "type": "string",
-      "pattern": "^[a-z0-9_-]+:[A-Fa-f0-9]+$"
-    },
-    "ir_version": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 32
-    },
-    "node_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "capability": {
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 160
-    },
-    "capability_contract_hash": {
-      "type": ["string", "null"],
-      "maxLength": 256
-    },
+    "schema_version": {"type": "string", "const": "0.1"},
+    "binding_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "attempt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "registry_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "ir_version": {"type": "string", "minLength": 1, "maxLength": 32},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+    "capability_contract_hash": {"type": ["string", "null"], "pattern": "^(?:sha256:[a-f0-9]{64})?$"},
     "provider": {
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "version"],
       "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
-        },
-        "version": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
-        },
-        "manifest_hash": {
-          "type": ["string", "null"],
-          "maxLength": 256
-        },
-        "conformance_status": {
-          "type": ["string", "null"],
-          "enum": [null, "declared", "tested", "certified"]
-        }
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "manifest_hash": {"type": ["string", "null"], "maxLength": 256},
+        "package_or_build_hash": {"type": ["string", "null"], "maxLength": 256},
+        "conformance_status": {"type": ["string", "null"], "enum": [null, "declared", "tested", "certified"]}
       }
     },
     "inputs": {
       "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["artifact_or_value_ref"],
+        "required": ["semantic_type", "artifact_or_value_ref"],
         "properties": {
-          "artifact_or_value_ref": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 1024
-          },
-          "content_hash": {
-            "type": ["string", "null"],
-            "maxLength": 256
-          }
+          "semantic_type": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+          "artifact_or_value_ref": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "content_hash": {"type": ["string", "null"], "maxLength": 256},
+          "revision": {"type": ["integer", "null"], "minimum": 0}
         }
       }
     },
     "outputs": {
       "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["allocation_ref"],
+        "required": ["semantic_type", "allocation_ref"],
         "properties": {
-          "allocation_ref": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 1024
-          }
+          "semantic_type": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+          "allocation_ref": {"type": "string", "minLength": 1, "maxLength": 1024}
         }
       }
     },
-    "policy_decision_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 256
+    "policy_decision_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256}
     },
     "authority": {
       "type": "object",
@@ -126,17 +89,11 @@
       "properties": {
         "grant_refs": {
           "type": "array",
+          "maxItems": 64,
           "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 512
-          }
+          "items": {"type": "string", "minLength": 1, "maxLength": 512}
         },
-        "expires_at": {
-          "type": ["string", "null"],
-          "format": "date-time"
-        }
+        "expires_at": {"type": ["string", "null"], "format": "date-time"}
       }
     },
     "execution_profile": {
@@ -144,15 +101,8 @@
       "additionalProperties": false,
       "required": ["profile_ref"],
       "properties": {
-        "profile_ref": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 512
-        },
-        "profile_hash": {
-          "type": ["string", "null"],
-          "maxLength": 256
-        }
+        "profile_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "profile_hash": {"type": ["string", "null"], "maxLength": 256}
       }
     },
     "placement": {
@@ -160,36 +110,16 @@
       "additionalProperties": false,
       "required": ["locality"],
       "properties": {
-        "locality": {
-          "type": "string",
-          "enum": ["local", "peer", "remote", "hybrid"]
-        },
-        "hardware_profile_ref": {
-          "type": ["string", "null"],
-          "maxLength": 512
-        },
-        "device_class": {
-          "type": ["string", "null"],
-          "maxLength": 160
-        },
-        "remote_endpoint_class": {
-          "type": ["string", "null"],
-          "maxLength": 160
-        }
+        "locality": {"type": "string", "enum": ["local", "peer", "remote", "hybrid"]},
+        "placement_decision_id": {"type": ["string", "null"], "maxLength": 256},
+        "hardware_profile_ref": {"type": ["string", "null"], "maxLength": 512},
+        "device_class": {"type": ["string", "null"], "maxLength": 160},
+        "service_id": {"type": ["string", "null"], "maxLength": 512},
+        "remote_endpoint_class": {"type": ["string", "null"], "maxLength": 160}
       }
     },
-    "model_descriptor_ref": {
-      "type": ["string", "null"],
-      "maxLength": 512
-    },
-    "attempt": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 100
-    },
-    "created_at": {
-      "type": ["string", "null"],
-      "format": "date-time"
-    }
+    "model_descriptor_ref": {"type": ["string", "null"], "maxLength": 512},
+    "attempt": {"type": "integer", "minimum": 1, "maximum": 100},
+    "created_at": {"type": "string", "format": "date-time"}
   }
 }
