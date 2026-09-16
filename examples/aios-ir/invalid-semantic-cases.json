@@ -9,9 +9,7 @@
       "ir_version": "0.1",
       "program_id": "invalid.type_mismatch",
       "kind": "task_graph",
-      "inputs": {
-        "source": {"type": "artifact.file@1", "required": true}
-      },
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
       "nodes": [
         {
           "id": "hash",
@@ -49,9 +47,7 @@
       "ir_version": "0.1",
       "program_id": "invalid.execution_class_contract",
       "kind": "task_graph",
-      "inputs": {
-        "source": {"type": "artifact.file@1", "required": true}
-      },
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
       "nodes": [
         {
           "id": "hash",
@@ -69,6 +65,33 @@
     }
   },
   {
+    "name": "required-authority-missing",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_REQUIRED_AUTHORITY_MISSING",
+    "registry_assumption": "artifact.hash@1 requires artifact.read",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.required_authority_missing",
+      "kind": "task_graph",
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
+      "nodes": [
+        {
+          "id": "hash",
+          "operation": {"kind": "verify", "capability": "artifact.hash@1"},
+          "execution_class": "deterministic",
+          "inputs": {"source": {"source": "input", "name": "source"}},
+          "outputs": {"hash": "data.hash@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+    }
+  },
+  {
     "name": "authority-class-exceeds-capability-contract",
     "expected": "invalid",
     "validation_stage": "semantic",
@@ -78,9 +101,7 @@
       "ir_version": "0.1",
       "program_id": "invalid.authority_exceeds_contract",
       "kind": "task_graph",
-      "inputs": {
-        "table": {"type": "data.table@1", "required": true}
-      },
+      "inputs": {"table": {"type": "data.table@1", "required": true}},
       "nodes": [
         {
           "id": "normalize",
@@ -88,8 +109,8 @@
           "execution_class": "deterministic",
           "inputs": {"table": {"source": "input", "name": "table"}},
           "outputs": {"table": "data.table@1"},
-          "authority_requests": [{"action": "network.connect", "resource": "https://example.invalid"}],
-          "egress": {"mode": "policy", "destination_classes": ["internet"]},
+          "authority_requests": [{"action": "network.connect", "resource": "service:external"}],
+          "egress": {"mode": "deny"},
           "failure": {"on_error": "stop"},
           "cache": "never"
         }
@@ -107,9 +128,7 @@
       "ir_version": "0.1",
       "program_id": "invalid.output_contract",
       "kind": "task_graph",
-      "inputs": {
-        "table": {"type": "data.table@1", "required": true}
-      },
+      "inputs": {"table": {"type": "data.table@1", "required": true}},
       "nodes": [
         {
           "id": "metrics",
@@ -136,9 +155,7 @@
       "ir_version": "0.1",
       "program_id": "invalid.egress_contract",
       "kind": "task_graph",
-      "inputs": {
-        "source": {"type": "artifact.file@1", "required": true}
-      },
+      "inputs": {"source": {"type": "artifact.file@1", "required": true}},
       "nodes": [
         {
           "id": "hash",
@@ -146,13 +163,70 @@
           "execution_class": "deterministic",
           "inputs": {"source": {"source": "input", "name": "source"}},
           "outputs": {"hash": "data.hash@1"},
-          "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
+          "authority_requests": [
+            {"action": "artifact.read", "resource": "input:source"},
+            {"action": "data.egress", "resource": "destination:internet"}
+          ],
           "egress": {"mode": "policy", "destination_classes": ["internet"]},
           "failure": {"on_error": "stop"},
           "cache": "never"
         }
       ],
       "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
+    }
+  },
+  {
+    "name": "egress-policy-missing-matching-data-egress-authority",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_EGRESS_AUTHORITY_MISMATCH",
+    "registry_assumption": "report.summarize@1 allows policy egress only when a matching destination:<class> data.egress request is declared",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.egress_authority_missing",
+      "kind": "task_graph",
+      "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
+      "nodes": [
+        {
+          "id": "summarize",
+          "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+          "execution_class": "probabilistic",
+          "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+          "outputs": {"narrative": "text.narrative@1"},
+          "authority_requests": [{"action": "network.connect", "resource": "service:model"}],
+          "egress": {"mode": "policy", "destination_classes": ["remote-model"]},
+          "failure": {"on_error": "stop"},
+          "cache": "never"
+        }
+      ],
+      "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
+    }
+  },
+  {
+    "name": "probabilistic-content-addressed-cache",
+    "expected": "invalid",
+    "validation_stage": "semantic",
+    "reason_code": "IR_CACHE_EXECUTION_CLASS_MISMATCH",
+    "registry_assumption": "content-addressed caching is allowed only for deterministic execution in AIOS IR v0.1",
+    "program": {
+      "ir_version": "0.1",
+      "program_id": "invalid.probabilistic_cache",
+      "kind": "task_graph",
+      "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
+      "nodes": [
+        {
+          "id": "summarize",
+          "operation": {"kind": "invoke", "capability": "report.summarize@1"},
+          "execution_class": "probabilistic",
+          "inputs": {"metrics": {"source": "input", "name": "metrics"}},
+          "outputs": {"narrative": "text.narrative@1"},
+          "authority_requests": [],
+          "egress": {"mode": "deny"},
+          "failure": {"on_error": "stop"},
+          "cache": "content_addressed"
+        }
+      ],
+      "outputs": {"narrative": {"source": "node", "node": "summarize", "port": "narrative"}}
     }
   }
 ]
