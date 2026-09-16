@@ -4,7 +4,7 @@
 
 Issue #17 needs stable machine-readable diagnostics so tests, Task recovery, planners, developer tools, and future UI can react to failure classes without parsing English messages.
 
-This catalog defines the bootstrap v0.1 code families.
+This catalog defines the bootstrap v0.1 validator/semantic-registry code families and points to the separate provider-conformance catalog.
 
 Human messages MAY improve. Code meaning must not silently change once implementation/tests depend on it.
 
@@ -13,9 +13,12 @@ Human messages MAY improve. Code meaning must not silently change once implement
 ```text
 IR_*        candidate program/semantic-graph problem
 REGISTRY_*  loaded semantic registry/snapshot/contract problem
+PROVIDER_*  separate provider-conformance/runtime namespaces
 ```
 
-Provider-conformance, policy/authorization, runtime, package, and compatibility errors use separate future catalogs. Do not overload IR codes for unrelated runtime failures.
+Provider-conformance codes are machine-listed in `specs/provider-conformance-reason-codes.json`.
+
+Policy/authorization, provider-runtime, credential, recovery, package, and compatibility errors use their own catalogs. Do not overload IR codes for unrelated runtime failures.
 
 ## Severity
 
@@ -96,12 +99,20 @@ Schema validators may generate detailed underlying messages, but externally map 
 | Code | Severity | Meaning |
 | --- | --- | --- |
 | `IR_AUTHORITY_CLASS_NOT_ALLOWED` | error | node requests authority outside resolved capability contract envelope |
-| `IR_REQUIRED_AUTHORITY_MISSING` | error | node omits authority required by capability semantic lower bound (once lower-bound profile is present in loaded contract) |
+| `IR_REQUIRED_AUTHORITY_MISSING` | error | node omits authority required by capability semantic lower bound |
 | `IR_AUTHORITY_DUPLICATE_REQUEST` | error | duplicate semantic `(action, resource)` request |
 | `IR_EFFECT_CLASS_NOT_ALLOWED` | error | derived effect exceeds capability semantic effect envelope |
-| `IR_EGRESS_CONTRADICTION` | error | egress mode/destination structure contradicts itself or capability contract |
-| `IR_EGRESS_AUTHORITY_MISMATCH` | error | policy-controlled egress lacks matching semantic data-egress authority request/destination |
+| `IR_EGRESS_NOT_ALLOWED` | error | node declares an egress mode that the resolved capability contract does not permit |
+| `IR_EGRESS_CONTRADICTION` | error | egress structure contradicts itself (for example `deny` plus non-empty destination classes) or another closed semantic rule |
+| `IR_EGRESS_AUTHORITY_MISMATCH` | error | policy-controlled egress lacks matching semantic `data.egress` authority request/destination class |
 | `IR_CACHE_EXECUTION_CLASS_MISMATCH` | error | cache policy requires deterministic execution but node class is not deterministic |
+
+Important distinction:
+
+- a capability can permit `policy` egress while one particular IR node chooses `deny`;
+- `network.connect` is not itself equivalent to `data.egress`;
+- `policy` egress requires explicit matching `data.egress` authority semantics;
+- authorization of the concrete destination occurs later in the Authority Coordinator, not in the validator.
 
 ## Failure / fallback
 
@@ -139,13 +150,41 @@ If implementation discovers a stable sub-family is necessary (for example unsupp
 
 ## Registry semantic-contract consistency
 
-These codes become active when ADR 0033's lower/upper effect/authority fields are represented in the loaded capability-contract profile.
+ADR 0033's lower/upper effect/authority profile is now represented in the capability-contract schema.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
 | `REGISTRY_REQUIRED_EFFECT_NOT_ALLOWED` | error | required effect absent from allowed effect set |
 | `REGISTRY_REQUIRED_AUTHORITY_NOT_ALLOWED` | error | required authority absent from allowed authority set |
 | `REGISTRY_PURE_EFFECT_CONTRADICTION` | error | `PURE` lower-bound semantics contradict non-PURE allowed/required semantics |
+
+## Provider conformance namespace
+
+Provider conformance is separate from semantic IR validation.
+
+The canonical bootstrap list is `specs/provider-conformance-reason-codes.json`, including:
+
+```text
+PROVIDER_CONTRACT_NOT_FOUND
+PROVIDER_CONTRACT_HASH_MISMATCH
+PROVIDER_EXECUTION_CLASS_INCOMPATIBLE
+PROVIDER_EFFECT_NOT_ALLOWED
+PROVIDER_REQUIRED_EFFECT_MISSING
+PROVIDER_AUTHORITY_NOT_ALLOWED
+PROVIDER_REQUIRED_AUTHORITY_MISSING
+PROVIDER_EGRESS_NOT_ALLOWED
+PROVIDER_PORT_OR_TYPE_MISMATCH
+PROVIDER_ISOLATION_INCOMPATIBLE
+PROVIDER_SUITE_MISMATCH
+PROVIDER_BUILD_IDENTITY_MISSING
+PROVIDER_CONFORMANCE_FAILED
+PROVIDER_CONFORMANCE_EXPIRED
+PROVIDER_DECLARATION_INVALID
+```
+
+These do not authorize a provider. A provider can be structurally valid and conforming but still be disabled, untrusted for the current policy, unavailable, or denied authority at runtime.
+
+Provider runtime/supervisor failures have a different catalog: `specs/provider-runtime-reason-codes.json`.
 
 ## Code selection precedence
 
@@ -200,9 +239,9 @@ See `docs/65-contract-maturity-and-architecture-change-control.md`.
 
 ## Implementation rule
 
-Reason codes should be represented as a strongly typed enum/closed mapping in the trusted validator, with one canonical string representation.
+Reason codes should be represented as strongly typed enums/closed mappings in trusted components, with one canonical string representation per namespace.
 
-Do not scatter ad-hoc reason-code string construction throughout validation passes.
+Do not scatter ad-hoc reason-code string construction throughout validation or conformance passes.
 
 ## Principle
 
