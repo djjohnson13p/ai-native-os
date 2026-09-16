@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provider-invocation-request.schema.json",
+  "title": "AIOS v0.1 Provider Invocation Request",
+  "description": "Attempt-specific typed invocation passed from the trusted Provider Supervisor to a registered provider. It carries bounded handles/refs, never semantic authority invention or raw long-lived secrets.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "invocation_id",
+    "task_id",
+    "semantic_program_hash",
+    "registry_snapshot_id",
+    "node_id",
+    "capability",
+    "execution_binding_id",
+    "attempt",
+    "provider",
+    "inputs",
+    "outputs",
+    "grant_refs",
+    "execution_profile_ref",
+    "deadline"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "invocation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "semantic_program_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "registry_snapshot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+    "execution_binding_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "attempt": {"type": "integer", "minimum": 1, "maximum": 100},
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "manifest_hash": {"type": ["string", "null"], "maxLength": 256},
+        "package_or_build_hash": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "ref"],
+        "properties": {
+          "type": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+          "ref": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "content_hash": {"type": ["string", "null"], "maxLength": 256},
+          "revision": {"type": ["integer", "null"], "minimum": 0}
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "allocation_ref"],
+        "properties": {
+          "type": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
+          "allocation_ref": {"type": "string", "minLength": 1, "maxLength": 1024}
+        }
+      }
+    },
+    "grant_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 512}
+    },
+    "credential_use_handles": {
+      "type": "array",
+      "description": "Opaque broker references only; never raw secret/token material.",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^credential://", "maxLength": 1024}
+    },
+    "execution_profile_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+    "deadline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expires_at"],
+      "properties": {
+        "expires_at": {"type": "string", "format": "date-time"},
+        "max_cpu_time_ms": {"type": ["integer", "null"], "minimum": 1},
+        "max_memory_bytes": {"type": ["integer", "null"], "minimum": 1},
+        "max_output_bytes": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
