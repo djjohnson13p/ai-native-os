@@ -1,0 +1,95 @@
+[
+  {
+    "name": "binding-persisted-provider-never-started",
+    "certainty": "NOT_STARTED",
+    "safe_action": "CREATE_NEW_ATTEMPT",
+    "reason_code": "RECOVERY_NOT_STARTED",
+    "new_binding_required": true
+  },
+  {
+    "name": "provider-crashed-with-only-staging-bytes",
+    "certainty": "FAILED_PARTIAL_EFFECT",
+    "safe_action": "CLEAN_STAGING",
+    "reason_code": "RECOVERY_ARTIFACT_STAGING_ONLY",
+    "new_binding_required": true
+  },
+  {
+    "name": "blob-created-metadata-not-committed",
+    "certainty": "FAILED_PARTIAL_EFFECT",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_ORPHAN_BLOB",
+    "new_binding_required": false
+  },
+  {
+    "name": "artifact-published-response-lost",
+    "certainty": "COMPLETED",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_PUBLICATION_ALREADY_COMMITTED",
+    "new_binding_required": false
+  },
+  {
+    "name": "task-transition-committed-response-lost",
+    "certainty": "COMPLETED",
+    "safe_action": "NO_ACTION",
+    "reason_code": "RECOVERY_TRANSITION_ALREADY_COMMITTED",
+    "new_binding_required": false
+  },
+  {
+    "name": "published-artifact-missing-blob",
+    "certainty": "FAILED_PARTIAL_EFFECT",
+    "safe_action": "FAIL_TASK",
+    "reason_code": "RECOVERY_ARTIFACT_INTEGRITY_FAILED",
+    "new_binding_required": false
+  },
+  {
+    "name": "expired-grant-after-reboot",
+    "certainty": "NOT_STARTED",
+    "safe_action": "REVOKE_GRANTS",
+    "reason_code": "RECOVERY_GRANT_EXPIRED_OR_REVOKED",
+    "new_binding_required": true
+  },
+  {
+    "name": "one-shot-grant-consumed-response-lost",
+    "certainty": "COMPLETED",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_GRANT_CONSUMED",
+    "new_binding_required": false
+  },
+  {
+    "name": "input-changed-before-safe-retry",
+    "certainty": "FAILED_NO_EFFECT",
+    "safe_action": "WAIT_FOR_INPUT",
+    "reason_code": "RECOVERY_INPUT_REVISION_CHANGED",
+    "new_binding_required": true
+  },
+  {
+    "name": "provider-substitution-after-crash",
+    "certainty": "FAILED_NO_EFFECT",
+    "safe_action": "CREATE_NEW_ATTEMPT",
+    "reason_code": "RECOVERY_NEW_BINDING_REQUIRED",
+    "new_binding_required": true
+  },
+  {
+    "name": "external-message-timeout-no-status-proof",
+    "certainty": "OUTCOME_UNKNOWN",
+    "safe_action": "REQUIRE_EXTERNAL_RECONCILIATION",
+    "reason_code": "RECOVERY_EXTERNAL_RECONCILIATION_REQUIRED",
+    "new_binding_required": false,
+    "external_reconciliation_required": true
+  },
+  {
+    "name": "external-idempotency-status-proves-complete",
+    "certainty": "COMPLETED",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_COMPLETED",
+    "new_binding_required": false,
+    "external_reconciliation_required": false
+  },
+  {
+    "name": "task-state-provenance-head-mismatch",
+    "certainty": "OUTCOME_UNKNOWN",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_PROVENANCE_MISMATCH",
+    "new_binding_required": false
+  }
+]
