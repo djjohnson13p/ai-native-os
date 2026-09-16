@@ -9,6 +9,10 @@ The project now has broad architecture requirements spanning the v0.1 trusted co
 
 This document maps requirement families to their current roadmap scope, primary source contracts, GitHub workstreams, and expected evidence.
 
+The base requirement catalog is `docs/16-requirements.md`.
+
+The implementation-sensitive trusted-core requirement addendum is `docs/85-v0.1-trusted-core-requirements-addendum.md` and is normative for Stage-1 implementation.
+
 ## Scope legend
 
 ```text
@@ -31,12 +35,16 @@ A requirement can be both `INTERFACE` and `CROSS-CUTTING`.
 
 | Requirement family | IDs | Current scope | Primary architecture/contracts | Primary issues/workstreams | Evidence / gate |
 | --- | --- | --- | --- | --- | --- |
-| Task / intent | R-TASK-001..005 | CORE-v0.1 | docs 03, 24, 34, 35; `task-record` | #1, #8 | persisted lifecycle/revision/recovery tests |
-| AIOS IR | R-IR-001..012 | CORE-v0.1 | docs 25, 26, 30, 31, 39, 60, 61; IR schemas/fixtures | #16, **#17** | validator positive/negative/hash/effect/fuzz gates |
-| Semantic contracts | R-CONTRACT-001..007 | CORE-v0.1 | docs 28, 29, 31; capability/type/registry schemas | #2, #17 | registry + semantic fixture validation |
-| Capability system | R-CAP-001..006 | CORE-v0.1 / INTERFACE | docs 04, 28, 37, 38 | #2, #9 | two-provider semantic substitution/conformance |
-| Security/authority | R-SEC-001..007 | CORE-v0.1 / CROSS-CUTTING | docs 08, 19, 21, 39; policy/token contracts | #3, #11 | deterministic allow/deny + adversarial tests |
-| Artifact/data | R-DATA-001..005 | CORE-v0.1 | docs 20, 35, 58; artifact schema | #4, #5, #27 boundary | handle/hash/lineage/portable-output tests |
+| Task / intent | R-TASK-001..005 | CORE-v0.1 | docs 03, 24, 34, 35, 74; Task schemas | #1, #8 | persisted lifecycle/CAS/idempotency/recovery tests |
+| AIOS IR | R-IR-001..012 | CORE-v0.1 | docs 25, 26, 30, 31, 39, 60, 61, 66–72; IR schemas/fixtures | #16, **#17** | validator positive/negative/hash/effect/fuzz gates |
+| Semantic contracts | R-CONTRACT-001..007 | CORE-v0.1 | docs 28, 29, 31, 69, 72; capability/type/registry schemas | #2, #17 | registry + semantic fixture validation |
+| Capability system | R-CAP-001..006 | CORE-v0.1 / INTERFACE | docs 04, 28, 37, 38, 76 | #2, #9 | two-provider semantic substitution/conformance |
+| Security/authority | R-SEC-001..007 + R-AUTH-001..008 | CORE-v0.1 / CROSS-CUTTING | docs 08, 19, 21, 39, 77, 85; authority/policy/grant contracts | #3, #11 | deterministic allow/deny/approval/grant + adversarial tests |
+| Artifact/data | R-DATA-001..005 + R-ART-001..005 | CORE-v0.1 | docs 20, 35, 75, 85; Artifact allocation/publication schemas | #4, #5 | content identity/staging/publication/lineage/crash tests |
+| Credential mediation | R-ID-003..006 + R-CRED-001..006 | CORE-v0.1 boundary / CROSS-CUTTING | docs 56, 79, 85; credential handle/use contracts | #28 | brokered operation/exportability/secret non-leakage fixtures |
+| Provider execution | R-EXEC-001..009 | CORE-v0.1 | docs 78, 80, 82, 85; binding/invocation/profile contracts | **#30** | bounded offline deterministic provider + malicious-provider tests |
+| Persistence integrity | R-PERSIST-001..004 | CORE-v0.1 / CROSS-CUTTING | docs 35, 73–80, 85; `persistence-v0.1.sql` | #1/#4/#5/#3/#30 | transaction/idempotency/crash-injection tests |
+| Recovery certainty | R-REC-001..009 | CORE-v0.1 / CROSS-CUTTING | docs 80, 85, 86; recovery contracts | #11 + all core issues | crash/response-loss/unknown-outcome tests |
 | Semantic Objects | R-OBJ-001..006 | INTERFACE → Stage 5 | docs 42, 44, 49; object/relationship/identity schemas | #19, #25 | first federated objects + merge/split tests |
 | Domain Packs | R-DOM-001..003 | INTERFACE → Stage 5+ | docs 40, 41, 43, 46; domain-pack schema | #19 | cross-domain workflow/conformance |
 | Cross-domain effects | R-XDOM-001..005 | INTERFACE → Stage 5+ | docs 45, 47; effect/provenance/task state | #21 | compensation/unknown-outcome/commit-barrier fixtures |
@@ -46,14 +54,14 @@ A requirement can be both `INTERFACE` and `CROSS-CUTTING`.
 | Network | R-NET-001..006 | INTERFACE → Stage 4 | docs 51; network service/transfer contracts | #23, #28 | peer transfer with explicit grant/provenance |
 | Cloud/edge | R-CLOUD-001..005 | INTERFACE → Stage 9 | docs 52; remote-service/placement | #24 | local/peer/self-hosted/public substitution + outage |
 | Storage/replica/namespace | R-STOR-001..007 | identity boundary CORE; distributed behavior Stage 4+ | docs 55, 58; replica/projection | #4, #27 | local Artifact identity then peer/cloud replica tests |
-| Identity/trust/credentials | R-ID-001..007 | local/workload/handle boundary CORE; distributed Stage 4+ | docs 19, 21, 56; trust/credential schemas | #3, #28 | auth≠authz, credential mediation, peer revocation |
+| Identity/trust | R-ID-001..002/007 | local/workload boundary CORE; distributed Stage 4+ | docs 19, 21, 56; trust-identity | #3, #28 | auth≠authz, workload identity, peer revocation |
 | Component distribution | R-PKG-001..008 | version attribution INTERFACE/CORE; activation Stage 6+ | docs 57; component-package schema | #29 | authority-diff + staged activation/rollback |
 | Legacy compatibility | R-COMPAT-001..005 | v0.1 Demo B / later expansion | docs 07 + compatibility research/profile | #10 | package classification + contained known app launch |
-| Provenance/recovery | R-PROV-001..006 | CORE-v0.1 / CROSS-CUTTING | docs 22, 24, 35; provenance schema | #1, #5, #11 | restart/provider-failure/action attribution |
+| Provenance/recovery | R-PROV-001..006 + R-REC-* | CORE-v0.1 / CROSS-CUTTING | docs 22, 24, 35, 73, 80; provenance/recovery schemas | #1, #5, #11 | restart/provider-failure/action attribution/reconciliation |
 | Learning/Skills | R-SKILL-001..007 | v0.1 proof / later optimization | docs 09, 27, 32, 36; skill/compiled target | #12, #18 | M0–M4 benchmark + no inherited authority |
 | Base system | R-BASE-001..004 | CORE-v0.1 | docs 10 + Linux/update research; ADR 0001/0002/0008 | #14 | reproducible dev base + AI-independent recovery design |
 | UX | R-UX-001..004 | Stage 3 / v0.1 user demo | docs 20, 23, 50 | #13, #22 | Task-first shell + inspectability |
-| Open-source architecture | R-OSS-001..004 | CROSS-CUTTING / pre-public release | CONTRIBUTING, SECURITY, ADRs, specs | #26, #29 + governance work | public contracts/conformance/license boundaries |
+| Open-source architecture | R-OSS-001..004 | CROSS-CUTTING / pre-public release | CONTRIBUTING, SECURITY, ADRs, specs, docs84 | #26, #29 + governance work | public contracts/conformance/license boundaries |
 
 ## Phase-0 / Issue #17 direct requirement map
 
@@ -86,44 +94,50 @@ Issue #17 is the first implementation spike. The following requirements are dire
 
 The detailed test matrix is `docs/61-validator-test-fuzz-and-resource-limit-matrix.md`.
 
-## Phase-I trusted substrate map
+## Stage-1 trusted deterministic substrate map
 
-After #17, Phase I should satisfy/advance:
+After #17, Stage 1 proceeds in the sequence from `docs/82-stage1-core-substrate-codex-runbook.md`.
 
-| Workstream | Requirements | Issue(s) | Minimum Phase-I evidence |
+| Workstream | Requirements | Issue(s) | Minimum Stage-1 evidence |
 | --- | --- | --- | --- |
-| Task persistence/state machine | R-TASK-001..005, R-PROV-005 | #1 | create/state-transition/revision/restart recovery |
-| Artifact store/handles | R-DATA-001..005, R-STOR-001, R-STOR-006 | #4, #27 boundary | local content identity independent of host path |
-| Provenance | R-PROV-001..006 | #5 | append-oriented material action/version/grant attribution |
-| Semantic registry/provider conformance | R-CONTRACT-001..007, R-CAP-001..003/006 | #2 | immutable snapshot + one/two fixture provider records |
-| Policy/authority | R-SEC-001..007, R-ID-001/003/005 | #3, #28 boundary | deterministic allow/deny + scoped grants/opaque credential reference |
-| Execution Binding | R-IR-010, R-CAP-004/005 | #3/#9 | bind one validated node to one isolated deterministic provider |
-| Provider/component attribution | R-PROV-002/006, R-PKG-001/002 | #29 boundary | exact provider/package/version/digest attribution; no package manager required |
+| Task Manager | R-TASK-001..005, R-PERSIST-001/002, R-REC-005/008/009 | #1 | create/CAS transitions/idempotency/restart recovery |
+| Artifact Store | R-DATA-001..005, R-ART-001..005, R-PERSIST-003, R-STOR-001/006 | #4 | local immutable content identity, staging/publication/crash recovery |
+| Provenance | R-PROV-001..006, R-PERSIST-002/004, R-REC-008 | #5 | append/hash-chain/material action attribution |
+| Semantic/provider registry | R-CONTRACT-001..007, R-CAP-001..003/006 | #2 | immutable snapshot + multiple provider records/conformance |
+| Authority Coordinator | R-SEC-001..007, R-AUTH-001..008 | #3 | concrete deterministic allow/deny/approval/scoped grants |
+| Credential Broker minimum | R-CRED-001..006, R-ID-003..006 | #28 | brokered synthetic secret use; no source-secret propagation |
+| Provider Supervisor | R-EXEC-001..009, R-CAP-004/005 | **#30** | one isolated deterministic provider under immutable binding |
+| Crash/recovery | R-REC-001..009 | #11 + all above | deterministic crash-point reconciliation + no blind unknown retry |
+| Provider/component attribution | R-PROV-002/006, R-PKG-001/002 | #2/#29 boundary/#30 | exact provider/package/build attribution; no package manager required |
 
-Phase I deliberately does **not** require peer networking, cloud storage, full PKI, a GUI, broad Domain Packs, or a public package registry.
+The Stage-1 integrated acceptance gate is `docs/86-stage1-deterministic-spine-acceptance-tests.md`.
+
+Stage 1 deliberately does **not** require peer networking, cloud storage, full PKI, a GUI, broad Domain Packs, a public package registry, or an AI planner.
 
 ## v0.1 acceptance crosswalk
 
-The acceptance plan is authoritative for the v0.1 release gate. Approximate requirement relationships:
+The acceptance plan remains authoritative for the overall v0.1 release gate. The deterministic Stage-1 gate is an earlier prerequisite.
 
 | Acceptance group | Primary requirement families |
 | --- | --- |
+| Issue #17 validator gate | R-IR, R-CONTRACT, R-SEC-006/007 |
+| Stage-1 deterministic spine S1–S9 | R-TASK, R-ART, R-PROV, R-AUTH, R-CRED, R-EXEC, R-REC, R-PERSIST |
 | Demonstration A1 Task creation | R-TASK, R-DATA |
 | A2 typed planning/semantic validation | R-IR, R-CONTRACT |
-| A3 least authority | R-SEC, R-ID |
-| A4 provider substitution | R-CAP, R-CONTRACT, R-PROV |
+| A3 least authority | R-SEC, R-AUTH, R-ID |
+| A4 provider substitution | R-CAP, R-CONTRACT, R-EXEC, R-PROV |
 | A5 deterministic calculations/verification | R-AI-005, R-IR-008, R-CONTRACT |
-| A6 artifact production/lineage | R-DATA, R-PROV |
+| A6 artifact production/lineage | R-DATA, R-ART, R-PROV |
 | A7 provenance inspection | R-PROV, R-UX-003 |
-| A8 local/remote policy routing | R-AI-002, R-RES, R-SEC-003, R-NET interface |
-| A9 planner failure containment | R-IR, R-SEC, R-TASK |
+| A8 local/remote policy routing | R-AI-002, R-RES, R-SEC-003, R-AUTH, R-NET interface |
+| A9 planner failure containment | R-IR, R-SEC, R-TASK, R-EXEC |
 | A10 reusable procedure | R-SKILL |
 | Demo B legacy compatibility | R-COMPAT, R-SEC, R-DATA |
 | Hardware/resource tests | R-RES |
-| Recovery tests | R-TASK-005, R-PROV-005, R-BASE-004 |
-| Security regression fixtures | R-SEC + relevant IR/network/credential/compatibility boundaries |
+| Recovery tests | R-REC, R-TASK-005, R-PROV-005, R-BASE-004 |
+| Security regression fixtures | R-SEC/R-AUTH/R-CRED/R-EXEC + relevant IR/network/compatibility boundaries |
 
-Not every later-stage requirement above must have implementation evidence for v0.1. The v0.1 implementation must, however, avoid violating their core identity/security separation rules.
+Not every later-stage requirement must have implementation evidence for v0.1. The v0.1 implementation must, however, avoid violating their core identity/security separation rules.
 
 ## Interface-preservation checks for early PRs
 
@@ -136,10 +150,15 @@ Artifact identity == host filesystem path
 Service identity == IP/hostname
 Provider identity == semantic capability meaning
 Authentication == authorization
+Credential handle == permission
+Bearer token == durable grant semantics
 Package signature == trusted execution
 Cloud/storage location == semantic identity
 View/window == object lifetime/identity
 Model output == permission
+Provider process exit == semantic success
+Staging bytes == published Artifact
+Lost response == safe retry
 ```
 
 Any `==` above is an architecture defect unless an explicit ADR narrowly justifies a special case.
@@ -160,17 +179,20 @@ DEFERRED_BY_STAGE
 
 Do not mark a requirement implemented merely because a schema or document exists.
 
+The current machine-readable contract readiness snapshot is `specs/contract-maturity.json`.
+
 ## Change-control rule
 
 When a requirement changes:
 
 1. identify controlling invariant/ADR;
 2. update requirement text/ID compatibility intentionally;
-3. update affected schema/contracts;
+3. update affected schemas/contracts;
 4. update acceptance/negative fixtures;
 5. update this traceability map;
-6. identify migration/provider-conformance consequences;
-7. reference the change in the implementing issue/PR.
+6. update persistence mapping if durable state changes;
+7. identify migration/provider-conformance consequences;
+8. reference the change in the implementing issue/PR.
 
 Stable requirement IDs should not be silently reused for incompatible meanings after external implementations depend on them.
 
