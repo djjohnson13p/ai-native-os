@@ -12,7 +12,7 @@
         {
           "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
-          "side_effects": ["artifact_read"],
+          "effect_classes": ["ARTIFACT_READ"],
           "execution": {"locality": ["local"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "none"},
           "authority": {"actions": ["artifact.read"], "resource_classes": ["artifact"]},
           "representations": {},
@@ -36,7 +36,7 @@
         {
           "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
-          "side_effects": ["artifact_read"],
+          "effect_classes": ["ARTIFACT_READ"],
           "execution": {"locality": ["local"], "execution_class": "probabilistic", "minimum_isolation": "P2", "network_default": "none"},
           "authority": {"actions": ["artifact.read"], "resource_classes": ["artifact"]},
           "representations": {},
@@ -60,9 +60,33 @@
         {
           "contract": {"capability": "table.normalize", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://table.normalize/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
-          "side_effects": ["network"],
+          "effect_classes": ["NETWORK", "DATA_EGRESS"],
           "execution": {"locality": ["remote"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "internet"},
           "authority": {"actions": ["network.connect", "data.egress"], "resource_classes": ["internet"]},
+          "representations": {},
+          "resource_requirements": {"min_memory_bytes": null, "preferred_accelerators": [], "requires_gpu": false}
+        }
+      ],
+      "trust": {"source_hash": null, "build_provenance": null, "review_status": "unreviewed"}
+    }
+  },
+  {
+    "name": "provider-effect-exceeds-contract",
+    "expected": "invalid",
+    "reason_code": "PROVIDER_EFFECT_NOT_ALLOWED",
+    "provider": {
+      "schema_version": "0.1",
+      "id": "org.ainative.fixture.bad-hash-network",
+      "version": "0.1.0",
+      "publisher": {"id": "org.ainative.fixture", "name": null, "source_url": null, "signature": null},
+      "runtime": {"kind": "process", "entrypoint": "fixture-bad-hash", "interface": null, "image": null, "digest": null},
+      "provides": [
+        {
+          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
+          "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
+          "effect_classes": ["ARTIFACT_READ", "NETWORK"],
+          "execution": {"locality": ["local"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "allowlist"},
+          "authority": {"actions": ["artifact.read"], "resource_classes": ["artifact"]},
           "representations": {},
           "resource_requirements": {"min_memory_bytes": null, "preferred_accelerators": [], "requires_gpu": false}
         }
@@ -84,7 +108,7 @@
         {
           "contract": {"capability": "unknown.do-everything", "version": "99.0", "contract_hash": null, "contract_source": null},
           "conformance": {"suite": "conformance://unknown/99", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
-          "side_effects": ["none"],
+          "effect_classes": ["LEGACY_OPAQUE"],
           "execution": {"locality": ["local"], "execution_class": "opaque_external", "minimum_isolation": "P5", "network_default": "none"},
           "authority": {"actions": [], "resource_classes": []},
           "representations": {},
