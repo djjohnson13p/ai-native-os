@@ -4,15 +4,15 @@
 
 This is the short preflight status for the first serious Codex implementation assignment.
 
-It distinguishes **architecture questions that are closed** from **mechanical implementation/contract migration that belongs inside the spike**.
+It distinguishes **architecture questions that are closed** from **mechanical implementation work that belongs inside the spike**.
 
 ## Status
 
 **Issue #17 is SPIKE_READY.**
 
-That means architecture is sufficiently constrained to begin implementation. It does **not** mean all code/schemas/hashes already exist.
+That means architecture/contracts/fixtures are sufficiently constrained to begin implementation. It does **not** mean the validator code, real hashes, or fuzz results already exist.
 
-## Closed decisions
+## Closed decisions / repository migrations
 
 - [x] AIOS IR is provider/runtime independent.
 - [x] Task ID is outside semantic IR.
@@ -30,10 +30,16 @@ That means architecture is sufficiently constrained to begin implementation. It 
 - [x] egress/cache/fallback edge rules are defined (ADR 0031 / docs 68).
 - [x] semantic effect vocabulary is unified (ADR 0032).
 - [x] required-vs-allowed effect/authority model is decided (ADR 0033 / docs 69).
-- [x] bootstrap validator/registry reason-code catalog exists (docs 70 + machine registry).
+- [x] `capability-contract.schema.json` structurally requires `required_effect_classes`, `allowed_effect_classes`, `required_authority_classes`, and `allowed_authority_classes`.
+- [x] bootstrap capability fixtures use the canonical uppercase effect vocabulary and explicit lower/upper bounds.
+- [x] bootstrap registry fixture explicitly includes fallback/test capabilities (`artifact.copy.compat`, `text.uppercase`) instead of relying on an implicit private test registry.
+- [x] validator reason-code registry covers current negative fixtures, including `IR_EGRESS_NOT_ALLOWED`.
+- [x] provider-conformance reason-code registry exists separately from validator/runtime reason codes.
+- [x] valid/invalid semantic fixtures cover policy-controlled data egress, missing required authority, capability egress mismatch, and invalid probabilistic content-addressed caching.
 - [x] minimal Rust workspace/trusted boundary is documented (docs 60).
 - [x] test/fuzz/resource-limit matrix exists (docs 61).
 - [x] first-session runbook exists (docs 62).
+- [x] Stage-0 closure audit/maturity index exists (docs 81 + `specs/contract-maturity.json`).
 - [x] root agent/contribution/PR rules exist.
 
 ## Mechanical work intentionally inside Issue #17
@@ -41,15 +47,18 @@ That means architecture is sufficiently constrained to begin implementation. It 
 These are implementation tasks, not open architecture questions:
 
 - [ ] create Rust workspace/crates/CLI;
-- [ ] add `required_effect_classes` / `required_authority_classes` to the structural capability-contract schema and bootstrap fixtures under ADR 0033;
+- [ ] implement capability/type/Registry Snapshot structural loaders against the now-aligned schemas;
 - [ ] implement semantic contract consistency checks;
-- [ ] generate real contract hashes and registry snapshot identity to replace fixture placeholders;
+- [ ] generate real contract hashes and Registry Snapshot identity to replace fixture placeholders;
 - [ ] implement strict duplicate-key parser/resource limits;
 - [ ] implement graph/type/capability/effect/fallback passes;
+- [ ] implement required-vs-allowed authority/effect checks;
+- [ ] implement policy-egress semantic consistency (including `data.egress` destination-class matching) without performing authorization;
 - [ ] implement effect summary;
 - [ ] implement semantic-view normalization/JCS/hash;
 - [ ] automate repository positive/negative/version/hash/edge fixtures;
 - [ ] add property/fuzz smoke targets;
+- [ ] run differential/round-trip canonicalization tests;
 - [ ] reconcile any actual implementation-discovered contradiction through explicit ADR/schema/fixture update.
 
 ## Pre-spike audit checks
@@ -67,6 +76,7 @@ docs/67-v0.1-semantic-reference-and-version-resolution.md
 docs/68-aios-ir-v0.1-edge-case-semantics.md
 docs/69-v0.1-capability-effect-and-authority-contract-profile.md
 docs/70-validator-and-registry-reason-code-catalog.md
+docs/81-stage0-architecture-closure-audit.md
 ```
 
 and:
@@ -80,6 +90,8 @@ specs/ir-validation-result.schema.json
 specs/validator-output.schema.json
 specs/effect-summary.schema.json
 specs/validator-reason-codes.json
+specs/provider-conformance-reason-codes.json
+specs/contract-maturity.json
 ```
 
 with fixtures:
@@ -95,6 +107,7 @@ examples/aios-ir/edge-case-cases.json
 examples/aios-ir/capability-contracts.json
 examples/aios-ir/type-contracts.json
 examples/aios-ir/registry-snapshot.json
+examples/aios-ir/provider-conformance-cases.json
 ```
 
 ## Stop conditions remain active
@@ -108,13 +121,15 @@ Stop/propose an architecture change if implementation finds, for example:
 - hash profile produces non-deterministic output across conforming implementations;
 - required effect/authority semantics cannot be represented without broadening trusted authority;
 - a dependency forces network/provider/model execution in trusted validation;
-- registry resolution cannot be made immutable/reproducible as specified.
+- registry resolution cannot be made immutable/reproducible as specified;
+- JCS/numeric/Unicode/duplicate-key behavior of the selected Rust stack differs from the controlling canonicalization/parser contract.
 
 ## Explicitly deferred from Issue #17
 
 - Task daemon/SQLite persistence;
 - Cedar policy authorization;
 - provider process execution;
+- Credential Broker;
 - model planner/router;
 - Varlink/WIT production provider runtime;
 - Resource Broker;
@@ -136,13 +151,24 @@ bytes
 → immutable registry
 → graph/references
 → types/capabilities
-→ effects/authority/egress/fallback
+→ required/allowed effects + authority + egress + fallback
 → effect summary
 → normalized semantic view
 → canonical semantic hash
 ```
 
 with deterministic machine diagnostics and no execution/authority side effects.
+
+## After #17
+
+Do not jump directly to an AI planner.
+
+Follow:
+
+- `docs/82-stage1-core-substrate-codex-runbook.md`
+- `docs/86-stage1-deterministic-spine-acceptance-tests.md`
+
+The next milestone is a complete deterministic Task/Artifact/Provenance/Registry/Authority/Provider execution/recovery spine with no AI model.
 
 ## Principle
 
