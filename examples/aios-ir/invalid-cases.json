@@ -161,7 +161,7 @@
           "execution_class": "deterministic",
           "inputs": {"source": {"source": "input", "name": "source"}},
           "outputs": {"hash": "data.hash@1"},
-          "authority_requests": [],
+          "authority_requests": [{"action": "artifact.read", "resource": "input:source"}],
           "egress": {"mode": "deny"},
           "failure": {"on_error": "stop"},
           "cache": "content_addressed"
@@ -256,7 +256,7 @@
     }
   },
   {
-    "name": "network-authority-contradicts-egress-deny",
+    "name": "egress-deny-cannot-name-destinations",
     "expected": "invalid",
     "validation_stage": "semantic",
     "reason_code": "IR_EGRESS_CONTRADICTION",
@@ -272,10 +272,8 @@
           "execution_class": "deterministic",
           "inputs": {"text": {"source": "input", "name": "text"}},
           "outputs": {"text": "text.plain@1"},
-          "authority_requests": [
-            {"action": "network.connect", "resource": "https://example.invalid"}
-          ],
-          "egress": {"mode": "deny"},
+          "authority_requests": [],
+          "egress": {"mode": "deny", "destination_classes": ["remote-model"]},
           "failure": {"on_error": "stop"},
           "cache": "never"
         }
@@ -326,7 +324,10 @@
           "execution_class": "deterministic",
           "inputs": {"source": {"source": "input", "name": "source"}},
           "outputs": {"copy": "artifact.file@1"},
-          "authority_requests": [],
+          "authority_requests": [
+            {"action": "artifact.read", "resource": "input:source"},
+            {"action": "artifact.write", "resource": "task.output"}
+          ],
           "egress": {"mode": "deny"},
           "failure": {
             "on_error": "fallback",
