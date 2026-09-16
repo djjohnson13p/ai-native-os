@@ -1,0 +1,38 @@
+{
+  "schema_version": "0.1",
+  "approval_id": "APR-T92-remote-summary-egress",
+  "authority_request_id": "AR-T92-remote-summary-egress",
+  "task_id": "T92",
+  "semantic_program_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "node_id": "draft_summary",
+  "action": "data.egress",
+  "resource": {
+    "kind": "artifact",
+    "id": "artifact://METRICS-92",
+    "display_class": "Task metrics",
+    "sensitivity": "private"
+  },
+  "principal": {
+    "kind": "provider",
+    "id": "org.ainative.fixture.remote-summary",
+    "version": "0.1.0"
+  },
+  "destination": {
+    "class": "remote-model",
+    "service_id": "service://model/fixture-remote",
+    "region_or_jurisdiction": "fixture-region"
+  },
+  "effect_classes": ["NETWORK", "DATA_EGRESS"],
+  "irreversibility": "reversible",
+  "scope": "ONE_SHOT",
+  "requested_limits": {
+    "max_uses": 1,
+    "max_cost_microusd": 50000
+  },
+  "policy_reason_codes": ["AUTH_REQUIRE_APPROVAL"],
+  "trusted_summary": "Send the selected Task metrics to the named remote model service one time to draft a summary.",
+  "provider_context": "Provider-supplied context is supplementary and not authoritative approval text.",
+  "status": "PENDING",
+  "created_at": "2026-09-15T20:40:00Z",
+  "expires_at": "2026-09-15T20:50:00Z"
+}
