@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/recovery-assessment.schema.json",
+  "title": "AIOS v0.1 Recovery Assessment",
+  "description": "Deterministic reconciliation record describing durable evidence, outcome certainty, and the next safe recovery action after a crash/restart/uncertain attempt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "assessment_id",
+    "recovery_epoch_id",
+    "task_id",
+    "subject",
+    "certainty",
+    "evidence",
+    "safe_action",
+    "reason_codes",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "assessment_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "recovery_epoch_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["task", "attempt", "binding", "artifact-publication", "authority-grant", "credential-use", "external-operation"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "binding_id": {"type": ["string", "null"], "maxLength": 256},
+        "attempt_id": {"type": ["string", "null"], "maxLength": 256},
+        "operation_id": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
+    "certainty": {
+      "type": "string",
+      "enum": ["NOT_STARTED", "STARTED_NO_EFFECT", "COMPLETED", "FAILED_NO_EFFECT", "FAILED_PARTIAL_EFFECT", "OUTCOME_UNKNOWN"]
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "ref", "observation"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["task-record", "provenance", "attempt-record", "provider-runtime", "artifact-allocation", "artifact-publication", "blob-integrity", "grant-record", "approval-record", "credential-record", "external-status", "idempotency-record", "other"]},
+          "ref": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "observation": {"type": "string", "minLength": 1, "maxLength": 2048}
+        }
+      }
+    },
+    "safe_action": {
+      "type": "string",
+      "enum": ["NO_ACTION", "RECONCILE_STATE", "CLEAN_STAGING", "MARK_ATTEMPT_FAILED", "CREATE_NEW_ATTEMPT", "RESUME_EXISTING_ATTEMPT", "REVOKE_GRANTS", "WAIT_FOR_INPUT", "WAIT_FOR_AUTH", "REQUIRE_EXTERNAL_RECONCILIATION", "FAIL_TASK", "BEGIN_COMPENSATION"]
+    },
+    "new_binding_required": {"type": "boolean", "default": false},
+    "external_reconciliation_required": {"type": "boolean", "default": false},
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^RECOVERY_[A-Z0-9_]+$", "maxLength": 128}
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
