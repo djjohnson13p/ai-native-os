@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/time-trust-state.schema.json",
+  "title": "AIOS v0.1 Time Trust State",
+  "description": "Local trusted-core assessment of wall-clock confidence for security-sensitive expiry decisions. This is not a global distributed clock.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state", "observed_wall_time", "reason_codes", "assessed_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "state": {"type": "string", "enum": ["TRUSTED_LOCAL", "TIME_UNCERTAIN"]},
+    "observed_wall_time": {"type": "string", "format": "date-time"},
+    "last_trusted_wall_time": {"type": ["string", "null"], "format": "date-time"},
+    "rollback_tolerance_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
+    "source_class": {"type": "string", "enum": ["SYSTEM_RTC", "SYSTEM_SYNCHRONIZED", "ADMIN_CONFIRMED", "TRUSTED_SERVICE", "UNKNOWN"]},
+    "boot_id": {"type": ["string", "null"], "maxLength": 256},
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^TIME_[A-Z0-9_]+$", "maxLength": 128}
+    },
+    "assessed_at": {"type": "string", "format": "date-time"}
+  }
+}
