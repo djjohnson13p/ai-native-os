@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/contract-maturity.schema.json",
+  "title": "AIOS Contract Maturity Index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_for", "entries"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1"},
+    "generated_for": {"type": "string", "minLength": 1, "maxLength": 128},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "maturity", "workstream", "artifacts", "blocking_questions"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "maturity": {"type": "string", "enum": ["DRAFT", "SPIKE_READY", "PROTOTYPE", "CONFORMANCE_CANDIDATE", "STABLE"]},
+          "workstream": {"type": "string", "minLength": 1, "maxLength": 256},
+          "issue": {"type": ["integer", "null"], "minimum": 1},
+          "artifacts": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "maxLength": 512}},
+          "controlling_adrs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 128}},
+          "fixture_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 512}},
+          "blocking_questions": {"type": "array", "items": {"type": "string", "maxLength": 2048}},
+          "notes": {"type": ["string", "null"], "maxLength": 4096}
+        }
+      }
+    }
+  }
+}
