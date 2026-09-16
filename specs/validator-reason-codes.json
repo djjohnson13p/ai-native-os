@@ -37,6 +37,7 @@
     {"code": "IR_REQUIRED_AUTHORITY_MISSING", "severity": "error", "stage": "effects_authority"},
     {"code": "IR_AUTHORITY_DUPLICATE_REQUEST", "severity": "error", "stage": "effects_authority"},
     {"code": "IR_EFFECT_CLASS_NOT_ALLOWED", "severity": "error", "stage": "effects_authority"},
+    {"code": "IR_EGRESS_NOT_ALLOWED", "severity": "error", "stage": "effects_authority"},
     {"code": "IR_EGRESS_CONTRADICTION", "severity": "error", "stage": "effects_authority"},
     {"code": "IR_EGRESS_AUTHORITY_MISMATCH", "severity": "error", "stage": "effects_authority"},
     {"code": "IR_CACHE_EXECUTION_CLASS_MISMATCH", "severity": "error", "stage": "effects_authority"},
