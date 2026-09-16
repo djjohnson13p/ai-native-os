@@ -2,204 +2,195 @@
   {
     "capability": "table.import",
     "version": "1.0",
-    "description": "Import a user-selected tabular artifact into a normalized semantic table value.",
+    "description": "Import a user-selected tabular artifact into the normalized table semantic type.",
     "role": "ordinary",
-    "inputs": {
-      "source": {"type": "artifact.table@1", "required": true, "description": "Selected tabular artifact"}
-    },
-    "outputs": {
-      "table": {"type": "data.table@1", "required": true, "description": "Parsed semantic table"}
-    },
+    "inputs": {"source": {"type": "artifact.table@1", "required": true}},
+    "outputs": {"table": {"type": "data.table@1", "required": true}},
     "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["ARTIFACT_READ"],
     "allowed_effect_classes": ["ARTIFACT_READ"],
+    "required_authority_classes": ["artifact.read"],
     "allowed_authority_classes": ["artifact.read"],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "canonical_value", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
+    "determinism": {"equivalence": "canonical_value"},
     "error_classes": ["TABLE_IMPORT_UNSUPPORTED_FORMAT", "TABLE_IMPORT_MALFORMED_INPUT", "TABLE_IMPORT_SIZE_LIMIT"],
-    "conformance": {"suite_id": "conformance://table.import/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
+    "conformance": {"suite_id": "conformance://table.import/1", "suite_version": "0.1"}
   },
   {
     "capability": "table.normalize",
     "version": "1.0",
-    "description": "Normalize a semantic table into the canonical v1 table semantics used by downstream deterministic providers.",
+    "description": "Normalize a parsed table under a declared table normalization contract.",
     "role": "ordinary",
-    "inputs": {
-      "table": {"type": "data.table@1", "required": true, "description": "Input table"}
-    },
-    "outputs": {
-      "table": {"type": "data.table@1", "required": true, "description": "Normalized table"}
-    },
+    "inputs": {"table": {"type": "data.table@1", "required": true}},
+    "outputs": {"table": {"type": "data.table@1", "required": true}},
     "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["PURE"],
     "allowed_effect_classes": ["PURE"],
+    "required_authority_classes": [],
     "allowed_authority_classes": [],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "canonical_value", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["TABLE_NORMALIZE_INVALID_SCHEMA"],
-    "conformance": {"suite_id": "conformance://table.normalize/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
+    "determinism": {"equivalence": "canonical_value"},
+    "error_classes": ["TABLE_NORMALIZE_INVALID_SCHEMA", "TABLE_NORMALIZE_UNSUPPORTED_VALUE"],
+    "conformance": {"suite_id": "conformance://table.normalize/1", "suite_version": "0.1"}
   },
   {
     "capability": "stats.compare_periods",
     "version": "1.0",
-    "description": "Compute deterministic comparative metrics from a normalized table.",
+    "description": "Produce deterministic comparison metrics from a normalized table.",
     "role": "ordinary",
-    "inputs": {
-      "table": {"type": "data.table@1", "required": true, "description": "Normalized source table"}
-    },
-    "outputs": {
-      "metrics": {"type": "data.metrics@1", "required": true, "description": "Machine-verifiable metrics"}
-    },
+    "inputs": {"table": {"type": "data.table@1", "required": true}},
+    "outputs": {"metrics": {"type": "data.metrics@1", "required": true}},
     "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["PURE"],
     "allowed_effect_classes": ["PURE"],
+    "required_authority_classes": [],
     "allowed_authority_classes": [],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "canonical_value", "numeric_absolute_tolerance": 0, "numeric_relative_tolerance": 0},
-    "error_classes": ["STATS_INPUT_INVALID", "STATS_PERIOD_NOT_FOUND"],
-    "conformance": {"suite_id": "conformance://stats.compare_periods/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
+    "determinism": {"equivalence": "numeric_tolerance", "numeric_absolute_tolerance": 0.000000001, "numeric_relative_tolerance": 0.000000001},
+    "error_classes": ["STATS_INVALID_INPUT", "STATS_INSUFFICIENT_PERIODS"],
+    "conformance": {"suite_id": "conformance://stats.compare_periods/1", "suite_version": "0.1"}
   },
   {
     "capability": "chart.render",
     "version": "1.0",
-    "description": "Render a portable chart artifact from typed metrics.",
+    "description": "Render a chart artifact from typed metrics.",
     "role": "ordinary",
-    "inputs": {
-      "metrics": {"type": "data.metrics@1", "required": true, "description": "Metrics to visualize"}
-    },
-    "outputs": {
-      "chart": {"type": "artifact.image@1", "required": true, "description": "Rendered chart artifact"}
-    },
+    "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
+    "outputs": {"chart": {"type": "artifact.image@1", "required": true}},
     "allowed_execution_classes": ["deterministic", "bounded_nondeterministic"],
+    "required_effect_classes": ["ARTIFACT_WRITE"],
     "allowed_effect_classes": ["ARTIFACT_WRITE"],
+    "required_authority_classes": ["artifact.write"],
     "allowed_authority_classes": ["artifact.write"],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "semantic", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["CHART_RENDER_INVALID_INPUT", "CHART_RENDER_FAILED"],
-    "conformance": {"suite_id": "conformance://chart.render/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": ["The Demonstration A fixture requests deterministic execution even though the semantic contract permits a bounded nondeterministic renderer implementation class in other programs."]
+    "determinism": {"equivalence": "semantic"},
+    "error_classes": ["CHART_INVALID_DATA", "CHART_RENDER_FAILED"],
+    "conformance": {"suite_id": "conformance://chart.render/1", "suite_version": "0.1"}
   },
   {
     "capability": "report.summarize",
     "version": "1.0",
-    "description": "Create a concise narrative interpretation of typed metrics. May be satisfied by local or policy-approved remote probabilistic providers.",
+    "description": "Generate a concise narrative from typed metrics. Local providers may be pure; remote providers require explicit network/data-egress authority and policy.",
     "role": "ordinary",
-    "inputs": {
-      "metrics": {"type": "data.metrics@1", "required": true, "description": "Authoritative metrics"}
-    },
-    "outputs": {
-      "narrative": {"type": "text.narrative@1", "required": true, "description": "Candidate narrative requiring downstream verification where consequential"}
-    },
+    "inputs": {"metrics": {"type": "data.metrics@1", "required": true}},
+    "outputs": {"narrative": {"type": "text.narrative@1", "required": true}},
     "allowed_execution_classes": ["probabilistic", "bounded_nondeterministic"],
+    "required_effect_classes": [],
     "allowed_effect_classes": ["PURE", "NETWORK", "DATA_EGRESS"],
+    "required_authority_classes": [],
     "allowed_authority_classes": ["network.connect", "data.egress"],
     "allowed_egress_modes": ["deny", "policy"],
-    "determinism": {"equivalence": "not_applicable", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["REPORT_SUMMARY_PROVIDER_UNAVAILABLE", "REPORT_SUMMARY_INVALID_OUTPUT"],
-    "conformance": {"suite_id": "conformance://report.summarize/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": ["A local provider can satisfy the contract with egress denied. Remote placement additionally requires explicit policy-controlled egress/authority in the semantic program and runtime binding."]
+    "determinism": {"equivalence": "not_applicable"},
+    "error_classes": ["REPORT_MODEL_UNAVAILABLE", "REPORT_INVALID_STRUCTURED_OUTPUT", "REPORT_CONTEXT_LIMIT"],
+    "conformance": {"suite_id": "conformance://report.summarize/1", "suite_version": "0.1"}
   },
   {
     "capability": "verify.numeric_claims",
     "version": "1.0",
-    "description": "Verify numeric claims in a narrative against authoritative typed metrics and return only an approved narrative value.",
+    "description": "Validate narrative numeric claims against authoritative deterministic metrics and return a verified narrative or failure.",
     "role": "verifier",
     "inputs": {
-      "narrative": {"type": "text.narrative@1", "required": true, "description": "Candidate narrative"},
-      "metrics": {"type": "data.metrics@1", "required": true, "description": "Authoritative metrics"}
+      "narrative": {"type": "text.narrative@1", "required": true},
+      "metrics": {"type": "data.metrics@1", "required": true}
     },
-    "outputs": {
-      "verified_narrative": {"type": "text.narrative@1", "required": true, "description": "Narrative after numeric-claim verification"}
-    },
+    "outputs": {"verified_narrative": {"type": "text.narrative@1", "required": true}},
     "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["PURE"],
     "allowed_effect_classes": ["PURE"],
+    "required_authority_classes": [],
     "allowed_authority_classes": [],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "canonical_value", "numeric_absolute_tolerance": 0, "numeric_relative_tolerance": 0},
-    "error_classes": ["VERIFY_NUMERIC_CLAIM_UNSUPPORTED", "VERIFY_NUMERIC_CLAIM_FALSE", "VERIFY_NUMERIC_CLAIM_AMBIGUOUS"],
-    "conformance": {"suite_id": "conformance://verify.numeric_claims/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
+    "determinism": {"equivalence": "canonical_value"},
+    "error_classes": ["VERIFY_UNSUPPORTED_CLAIM", "VERIFY_NUMERIC_MISMATCH", "VERIFY_PARSE_FAILED"],
+    "conformance": {"suite_id": "conformance://verify.numeric_claims/1", "suite_version": "0.1"}
   },
   {
     "capability": "document.compose",
     "version": "1.0",
-    "description": "Compose verified narrative, chart, and metrics into a portable report artifact.",
+    "description": "Compose report artifacts from a chart, verified narrative, and machine-readable metrics.",
     "role": "ordinary",
     "inputs": {
-      "chart": {"type": "artifact.image@1", "required": true, "description": "Chart representation"},
-      "narrative": {"type": "text.narrative@1", "required": true, "description": "Verified narrative"},
-      "metrics": {"type": "data.metrics@1", "required": true, "description": "Authoritative metrics"}
+      "chart": {"type": "artifact.image@1", "required": true},
+      "narrative": {"type": "text.narrative@1", "required": true},
+      "metrics": {"type": "data.metrics@1", "required": true}
     },
-    "outputs": {
-      "report": {"type": "artifact.report@1", "required": true, "description": "Portable report artifact"}
-    },
-    "allowed_execution_classes": ["deterministic"],
+    "outputs": {"report": {"type": "artifact.report@1", "required": true}},
+    "allowed_execution_classes": ["deterministic", "bounded_nondeterministic"],
+    "required_effect_classes": ["ARTIFACT_WRITE"],
     "allowed_effect_classes": ["ARTIFACT_WRITE"],
+    "required_authority_classes": ["artifact.write"],
     "allowed_authority_classes": ["artifact.write"],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "semantic", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["DOCUMENT_COMPOSE_INVALID_INPUT", "DOCUMENT_COMPOSE_FAILED"],
-    "conformance": {"suite_id": "conformance://document.compose/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
-  },
-  {
-    "capability": "artifact.copy",
-    "version": "1.0",
-    "description": "Copy an artifact to a Task-owned output allocation without changing its semantic content.",
-    "role": "ordinary",
-    "inputs": {
-      "source": {"type": "artifact.file@1", "required": true, "description": "Source artifact"}
-    },
-    "outputs": {
-      "copy": {"type": "artifact.file@1", "required": true, "description": "Copied artifact"}
-    },
-    "allowed_execution_classes": ["deterministic"],
-    "allowed_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
-    "allowed_authority_classes": ["artifact.read", "artifact.write"],
-    "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "byte_identical", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["ARTIFACT_COPY_READ_FAILED", "ARTIFACT_COPY_WRITE_FAILED"],
-    "conformance": {"suite_id": "conformance://artifact.copy/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
-  },
-  {
-    "capability": "artifact.copy.compat",
-    "version": "1.0",
-    "description": "Semantically compatible alternate artifact-copy capability used for fallback/conformance fixtures.",
-    "role": "ordinary",
-    "inputs": {
-      "source": {"type": "artifact.file@1", "required": true, "description": "Source artifact"}
-    },
-    "outputs": {
-      "copy": {"type": "artifact.file@1", "required": true, "description": "Copied artifact"}
-    },
-    "allowed_execution_classes": ["deterministic"],
-    "allowed_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
-    "allowed_authority_classes": ["artifact.read", "artifact.write"],
-    "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "byte_identical", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
-    "error_classes": ["ARTIFACT_COPY_READ_FAILED", "ARTIFACT_COPY_WRITE_FAILED"],
-    "conformance": {"suite_id": "conformance://artifact.copy/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": ["Fixture capability used to test a compatible fallback/substitution target."]
+    "determinism": {"equivalence": "semantic"},
+    "error_classes": ["DOCUMENT_INVALID_INPUT", "DOCUMENT_COMPOSE_FAILED"],
+    "conformance": {"suite_id": "conformance://document.compose/1", "suite_version": "0.1"}
   },
   {
     "capability": "artifact.hash",
     "version": "1.0",
-    "description": "Compute a deterministic content hash of an explicitly authorized artifact.",
+    "description": "Produce a cryptographic content hash for an artifact.",
     "role": "verifier",
-    "inputs": {
-      "source": {"type": "artifact.file@1", "required": true, "description": "Source artifact"}
-    },
-    "outputs": {
-      "hash": {"type": "data.hash@1", "required": true, "description": "Content hash"}
-    },
+    "inputs": {"source": {"type": "artifact.file@1", "required": true}},
+    "outputs": {"hash": {"type": "data.hash@1", "required": true}},
     "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["ARTIFACT_READ"],
     "allowed_effect_classes": ["ARTIFACT_READ"],
+    "required_authority_classes": ["artifact.read"],
     "allowed_authority_classes": ["artifact.read"],
     "allowed_egress_modes": ["deny"],
-    "determinism": {"equivalence": "byte_identical", "numeric_absolute_tolerance": null, "numeric_relative_tolerance": null},
+    "determinism": {"equivalence": "byte_identical"},
     "error_classes": ["ARTIFACT_HASH_READ_FAILED", "ARTIFACT_HASH_UNSUPPORTED_ALGORITHM"],
-    "conformance": {"suite_id": "conformance://artifact.hash/1", "suite_version": "0.1", "suite_hash": null},
-    "notes": []
+    "conformance": {"suite_id": "conformance://artifact.hash/1", "suite_version": "0.1"}
+  },
+  {
+    "capability": "artifact.copy",
+    "version": "1.0",
+    "description": "Copy an artifact into a task-owned output resource without changing its semantic content.",
+    "role": "ordinary",
+    "inputs": {"source": {"type": "artifact.file@1", "required": true}},
+    "outputs": {"copy": {"type": "artifact.file@1", "required": true}},
+    "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+    "allowed_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+    "required_authority_classes": ["artifact.read", "artifact.write"],
+    "allowed_authority_classes": ["artifact.read", "artifact.write"],
+    "allowed_egress_modes": ["deny"],
+    "determinism": {"equivalence": "canonical_value"},
+    "error_classes": ["ARTIFACT_COPY_READ_FAILED", "ARTIFACT_COPY_WRITE_FAILED"],
+    "conformance": {"suite_id": "conformance://artifact.copy/1", "suite_version": "0.1"}
+  },
+  {
+    "capability": "artifact.copy.compat",
+    "version": "1.0",
+    "description": "Fallback-compatible deterministic Artifact copy with the same v0.1 semantic ports/effects as artifact.copy@1.",
+    "role": "ordinary",
+    "inputs": {"source": {"type": "artifact.file@1", "required": true}},
+    "outputs": {"copy": {"type": "artifact.file@1", "required": true}},
+    "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+    "allowed_effect_classes": ["ARTIFACT_READ", "ARTIFACT_WRITE"],
+    "required_authority_classes": ["artifact.read", "artifact.write"],
+    "allowed_authority_classes": ["artifact.read", "artifact.write"],
+    "allowed_egress_modes": ["deny"],
+    "determinism": {"equivalence": "canonical_value"},
+    "error_classes": ["ARTIFACT_COPY_READ_FAILED", "ARTIFACT_COPY_WRITE_FAILED"],
+    "conformance": {"suite_id": "conformance://artifact.copy.compat/1", "suite_version": "0.1"}
+  },
+  {
+    "capability": "text.uppercase",
+    "version": "1.0",
+    "description": "Transform plain text to uppercase under the v0.1 fixture text normalization contract.",
+    "role": "ordinary",
+    "inputs": {"text": {"type": "text.plain@1", "required": true}},
+    "outputs": {"text": {"type": "text.plain@1", "required": true}},
+    "allowed_execution_classes": ["deterministic"],
+    "required_effect_classes": ["PURE"],
+    "allowed_effect_classes": ["PURE"],
+    "required_authority_classes": [],
+    "allowed_authority_classes": [],
+    "allowed_egress_modes": ["deny"],
+    "determinism": {"equivalence": "canonical_value"},
+    "error_classes": ["TEXT_INVALID_INPUT"],
+    "conformance": {"suite_id": "conformance://text.uppercase/1", "suite_version": "0.1"}
   }
 ]
