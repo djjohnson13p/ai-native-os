@@ -4,277 +4,321 @@ This directory contains draft contracts for the AI-native operating-system contr
 
 They exist so architecture decisions can be tested independently of implementation language, model provider, Linux distribution, UI toolkit, network transport, database, storage backend, package catalog, or cloud vendor.
 
-## Status
+## Status / maturity
 
-All schemas are **pre-v1 architecture drafts**. Breaking changes are expected while v0.1 is being designed and prototyped.
+All contracts are **pre-v1**.
 
-A schema being present here does not mean the implementation exists yet.
+A schema being present here does not mean implementation exists.
 
-Contract maturity/change rules are documented in `docs/65-contract-maturity-and-architecture-change-control.md`.
+Contract maturity/change rules:
+
+- `docs/65-contract-maturity-and-architecture-change-control.md`
+- `specs/contract-maturity.schema.json`
+- `specs/contract-maturity.json`
+
+Maturity levels:
+
+```text
+DRAFT
+SPIKE_READY
+PROTOTYPE
+CONFORMANCE_CANDIDATE
+STABLE
+```
+
+No current AIOS contract is `STABLE`.
 
 ## Contract principles
 
-1. **Provider-neutral** — no OpenAI-, Anthropic-, Google-, Microsoft-, Apple-, cloud-, database-, storage-, package-catalog-, or application-specific field is a mandatory core semantic concept.
-2. **Task-scoped** — machine-actionable operations retain task identity and authority context outside reusable semantic-program identity where appropriate.
-3. **Handles over arbitrary paths** — contracts prefer artifact/resource/object identifiers rather than unrestricted host paths.
-4. **Plans are not authority** — planner/IR schemas describe proposed work; policy/grant schemas govern permission.
-5. **Semantic contracts precede providers** — a capability/type/object has provider-independent meaning before an implementation claims to provide it.
-6. **Semantic IR is separate from execution binding** — providers, Task ID, hardware placement, grant references, network paths, namespace paths, and sandbox instances are outside AIOS IR semantic identity.
-7. **Versioned meaning** — successful semantic validation records the exact registry snapshot of type/capability contracts used to interpret a program.
-8. **Presentation is separate from identity** — display/View schemas describe projections of Tasks/objects rather than redefining them.
-9. **Network/cloud are runtime fabrics** — service endpoints, network paths, cloud regions, and remote workers do not become semantic Task/object identity.
-10. **Object identity is separate from storage/provider records** — federated/external IDs are mappings to durable AIOS object identity.
-11. **Storage/namespace are projections** — replicas, caches, filesystem paths, mounts, and cloud object keys do not become semantic identity or authority.
-12. **Authentication is not authorization** — trust identities and credentials provide evidence/tools; deterministic policy still authorizes protected actions.
-13. **Signed is not automatically trusted** — component/package signatures establish publisher/integrity evidence, not semantic conformance or runtime authority.
-14. **Bulk data out-of-band** — large files/media/model weights should not be embedded in ordinary control-plane JSON messages.
-15. **Explicit versions** — contracts carry schema/interface versions as implementation stabilizes.
-16. **Fail closed for execution** — unknown required fields/versions/capabilities must not be silently interpreted as broader permission.
-17. **Portable serialization first** — JSON Schema is the first interchange notation because it is inspectable and easy to fixture-test. It is not a permanent requirement for all hot-path runtime communication.
-18. **Hash executable meaning, not labels/runtime state** — AIOS IR v0.1 semantic hashing follows ADR 0029 and `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md`.
+1. **Provider-neutral** — no model/cloud/application/database/programming-language vendor is a mandatory semantic concept.
+2. **Task-scoped execution** — runtime protected actions retain Task/principal/binding context while reusable semantic-program identity remains Task-independent where specified.
+3. **Handles over ambient paths/secrets** — prefer typed Artifact/Object/resource/credential handles over unrestricted host paths or secret propagation.
+4. **Plans are not authority** — AIOS IR can request authority; deterministic policy/grants govern execution.
+5. **Semantic contracts precede providers** — a capability/type has stable meaning before an implementation claims it.
+6. **Semantic IR is separate from runtime binding** — providers, Task ID, device, grants, paths, endpoints, and sandbox instances are outside semantic-program identity.
+7. **Required vs allowed effects/authority are explicit** — capability contracts declare semantic lower bounds and maximum implementation envelopes.
+8. **Versioned meaning** — successful validation records the immutable Registry Snapshot used to interpret the program.
+9. **Presentation/storage/network/cloud are projections/runtime fabrics** — they may change without redefining Task/Object/program meaning.
+10. **Authentication is not authorization** — identity/credential evidence never replaces deterministic Task authority.
+11. **Signed is not automatically trusted** — signatures prove integrity/publisher evidence, not semantic conformance/runtime permission.
+12. **Execution Bindings are immutable receipts** — retries/substitution create new bindings/attempts.
+13. **Unknown outcome remains unknown** — recovery cannot manufacture completion/failure when external effect certainty is lost.
+14. **Bulk data stays out-of-band** — large files/media/model weights do not travel inside normal control-plane JSON.
+15. **Fail closed** — unknown required semantics/versions/authority mappings do not widen behavior.
+16. **Portable inspectable bootstrap** — JSON/JSON Schema are bootstrap interchange forms, not a permanent hot-path mandate.
+17. **Hash executable meaning, not labels/runtime state** — semantic hashing follows the controlling AIOS IR/registry hash profiles.
 
-## Current schemas
+## Current contract families
 
-### Semantic compute / execution
+### AIOS IR / semantic compute
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `aios-ir.schema.json` | provider-independent AI-native semantic execution graph; excludes Task/runtime binding identity |
-| `ir-validation-result.schema.json` | deterministic structural/semantic result, diagnostics, semantic hash/profile, validator/registry identity |
-| `validator-output.schema.json` | top-level validator bundle: validation result plus derived effect summary for valid programs |
-| `registry-snapshot.schema.json` | immutable/content-addressed set of semantic type/capability contracts used for validation |
-| `capability-contract.schema.json` | stable semantic meaning of a capability independent of providers |
-| `type-contract.schema.json` | semantic type identity/representation/equality contract |
-| `execution-binding.schema.json` | concrete attempt-specific Task/provider/authority/resource binding for one IR node |
-| `execution-profile.schema.json` | effective process/container/VM isolation profile |
-| `effect-summary.schema.json` | deterministic summary of semantic effects/authority classes/verification boundaries |
-| `compiled-target.schema.json` | compiled deterministic target identity linked to semantic source without carrying authority |
-| `skill-manifest.schema.json` | versioned reusable/compiled procedure metadata |
+| `aios-ir.schema.json` | provider-independent AI-native semantic execution graph |
+| `ir-validation-result.schema.json` | deterministic validation result + semantic hash/registry identity |
+| `validator-output.schema.json` | validator bundle including derived effect summary |
+| `validator-reason-codes.json` | stable validator diagnostics |
+| `effect-summary.schema.json` | derived program/node effects, authority classes, verification barriers |
+| `capability-contract.schema.json` | provider-independent capability meaning, required/allowed effect+authority bounds |
+| `type-contract.schema.json` | semantic type/representation/equality contract |
+| `registry-snapshot.schema.json` | immutable semantic contract-set identity |
+| `compiled-target.schema.json` | compiled deterministic target tied to source semantics without authority |
+| `skill-manifest.schema.json` | reusable/compiled Skill metadata |
 
-### Task / policy / provenance
+### Task lifecycle / persistence
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `task-plan.schema.json` | planner-facing typed capability proposal graph during v0.1 transition |
-| `task-record.schema.json` | durable task identity/state plus validated semantic-program identity |
-| `artifact-handle.schema.json` | stable identity and metadata for task data/output |
-| `capability-token.schema.json` | task/principal-scoped authority grant representation |
-| `policy-decision.schema.json` | deterministic authorization decision record |
-| `provenance-event.schema.json` | append-oriented execution/audit event linked to semantic program and runtime binding identities |
-| `persistence-v0.1.sql` | draft SQLite persistence layout for control-plane recovery/state |
+| `task-plan.schema.json` | planner-facing proposal envelope during transition |
+| `task-record.schema.json` | durable Task identity/current state |
+| `task-transition-request.schema.json` | CAS/idempotent Task transition request |
+| `task-transition-result.schema.json` | committed/rejected Task transition result |
+| `task-reason-codes.json` | stable Task Manager reason codes |
+| `step-execution-record.schema.json` | mutable execution-attempt lifecycle state |
+| `persistence-v0.1.sql` | aligned SQLite draft for trusted-core durability/recovery |
 
-### Identity / trust / credential mediation
+### Artifact/data substrate
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `trust-identity.schema.json` | stable user/device/service/workload/provider/publisher identity and key lifecycle metadata |
-| `credential-handle.schema.json` | opaque mediated credential metadata/scope/exportability without raw secret material |
+| `artifact-handle.schema.json` | stable Artifact identity/type/hash/sensitivity/origin metadata |
+| `artifact-output-allocation.schema.json` | bounded Task/node output staging allocation |
+| `artifact-publication-request.schema.json` | idempotent request to finalize staged output |
+| `artifact-publication-result.schema.json` | publication result / published Artifact identity |
+| `artifact-reason-codes.json` | stable Artifact Store diagnostics |
 
-### Providers / models / compatibility / distribution
+### Provenance / audit
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `capability-manifest.schema.json` | provider declaration of semantic contracts implemented, conformance status, and runtime requirements |
-| `provider-registration.schema.json` | registration/conformance/trust state for a provider implementation |
-| `component-package.schema.json` | signed/content-addressed distributable provider/Domain-Pack/View/Skill/model/adapter package metadata |
-| `model-request.schema.json` | provider-neutral AI/model invocation request |
-| `model-result.schema.json` | provider-neutral model invocation result |
-| `compatibility-profile.schema.json` | known legacy-app habitat/translation profile |
+| `provenance-event.schema.json` | typed material event payload |
+| `provenance-journal-record.schema.json` | stream/sequence/hash-chain envelope around event payload |
+| `provenance-checkpoint.schema.json` | independently verifiable journal checkpoint |
+| `provenance-verification-result.schema.json` | stream verification result |
+| `provenance-reason-codes.json` | stable provenance diagnostics |
+
+### Authority / approvals / policy
+
+| Contract | Purpose |
+| --- | --- |
+| `authority-evaluation-request.schema.json` | concrete runtime request derived from validated semantic authority |
+| `policy-decision.schema.json` | engine-neutral deterministic ALLOW/DENY/REQUIRE_APPROVAL decision |
+| `policy-snapshot.schema.json` | exact policy/engine/config identity for reproducible attribution |
+| `approval-request.schema.json` | trusted structured approval prompt facts |
+| `approval-decision.schema.json` | authenticated user/admin approval outcome |
+| `authority-grant-record.schema.json` | durable scoped runtime grant state/scope/usage/expiry |
+| `capability-token.schema.json` | opaque token-handle metadata referencing the durable grant; no embedded scope/secret bytes |
+| `authority-reason-codes.json` | stable Authority Coordinator diagnostics |
+
+### Credentials / trust identities
+
+| Contract | Purpose |
+| --- | --- |
+| `trust-identity.schema.json` | user/device/service/workload/provider/publisher cryptographic identity metadata |
+| `credential-handle.schema.json` | opaque credential metadata/exportability/lifecycle without raw secret |
+| `credential-use-request.schema.json` | exact grant/binding-scoped request for credential-backed operation |
+| `credential-use-result.schema.json` | mediated result/delegation metadata without source secret |
+| `credential-reason-codes.json` | stable Credential Broker diagnostics |
+
+### Providers / execution bindings
+
+| Contract | Purpose |
+| --- | --- |
+| `capability-manifest.schema.json` | provider implementation declaration using canonical effect vocabulary |
+| `provider-registration.schema.json` | provider package/trust/conformance registration state |
+| `provider-conformance-evidence.schema.json` | evidence tied to exact provider/contract/package identity |
+| `provider-conformance-result.schema.json` | provider-vs-contract conformance result |
+| `execution-binding.schema.json` | immutable attempt-specific semantic-node → provider/resources/grants/placement receipt |
+| `execution-profile.schema.json` | sandbox/process/container/VM isolation profile |
+| `provider-invocation-request.schema.json` | typed bounded request delivered by Provider Supervisor |
+| `provider-invocation-result.schema.json` | structured semantic/runtime outcome for one invocation |
+| `provider-runtime-reason-codes.json` | Provider Supervisor diagnostics |
+
+### Crash recovery
+
+| Contract | Purpose |
+| --- | --- |
+| `recovery-assessment.schema.json` | durable evidence/certainty/safe-action reconciliation record |
+| `recovery-reason-codes.json` | stable recovery diagnostics |
+
+### Component distribution / models / compatibility
+
+| Contract | Purpose |
+| --- | --- |
+| `component-package.schema.json` | content-addressed/signed distributable component metadata |
+| `model-request.schema.json` | provider-neutral model invocation request |
+| `model-result.schema.json` | provider-neutral model result |
+| `compatibility-profile.schema.json` | legacy application habitat/translation profile |
 
 ### Hardware / resource placement
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `hardware-profile.schema.json` | relatively stable normalized hardware/security profile |
-| `resource-snapshot.schema.json` | time-sensitive available memory/load/thermal/network/provider resource state |
-| `placement-decision.schema.json` | candidate eligibility/ranking/selection with machine-readable reasons |
+| `hardware-profile.schema.json` | relatively stable normalized hardware/security facts |
+| `resource-snapshot.schema.json` | live memory/load/thermal/network/provider resource state |
+| `placement-decision.schema.json` | hard eligibility + objective ranking/selection with reason codes |
 
 ### Universal Software / Object Fabric
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `domain-pack.schema.json` | versioned Domain Pack declaration of objects/capabilities/Views/adapters/policy/dependencies |
-| `semantic-object-contract.schema.json` | stable semantic contract for an object type |
-| `relationship-contract.schema.json` | typed relationship predicate/source/target/cardinality semantics |
-| `object-record.schema.json` | durable/federated semantic object identity, representations, relationships, source state, and lineage |
-| `identity-resolution.schema.json` | cross-source identity match proposal/evidence/consequence/policy state |
+| `domain-pack.schema.json` | Domain Pack objects/capabilities/Views/adapters/policy/dependencies |
+| `semantic-object-contract.schema.json` | stable semantic object-type contract |
+| `relationship-contract.schema.json` | typed object relationship semantics |
+| `object-record.schema.json` | durable/federated object identity/source/lineage metadata |
+| `identity-resolution.schema.json` | cross-source match/link/merge proposal evidence/policy state |
 
 ### Storage / namespace / replica fabric
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `storage-replica.schema.json` | explicit artifact/object/package/model replica location, role, consistency, encryption, retention, and sync state |
-| `namespace-projection.schema.json` | mapping of semantic Object/Artifact/stream identity into file/path/URI/workspace materialization without redefining identity |
+| `storage-replica.schema.json` | replica role/location/consistency/encryption/retention state |
+| `namespace-projection.schema.json` | mapping semantic identity into legacy path/URI/workspace projections |
 
 ### Presentation Fabric
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `display-profile.schema.json` | current display/input/accessibility/trust context for presentation selection |
-| `view-contract.schema.json` | semantic object/action requirements for an adaptive/specialized View |
+| `display-profile.schema.json` | current display/input/accessibility/trust context |
+| `view-contract.schema.json` | semantic object/action requirements for a View |
 
 ### Network / cloud / service fabrics
 
-| Schema | Purpose |
+| Contract | Purpose |
 | --- | --- |
-| `network-service-descriptor.schema.json` | stable service identity, trust state, capabilities, and current reachable endpoints |
-| `network-transfer.schema.json` | explicit task-scoped bulk/material transfer record with policy/path/provenance state |
-| `remote-service-descriptor.schema.json` | cloud/edge/self-hosted remote service classes, trust, region, cost, lifecycle, and capabilities |
+| `network-service-descriptor.schema.json` | stable service identity/trust/capabilities/current endpoints |
+| `network-transfer.schema.json` | explicit Task-scoped material transfer/provenance |
+| `remote-service-descriptor.schema.json` | cloud/edge/self-hosted service trust/region/cost/lifecycle/capabilities |
 
-Planned contracts may include provider health, richer model descriptors, peer pairing/attestation evidence, operation-attempt/compensation records, object merge/split records, sync sessions, collaboration sessions, package revocation metadata, update activation records, and registry-signing/transparency metadata as implementation requires them.
-
-## Semantic/runtime relationship
-
-The intended core execution relationship is:
+## Core semantic/runtime relationship
 
 ```text
 Planner proposal
     ↓
 AIOS IR
-    ↓ validated against
-Semantic Type + Capability Registry Snapshot
+    ↓ deterministic validation against
+Immutable Semantic Registry Snapshot
     ↓ emits
-Validation Result + Derived Effect Summary + Semantic Hash
-    ↓ then evaluated/bound through
-Policy + Provider/Resource Broker
-    ↓ creates
-Execution Binding + Execution Profile
-    ↓ executes Provider
-    ↓ emits
-Artifacts + Provenance
+Validation Result + Effect Summary + Semantic Hash
+    ↓
+Concrete resource/provider resolution
+    ↓
+Authority Evaluation → Policy → optional Approval → scoped Grant
+    ↓
+Immutable Execution Binding
+    ↓
+Provider Supervisor / typed Provider Invocation
+    ↓
+Artifact publication + structured result
+    ↓
+Task transition + Provenance
+    ↓
+Recovery evidence if any boundary fails
 ```
 
-Task identity links to the semantic hash/control-plane records; it is not embedded into reusable AIOS IR.
+No layer below semantic validation gains permission merely because the program is valid.
 
-The broader platform adds orthogonal runtime context:
-
-```text
-Semantic Objects / Domain Packs
-        │
-        ├──── Presentation Profile + View Contract
-        ├──── Resource Snapshot + Placement Decision
-        ├──── Network Service + Transfer Record
-        ├──── Storage Replica + Namespace Projection
-        ├──── Trust Identity + Credential Handle
-        ├──── Component Package + Activation State
-        └──── Remote Service / Compatibility Provider
-```
-
-Those runtime fabrics may change without silently changing semantic program/object identity.
-
-No layer below AIOS IR may reinterpret the program as carrying authority simply because it passed schema validation.
-
-A successful IR validation identifies the semantic program hash/profile and the registry snapshot used to give that program meaning.
+No provider gains semantic authority merely because it is signed, registered, or conforming.
 
 ## AIOS IR v0.1 identity rule
 
-For the Issue #17 spike:
+For Issue #17:
 
 ```text
 Task ID          outside AIOS IR
-program_id       logical identifier; excluded from semantic hash
+program_id       authoring/family label; excluded from semantic hash
 metadata         excluded
 description      excluded
 authority reason excluded
 runtime binding  excluded
 ```
 
-Executable semantics such as capability/data flow/types/effects/authority action+resource/egress/verification/failure/cache/constraints are included.
+Semantic capability/data flow/types/effects/authority action+selector/egress/verification/failure/cache/constraints are included.
 
-See ADR 0029 / `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md` for exact ordering/default/canonicalization rules.
+See ADR 0029 and `docs/66-aios-ir-v0.1-canonicalization-and-semantic-hash-profile.md`.
+
+## Effect vocabulary
+
+Canonical effect names are uppercase:
+
+```text
+PURE
+ARTIFACT_READ
+ARTIFACT_WRITE
+NETWORK
+DATA_EGRESS
+EXTERNAL_MESSAGE
+SECRET_ACCESS
+PERSISTENT_STATE
+DEVICE_ACCESS
+SYSTEM_CHANGE
+LEGACY_OPAQUE
+```
+
+Semantic capability contracts declare **required** lower bounds and **allowed** upper bounds. Provider manifests declare their actual implementation envelope using the same vocabulary.
+
+See `docs/69-v0.1-capability-effect-and-authority-contract-profile.md`.
 
 ## Schema IDs
 
-Until the project has a final name/domain, schemas use the documentation-only domain:
+Until the project has a stable domain, schemas use:
 
 ```text
 https://ai-native-os.example/specs/...
 ```
 
-No software should attempt to fetch that URL at runtime.
+No runtime should fetch that host. Cross-schema references resolve from a bundled local trusted schema set.
 
-Cross-schema `$ref` values using those IDs must be resolved from the locally bundled schema set during validation/testing rather than by network fetch.
-
-When the project gains a stable domain, schema IDs can move through an explicit compatibility/versioning ADR.
-
-## Versioning approach
+## Versioning
 
 Before v1.0:
 
-- breaking changes are allowed under `docs/65-contract-maturity-and-architecture-change-control.md`;
-- every breaking semantic/security change should update fixtures/tests in the same change;
-- consumers should reject schema versions they cannot interpret safely;
-- optional fields should be preferred for additive compatible evolution;
-- authority/security semantics must not change accidentally through a schema-only edit.
+- breaking changes are allowed under change control;
+- security/semantic changes update ADR/docs + schema + positive/negative fixtures + acceptance tests together;
+- unknown major/interface versions fail closed;
+- historical released snapshots/migrations are not silently edited once implementations depend on them.
 
-For stable interfaces, use semantic major/minor concepts:
+Semantic major/minor concepts:
 
 ```text
-major — incompatible contract/semantic change
-minor — additive compatible fields/capabilities
-patch — documentation/constraint clarification that does not change valid semantics
+major — incompatible meaning
+minor — explicitly compatible additive evolution
+patch — editorial/constraint clarification with no semantic change
 ```
 
-## Fixtures
+## Fixture directories
 
-### AIOS IR
+```text
+examples/aios-ir/          semantic validator/registry/provider-conformance
+examples/task-manager/     state/CAS/idempotency
+examples/artifact-store/   import/output/publication/crash cases
+examples/provenance/       append/hash-chain/correction cases
+examples/registry-lifecycle/ semantic/provider activation cases
+examples/authority/        policy/approval/grant adversarial cases
+examples/credentials/      secret mediation/exportability cases
+examples/provider-runtime/ binding/supervisor/runtime cases
+examples/recovery/         crash/outcome-certainty reconciliation
+examples/reference-task/   broader control-plane reference path
+examples/domain-fabric/    future cross-domain semantic object examples
+examples/platform-fabric/  future presentation/network/cloud/storage interfaces
+```
 
-`examples/aios-ir/` contains:
+All fixtures must remain synthetic. Placeholder hashes explicitly labeled as placeholders are not cryptographic evidence.
 
-- complete Demonstration A semantic IR;
-- semantic capability/type fixtures;
-- bootstrap registry snapshot;
-- validation/effect/binding/validator-output fixtures;
-- candidate reusable Skill manifest;
-- valid compact IR programs;
-- invalid/adversarial IR programs with expected reason codes;
-- semantic-hash equivalence/difference fixtures under `canonicalization-cases.json`.
+## Structural validation is not semantic trust
 
-Placeholder hashes are architecture/test placeholders until the reference implementation computes canonical identities. They are not cryptographic evidence.
+Passing JSON Schema validation does **not** prove:
 
-### Platform fabrics
+- AIOS IR is semantically valid;
+- requested action is authorized;
+- provider conforms to the contract;
+- package/publisher is trustworthy;
+- credential use is permitted;
+- Artifact content is benign;
+- two semantic objects are the same real entity;
+- storage replica is current/authoritative;
+- cloud/peer/display path satisfies policy;
+- model output is correct;
+- external action occurred exactly once.
 
-`examples/platform-fabric/` contains synthetic fixtures for:
-
-- compact and workstation presentation profiles;
-- paired peer service/trust identity;
-- remote service descriptor;
-- explicit peer data transfer;
-- storage replica state;
-- mediated credential handle metadata;
-- component package metadata;
-- namespace projection;
-- cross-source identity-resolution proposal.
-
-### General fixture rule
-
-A schema should not be considered implementation-ready until it has:
-
-- at least one minimal valid fixture;
-- at least one realistic valid fixture;
-- invalid fixtures for important missing/contradictory security/identity/version fields;
-- automated validation in CI.
-
-For AIOS IR and security-sensitive contracts, semantic/adversarial validation is also required; structural validation alone is insufficient.
-
-## Security note
-
-Passing JSON Schema validation only proves structural conformance.
-
-It does not prove:
-
-- the provider/service/peer/publisher is trustworthy;
-- the requested action/transfer/credential use is authorized;
-- the AIOS IR graph is semantically valid;
-- a capability provider conforms to its semantic contract;
-- a registry publisher should be trusted;
-- two object records really represent the same entity;
-- a storage replica is current/authoritative merely because it exists;
-- a signed component is safe or deserves broad authority;
-- a remote display is safe for confidential output;
-- a cloud region/provider satisfies policy;
-- a compatibility profile is safe;
-- model output is factually correct;
-- an artifact is non-malicious.
-
-Those decisions belong to semantic validation, policy, identity resolution, storage/source-of-truth logic, sandboxing, verification, provenance, conformance, and trust systems.
+Those are separate validator/policy/conformance/identity/sandbox/verification/provenance/recovery responsibilities.
