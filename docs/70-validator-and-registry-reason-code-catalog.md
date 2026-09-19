@@ -50,6 +50,17 @@ Warnings do not grant authority and remain bounded by the diagnostic limit.
 
 Schema validators may generate detailed underlying messages, but externally map them to the most specific stable family above.
 
+For closed `oneOf` structures whose alternatives use a common required `const`
+discriminator, classification uses the validator's structured branch contexts.
+Exactly one discriminator-compatible branch may contribute its unanimous nested
+code; a missing common discriminator maps to `IR_SCHEMA_REQUIRED`, and a present
+value matching no discriminator maps to `IR_SCHEMA_ENUM`. If more than one branch
+is genuinely compatible, or one selected branch has conflicting failure families,
+the conservative result is `IR_SCHEMA_TYPE`. Branch order and rendered English
+messages never select the code. A dedicated pre-schema invariant code remains more
+specific where already defined, such as `IR_FAILURE_POLICY_UNBOUNDED` for retry or
+replan without its finite budget.
+
 ## Resource limits
 
 | Code | Severity | Meaning |

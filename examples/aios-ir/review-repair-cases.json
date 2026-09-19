@@ -49,6 +49,27 @@
     {"token":"Infinity","valid":false}
   ],
   "diagnostic_property_names": ["pattern", "required property", "constant", "minimum", "maximum", "additional properties", "not unique", "does not match"],
+  "nested_diagnostic_cases": [
+    {"name":"value-ref-input-additional","pointer":"/nodes/0/inputs/source","value":{"source":"input","name":"source","required":"attack"},"reason_code":"IR_SCHEMA_ADDITIONAL_PROPERTY"},
+    {"name":"value-ref-node-additional","pointer":"/nodes/0/inputs/source","value":{"source":"node","node":"copy","port":"copy","required":"attack"},"reason_code":"IR_SCHEMA_ADDITIONAL_PROPERTY"},
+    {"name":"value-ref-input-required","pointer":"/nodes/0/inputs/source","value":{"source":"input"},"reason_code":"IR_SCHEMA_REQUIRED"},
+    {"name":"value-ref-node-required","pointer":"/nodes/0/inputs/source","value":{"source":"node","node":"copy"},"reason_code":"IR_SCHEMA_REQUIRED"},
+    {"name":"value-ref-input-pattern","pointer":"/nodes/0/inputs/source","value":{"source":"input","name":"bad/name"},"reason_code":"IR_SCHEMA_PATTERN"},
+    {"name":"value-ref-node-pattern","pointer":"/nodes/0/inputs/source","value":{"source":"node","node":"bad/node","port":"copy"},"reason_code":"IR_SCHEMA_PATTERN"},
+    {"name":"value-ref-program-output-additional","pointer":"/outputs/copy","value":{"source":"node","node":"copy","port":"copy","required":"attack"},"reason_code":"IR_SCHEMA_ADDITIONAL_PROPERTY"},
+    {"name":"value-ref-program-output-pattern","pointer":"/outputs/copy","value":{"source":"node","node":"bad/node","port":"copy"},"reason_code":"IR_SCHEMA_PATTERN"},
+    {"name":"value-ref-conflicting-selected-branch-errors","pointer":"/nodes/0/inputs/source","value":{"source":"input","required":"attack"},"reason_code":"IR_SCHEMA_TYPE"},
+    {"name":"value-ref-missing-discriminator","pointer":"/nodes/0/inputs/source","value":{},"reason_code":"IR_SCHEMA_REQUIRED"},
+    {"name":"value-ref-unknown-discriminator","pointer":"/nodes/0/inputs/source","value":{"source":"unknown"},"reason_code":"IR_SCHEMA_ENUM"},
+    {"name":"failure-stop-additional","pointer":"/nodes/0/failure","value":{"on_error":"stop","required":"attack"},"reason_code":"IR_SCHEMA_ADDITIONAL_PROPERTY"},
+    {"name":"failure-retry-required","pointer":"/nodes/0/failure","value":{"on_error":"retry"},"reason_code":"IR_FAILURE_POLICY_UNBOUNDED"},
+    {"name":"failure-replan-required","pointer":"/nodes/0/failure","value":{"on_error":"replan"},"reason_code":"IR_FAILURE_POLICY_UNBOUNDED"},
+    {"name":"failure-fallback-pattern","pointer":"/nodes/0/failure","value":{"on_error":"fallback","fallback_capabilities":["INVALID"]},"reason_code":"IR_SCHEMA_PATTERN"},
+    {"name":"failure-retry-range","pointer":"/nodes/0/failure","value":{"on_error":"retry","max_attempts":4},"reason_code":"IR_SCHEMA_RANGE"},
+    {"name":"failure-replan-range","pointer":"/nodes/0/failure","value":{"on_error":"replan","max_replans":0},"reason_code":"IR_SCHEMA_RANGE"},
+    {"name":"failure-missing-discriminator","pointer":"/nodes/0/failure","value":{},"reason_code":"IR_SCHEMA_REQUIRED"},
+    {"name":"failure-unknown-discriminator","pointer":"/nodes/0/failure","value":{"on_error":"unknown"},"reason_code":"IR_SCHEMA_ENUM"}
+  ],
   "verification_case": {
     "base": "demonstration-a.ir.json",
     "additional_output": {"source":"node","node":"draft_narrative","port":"narrative"},

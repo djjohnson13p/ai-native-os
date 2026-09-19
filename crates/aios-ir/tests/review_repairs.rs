@@ -152,6 +152,38 @@ fn diagnostic_codes_do_not_depend_on_attacker_property_names() {
 }
 
 #[test]
+fn discriminated_union_diagnostics_retain_specific_structured_codes() {
+    let validator = validator();
+    for case in fixture("review-repair-cases.json")["nested_diagnostic_cases"]
+        .as_array()
+        .unwrap()
+    {
+        let mut input = program();
+        *input
+            .pointer_mut(case["pointer"].as_str().unwrap())
+            .unwrap() = case["value"].clone();
+        let expected = case["reason_code"]
+            .as_str()
+            .unwrap()
+            .parse::<ValidatorReasonCode>()
+            .unwrap();
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+        let codes = report
+            .output
+            .validation
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert!(!report.output.validation.valid, "{case}");
+        assert!(report.output.validation.semantic_hash.is_none(), "{case}");
+        assert!(report.normalized.is_none(), "{case}");
+        assert_eq!(codes, vec![expected], "{case}");
+    }
+}
+
+#[test]
 fn verifier_inventory_does_not_claim_all_outputs_are_gated() {
     let validator = validator();
     let case = &fixture("review-repair-cases.json")["verification_case"];

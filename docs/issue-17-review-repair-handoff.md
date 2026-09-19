@@ -137,4 +137,32 @@ model execution was exercised.
 This pass does not claim formal correctness, exhaustive fuzzing, cross-platform
 binary reproducibility, or production readiness. Review the parser changes as trusted
 code, especially the exact-token/binary64 distinction. Do not merge or start Stage 1
-until the second review has resolved any remaining findings.
+until the required follow-up review has resolved any remaining findings.
+
+## R17-06 follow-up after the second review
+
+The [second independent review](https://github.com/djjohnson13p/ai-native-os/issues/17#issuecomment-5745523710)
+verified R17-01, R17-02, R17-04 and R17-05, found R17-03 fixed for direct schema
+errors, and reported one remaining nested-`oneOf` diagnostic defect as R17-06.
+
+The follow-up repair keeps the schemas, acceptance rules and reason-code vocabulary
+unchanged. `classify_schema_failure` now examines structured `OneOfNotValid` branch
+contexts. A single const-discriminator-compatible branch supplies a nested code only
+when its child failures agree. Missing common discriminators map to required, unknown
+discriminators map to enum, and genuine ambiguity or conflicting child families stay
+at the conservative type family. No branch is selected by array order, rendered
+English text or attacker-controlled property prose.
+
+The permanent corpus contains 19 nested cases across input/node value references,
+program outputs and stop/retry/fallback/replan policies. It covers additional-property,
+required, pattern, range, missing/unknown discriminator and conflicting-failure cases.
+The existing dedicated `IR_FAILURE_POLICY_UNBOUNDED` precheck remains authoritative
+for retry/replan policies that omit their finite budget.
+
+On the R17-06 repair tree, formatter, locked/offline Clippy with warnings denied and
+the full locked/offline suite pass (142 tests). The existing adversarial harness emits
+84 passing result records, and a separate targeted CLI harness passes all 19 R17-06
+cases. Registry Snapshot, Demonstration A and `table.import` identities remain the
+three values recorded above. These are implementer checks, not the final independent
+targeted read-only review. Issue #17 remains open and the branch must not merge until
+that review is complete.

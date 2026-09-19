@@ -235,7 +235,7 @@ fn required_structure_and_value_reference_shapes_fail_closed() {
     let mut malformed_reference = base.clone();
     malformed_reference["nodes"][0]["inputs"]["source"] = json!({"source":"input"});
     let report = validate(&malformed_reference);
-    assert!(has_code(&report, ValidatorReasonCode::IrSchemaType));
+    assert!(has_code(&report, ValidatorReasonCode::IrSchemaRequired));
     assert!(report.output.validation.semantic_hash.is_none());
 
     let mut malformed_identifier = base;
