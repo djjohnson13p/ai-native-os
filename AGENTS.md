@@ -150,9 +150,13 @@ Use subagents proactively when work can be separated without weakening evidence:
 
 The root coordinator integrates the work and remains accountable for the final result. Subagent conclusions do not merge code by themselves.
 
+**Continuation rule:** a subagent returning is not a reason to stop. The root coordinator must consume the result, route any repair/re-review automatically, update the GitHub handoff, and continue until the issue reaches its defined gate or a genuine owner decision/tool limitation blocks progress.
+
 ### GitHub as the handoff bridge
 
 GitHub is the durable coordination layer between ChatGPT, Codex, reviews, and future sessions.
+
+**Control-plane issue:** GitHub Issue #38 (`[meta] AIOS autonomous development control plane`) is the persistent project-level coordination bus. The root Codex coordinator should read it at the start of every work cycle and update it when the active work item changes state. Current GitHub state outranks stale chat context.
 
 For active implementation:
 
