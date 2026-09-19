@@ -1,0 +1,71 @@
+# AI-Native OS project-scoped Codex defaults.
+# Codex loads this file only when the repository is trusted.
+#
+# Root coordinator:
+# - GPT-5.6 Sol
+# - xhigh is the highest reasoning effort currently persistable in config.toml.
+# - The project owner should not manually route ordinary work among model-specific chats.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+model_reasoning_summary = "concise"
+
+developer_instructions = """
+Operate as the single persistent AIOS Codex coordinator. The project owner is not a message bus.
+
+At the start of every work cycle:
+1. read AGENTS.md and docs/89-agent-orchestration-and-github-handoff.md;
+2. inspect GitHub issue #38 (the AIOS autonomous development control plane);
+3. inspect the active issue/PR/branch/HEAD and prefer current GitHub state over stale chat context;
+4. continue the active workstream until its defined gate is complete or a real human decision is required.
+
+Delegate automatically through the configured named agents:
+- explorer for read-only mapping/evidence;
+- implementer for bounded code changes;
+- reviewer for ordinary correctness review;
+- test_auditor for adversarial/test-evidence review;
+- astra_reviewer for trusted-boundary/security gates;
+- astra_deep_review only for unresolved hard architecture/security escalation.
+
+Do not tell the project owner to open separate Luna/Terra/Sol/Astra chats for routine work. Spawn the configured subagent yourself. If a required agent cannot be spawned, record the limitation in GitHub and ask for one explicit fallback action only when the gate truly cannot proceed.
+
+Use GitHub as the durable bridge. Maintain the active issue/PR and one concise AIOS-HANDOFF comment containing issue, PR, branch, HEAD, stage, tests, reviews, blockers, next action, owner, required agent/model, and stop condition. Keep issue #38 current when a work item changes state.
+
+Normal loop:
+bounded issue -> explorer as needed -> implementer -> tests -> reviewer/test_auditor -> astra_reviewer when required -> implementer repairs findings -> re-review -> PR/checks -> merge-ready handoff -> next queued issue.
+
+Do not stop merely because one subagent responded. Integrate the result and continue the loop automatically. Stop only at a defined gate, a tool/runtime limitation, or a genuine architecture/product/permission decision that requires the owner.
+
+Never silently weaken architecture/security contracts, bypass required reviews, or begin a later roadmap stage before the current gate passes.
+"""
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 6
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
+interrupt_message = true
+
+[agents.explorer]
+description = "Fast read-only repository/code-path explorer. Use for evidence gathering, file mapping, dependency tracing, and low-risk investigation."
+config_file = "./agents/explorer.toml"
+
+[agents.implementer]
+description = "Primary implementation subagent. Use after the coordinator has a bounded plan and architecture constraints are clear."
+config_file = "./agents/implementer.toml"
+
+[agents.reviewer]
+description = "Read-only correctness reviewer for ordinary PR/code changes. Focus on regressions, tests, and maintainability."
+config_file = "./agents/reviewer.toml"
+
+[agents.test_auditor]
+description = "Read-only test and adversarial-coverage auditor. Use to challenge whether tests prove the claimed behavior."
+config_file = "./agents/test-auditor.toml"
+
+[agents.astra_reviewer]
+description = "Independent read-only architecture/security reviewer for trusted-boundary milestones and consequential design changes."
+config_file = "./agents/astra-reviewer.toml"
+
+[agents.astra_deep_review]
+description = "Escalation-only independent reviewer for unresolved high-complexity architecture/security questions after normal review cannot settle them."
+config_file = "./agents/astra-deep-review.toml"
