@@ -184,7 +184,11 @@ pub enum EqualityMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnitSemantics {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub unit_required: Option<bool>,
     #[serde(default)]
     pub canonical_unit: Option<String>,
@@ -250,6 +254,24 @@ mod tests {
             serde_json::from_str(r#"{"id":"canonical","media_type":null,"schema_ref":null}"#)
                 .unwrap();
         assert!(!representation.zero_copy_candidate);
+    }
+
+    #[test]
+    fn unit_required_distinguishes_absence_from_explicit_null() {
+        let absent: UnitSemantics = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.unit_required, None);
+        assert!(
+            serde_json::to_value(absent)
+                .unwrap()
+                .get("unit_required")
+                .is_none()
+        );
+        assert!(serde_json::from_str::<UnitSemantics>(r#"{"unit_required":null}"#).is_err());
+        for boolean in [true, false] {
+            let unit: UnitSemantics =
+                serde_json::from_value(serde_json::json!({"unit_required":boolean})).unwrap();
+            assert_eq!(unit.unit_required, Some(boolean));
+        }
     }
 
     #[test]

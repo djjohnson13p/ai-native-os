@@ -393,6 +393,20 @@ For arbitrary bytes/structures:
 
 ## Regression corpus
 
+The Issue #17 R17-01–05 review repair gate additionally consumes:
+
+- `examples/aios-ir/registry-structure-repair-cases.json`: raw schema/typed admission,
+  optional omission/null/empty object/value parity;
+- `examples/aios-ir/review-repair-cases.json`: exact integer lexical equivalence,
+  safe-range/fractional adversaries, tolerance sign/underflow/overflow/subnormals,
+  attacker-named diagnostic properties, and verification inventory versus outputs.
+
+Integer tests must cover every constraint and retry/replan path without first
+decoding fixture number spellings to floating point. Property tests include
+decimal/exponent equivalents and fractional near-integer rejections. Tolerance
+cases run against both contract classes and both tolerance fields. The original
+bootstrap hashes must still reproduce after the repairs.
+
 Every discovered crash, hash ambiguity, parser discrepancy, or security-significant invalid acceptance becomes a permanent regression fixture.
 
 Name fixture by reason rather than incident date only, e.g.:

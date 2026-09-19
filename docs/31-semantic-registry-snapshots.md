@@ -111,6 +111,13 @@ Registry loading must fail if:
 
 No partially valid registry becomes executable input.
 
+Strict bundle ingestion checks raw record structure against the embedded Snapshot,
+Type Contract and Capability Contract schemas before typed decoding. Optional
+`Option<T>` representation is not evidence that explicit null is schema-valid.
+The R17-01 repair corpus includes omission, null, empty nested objects and valid
+values. Numeric tolerance authoring is additionally constrained by docs72 before
+lossy binary64 interpretation. Semantic cross-record checks remain mandatory.
+
 ## Why snapshots matter
 
 They make several questions answerable:

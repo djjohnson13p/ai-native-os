@@ -86,8 +86,8 @@
       "additionalProperties": false,
       "properties": {
         "equivalence": {"type": "string", "enum": ["byte_identical", "canonical_value", "numeric_tolerance", "semantic", "not_applicable"]},
-        "numeric_absolute_tolerance": {"type": ["number", "null"], "minimum": 0},
-        "numeric_relative_tolerance": {"type": ["number", "null"], "minimum": 0}
+        "numeric_absolute_tolerance": {"type": ["number", "null"], "minimum": 0, "description": "Finite nonnegative binary64 under docs72: reject negative nonzero tokens, overflow and nonzero underflow before conversion; exact signed zero is zero."},
+        "numeric_relative_tolerance": {"type": ["number", "null"], "minimum": 0, "description": "Finite nonnegative binary64 under docs72: reject negative nonzero tokens, overflow and nonzero underflow before conversion; exact signed zero is zero."}
       }
     },
     "error_classes": {

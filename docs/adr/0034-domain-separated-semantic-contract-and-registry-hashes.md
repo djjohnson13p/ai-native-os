@@ -2,6 +2,7 @@
 
 - Status: **Accepted for the v0.1 / Issue #17 spike**
 - Date: 2026-09-15
+- Clarified: 2026-09-19 (R17-01 structural admission and R17-04 tolerance authoring)
 
 ## Context
 
@@ -25,6 +26,15 @@ For v0.1:
 - contract/snapshot hashing happens only after structural/semantic registry validation;
 - placeholder fixture hashes are never accepted as production trust evidence;
 - exact validated interpretation retains both AIOS semantic-program hash and Registry Snapshot ID rather than folding one into the other.
+
+R17-01/R17-04 clarification: raw records must satisfy the embedded schemas before
+typed interpretation. Optional fields do not implicitly permit null. Registry
+tolerances use finite nonnegative binary64 semantics with nearest/ties-even
+rounding; exact signed zero becomes zero. Negative nonzero tokens, nonzero-to-zero
+underflow, and overflow are rejected before numeric information is lost. Positive
+finite subnormals and ordinary finite rounding remain permitted. Docs72 defines
+the authoring and migration details. This validation tightening preserves all
+valid bootstrap identities and does not introduce arbitrary decimal semantics.
 
 ## Consequences
 

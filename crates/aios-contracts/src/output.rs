@@ -50,6 +50,7 @@ pub struct EffectSummary {
     pub contains_probabilistic: bool,
     pub contains_opaque_external: bool,
     pub nodes: Vec<NodeEffectSummary>,
+    /// Verifier-node inventory, not a proof that every output is gated or verified.
     pub verification_barriers: Vec<String>,
     #[serde(default)]
     pub generated_by: Option<GeneratedBy>,
@@ -67,6 +68,7 @@ pub struct NodeEffectSummary {
     pub authority_classes: Vec<String>,
     pub egress_mode: EgressMode,
     #[serde(default)]
+    /// Identifies a verifier operation, not successful verification of any output.
     pub verification_gate: bool,
 }
 

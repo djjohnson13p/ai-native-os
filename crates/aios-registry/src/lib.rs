@@ -11,6 +11,8 @@ mod conformance;
 mod error;
 mod hash;
 mod loader;
+pub mod numbers;
+mod schema;
 mod strict_json;
 mod version;
 

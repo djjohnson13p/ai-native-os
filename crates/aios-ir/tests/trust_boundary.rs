@@ -1,6 +1,14 @@
 //! Static tripwires for the deterministic trusted-library boundary.
 
 const TRUSTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "registry/numbers.rs",
+        include_str!("../../aios-registry/src/numbers.rs"),
+    ),
+    (
+        "registry/schema.rs",
+        include_str!("../../aios-registry/src/schema.rs"),
+    ),
     ("ir/lib.rs", include_str!("../src/lib.rs")),
     ("ir/diagnostics.rs", include_str!("../src/diagnostics.rs")),
     ("ir/explain.rs", include_str!("../src/explain.rs")),

@@ -192,6 +192,12 @@ v0.1 behavior:
 
 A `verify` node that does not gate any consumed/effectful downstream path likewise receives the warning; it does not magically verify unrelated work.
 
+The effect summary's verifier inventory is not a per-output assurance proof.
+A graph may expose both a verified value and a pre-verification value as different
+outputs; the inventory alone cannot distinguish their assurance. See docs39 and
+the R17-05 regression in `review-repair-cases.json`. Normalization preserves both
+the verifier and the actual output mappings; adding a bypass changes identity.
+
 Warnings never turn invalid programs valid or grant authority.
 
 ## 7. Egress declaration rules

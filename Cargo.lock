@@ -64,6 +64,7 @@ name = "aios-registry"
 version = "0.1.0"
 dependencies = [
  "aios-contracts",
+ "jsonschema",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

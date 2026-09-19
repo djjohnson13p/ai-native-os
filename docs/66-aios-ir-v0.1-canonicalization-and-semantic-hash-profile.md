@@ -272,6 +272,28 @@ The reference implementation should deserialize them into bounded integer types 
 
 This avoids floating-point canonicalization ambiguity in the v0.1 semantic program.
 
+### Exact authoring spelling (Issue #17 review repair)
+
+For every semantic integer field, accept any syntactically valid JSON number whose
+**exact decimal mathematical value** is integral, nonnegative, within
+`0..=9007199254740991`, and within that field's tighter schema bounds.
+Thus `1`, `1.0`, `1e0`, and `100e-2` normalize to integer `1`.
+Exact signed zero (`0`, `-0`, `-0.0`, including exponent notation) normalizes to
+integer `0`; fields with minimum 1 still reject it.
+
+Determine integrality/sign/range from the original token before any binary64
+rounding. `9007199254740991.1` and nonzero values such as `1e-9999` are not integers
+in this profile and cannot become accepted merely by rounding. Invalid JSON
+spellings (`01`, `1.`, `+1`) remain invalid. Exponent magnitude must not control
+allocation or loop counts; bounded digit/decimal-scale analysis suffices without
+an arbitrary-precision arithmetic dependency.
+
+This corrects authoring acceptance, not integer meaning or the hash domain.
+Previously valid programs retain their identities. Newly accepted equivalent
+spellings receive the same identity as their existing canonical integer spelling.
+Metadata stays inert and is removed before semantic hashing; numeric text inside
+strings is never interpreted by this rule.
+
 ## Canonical serialization
 
 After constructing the normalized semantic-hash view, serialize using RFC 8785 JSON Canonicalization Scheme (JCS) semantics.

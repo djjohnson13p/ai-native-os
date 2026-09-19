@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 aios-contracts.workspace = true
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true

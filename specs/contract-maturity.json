@@ -12,7 +12,7 @@
       "controlling_adrs": ["ADR-0011", "ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015", "ADR-0029", "ADR-0030", "ADR-0031", "ADR-0032", "ADR-0033", "ADR-0034"],
       "fixture_paths": ["examples/aios-ir/"],
       "blocking_questions": [],
-      "notes": "First serious Codex implementation target. Real hashes/workspace/tests are intentionally implementation work."
+      "notes": "Issue #17 implementation and R17-01–05 repair bundle exist on the review branch. Maturity remains SPIKE_READY pending second independent read-only review and merge; see docs/issue-17-review-repair-handoff.md."
     },
     {
       "id": "task-manager-v0.1",

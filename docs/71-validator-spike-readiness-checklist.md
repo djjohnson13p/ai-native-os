@@ -14,6 +14,11 @@ That means architecture/contracts/fixtures were sufficiently constrained to begi
 As of 2026-09-19, the Issue #17 implementation, generated hashes, fixture automation,
 property tests, and resource-limit tests are present on the dedicated implementation branch.
 
+The R17-01–05 review repairs are tracked in
+`docs/issue-17-review-repair-handoff.md`. The branch still requires a second
+independent read-only review before merge; implementation checks are not independent
+sign-off. No Stage-1 work or maturity promotion is included in this repair pass.
+
 ## Closed decisions / repository migrations
 
 - [x] AIOS IR is provider/runtime independent.

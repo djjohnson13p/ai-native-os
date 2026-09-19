@@ -3,7 +3,10 @@ use crate::hash::{
     capability_contract_hash, is_obvious_placeholder_hash, is_sha256_id, registry_snapshot_id,
     type_contract_hash,
 };
-use crate::strict_json::{StrictJsonLimits, parse_strict_json};
+use crate::schema::{self, RecordKind};
+use crate::strict_json::StrictJsonLimits;
+#[cfg(test)]
+use crate::strict_json::parse_strict_json;
 use crate::version::{FullVersion, SemanticRef, validate_semantic_id};
 use crate::{RegistryError, RegistryResult, effect_for_authority_class};
 use aios_contracts::{
@@ -108,6 +111,11 @@ impl SemanticRegistry {
     }
 
     /// Build a registry from already decoded immutable records.
+    ///
+    /// This programmatic API validates structure, values and identities, but cannot
+    /// recover duplicate keys or numeric tokens discarded by a caller's decoder.
+    /// Untrusted authored JSON must enter through [`Self::load_bundle`], which
+    /// enforces lexical numeric rules and raw schemas before typed decoding.
     ///
     /// # Errors
     ///
@@ -223,9 +231,13 @@ pub fn load_registry_bundle(
     let snapshot_bytes = read_bounded(&snapshot_path, options.limits.json.max_bytes)?;
     let mut total_bytes = snapshot_bytes.len();
     enforce_total_bytes(total_bytes, options.limits.max_total_bytes)?;
-    let snapshot: RegistrySnapshot = parse_strict_json(&snapshot_bytes, options.limits.json)
-        .map_err(RegistryError::from)
-        .map_err(|error| error.at_path(&snapshot_path))?;
+    let snapshot: RegistrySnapshot = schema::decode(
+        &snapshot_bytes,
+        options.limits.json,
+        RecordKind::Snapshot,
+        false,
+    )
+    .map_err(|error| error.at_path(&snapshot_path))?;
 
     let type_sources = collect_sources(&snapshot.type_contracts, options.limits.max_source_files)?;
     let capability_sources = collect_sources(
@@ -246,9 +258,9 @@ pub fn load_registry_bundle(
         let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
-        let mut contracts: Vec<TypeContract> = parse_strict_json(&bytes, options.limits.json)
-            .map_err(RegistryError::from)
-            .map_err(|error| error.at_path(&path))?;
+        let mut contracts: Vec<TypeContract> =
+            schema::decode(&bytes, options.limits.json, RecordKind::Type, true)
+                .map_err(|error| error.at_path(&path))?;
         type_contracts.append(&mut contracts);
         enforce_contract_count(type_contracts.len(), options.limits.max_contracts)?;
     }
@@ -259,9 +271,9 @@ pub fn load_registry_bundle(
         let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
-        let mut contracts: Vec<CapabilityContract> = parse_strict_json(&bytes, options.limits.json)
-            .map_err(RegistryError::from)
-            .map_err(|error| error.at_path(&path))?;
+        let mut contracts: Vec<CapabilityContract> =
+            schema::decode(&bytes, options.limits.json, RecordKind::Capability, true)
+                .map_err(|error| error.at_path(&path))?;
         capability_contracts.append(&mut contracts);
         enforce_contract_count(
             type_contracts.len() + capability_contracts.len(),
@@ -296,6 +308,28 @@ fn build_registry(
     let supplied_contract_count =
         checked_contract_count(type_contracts.len(), capability_contracts.len())?;
     enforce_contract_count(supplied_contract_count, options.max_contracts)?;
+
+    // Typed callers cannot bypass the machine contract either. Semantic checks below
+    // remain necessary for cross-record and required/allowed-envelope invariants.
+    schema::validate(
+        RecordKind::Snapshot,
+        &serde_json::to_value(&snapshot)
+            .map_err(|error| RegistryError::schema(error.to_string()))?,
+    )?;
+    for contract in &type_contracts {
+        schema::validate(
+            RecordKind::Type,
+            &serde_json::to_value(contract)
+                .map_err(|error| RegistryError::schema(error.to_string()))?,
+        )?;
+    }
+    for contract in &capability_contracts {
+        schema::validate(
+            RecordKind::Capability,
+            &serde_json::to_value(contract)
+                .map_err(|error| RegistryError::schema(error.to_string()))?,
+        )?;
+    }
 
     let type_entries = index_snapshot_entries(&snapshot.type_contracts, ContractKind::Type)?;
     let capability_entries =

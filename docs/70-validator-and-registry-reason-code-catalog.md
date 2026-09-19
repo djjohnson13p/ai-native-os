@@ -221,6 +221,10 @@ related[]
 
 Context supplements the code. It does not change the code's meaning.
 
+Schema classifications use structured error kinds/keywords, never substring
+matching on rendered English messages. In particular, an undeclared property
+named `pattern` or `required property` is still an additional-property violation.
+
 ## Reason-code change control
 
 Before external stability:

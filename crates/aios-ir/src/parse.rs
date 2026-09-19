@@ -25,7 +25,12 @@ pub fn parse_strict_json(bytes: &[u8], max_depth: usize) -> Result<Value, Strict
         return Err(StrictJsonError::DepthLimit);
     }
 
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let prepared = aios_registry::numbers::prepare_numbers(
+        bytes,
+        aios_registry::numbers::NumberProfile::IrIntegers,
+    )
+    .map_err(StrictJsonError::Invalid)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&prepared);
     let value =
         StrictValue::deserialize(&mut deserializer).map_err(|error| classify_error(&error))?;
     deserializer.end().map_err(|error| classify_error(&error))?;

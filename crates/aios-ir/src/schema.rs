@@ -27,9 +27,8 @@ pub(crate) fn validate_schema(
     // collector and stop after the first suppressed diagnostic, so hostile
     // documents cannot amplify into an unbounded intermediate Vec.
     for error in validator.iter_errors(value) {
-        let schema_path = error.schema_path().as_str();
         let message = error.to_string();
-        let code = classify_schema_failure(schema_path, &message);
+        let code = classify_schema_failure(error.kind());
         let instance_path = error.instance_path().as_str();
         let mut diagnostic = Diagnostic::new(code, message);
         diagnostic.json_pointer = Some(if instance_path.is_empty() {
@@ -45,43 +44,28 @@ pub(crate) fn validate_schema(
     Ok(())
 }
 
-fn classify_schema_failure(schema_path: &str, message: &str) -> ValidatorReasonCode {
-    let lower = message.to_ascii_lowercase();
-    if schema_path.ends_with("/required") || lower.contains("required propert") {
-        ValidatorReasonCode::IrSchemaRequired
-    } else if schema_path.ends_with("/pattern")
-        || lower.contains("pattern")
-        || lower.contains(" does not match ")
-    {
-        ValidatorReasonCode::IrSchemaPattern
-    } else if schema_path.ends_with("/additionalProperties")
-        || lower.contains("additional propert")
-        || lower.contains("unexpected propert")
-    {
-        ValidatorReasonCode::IrSchemaAdditionalProperty
-    } else if schema_path.ends_with("/enum")
-        || schema_path.ends_with("/const")
-        || lower.contains("not one of")
-        || lower.contains("constant")
-    {
-        ValidatorReasonCode::IrSchemaEnum
-    } else if schema_path.ends_with("/minimum")
-        || schema_path.ends_with("/maximum")
-        || schema_path.ends_with("/minItems")
-        || schema_path.ends_with("/maxItems")
-        || schema_path.ends_with("/minLength")
-        || schema_path.ends_with("/maxLength")
-        || schema_path.ends_with("/minProperties")
-        || schema_path.ends_with("/maxProperties")
-        || schema_path.ends_with("/uniqueItems")
-        || lower.contains("minimum")
-        || lower.contains("maximum")
-        || lower.contains("too short")
-        || lower.contains("too long")
-        || lower.contains("not unique")
-    {
-        ValidatorReasonCode::IrSchemaRange
-    } else {
-        ValidatorReasonCode::IrSchemaType
+fn classify_schema_failure(kind: &jsonschema::error::ValidationErrorKind) -> ValidatorReasonCode {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    match kind {
+        Kind::Required { .. } => ValidatorReasonCode::IrSchemaRequired,
+        Kind::Pattern { .. } => ValidatorReasonCode::IrSchemaPattern,
+        Kind::PropertyNames { error } => classify_schema_failure(error.kind()),
+        Kind::AdditionalProperties { .. } | Kind::UnevaluatedProperties { .. } => {
+            ValidatorReasonCode::IrSchemaAdditionalProperty
+        }
+        Kind::Enum { .. } | Kind::Constant { .. } => ValidatorReasonCode::IrSchemaEnum,
+        Kind::Minimum { .. }
+        | Kind::Maximum { .. }
+        | Kind::ExclusiveMinimum { .. }
+        | Kind::ExclusiveMaximum { .. }
+        | Kind::MinItems { .. }
+        | Kind::MaxItems { .. }
+        | Kind::MinLength { .. }
+        | Kind::MaxLength { .. }
+        | Kind::MinProperties { .. }
+        | Kind::MaxProperties { .. }
+        | Kind::UniqueItems
+        | Kind::MultipleOf { .. } => ValidatorReasonCode::IrSchemaRange,
+        _ => ValidatorReasonCode::IrSchemaType,
     }
 }
