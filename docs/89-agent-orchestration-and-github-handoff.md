@@ -33,6 +33,8 @@ Routine exploration, implementation, ordinary review, test auditing, and Astra r
 
 The owner should not be asked to create a separate chat for each model.
 
+**Default operator rule:** once the repository is trusted, the owner starts/continues one Codex coordinator session and does not manually choose child-agent models. Project configuration selects the root and named subagent models/reasoning levels. The coordinator must spawn those roles itself.
+
 ## Project-scoped Codex configuration
 
 The repository carries:
@@ -102,6 +104,10 @@ Level C should be uncommon. It is not the routine workflow.
 ## GitHub is the durable bridge
 
 GitHub is the system of record for cross-session handoff.
+
+### Permanent control-plane issue
+
+Issue #38 (`[meta] AIOS autonomous development control plane`) is the project-level queue and handoff bus. ChatGPT and the persistent Codex coordinator should use it to identify the active work item, current gate, blockers, and next action. Update it when work moves between issues/PRs; do not make the owner reconstruct state from chat history.
 
 ### Issue
 
@@ -197,8 +203,9 @@ At the beginning of a work cycle:
 6. implement only after the task is bounded;
 7. run required tests;
 8. obtain required review;
-9. update GitHub with `AIOS-HANDOFF`;
-10. stop at the defined gate.
+9. update GitHub with `AIOS-HANDOFF` and keep Issue #38 current;
+10. continue automatically through repair/re-review while the next action is agent-resolvable;
+11. stop only at the defined gate, a tool/runtime limitation, or a genuine owner decision.
 
 ## Project owner notification policy
 
