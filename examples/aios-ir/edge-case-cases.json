@@ -317,6 +317,64 @@
         ],
         "outputs": {"hash": {"source": "node", "node": "hash", "port": "hash"}}
       }
+    },
+    {
+      "name": "constraint-integer-at-jcs-exact-boundary-is-valid",
+      "expected": "valid",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.jcs-safe-integer-boundary",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "constraints": {"min_memory_bytes": 9007199254740991},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      }
+    },
+    {
+      "name": "constraint-integer-outside-jcs-exact-range-is-invalid",
+      "expected": "invalid",
+      "validation_stage": "schema",
+      "reason_code": "IR_SCHEMA_RANGE",
+      "program": {
+        "ir_version": "0.1",
+        "program_id": "edge.jcs-unsafe-integer",
+        "kind": "task_graph",
+        "inputs": {"source": {"type": "artifact.file@1"}},
+        "nodes": [
+          {
+            "id": "copy",
+            "operation": {"kind": "invoke", "capability": "artifact.copy@1"},
+            "execution_class": "deterministic",
+            "inputs": {"source": {"source": "input", "name": "source"}},
+            "outputs": {"copy": "artifact.file@1"},
+            "authority_requests": [
+              {"action": "artifact.read", "resource": "input:source"},
+              {"action": "artifact.write", "resource": "task.output"}
+            ],
+            "egress": {"mode": "deny"},
+            "constraints": {"min_memory_bytes": 9007199254740992},
+            "failure": {"on_error": "stop"},
+            "cache": "content_addressed"
+          }
+        ],
+        "outputs": {"copy": {"source": "node", "node": "copy", "port": "copy"}}
+      }
     }
   ]
 }

@@ -10,7 +10,7 @@
       "runtime": {"kind": "process", "entrypoint": "fixture-artifact-hash", "interface": null, "image": null, "digest": null},
       "provides": [
         {
-          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
+          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": "sha256:03b838e40f74382cf86f49e2b5c50e2ac0101d6b169ac68052a25a2fab32b174", "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
           "effect_classes": ["ARTIFACT_READ"],
           "execution": {"locality": ["local"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "none"},
@@ -34,7 +34,7 @@
       "runtime": {"kind": "model-adapter", "entrypoint": null, "interface": "fixture.hash", "image": null, "digest": null},
       "provides": [
         {
-          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
+          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": "sha256:03b838e40f74382cf86f49e2b5c50e2ac0101d6b169ac68052a25a2fab32b174", "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
           "effect_classes": ["ARTIFACT_READ"],
           "execution": {"locality": ["local"], "execution_class": "probabilistic", "minimum_isolation": "P2", "network_default": "none"},
@@ -58,7 +58,7 @@
       "runtime": {"kind": "remote", "entrypoint": null, "interface": "fixture.normalize", "image": null, "digest": null},
       "provides": [
         {
-          "contract": {"capability": "table.normalize", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
+          "contract": {"capability": "table.normalize", "version": "1.0", "contract_hash": "sha256:1dfc9e43a01ce1196fbc7293c7f4865fb964295d55ee1e85a0e7912d38fd50b2", "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://table.normalize/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
           "effect_classes": ["NETWORK", "DATA_EGRESS"],
           "execution": {"locality": ["remote"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "internet"},
@@ -82,7 +82,7 @@
       "runtime": {"kind": "process", "entrypoint": "fixture-bad-hash", "interface": null, "image": null, "digest": null},
       "provides": [
         {
-          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": null, "contract_source": "capability-contracts.json"},
+          "contract": {"capability": "artifact.hash", "version": "1.0", "contract_hash": "sha256:03b838e40f74382cf86f49e2b5c50e2ac0101d6b169ac68052a25a2fab32b174", "contract_source": "capability-contracts.json"},
           "conformance": {"suite": "conformance://artifact.hash/1", "suite_hash": null, "status": "declared", "tested_at": null, "test_environment": null},
           "effect_classes": ["ARTIFACT_READ", "NETWORK"],
           "execution": {"locality": ["local"], "execution_class": "deterministic", "minimum_isolation": "P2", "network_default": "allowlist"},

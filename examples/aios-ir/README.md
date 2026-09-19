@@ -31,13 +31,13 @@ This directory exercises the semantic IR and adaptive-execution model described 
 - `provider-conformance-cases.json` — provider declarations tested against provider-independent semantic capability contracts.
 - `canonicalization-cases.json` — paired valid programs that MUST hash equal/different under ADR 0029 plus structural invalidity for forbidden Task identity in semantic IR.
 
-## Placeholder hashes
+## Generated identities
 
-Files such as `registry-snapshot.json`, `validation-result.json`, the derived effect/binding/Skill examples, and other pre-implementation records may contain obvious synthetic placeholder hashes.
-
-They are **not** claims that canonical hashing has been implemented.
-
-The first reference validator/canonicalizer must replace/generated-check these values using the accepted v0.1 profile and test vectors.
+`registry-snapshot.json`, `validation-result.json`, the derived effect summary, and the
+semantic identity fields in the binding/Skill examples contain generated v0.1 identities
+locked by the reference implementation tests. Obvious repeated-digit hashes that remain in
+explicitly synthetic cross-snapshot or runtime-artifact examples are test data, not registry or
+AIOS IR semantic identities.
 
 ## Important distinction
 

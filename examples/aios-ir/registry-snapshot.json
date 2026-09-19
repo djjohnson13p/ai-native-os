@@ -1,35 +1,35 @@
 {
   "schema_version": "0.1",
-  "snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "snapshot_id": "sha256:5b1e89c974f35a0f3e1e7040bbec8f2e44ea908eb9a12d313ecda40600c6ddbd",
   "generation": "fixture-v0.1",
   "type_contracts": [
-    {"id": "artifact.file", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "source": "type-contracts.json"},
-    {"id": "artifact.table", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000002", "source": "type-contracts.json"},
-    {"id": "artifact.image", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000003", "source": "type-contracts.json"},
-    {"id": "artifact.report", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000004", "source": "type-contracts.json"},
-    {"id": "data.table", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000005", "source": "type-contracts.json"},
-    {"id": "data.metrics", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000006", "source": "type-contracts.json"},
-    {"id": "data.hash", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000007", "source": "type-contracts.json"},
-    {"id": "text.plain", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000008", "source": "type-contracts.json"},
-    {"id": "text.narrative", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000009", "source": "type-contracts.json"},
-    {"id": "verification.result", "version": "1.0", "content_hash": "sha256:000000000000000000000000000000000000000000000000000000000000000a", "source": "type-contracts.json"}
+    {"id": "artifact.file", "version": "1.0", "content_hash": "sha256:d6b09d10397738719b82bb6896606df22f4997ca37fe6d531289e269660477a7", "source": "type-contracts.json"},
+    {"id": "artifact.table", "version": "1.0", "content_hash": "sha256:c5ec22237e6d390a8e377b429d1247946102de1d82316921af3dbc5cdceab397", "source": "type-contracts.json"},
+    {"id": "artifact.image", "version": "1.0", "content_hash": "sha256:19f8f4a94aa913be4e57ea46cafefd65c53c1d7fe3382cc56a300dd13b1cd72c", "source": "type-contracts.json"},
+    {"id": "artifact.report", "version": "1.0", "content_hash": "sha256:7a5841c4f84a566d2568539cc2c58d0175ccfe071e8f42fafa1b483c2a96e997", "source": "type-contracts.json"},
+    {"id": "data.table", "version": "1.0", "content_hash": "sha256:d1ee3178cdff1304bee09e01a4b0e03a6b1d19e781b80e0e886e4816b19c927e", "source": "type-contracts.json"},
+    {"id": "data.metrics", "version": "1.0", "content_hash": "sha256:67654e3256c32d035d5c3accf1dc1e11984767d1d3bb08cb1951218bc1fa59ed", "source": "type-contracts.json"},
+    {"id": "data.hash", "version": "1.0", "content_hash": "sha256:dd451aabbd2be94cc3d2446e1c5cf946001cf81b657aa5fedaaacc9499f660c8", "source": "type-contracts.json"},
+    {"id": "text.plain", "version": "1.0", "content_hash": "sha256:2e5bf88f286aada2359bd70bff864db74926d521d868f247449ed144e5a5f5f6", "source": "type-contracts.json"},
+    {"id": "text.narrative", "version": "1.0", "content_hash": "sha256:8e3c9d6977e0a6321650dc578afa1ffbaf009109d556ed76c07ccf7fea73ad8b", "source": "type-contracts.json"},
+    {"id": "verification.result", "version": "1.0", "content_hash": "sha256:fc9f1fe4bd26a710663ce8e278d2318fcb05b6ba1d09f09a668a34553c79ef91", "source": "type-contracts.json"}
   ],
   "capability_contracts": [
-    {"id": "table.import", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000101", "source": "capability-contracts.json"},
-    {"id": "table.normalize", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000102", "source": "capability-contracts.json"},
-    {"id": "stats.compare_periods", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000103", "source": "capability-contracts.json"},
-    {"id": "chart.render", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000104", "source": "capability-contracts.json"},
-    {"id": "report.summarize", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000105", "source": "capability-contracts.json"},
-    {"id": "verify.numeric_claims", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000106", "source": "capability-contracts.json"},
-    {"id": "document.compose", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000107", "source": "capability-contracts.json"},
-    {"id": "artifact.hash", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000108", "source": "capability-contracts.json"},
-    {"id": "artifact.copy", "version": "1.0", "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000109", "source": "capability-contracts.json"},
-    {"id": "artifact.copy.compat", "version": "1.0", "content_hash": "sha256:000000000000000000000000000000000000000000000000000000000000010a", "source": "capability-contracts.json"},
-    {"id": "text.uppercase", "version": "1.0", "content_hash": "sha256:000000000000000000000000000000000000000000000000000000000000010b", "source": "capability-contracts.json"}
+    {"id": "table.import", "version": "1.0", "content_hash": "sha256:b6ab9313d952be9ee69e1fa240f17032a7a71b2e15c5d413077ce106570710c6", "source": "capability-contracts.json"},
+    {"id": "table.normalize", "version": "1.0", "content_hash": "sha256:1dfc9e43a01ce1196fbc7293c7f4865fb964295d55ee1e85a0e7912d38fd50b2", "source": "capability-contracts.json"},
+    {"id": "stats.compare_periods", "version": "1.0", "content_hash": "sha256:7d637da8cef1b7a02b8653c09a9cd901fedb7297c50b3f4a5b20c20d2ac8da24", "source": "capability-contracts.json"},
+    {"id": "chart.render", "version": "1.0", "content_hash": "sha256:d087fa1d01dca16152c0dd895402c8cb3f3973c8314a1edb3ee24a3a3ffe5867", "source": "capability-contracts.json"},
+    {"id": "report.summarize", "version": "1.0", "content_hash": "sha256:cc14edb6f65813fbba02756e5a154342522d57f6244f86327a0e7e3acafc0852", "source": "capability-contracts.json"},
+    {"id": "verify.numeric_claims", "version": "1.0", "content_hash": "sha256:c5b03578fd63e125caf948168b59b4808839f2739d79f3fc2d4875c6aa8885d5", "source": "capability-contracts.json"},
+    {"id": "document.compose", "version": "1.0", "content_hash": "sha256:335fbb1d57f1921aab827f82027346f61c48b8138a2ba7b9649478d25e7c0d79", "source": "capability-contracts.json"},
+    {"id": "artifact.hash", "version": "1.0", "content_hash": "sha256:03b838e40f74382cf86f49e2b5c50e2ac0101d6b169ac68052a25a2fab32b174", "source": "capability-contracts.json"},
+    {"id": "artifact.copy", "version": "1.0", "content_hash": "sha256:e131f5ec57aa4513371eb55897e74e9d9e5af31c513e1613886923b4a8503920", "source": "capability-contracts.json"},
+    {"id": "artifact.copy.compat", "version": "1.0", "content_hash": "sha256:7138ee705f7aa612aed8a08592f6813f44a57d118a29e56e6ad8ad2089c3812c", "source": "capability-contracts.json"},
+    {"id": "text.uppercase", "version": "1.0", "content_hash": "sha256:e741813442438e876b9353ba4a14712c0cc0dd59cba32c95997ef1dc4b63e2b2", "source": "capability-contracts.json"}
   ],
   "created_at": "2026-09-15T00:00:00Z",
   "publisher": null,
   "notes": [
-    "STRUCTURAL FIXTURE ONLY: zero-prefixed hashes are placeholders and MUST be replaced by computed canonical hashes when the reference canonicalizer exists."
+    "Content identities generated with the v0.1 domain-separated RFC 8785 canonicalization profiles."
   ]
 }

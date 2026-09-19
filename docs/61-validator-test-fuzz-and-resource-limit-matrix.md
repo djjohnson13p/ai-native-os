@@ -238,6 +238,9 @@ Test vectors must prove:
 - user-visible hash identifier records algorithm explicitly;
 - no other module independently constructs a different semantic-hash prefix/serialization;
 - raw authoring JSON hash cannot be confused with semantic hash.
+- integer values at `2^53 - 1` remain accepted, while `2^53` and adjacent
+  higher values are rejected before JCS serialization so distinct typed values
+  cannot collapse to one ECMAScript number.
 
 ### Program-ID collision tests
 

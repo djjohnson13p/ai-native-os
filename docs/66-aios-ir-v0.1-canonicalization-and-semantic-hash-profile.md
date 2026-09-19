@@ -263,6 +263,11 @@ Rules:
 
 AIOS IR v0.1 semantic numeric fields are integers with schema bounds.
 
+Every integer that reaches RFC 8785 serialization is limited to the interoperable
+I-JSON exact-integer range `0..=9007199254740991` (`2^53 - 1`). This explicit
+upper bound prevents two distinct Rust `u64` values from collapsing to the same
+ECMAScript/JCS number during serialization.
+
 The reference implementation should deserialize them into bounded integer types appropriate to each field and reject out-of-range values before canonical hashing.
 
 This avoids floating-point canonicalization ambiguity in the v0.1 semantic program.

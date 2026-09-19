@@ -317,7 +317,7 @@ The v0.1 registry/IR validator must:
 2. validate structural contract records;
 3. reject duplicate/ambiguous `(ID, major)` entries;
 4. reject snapshot-entry/full-contract version-major mismatch;
-5. verify content hashes once generated values replace placeholders;
+5. verify generated content hashes against the supplied contracts;
 6. build immutable lookup indexes;
 7. resolve every IR semantic type/capability major reference from that snapshot;
 8. never merge conflicting registries silently;
@@ -359,9 +359,9 @@ An unrelated additive registry change should not invalidate every Skill automati
 
 ## v0.1 fixtures
 
-`examples/aios-ir/registry-snapshot.json` identifies the contract fixtures used for Demonstration A.
+`examples/aios-ir/registry-snapshot.json` identifies the contract fixtures used for Demonstration A. Its checked-in contract hashes and snapshot ID are generated semantic identities that the strict loader recomputes and verifies exactly.
 
-Early repository fixtures may contain placeholder content hashes until the reference canonicalizers exist. The implementation must distinguish obvious placeholder architecture fixtures from generated cryptographic evidence and eventually compute/check real contract/snapshot hashes.
+The explicit `BootstrapGenerate` path is non-production development/test tooling for constructing generated identities from deliberately marked placeholder inputs. A registry built through that path remains non-strict and cannot produce executable semantic-program identity through the validator.
 
 Version-resolution fixtures should test:
 

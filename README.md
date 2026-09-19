@@ -317,7 +317,9 @@ The goal is to prove an architecture that is meaningfully different from a norma
 
 ## Current implementation entry point
 
-**Stage 0 is closed enough for bounded trusted-core implementation. No working AIOS implementation is claimed yet.**
+**Stage 0 is closed enough for bounded trusted-core implementation.** The repository now includes
+the Issue #17 reference implementation of the deterministic AIOS IR v0.1 trust boundary. It is a
+validator and development CLI, not an execution runtime or authority system.
 
 The first serious implementation assignment remains **GitHub Issue #17**:
 
@@ -331,6 +333,32 @@ It intentionally requires:
 - no GUI;
 - no policy backend yet;
 - no custom source language.
+
+### Run the reference validator
+
+Install a Rust toolchain compatible with `rust-toolchain.toml`, then run the complete trusted-core
+suite from the repository root:
+
+```text
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+The CLI always requires an explicit local immutable registry bundle for commands that interpret a
+program:
+
+```text
+cargo run -p aios-ir-cli -- validate examples/aios-ir/demonstration-a.ir.json --registry examples/aios-ir
+cargo run -p aios-ir-cli -- normalize examples/aios-ir/demonstration-a.ir.json --registry examples/aios-ir
+cargo run -p aios-ir-cli -- hash examples/aios-ir/demonstration-a.ir.json --registry examples/aios-ir
+cargo run -p aios-ir-cli -- effects examples/aios-ir/demonstration-a.ir.json --registry examples/aios-ir
+cargo run -p aios-ir-cli -- explain-error IR_GRAPH_CYCLE
+```
+
+All CLI responses are JSON. Exit status `0` means valid/successful, `2` means deterministic
+rejection, and `1` means an operational or invocation error. Validation performs no model call,
+provider execution, authority grant, or network lookup.
 
 After #17, the project builds a deterministic operating spine before introducing AI planning:
 
