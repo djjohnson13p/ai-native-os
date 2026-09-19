@@ -21,13 +21,17 @@ fn fixture(name: &str) -> Value {
 }
 
 fn validator() -> Validator {
+    validator_with_limits(ValidationLimits::default())
+}
+
+fn validator_with_limits(limits: ValidationLimits) -> Validator {
     Validator::new(
         SemanticRegistry::load_bundle(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/aios-ir"),
             RegistryLoadOptions::default(),
         )
         .unwrap(),
-        ValidationLimits::default(),
+        limits,
     )
 }
 
@@ -40,6 +44,46 @@ fn with_token(program: &Value, token: &str) -> Vec<u8> {
         .unwrap()
         .replace("\"RAW_NUMBER\"", token)
         .into_bytes()
+}
+
+fn with_raw_value(program: &Value, pointer: &str, raw_value: &str) -> Vec<u8> {
+    let mut document = program.clone();
+    *document.pointer_mut(pointer).unwrap() = Value::String("AIOS_RAW_VALUE".to_owned());
+    serde_json::to_string(&document)
+        .unwrap()
+        .replace("\"AIOS_RAW_VALUE\"", raw_value)
+        .into_bytes()
+}
+
+fn diagnostic_codes(report: &aios_ir::ValidationReport) -> Vec<ValidatorReasonCode> {
+    report
+        .output
+        .validation
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect()
+}
+
+fn diagnostic_signature(
+    report: &aios_ir::ValidationReport,
+) -> Vec<(ValidatorReasonCode, Option<String>)> {
+    report
+        .output
+        .validation
+        .diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.code, diagnostic.json_pointer.clone()))
+        .collect()
+}
+
+fn expected_codes(case: &Value) -> Vec<ValidatorReasonCode> {
+    case["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|code| code.as_str().unwrap().parse().unwrap())
+        .collect()
 }
 
 #[test]
@@ -136,18 +180,28 @@ fn diagnostic_codes_do_not_depend_on_attacker_property_names() {
         .as_array()
         .unwrap()
     {
-        let mut input = program();
-        input["nodes"][0][key.as_str().unwrap()] = json!("synthetic");
-        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
-        assert!(!report.output.validation.valid);
-        assert!(report.output.validation.semantic_hash.is_none());
-        assert!(
-            report.output.validation.diagnostics.iter().all(
-                |diagnostic| diagnostic.code == ValidatorReasonCode::IrSchemaAdditionalProperty
+        let key = key.as_str().unwrap();
+        for (pointer, mut selected) in [
+            ("/nodes/0", program()["nodes"][0].clone()),
+            (
+                "/nodes/0/inputs/source",
+                json!({"source":"input","name":"source"}),
             ),
-            "{key}: {:?}",
-            report.output.validation.diagnostics
-        );
+            ("/nodes/0/failure", json!({"on_error":"stop"})),
+        ] {
+            selected[key] = json!("synthetic");
+            let mut input = program();
+            *input.pointer_mut(pointer).unwrap() = selected;
+            let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+            assert!(!report.output.validation.valid);
+            assert!(report.output.validation.semantic_hash.is_none());
+            assert_eq!(
+                diagnostic_codes(&report),
+                [ValidatorReasonCode::IrSchemaAdditionalProperty],
+                "{pointer} {key}: {:?}",
+                report.output.validation.diagnostics
+            );
+        }
     }
 }
 
@@ -162,25 +216,215 @@ fn discriminated_union_diagnostics_retain_specific_structured_codes() {
         *input
             .pointer_mut(case["pointer"].as_str().unwrap())
             .unwrap() = case["value"].clone();
-        let expected = case["reason_code"]
-            .as_str()
-            .unwrap()
-            .parse::<ValidatorReasonCode>()
-            .unwrap();
         let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
-        let codes = report
-            .output
-            .validation
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code)
-            .collect::<Vec<_>>();
 
         assert!(!report.output.validation.valid, "{case}");
         assert!(report.output.validation.semantic_hash.is_none(), "{case}");
         assert!(report.normalized.is_none(), "{case}");
-        assert_eq!(codes, vec![expected], "{case}");
+        assert_eq!(diagnostic_codes(&report), expected_codes(case), "{case}");
     }
+}
+
+#[test]
+fn discriminator_type_and_value_matrix_is_structured() {
+    let validator = validator();
+    let repair_cases = fixture("review-repair-cases.json");
+
+    for wrong_type in repair_cases["discriminator_wrong_type_values"]
+        .as_array()
+        .unwrap()
+    {
+        for (pointer, discriminator, companion) in [
+            (
+                "/nodes/0/inputs/source",
+                "source",
+                Some(("name", json!("source"))),
+            ),
+            ("/nodes/0/failure", "on_error", None),
+        ] {
+            let mut selected = serde_json::Map::new();
+            selected.insert(discriminator.to_owned(), wrong_type.clone());
+            if let Some((name, value)) = &companion {
+                selected.insert((*name).to_owned(), value.clone());
+            }
+            let mut input = program();
+            *input.pointer_mut(pointer).unwrap() = Value::Object(selected);
+            let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+            assert_eq!(
+                diagnostic_codes(&report),
+                [ValidatorReasonCode::IrSchemaType],
+                "{pointer} {wrong_type}: {:?}",
+                report.output.validation.diagnostics
+            );
+            assert!(report.output.validation.semantic_hash.is_none());
+        }
+    }
+
+    for unsupported in repair_cases["discriminator_unsupported_strings"]
+        .as_array()
+        .unwrap()
+    {
+        for (pointer, discriminator, companion) in [
+            (
+                "/nodes/0/inputs/source",
+                "source",
+                Some(("name", json!("source"))),
+            ),
+            ("/nodes/0/failure", "on_error", None),
+        ] {
+            let mut selected = serde_json::Map::new();
+            selected.insert(discriminator.to_owned(), unsupported.clone());
+            if let Some((name, value)) = &companion {
+                selected.insert((*name).to_owned(), value.clone());
+            }
+            let mut input = program();
+            *input.pointer_mut(pointer).unwrap() = Value::Object(selected);
+            let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+            assert_eq!(
+                diagnostic_codes(&report),
+                [ValidatorReasonCode::IrSchemaEnum],
+                "{pointer} {unsupported}: {:?}",
+                report.output.validation.diagnostics
+            );
+            assert!(report.output.validation.semantic_hash.is_none());
+        }
+    }
+
+    for pointer in ["/nodes/0/inputs/source", "/nodes/0/failure"] {
+        let mut input = program();
+        *input.pointer_mut(pointer).unwrap() = json!({});
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+        assert_eq!(
+            diagnostic_codes(&report),
+            [ValidatorReasonCode::IrSchemaRequired],
+            "{pointer}: {:?}",
+            report.output.validation.diagnostics
+        );
+    }
+}
+
+#[test]
+fn uniquely_selected_branches_emit_all_actual_failure_families() {
+    let validator = validator();
+    for case in fixture("review-repair-cases.json")["mixed_diagnostic_cases"]
+        .as_array()
+        .unwrap()
+    {
+        let mut input = program();
+        *input
+            .pointer_mut(case["pointer"].as_str().unwrap())
+            .unwrap() = case["value"].clone();
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+
+        assert!(!report.output.validation.valid, "{case}");
+        assert!(report.output.validation.semantic_hash.is_none(), "{case}");
+        assert!(report.normalized.is_none(), "{case}");
+        assert_eq!(diagnostic_codes(&report), expected_codes(case), "{case}");
+    }
+}
+
+#[test]
+fn mixed_failure_order_is_repeatable_and_object_order_independent() {
+    let validator = validator();
+    for (pointer, left, right, expected) in [
+        (
+            "/nodes/0/inputs/source",
+            r#"{"source":"input","name":"bad/name","required":"attack"}"#,
+            r#"{"required":"attack","name":"bad/name","source":"input"}"#,
+            vec![
+                ValidatorReasonCode::IrSchemaAdditionalProperty,
+                ValidatorReasonCode::IrSchemaPattern,
+            ],
+        ),
+        (
+            "/nodes/0/failure",
+            r#"{"on_error":"retry","max_attempts":0,"required":"attack"}"#,
+            r#"{"required":"attack","max_attempts":0,"on_error":"retry"}"#,
+            vec![
+                ValidatorReasonCode::IrSchemaAdditionalProperty,
+                ValidatorReasonCode::IrSchemaRange,
+            ],
+        ),
+    ] {
+        let mut baseline = None;
+        for raw in [left, right] {
+            for _ in 0..8 {
+                let report = validator.validate_bytes(&with_raw_value(&program(), pointer, raw));
+                assert_eq!(diagnostic_codes(&report), expected, "{pointer} {raw}");
+                let signature = diagnostic_signature(&report);
+                if let Some(baseline) = &baseline {
+                    assert_eq!(&signature, baseline, "{pointer} {raw}");
+                } else {
+                    baseline = Some(signature);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_branch_expansion_respects_diagnostic_limit() {
+    let validator = validator_with_limits(ValidationLimits {
+        max_diagnostics: 1,
+        ..ValidationLimits::default()
+    });
+    let mut input = program();
+    input["nodes"][0]["inputs"]["source"] =
+        json!({"source":"input","name":"bad/name","required":"attack"});
+    let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+
+    assert_eq!(
+        diagnostic_codes(&report),
+        [ValidatorReasonCode::IrSchemaAdditionalProperty]
+    );
+    assert!(report.output.validation.diagnostics_truncated);
+    assert!(report.output.validation.semantic_hash.is_none());
+}
+
+#[test]
+fn egress_composite_diagnostics_and_precheck_precedence_are_unchanged() {
+    let validator = validator();
+    for (egress, expected) in [
+        (
+            json!({"mode":"policy"}),
+            ValidatorReasonCode::IrSchemaRequired,
+        ),
+        (
+            json!({"mode":"policy","destination_classes":[]}),
+            ValidatorReasonCode::IrSchemaRange,
+        ),
+        (
+            json!({"mode":"deny","destination_classes":["public"]}),
+            ValidatorReasonCode::IrEgressContradiction,
+        ),
+    ] {
+        let mut input = program();
+        input["nodes"][0]["egress"] = egress;
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+        assert_eq!(
+            diagnostic_codes(&report),
+            [expected],
+            "{:?}",
+            report.output.validation.diagnostics
+        );
+        assert!(report.output.validation.semantic_hash.is_none());
+    }
+
+    let mut too_many_fallbacks = program();
+    too_many_fallbacks["nodes"][0]["failure"] = json!({
+        "on_error":"fallback",
+        "fallback_capabilities":[
+            "artifact.copy@1",
+            "artifact.copy.compat@1",
+            "artifact.hash@1",
+            "table.import@1"
+        ]
+    });
+    let report = validator.validate_bytes(&serde_json::to_vec(&too_many_fallbacks).unwrap());
+    assert_eq!(
+        diagnostic_codes(&report),
+        [ValidatorReasonCode::IrLimitFallbackCount]
+    );
 }
 
 #[test]

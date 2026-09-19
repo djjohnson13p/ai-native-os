@@ -145,13 +145,12 @@ The [second independent review](https://github.com/djjohnson13p/ai-native-os/iss
 verified R17-01, R17-02, R17-04 and R17-05, found R17-03 fixed for direct schema
 errors, and reported one remaining nested-`oneOf` diagnostic defect as R17-06.
 
-The follow-up repair keeps the schemas, acceptance rules and reason-code vocabulary
-unchanged. `classify_schema_failure` now examines structured `OneOfNotValid` branch
-contexts. A single const-discriminator-compatible branch supplies a nested code only
-when its child failures agree. Missing common discriminators map to required, unknown
-discriminators map to enum, and genuine ambiguity or conflicting child families stay
-at the conservative type family. No branch is selected by array order, rendered
-English text or attacker-controlled property prose.
+The R17-06 commit kept the schemas, acceptance rules and reason-code vocabulary
+unchanged and made `classify_schema_failure` examine structured `OneOfNotValid`
+branch contexts. At that commit, a selected branch supplied one nested code only when
+its child failures agreed; conflicting families fell back to type. The subsequent
+targeted review identified that mixed-family fallback and wrong-type discriminator
+handling as R17-07/R17-08; the correction is recorded below.
 
 The permanent corpus contains 19 nested cases across input/node value references,
 program outputs and stop/retry/fallback/replan policies. It covers additional-property,
@@ -166,3 +165,47 @@ cases. Registry Snapshot, Demonstration A and `table.import` identities remain t
 three values recorded above. These are implementer checks, not the final independent
 targeted read-only review. Issue #17 remains open and the branch must not merge until
 that review is complete.
+
+## R17-07/R17-08 final diagnostic follow-up
+
+The [final targeted review](https://github.com/djjohnson13p/ai-native-os/issues/17#issuecomment-5745770727)
+confirmed R17-06 substantially worked but found two remaining diagnostic defects.
+R17-07 showed that a non-string `source` or `on_error` was reported as enum;
+R17-08 showed that mixed real failures in one uniquely selected alternative were
+replaced with a manufactured type code.
+
+The final repair separates discriminator resolution from error emission. It derives
+the expected discriminator JSON type from structured `const` values. Missing
+discriminators remain required, wrong-type values become type, unsupported strings
+remain enum, and one matching constant selects exactly one branch. That selected
+branch streams each real structured child failure through the ordinary classifier.
+Irrelevant alternatives are not emitted.
+
+Selected child errors use the stable machine key: instance path, reason-code string,
+schema path and structured detail. The emitter scans the dependency-owned branch
+context without building a second diagnostics collection, deduplicates exact keys,
+and stops immediately when `DiagnosticCollector` truncates. Genuine multi-branch
+ambiguity alone retains the conservative type fallback.
+
+Permanent tests cover null/boolean/number/array/object discriminator values,
+unsupported and supported strings, mixed range/pattern/type/required plus additional
+properties, keyword-like attacker property names, repeated and reversed object order,
+reversed temporary `oneOf` alternative order, diagnostic truncation, and all seven
+composite-keyword locations. Existing unbounded-failure, fallback-count and egress
+contradiction prechecks retain their public precedence.
+
+On the R17-07/R17-08 repair tree, formatter, locked/offline Clippy with warnings
+denied and the full locked/offline workspace suite pass (148 tests). The existing
+adversarial harness emits 84 passing result records. The targeted R17-07/R17-08
+harness completes 116 validation runs across 25 fixture cases, 22 discriminator
+cases, 32 attacker-property cases, 32 ordering runs and four public-precheck cases.
+Registry Snapshot, Demonstration A and `table.import` retain the three identities
+recorded above.
+
+A separate read-only implementation self-review found no critical, high, medium or
+low findings. It independently reran the 148-test workspace suite and strict Clippy,
+then passed 23 additional no-file probes covering discriminator matrices, mixed
+errors, distinct diagnostic preservation, irrelevant alternatives, all egress
+conditional paths and precheck precedence. This self-review is supporting evidence,
+not the requested final independent Astra targeted review. Issue #17 remains open;
+do not merge or begin Stage 1 until that review is complete.

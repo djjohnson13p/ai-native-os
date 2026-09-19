@@ -242,7 +242,9 @@ It does not contain task-specific approval or capability grants.
 admission. `review-repair-cases.json` covers R17-02 exact integer spellings,
 R17-03 diagnostic key attacks, R17-04 tolerance numeric bounds and R17-05 verifier
 inventory versus output assurance, plus R17-06 nested discriminated-union diagnostic
-classification. Numeric tokens are stored as strings on purpose:
+classification. The same corpus covers R17-07 discriminator type/value separation and
+R17-08 deterministic mixed-family emission from uniquely selected alternatives.
+Numeric tokens are stored as strings on purpose:
 tests inject their original bytes rather than rounding them while loading fixtures.
 Both corpora are executed by the offline Rust test gate.
 

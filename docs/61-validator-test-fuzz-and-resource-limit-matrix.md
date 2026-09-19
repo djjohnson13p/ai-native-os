@@ -393,7 +393,7 @@ For arbitrary bytes/structures:
 
 ## Regression corpus
 
-The Issue #17 R17-01–06 review repair gate additionally consumes:
+The Issue #17 R17-01–08 review repair gate additionally consumes:
 
 - `examples/aios-ir/registry-structure-repair-cases.json`: raw schema/typed admission,
   optional omission/null/empty object/value parity;
@@ -406,6 +406,13 @@ Nested diagnostic cases cover input/node value references and stop/retry/fallbac
 replan failure policies. They lock additional-property, required, pattern, range,
 missing-discriminator, and unknown-discriminator classifications without depending
 on branch order or rendered validator messages.
+
+The R17-07/R17-08 extension distinguishes missing, wrong-JSON-type and unsupported
+string discriminators; preserves every actual family from one selected alternative;
+injects schema-keyword-like unknown properties inside selected alternatives; reverses
+JSON object-member and temporary `oneOf` alternative order; and exercises diagnostic
+truncation. Existing failure-budget, fallback-count and egress-contradiction prechecks
+retain their public precedence.
 
 Integer tests must cover every constraint and retry/replan path without first
 decoding fixture number spellings to floating point. Property tests include

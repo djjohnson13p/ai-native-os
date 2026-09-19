@@ -52,14 +52,21 @@ Schema validators may generate detailed underlying messages, but externally map 
 
 For closed `oneOf` structures whose alternatives use a common required `const`
 discriminator, classification uses the validator's structured branch contexts.
-Exactly one discriminator-compatible branch may contribute its unanimous nested
-code; a missing common discriminator maps to `IR_SCHEMA_REQUIRED`, and a present
-value matching no discriminator maps to `IR_SCHEMA_ENUM`. If more than one branch
-is genuinely compatible, or one selected branch has conflicting failure families,
-the conservative result is `IR_SCHEMA_TYPE`. Branch order and rendered English
-messages never select the code. A dedicated pre-schema invariant code remains more
-specific where already defined, such as `IR_FAILURE_POLICY_UNBOUNDED` for retry or
-replan without its finite budget.
+A missing common discriminator maps to `IR_SCHEMA_REQUIRED`. When the expected
+branch constants share one JSON type, a discriminator of another JSON type maps to
+`IR_SCHEMA_TYPE`; a value of the expected type matching no constant maps to
+`IR_SCHEMA_ENUM`.
+
+Exactly one discriminator-compatible branch emits its actual structured child
+failures, each classified normally. Mixed families are preserved rather than
+replaced with an invented type failure. The order is deterministic by instance
+path, reason-code string, schema path and structured detail; exact repeated keys
+are emitted once. Only a genuinely non-unique branch selection retains the
+conservative `IR_SCHEMA_TYPE` fallback. Irrelevant alternatives are never emitted,
+and the bounded diagnostic collector stops expansion at its configured ceiling.
+Branch order, object-key order and rendered English messages never select a code.
+A dedicated pre-schema invariant code remains more specific where already defined,
+such as `IR_FAILURE_POLICY_UNBOUNDED` for retry or replan without its finite budget.
 
 ## Resource limits
 
