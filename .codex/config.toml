@@ -1,0 +1,43 @@
+# AI-Native OS project-scoped Codex defaults.
+# Codex loads this file only when the repository is trusted.
+#
+# Root coordinator fallback:
+# - GPT-5.6 Sol
+# - xhigh is the highest reasoning effort currently persistable in config.toml.
+# - If the user explicitly selects Sol/Max in the Codex UI, that explicit session
+#   setting takes precedence and should be kept.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+model_reasoning_summary = "concise"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 6
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
+interrupt_message = true
+
+[agents.explorer]
+description = "Fast read-only repository/code-path explorer. Use for evidence gathering, file mapping, dependency tracing, and low-risk investigation."
+config_file = "./agents/explorer.toml"
+
+[agents.implementer]
+description = "Primary implementation subagent. Use after the coordinator has a bounded plan and architecture constraints are clear."
+config_file = "./agents/implementer.toml"
+
+[agents.reviewer]
+description = "Read-only correctness reviewer for ordinary PR/code changes. Focus on regressions, tests, and maintainability."
+config_file = "./agents/reviewer.toml"
+
+[agents.test_auditor]
+description = "Read-only test and adversarial-coverage auditor. Use to challenge whether tests prove the claimed behavior."
+config_file = "./agents/test-auditor.toml"
+
+[agents.astra_reviewer]
+description = "Independent read-only architecture/security reviewer for trusted-boundary milestones and consequential design changes."
+config_file = "./agents/astra-reviewer.toml"
+
+[agents.astra_deep_review]
+description = "Escalation-only independent reviewer for unresolved high-complexity architecture/security questions after normal review cannot settle them."
+config_file = "./agents/astra-deep-review.toml"
