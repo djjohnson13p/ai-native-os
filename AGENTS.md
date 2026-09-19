@@ -119,6 +119,67 @@ For post-validator work, start with:
 
 A reviewer should try to falsify the architecture rather than continue it. Do not treat a positive review as a substitute for tests.
 
+
+## Agent orchestration and human-handoff rule
+
+The project owner should **not** be used as a manual router between model-specific chats.
+
+Project-scoped Codex routing is defined in `.codex/config.toml` and `.codex/agents/*.toml`.
+
+The root coordinator should keep one implementation thread and delegate work through subagents:
+
+- `explorer` — GPT-5.6 Luna / medium / read-only for codebase mapping and evidence gathering;
+- `implementer` — GPT-5.6 Sol / high / workspace-write for bounded implementation and fixes;
+- `reviewer` — GPT-5.6 Terra / high / read-only for ordinary correctness review;
+- `test_auditor` — GPT-5.6 Terra / high / read-only for adversarial test/evidence review;
+- `astra_reviewer` — GPT-6 Astra / medium / read-only for trusted-boundary architecture/security gates;
+- `astra_deep_review` — GPT-6 Astra / high / read-only only when a normal review leaves a genuinely difficult architecture/security question unresolved.
+
+The project-level root fallback is GPT-5.6 Sol with xhigh reasoning because `config.toml` currently persists reasoning only through `xhigh`. If the user explicitly selects Sol/Max in the Codex UI, keep that setting; explicit session configuration takes precedence.
+
+### Delegation policy
+
+Use subagents proactively when work can be separated without weakening evidence:
+
+1. explorer maps the relevant code/contracts;
+2. implementer owns the bounded code change;
+3. test_auditor challenges the evidence;
+4. reviewer checks ordinary correctness;
+5. astra_reviewer is required for trusted-boundary/security milestones or when the active issue explicitly requires independent architecture review;
+6. astra_deep_review is escalation-only.
+
+The root coordinator integrates the work and remains accountable for the final result. Subagent conclusions do not merge code by themselves.
+
+### GitHub as the handoff bridge
+
+GitHub is the durable coordination layer between ChatGPT, Codex, reviews, and future sessions.
+
+For active implementation:
+
+- the GitHub issue defines the task and acceptance criteria;
+- the branch contains the work;
+- the pull request is the review/fix loop;
+- Codex review/fix work should be triggered from the PR with GitHub Codex integration where practical;
+- one structured `AIOS-HANDOFF` comment should summarize current HEAD, tests, review status, blockers, and the exact next action;
+- do not ask the project owner to copy large model-to-model transcripts when the same state can be written to the issue/PR.
+
+When a PR exists, prefer GitHub-native Codex operations (for example review, security review, or a bounded fix request) over asking the project owner to open another model-specific chat.
+
+### Human-interaction rule
+
+The project owner should normally need only:
+
+1. this main ChatGPT project conversation for direction/approval; and
+2. one persistent Codex coordinator session when new implementation work must be initiated outside GitHub.
+
+Do **not** instruct the project owner to create separate Sol/Terra/Luna/Astra chats for routine delegation. Spawn the configured subagent instead.
+
+A separate fresh human-visible review session is reserved for exceptional release/security gates where independence from the coordinator context materially matters.
+
+If the runtime cannot spawn the required configured agent, report that limitation explicitly and give one exact fallback action. Do not create a chain of ambiguous session instructions.
+
+See `docs/89-agent-orchestration-and-github-handoff.md`.
+
 ## Contract-change rule
 
 If you modify a security/semantic contract:
