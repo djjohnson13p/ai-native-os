@@ -4700,6 +4700,52 @@ fn locked_store_identity_checks_sqlite_main_after_path_swap_back() {
     assert!(verify_locked_store_identity(&connection, &lock).is_err());
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_store_identity_rejects_replacement_with_preserved_creation_time() {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.sqlite3");
+    let displaced = directory.path().join("identity-original.sqlite3");
+    std::fs::write(&path, b"original").unwrap();
+    let original_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let original_creation_time = original_file.metadata().unwrap().creation_time();
+    let original_identity = store_identity(&path, &original_file).unwrap();
+    drop(original_file);
+
+    std::fs::rename(&path, &displaced).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let creation_time_argument = original_creation_time.to_string();
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($path,$ticks) [System.IO.File]::SetCreationTimeUtc($path,[DateTime]::FromFileTimeUtc([Int64]$ticks)) }",
+            path.to_str().unwrap(),
+            &creation_time_argument,
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let replacement_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        replacement_file.metadata().unwrap().creation_time(),
+        original_creation_time
+    );
+    let replacement_identity = store_identity(&path, &replacement_file).unwrap();
+    assert_ne!(original_identity, replacement_identity);
+}
+
 #[test]
 fn mutation_provenance_excludes_free_form_waiting_and_failure_text() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();

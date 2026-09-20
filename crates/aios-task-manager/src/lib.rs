@@ -27,7 +27,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -443,12 +443,14 @@ pub struct StepExecutionRecord {
 
 pub struct TaskManager {
     connection: Connection,
-    clock: Box<dyn Clock>,
+    clock: Arc<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
+    artifact_scope_issuer: String,
+    database_locator: DatabaseLocator,
     artifact_store_root: PathBuf,
     artifact_store_dir: cap_std::fs::Dir,
-    _store_lock: Option<StoreLock>,
+    store_lock: Option<StoreLock>,
 }
 
 pub trait Clock: Send + Sync {
@@ -471,7 +473,7 @@ struct StoreLock {
     identity: StoreIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct StoreIdentity {
     canonical_path: PathBuf,
     #[cfg(unix)]
@@ -479,8 +481,30 @@ struct StoreIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    creation_time: u64,
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_index: u64,
 }
+
+impl PartialEq for StoreIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number == other.volume_serial_number
+                && self.file_index == other.file_index
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.canonical_path == other.canonical_path
+        }
+    }
+}
+
+impl Eq for StoreIdentity {}
 
 impl StoreIdentity {
     fn persistent_key(&self) -> String {
@@ -490,7 +514,7 @@ impl StoreIdentity {
         }
         #[cfg(windows)]
         {
-            format!("windows:{}", self.creation_time)
+            format!("windows:{}:{}", self.volume_serial_number, self.file_index)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -500,6 +524,7 @@ impl StoreIdentity {
 }
 
 fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
+    #[cfg(not(windows))]
     let metadata = file.metadata()?;
     #[cfg(unix)]
     {
@@ -512,10 +537,11 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        let information = winx::winapi_util::file::information(file)?;
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
-            creation_time: metadata.creation_time(),
+            volume_serial_number: information.volume_serial_number(),
+            file_index: information.file_index(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -524,6 +550,26 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
         })
+    }
+}
+
+#[derive(Clone)]
+enum DatabaseLocator {
+    File(PathBuf),
+    SharedMemory(String),
+}
+
+impl DatabaseLocator {
+    fn open(&self) -> rusqlite::Result<Connection> {
+        match self {
+            Self::File(path) => Connection::open(path),
+            Self::SharedMemory(uri) => Connection::open_with_flags(
+                uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            ),
+        }
     }
 }
 
@@ -590,7 +636,12 @@ where
     after_lock(path);
     let connection = Connection::open(path)?;
     verify_locked_store_identity(&connection, &lock)?;
-    TaskManager::initialize(connection, clock, Some(lock))
+    TaskManager::initialize(
+        connection,
+        clock,
+        Some(lock),
+        DatabaseLocator::File(path.to_path_buf()),
+    )
 }
 
 fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {
@@ -655,7 +706,7 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when `SQLite` cannot initialize the schema.
     pub fn open_in_memory() -> Result<Self> {
-        Self::initialize(Connection::open_in_memory()?, Box::new(SystemClock), None)
+        Self::open_shared_memory(Box::new(SystemClock))
     }
 
     /// Opens a store with an injected trusted clock.
@@ -672,13 +723,23 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when `SQLite` cannot initialize the schema.
     pub fn open_in_memory_with_clock(clock: Box<dyn Clock>) -> Result<Self> {
-        Self::initialize(Connection::open_in_memory()?, clock, None)
+        Self::open_shared_memory(clock)
+    }
+
+    fn open_shared_memory(clock: Box<dyn Clock>) -> Result<Self> {
+        static NEXT_MEMORY_STORE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let sequence = NEXT_MEMORY_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let uri = format!("file:aios-task-manager-{sequence}?mode=memory&cache=shared");
+        let locator = DatabaseLocator::SharedMemory(uri.clone());
+        Self::initialize(locator.open()?, clock, None, locator)
     }
 
     fn initialize(
         connection: Connection,
         clock: Box<dyn Clock>,
         store_lock: Option<StoreLock>,
+        database_locator: DatabaseLocator,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_migration_state(&connection)?;
@@ -690,20 +751,25 @@ impl TaskManager {
                 acquired_at TEXT NOT NULL
             );",
         )?;
+        let clock: Arc<dyn Clock> = Arc::from(clock);
         let acquired_at = clock.now();
         let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
         let (artifact_store_root, artifact_store_dir) =
             artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
+        let artifact_scope_issuer =
+            connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
         let mut manager = Self {
             connection,
             clock,
             lease_owner,
             lease_epoch,
+            artifact_scope_issuer,
+            database_locator,
             artifact_store_root,
             artifact_store_dir,
-            _store_lock: store_lock,
+            store_lock,
         };
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;

@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
@@ -21,7 +22,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    Actor, Result, SCHEMA_VERSION, StoreLock, TaskManager, TaskManagerError, append_event,
+    Actor, Clock, Result, SCHEMA_VERSION, StoreLock, TaskManager, TaskManagerError, append_event,
     assert_manager_lease, canonical_json,
 };
 
@@ -351,9 +352,29 @@ pub struct ArtifactPublicationResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactReadScope {
     scope_id: String,
+    issuer_id: String,
     task_id: String,
-    binding_id: Option<String>,
+    authority: ReadAuthority,
     artifact_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadAuthority {
+    task_principal_kind: String,
+    task_principal_id: String,
+    execution: Option<ExecutionAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionAuthority {
+    binding_id: String,
+    attempt_id: String,
+    semantic_program_hash: String,
+    node_id: String,
+    capability: String,
+    principal_id: String,
+    policy_decision_refs_json: String,
+    grant_refs_json: String,
 }
 
 impl ArtifactReadScope {
@@ -366,7 +387,10 @@ impl ArtifactReadScope {
     }
 
     pub fn binding_id(&self) -> Option<&str> {
-        self.binding_id.as_deref()
+        self.authority
+            .execution
+            .as_ref()
+            .map(|authority| authority.binding_id.as_str())
     }
 }
 
@@ -396,6 +420,10 @@ impl Seek for ArtifactReader {
 pub struct ArtifactStagingWriter {
     file: Option<cap_std::fs::File>,
     store: Dir,
+    authority_connection: Connection,
+    clock: Arc<dyn Clock>,
+    lease_owner: String,
+    lease_epoch: i64,
     allocation_id: String,
     seal_ref: String,
     maximum: u64,
@@ -420,6 +448,13 @@ impl ArtifactStagingWriter {
     }
 
     pub fn finish(mut self) -> Result<u64> {
+        validate_writer_fence(
+            &self.authority_connection,
+            &self.allocation_id,
+            &self.clock.now(),
+            &self.lease_owner,
+            self.lease_epoch,
+        )?;
         let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
             "Artifact staging writer is already finalized",
         ))?;
@@ -454,6 +489,14 @@ impl ArtifactStagingWriter {
 
 impl Write for ArtifactStagingWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        validate_writer_fence(
+            &self.authority_connection,
+            &self.allocation_id,
+            &self.clock.now(),
+            &self.lease_owner,
+            self.lease_epoch,
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         let length = u64::try_from(buffer.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
         })?;
@@ -550,10 +593,27 @@ pub(super) fn initialize_root(
             None,
         )
     };
-    std::fs::create_dir_all(&root)?;
+    durability_step("create-root")?;
+    let root_created = match std::fs::create_dir(&root) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
     reject_reparse_root(&root)?;
     let canonical_root = root.canonicalize()?;
     let directory = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
+    if root_created {
+        durability_step("sync-root")?;
+        sync_store_root(&directory)?;
+        durability_step("sync-root-parent")?;
+        sync_host_directory(
+            canonical_root
+                .parent()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact store root has no parent directory",
+                ))?,
+        )?;
+    }
     let root_file = directory.try_clone()?.into_std_file();
     let root_identity = super::store_identity(&canonical_root, &root_file)?.persistent_key();
     if stored_root_identity
@@ -564,10 +624,10 @@ pub(super) fn initialize_root(
             "Artifact store root identity does not match its database binding",
         ));
     }
-    directory.create_dir_all("blobs/sha256")?;
-    directory.create_dir_all("staging")?;
-    directory.create_dir_all("quarantine")?;
-    directory.create_dir_all("blobs/pending")?;
+    create_durable_ancestors(&directory, "blobs/sha256")?;
+    create_durable_ancestors(&directory, "staging")?;
+    create_durable_ancestors(&directory, "quarantine")?;
+    create_durable_ancestors(&directory, "blobs/pending")?;
     let canonical_text = canonical_root
         .to_str()
         .ok_or(TaskManagerError::InvalidRecord(
@@ -706,30 +766,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let task_exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1)",
-            [&request.task_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !task_exists {
-            return Err(TaskManagerError::InvalidRecord(
-                "Artifact allocation Task does not exist",
-            ));
-        }
-        if let (Some(binding_id), Some(attempt_id)) =
-            (request.binding_id.as_deref(), request.attempt_id.as_deref())
-        {
-            let exact = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM execution_bindings b JOIN step_executions s ON s.binding_id=b.binding_id AND s.attempt_id=b.attempt_id AND s.task_id=b.task_id AND s.semantic_program_hash=b.semantic_program_hash AND s.node_id=b.node_id WHERE b.binding_id=?1 AND b.attempt_id=?2 AND b.task_id=?3 AND b.semantic_program_hash=?4 AND b.node_id=?5)",
-                params![binding_id,attempt_id,request.task_id,request.semantic_program_hash,request.node_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !exact {
-                return Err(TaskManagerError::InvalidRecord(
-                    "Artifact allocation does not match its immutable attempt/binding",
-                ));
-            }
-        }
+        validate_requested_execution_scope(&transaction, request, &created_at)?;
         transaction.execute(
             "INSERT INTO artifact_output_allocations (allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,created_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ALLOCATED',?13,?14,?15,?14)",
             params![request.allocation_id,request.task_id,request.semantic_program_hash,request.node_id,request.binding_id,request.attempt_id,request.output_port,request.expected_semantic_type,serde_json::to_string(&request.allowed_media_types)?,request.max_size_bytes.map(to_i64).transpose()?,request.sensitivity.as_str(),request.retention.as_str(),staging_ref,created_at,request.expires_at],
@@ -743,6 +780,11 @@ impl TaskManager {
 
     pub fn open_artifact_output(&mut self, allocation_id: &str) -> Result<ArtifactStagingWriter> {
         validate_id(allocation_id, 256, "invalid Artifact allocation ID")?;
+        let authority_connection = self.database_locator.open()?;
+        authority_connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        if let Some(lock) = self.store_lock.as_ref() {
+            super::verify_locked_store_identity(&authority_connection, lock)?;
+        }
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
         let now = self.clock.now();
@@ -750,24 +792,22 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let row = transaction
-            .query_row(
-                "SELECT state,staging_ref,max_size_bytes,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",
-                [allocation_id],
-                |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,String>(3)?)),
-            )
-            .optional()?;
-        let Some((state, Some(staging_ref), maximum, expires_at)) = row else {
+        let Some(allocation) = load_allocation_row(&transaction, allocation_id)? else {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_ALLOCATION_NOT_FOUND",
             ));
         };
-        if state != "ALLOCATED" {
+        let Some(staging_ref) = allocation.staging_ref.clone() else {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_ALLOCATION_NOT_FOUND",
+            ));
+        };
+        if allocation.state != "ALLOCATED" {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_ALLOCATION_STATE_CONFLICT",
             ));
         }
-        if parse_time(&expires_at)? <= parse_time(&now)? {
+        if parse_time(&allocation.expires_at)? <= parse_time(&now)? {
             transaction.execute(
                 "UPDATE artifact_output_allocations SET state='EXPIRED',updated_at=?2 WHERE allocation_id=?1",
                 params![allocation_id,now],
@@ -777,6 +817,7 @@ impl TaskManager {
                 "ARTIFACT_ALLOCATION_EXPIRED",
             ));
         }
+        validate_allocation_execution_scope(&transaction, &allocation, &now)?;
         let file = self.artifact_store_dir.open_with(
             safe_internal_ref(&staging_ref)?,
             CapOpenOptions::new()
@@ -792,10 +833,15 @@ impl TaskManager {
         Ok(ArtifactStagingWriter {
             file: Some(file),
             store: self.artifact_store_dir.try_clone()?,
+            authority_connection,
+            clock: Arc::clone(&self.clock),
+            lease_owner: self.lease_owner.clone(),
+            lease_epoch: self.lease_epoch,
             allocation_id: allocation_id.to_owned(),
             seal_ref: seal_ref(&staging_ref),
-            maximum: maximum
-                .map_or(IMPORT_LIMIT, |value| u64::try_from(value).unwrap_or(0))
+            maximum: allocation
+                .max_size_bytes
+                .unwrap_or(IMPORT_LIMIT)
                 .min(IMPORT_LIMIT),
             written: 0,
         })
@@ -1077,28 +1123,18 @@ impl TaskManager {
                 "invalid Artifact read scope",
             ));
         }
+        let authority =
+            capture_read_authority(&self.connection, task_id, binding_id, &self.clock.now())?;
         for artifact_id in artifact_ids {
-            let authorized = if let Some(binding_id) = binding_id {
-                self.connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM step_executions s WHERE s.task_id=?1 AND s.binding_id=?2 AND EXISTS(SELECT 1 FROM json_each(s.input_artifacts_json) WHERE value=?3) AND EXISTS(SELECT 1 FROM task_artifacts t WHERE t.task_id=s.task_id AND t.artifact_id=?3))",
-                    params![task_id,binding_id,artifact_id],
-                    |row| row.get::<_,bool>(0),
-                )?
-            } else {
-                self.connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM task_artifacts WHERE task_id=?1 AND artifact_id=?2)",
-                    params![task_id,artifact_id],
-                    |row| row.get::<_,bool>(0),
-                )?
-            };
-            if !authorized {
+            if !artifact_read_authorized(&self.connection, task_id, &authority, artifact_id)? {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
             }
         }
         Ok(ArtifactReadScope {
             scope_id: format!("artifact-read-scope:{}", random_token(&self.connection)?),
+            issuer_id: self.artifact_scope_issuer.clone(),
             task_id: task_id.to_owned(),
-            binding_id: binding_id.map(ToOwned::to_owned),
+            authority,
             artifact_ids: artifact_ids.iter().cloned().collect(),
         })
     }
@@ -1108,7 +1144,21 @@ impl TaskManager {
         scope: &ArtifactReadScope,
         artifact_id: &str,
     ) -> Result<ArtifactReader> {
-        if !scope.artifact_ids.contains(artifact_id) {
+        if scope.issuer_id != self.artifact_scope_issuer
+            || !scope.artifact_ids.contains(artifact_id)
+            || capture_read_authority(
+                &self.connection,
+                &scope.task_id,
+                scope.binding_id(),
+                &self.clock.now(),
+            )? != scope.authority
+            || !artifact_read_authorized(
+                &self.connection,
+                &scope.task_id,
+                &scope.authority,
+                artifact_id,
+            )?
+        {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         let handle = self
@@ -1119,10 +1169,21 @@ impl TaskManager {
             [artifact_id],
             |row| row.get::<_,String>(0),
         )?;
-        let verified = hash_internal_file(&self.artifact_store_dir, &storage_ref);
+        let mut file = self
+            .artifact_store_dir
+            .open(safe_internal_ref(&storage_ref)?)?
+            .into_std();
+        let length_before = file.metadata()?.len();
+        let verified = hash_reader(&mut file);
+        let length_after = file.metadata()?.len();
         let expected_hash = handle.content_hash.tagged();
         match verified {
-            Ok((size, hash)) if size == handle.size_bytes && hash == expected_hash => {
+            Ok((size, hash))
+                if length_before == length_after
+                    && size == length_after
+                    && size == handle.size_bytes
+                    && hash == expected_hash =>
+            {
                 let now = self.clock.now();
                 let lease_owner = self.lease_owner.clone();
                 let lease_epoch = self.lease_epoch;
@@ -1139,11 +1200,9 @@ impl TaskManager {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
             }
         }
+        file.seek(SeekFrom::Start(0))?;
         Ok(ArtifactReader {
-            file: self
-                .artifact_store_dir
-                .open(safe_internal_ref(&storage_ref)?)?
-                .into_std(),
+            file,
             handle: self
                 .get_artifact(artifact_id)?
                 .ok_or(TaskManagerError::InvalidRecord(
@@ -1681,6 +1740,405 @@ fn load_allocation_row(
     .transpose()
 }
 
+fn validate_requested_execution_scope(
+    connection: &Connection,
+    request: &OutputAllocationRequest,
+    now: &str,
+) -> Result<()> {
+    let task = current_task_scope(connection, &request.task_id)?;
+    if !task_accepts_artifact_import(&task.2) {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    match (request.binding_id.as_deref(), request.attempt_id.as_deref()) {
+        (None, None) => validate_current_program_node(
+            connection,
+            &request.task_id,
+            task.3,
+            &request.semantic_program_hash,
+            &request.node_id,
+        ),
+        (Some(binding_id), Some(attempt_id)) => {
+            let execution =
+                capture_execution_authority(connection, &request.task_id, binding_id, now)?;
+            if execution.attempt_id != attempt_id
+                || execution.semantic_program_hash != request.semantic_program_hash
+                || execution.node_id != request.node_id
+            {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            Ok(())
+        }
+        _ => Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
+    }
+}
+
+fn validate_allocation_execution_scope(
+    connection: &Connection,
+    allocation: &AllocationRow,
+    now: &str,
+) -> Result<()> {
+    let request = OutputAllocationRequest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        allocation_id: String::new(),
+        task_id: allocation.task_id.clone(),
+        semantic_program_hash: allocation.semantic_program_hash.clone(),
+        node_id: allocation.node_id.clone(),
+        binding_id: allocation.binding_id.clone(),
+        attempt_id: allocation.attempt_id.clone(),
+        output_port: None,
+        expected_semantic_type: None,
+        allowed_media_types: Vec::new(),
+        max_size_bytes: None,
+        sensitivity: Sensitivity::Local,
+        retention: RetentionClass::Task,
+        expires_at: allocation.expires_at.clone(),
+    };
+    validate_requested_execution_scope(connection, &request, now)
+}
+
+fn validate_writer_fence(
+    connection: &Connection,
+    allocation_id: &str,
+    now: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+) -> Result<()> {
+    let owns_fence = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id=1 AND owner_id=?1 AND fence_epoch=?2)",
+        params![lease_owner, lease_epoch],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !owns_fence {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    let allocation = load_allocation_row(connection, allocation_id)?.ok_or(
+        TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+    )?;
+    if allocation.state != "WRITING" || parse_time(&allocation.expires_at)? <= parse_time(now)? {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    validate_allocation_execution_scope(connection, &allocation, now)
+}
+
+fn current_task_scope(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<(String, String, String, Option<i64>, String)> {
+    connection
+        .query_row(
+            "SELECT principal_kind,principal_id,state,active_program_revision,active_step_ids_json FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+}
+
+fn validate_current_program_node(
+    connection: &Connection,
+    task_id: &str,
+    active_revision: Option<i64>,
+    semantic_hash: &str,
+    node_id: &str,
+) -> Result<()> {
+    let Some(active_revision) = active_revision else {
+        // Pre-binding allocations are permitted before a Task has an active program.
+        return Ok(());
+    };
+    let program_json = connection
+        .query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id=?1 AND program_revision=?2 AND semantic_hash=?3 AND status='active' AND superseded_at IS NULL",
+            params![task_id, active_revision, semantic_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+    let program: serde_json::Value = serde_json::from_str(&program_json)?;
+    if !program
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|node| node.get("id").and_then(serde_json::Value::as_str) == Some(node_id))
+        })
+    {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    Ok(())
+}
+
+fn capture_read_authority(
+    connection: &Connection,
+    task_id: &str,
+    binding_id: Option<&str>,
+    now: &str,
+) -> Result<ReadAuthority> {
+    let task = current_task_scope(connection, task_id)?;
+    if !task_accepts_artifact_import(&task.2) {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    let execution = binding_id
+        .map(|binding_id| capture_execution_authority(connection, task_id, binding_id, now))
+        .transpose()?;
+    Ok(ReadAuthority {
+        task_principal_kind: task.0,
+        task_principal_id: task.1,
+        execution,
+    })
+}
+
+fn capture_execution_authority(
+    connection: &Connection,
+    task_id: &str,
+    binding_id: &str,
+    now: &str,
+) -> Result<ExecutionAuthority> {
+    let task = current_task_scope(connection, task_id)?;
+    if !matches!(
+        task.2.as_str(),
+        "RUNNABLE" | "RUNNING" | "VERIFYING" | "RECOVERING"
+    ) {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    let active_steps: Vec<String> = serde_json::from_str(&task.4)?;
+    let execution = connection
+        .query_row(
+            "SELECT s.attempt_id,s.semantic_program_hash,s.node_id,b.capability,b.provider_id,b.policy_decision_refs_json,b.grant_refs_json
+             FROM step_executions s
+             JOIN execution_bindings b ON b.binding_id=s.binding_id AND b.attempt_id=s.attempt_id
+                AND b.task_id=s.task_id AND b.semantic_program_hash=s.semantic_program_hash
+                AND b.registry_snapshot_id=s.registry_snapshot_id AND b.node_id=s.node_id
+             JOIN semantic_program_revisions p ON p.task_id=s.task_id
+                AND p.program_revision=?3 AND p.semantic_hash=s.semantic_program_hash
+                AND p.registry_snapshot_id=s.registry_snapshot_id AND p.status='active'
+                AND p.superseded_at IS NULL
+             WHERE s.task_id=?1 AND s.binding_id=?2
+                AND s.state IN ('READY','STARTING','RUNNING','SUCCEEDED')
+                AND s.attempt_number=(SELECT MAX(latest.attempt_number) FROM step_executions latest
+                    WHERE latest.task_id=s.task_id AND latest.semantic_program_hash=s.semantic_program_hash
+                    AND latest.registry_snapshot_id=s.registry_snapshot_id AND latest.node_id=s.node_id)",
+            params![task_id, binding_id, task.3],
+            |row| {
+                Ok(ExecutionAuthority {
+                    attempt_id: row.get(0)?,
+                    semantic_program_hash: row.get(1)?,
+                    node_id: row.get(2)?,
+                    binding_id: binding_id.to_owned(),
+                    capability: row.get(3)?,
+                    principal_id: row.get(4)?,
+                    policy_decision_refs_json: row.get(5)?,
+                    grant_refs_json: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+    if !active_steps.iter().any(|step| step == &execution.node_id)
+        || !binding_runtime_authority_valid(connection, task_id, &execution, now)?
+    {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    Ok(execution)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the durable grant, decision, request, approval, and principal intersection auditable"
+)]
+fn binding_runtime_authority_valid(
+    connection: &Connection,
+    task_id: &str,
+    execution: &ExecutionAuthority,
+    now: &str,
+) -> Result<bool> {
+    let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
+    let policy_ids: Vec<String> = serde_json::from_str(&execution.policy_decision_refs_json)?;
+    if grant_ids.len() > 64
+        || grant_ids.len() != policy_ids.len()
+        || !all_unique(&grant_ids)
+        || !all_unique(&policy_ids)
+    {
+        return Ok(false);
+    }
+    let request_count = connection.query_row(
+        "SELECT COUNT(*) FROM authority_requests WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3 AND execution_binding_id=?4 AND attempt_id=?5 AND principal_kind='provider' AND principal_id=?6",
+        params![task_id, execution.semantic_program_hash, execution.node_id, execution.binding_id, execution.attempt_id, execution.principal_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if usize::try_from(request_count).ok() != Some(grant_ids.len()) {
+        return Ok(false);
+    }
+    let checked_at = parse_time(now)?;
+    let mut covered_requests = BTreeSet::new();
+    let mut covered_decisions = BTreeSet::new();
+    for grant_id in grant_ids {
+        let grant = connection
+            .query_row(
+                "SELECT g.expires_at,g.approval_id,a.status,a.expires_at,
+                        d.decision,d.principal_kind,d.principal_id,
+                        r.principal_kind,r.principal_id,g.capability,g.grants_json,g.scope,
+                        g.delegable,g.max_delegation_depth,d.decision_id,d.action,
+                        d.resolved_resource_kind,d.resolved_resource_id,d.approval_request_id,
+                        r.request_id,r.capability,r.action,r.resolved_resource_kind,
+                        r.resolved_resource_id,r.semantic_selector
+                 FROM authority_grants g
+                 JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                    AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
+                    AND d.node_id=g.node_id AND d.policy_snapshot_id=g.policy_snapshot_id
+                 JOIN authority_requests r ON r.request_id=d.authority_request_id
+                    AND r.task_id=g.task_id AND r.semantic_program_hash=g.semantic_program_hash
+                    AND r.node_id=g.node_id AND r.execution_binding_id=g.execution_binding_id
+                    AND r.attempt_id=g.attempt_id
+                 LEFT JOIN approval_requests a ON a.approval_id=g.approval_id
+                    AND a.authority_request_id=r.request_id AND a.task_id=g.task_id
+                 WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
+                    AND g.node_id=?4 AND g.execution_binding_id=?5 AND g.attempt_id=?6
+                    AND g.principal_kind='provider' AND g.principal_id=?7
+                    AND g.state='ACTIVE' AND (g.max_uses IS NULL OR g.uses_consumed<g.max_uses)",
+                params![
+                    grant_id,
+                    task_id,
+                    execution.semantic_program_hash,
+                    execution.node_id,
+                    execution.binding_id,
+                    execution.attempt_id,
+                    execution.principal_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, bool>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, String>(19)?,
+                        row.get::<_, String>(20)?,
+                        row.get::<_, String>(21)?,
+                        row.get::<_, String>(22)?,
+                        row.get::<_, String>(23)?,
+                        row.get::<_, Option<String>>(24)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(grant) = grant else {
+            return Ok(false);
+        };
+        if parse_time(&grant.0)? <= checked_at
+            || grant.4 != "ALLOW"
+            || grant.5 != "provider"
+            || grant.6 != execution.principal_id
+            || grant.7 != "provider"
+            || grant.8 != execution.principal_id
+            || grant.9 != execution.capability
+            || grant.12
+            || grant.13 != 0
+            || !policy_ids.contains(&grant.14)
+            || grant.15 != grant.21
+            || grant.16 != grant.22
+            || grant.17 != grant.23
+            || grant.1 != grant.18
+            || grant.20 != execution.capability
+            || !covered_decisions.insert(grant.14.clone())
+            || !covered_requests.insert(grant.19.clone())
+        {
+            return Ok(false);
+        }
+        let items: serde_json::Value = serde_json::from_str(&grant.10)?;
+        let Some([item]) = items.as_array().map(Vec::as_slice) else {
+            return Ok(false);
+        };
+        if item.get("action").and_then(serde_json::Value::as_str) != Some(grant.21.as_str())
+            || item
+                .get("resource_kind")
+                .and_then(serde_json::Value::as_str)
+                != Some(grant.22.as_str())
+            || item.get("resource_id").and_then(serde_json::Value::as_str)
+                != Some(grant.23.as_str())
+            || item
+                .get("semantic_selector")
+                .and_then(serde_json::Value::as_str)
+                != grant.24.as_deref()
+        {
+            return Ok(false);
+        }
+        match (grant.1.as_deref(), grant.2.as_deref()) {
+            (None, None) => {}
+            (Some(_), Some("APPROVED")) => {
+                if grant.3.as_deref().is_some_and(|expires| {
+                    parse_time(expires).map_or(true, |expires| expires <= checked_at)
+                }) {
+                    return Ok(false);
+                }
+                let approval_valid = connection.query_row(
+                    "SELECT COUNT(*) FROM approval_decisions WHERE approval_id=?1 AND task_id=?2 AND decision='APPROVE' AND scope=?3 AND (approved_until IS NULL OR approved_until>?4)",
+                    params![grant.1, task_id, grant.11, now],
+                    |row| row.get::<_, i64>(0),
+                )? == 1;
+                if !approval_valid {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(
+        covered_requests.len() == usize::try_from(request_count).unwrap_or(usize::MAX)
+            && covered_decisions.len() == policy_ids.len(),
+    )
+}
+
+fn artifact_read_authorized(
+    connection: &Connection,
+    task_id: &str,
+    authority: &ReadAuthority,
+    artifact_id: &str,
+) -> Result<bool> {
+    if let Some(execution) = &authority.execution {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM step_executions s
+                 WHERE s.task_id=?1 AND s.binding_id=?2 AND s.attempt_id=?3
+                   AND EXISTS(SELECT 1 FROM json_each(s.input_artifacts_json) WHERE value=?4)
+                   AND EXISTS(SELECT 1 FROM task_artifacts t WHERE t.task_id=s.task_id AND t.artifact_id=?4))",
+                params![task_id, execution.binding_id, execution.attempt_id, artifact_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    } else {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_artifacts WHERE task_id=?1 AND artifact_id=?2)",
+                params![task_id, artifact_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    }
+}
+
 fn validate_publication_allocation(
     request: &ArtifactPublicationRequest,
     allocation: &AllocationRow,
@@ -2095,7 +2553,7 @@ fn place_blob(
         digest
     );
     let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
-    store.create_dir_all(safe_internal_ref(&parent_ref)?)?;
+    create_durable_ancestors(store, &parent_ref)?;
     let pending_ref = format!(
         "blobs/pending/{}-{}",
         digest,
@@ -2384,7 +2842,7 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<()> {
         }
         let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
         let final_ref = format!("{parent_ref}/{digest}");
-        store.create_dir_all(safe_internal_ref(&parent_ref)?)?;
+        create_durable_ancestors(store, &parent_ref)?;
         match store.hard_link(
             safe_internal_ref(&pending_ref)?,
             store,
@@ -2510,6 +2968,124 @@ fn all_unique(values: &[String]) -> bool {
     values.iter().collect::<BTreeSet<_>>().len() == values.len()
 }
 
+fn create_durable_ancestors(store: &Dir, reference: &str) -> Result<()> {
+    let relative = safe_internal_ref(reference)?;
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact storage reference is invalid",
+            ));
+        };
+        let parent = current.clone();
+        current.push(component);
+        let current_ref = current
+            .to_str()
+            .ok_or(TaskManagerError::InvalidRecord(
+                "Artifact directory reference is not UTF-8",
+            ))?
+            .replace('\\', "/");
+        durability_step(&format!("create:{current_ref}"))?;
+        match store.create_dir(&current) {
+            Ok(()) => {
+                durability_step(&format!("sync:{current_ref}"))?;
+                sync_cap_directory(store, &current_ref)?;
+                let parent_ref = parent
+                    .to_str()
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "Artifact directory reference is not UTF-8",
+                    ))?
+                    .replace('\\', "/");
+                durability_step(&format!(
+                    "sync-parent:{}",
+                    if parent_ref.is_empty() {
+                        "."
+                    } else {
+                        &parent_ref
+                    }
+                ))?;
+                if parent_ref.is_empty() {
+                    sync_store_root(store)?;
+                } else {
+                    sync_cap_directory(store, &parent_ref)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "directory synchronization is fallible on supported durable filesystems and a portability no-op elsewhere"
+)]
+fn sync_store_root(store: &Dir) -> Result<()> {
+    #[cfg(unix)]
+    store.try_clone()?.into_std_file().sync_all()?;
+    #[cfg(windows)]
+    sync_windows_directory(store, ".")?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = store;
+    Ok(())
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "directory synchronization is fallible on Unix and a portability no-op elsewhere"
+)]
+fn sync_host_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .sync_all()?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_TEST_CONTROL: std::cell::RefCell<Option<(Vec<String>, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn durability_step(operation: &str) -> Result<()> {
+    DURABILITY_TEST_CONTROL.with(|control| {
+        let mut control = control.borrow_mut();
+        if let Some((operations, failure)) = control.as_mut() {
+            operations.push(operation.to_owned());
+            if failure.as_deref() == Some(operation) {
+                return Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected directory durability failure",
+                )));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test fault injection shares the production call signature"
+)]
+fn durability_step(_operation: &str) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_cap_directory(store: &Dir, reference: &str) -> Result<()> {
     store
@@ -2524,13 +3100,35 @@ fn sync_cap_directory(store: &Dir, reference: &str) -> Result<()> {
     clippy::unnecessary_wraps,
     reason = "keeps the platform-specific durability helper signature uniform"
 )]
-fn sync_cap_directory(_store: &Dir, _reference: &str) -> Result<()> {
+fn sync_cap_directory(store: &Dir, reference: &str) -> Result<()> {
+    #[cfg(windows)]
+    sync_windows_directory(store, reference)?;
+    #[cfg(not(windows))]
+    let _ = (store, reference);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_windows_directory(store: &Dir, reference: &str) -> Result<()> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    store
+        .open_with(reference, &options)?
+        .into_std()
+        .sync_all()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read as _, Write as _};
+    use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
 
@@ -2541,6 +3139,37 @@ mod tests {
 
     impl Clock for FixedClock {
         fn now(&self) -> String {
+            "2026-09-19T22:00:00Z".to_owned()
+        }
+    }
+
+    struct SwapClock {
+        state: Arc<Mutex<SwapClockState>>,
+    }
+
+    struct SwapClockState {
+        armed_calls: Option<u8>,
+        blob: Option<PathBuf>,
+        replacement: Vec<u8>,
+        error: Option<String>,
+    }
+
+    impl Clock for SwapClock {
+        fn now(&self) -> String {
+            let mut state = self.state.lock().unwrap();
+            if let Some(calls) = state.armed_calls.as_mut() {
+                *calls -= 1;
+                if *calls == 0 {
+                    let blob = state.blob.clone().unwrap();
+                    let displaced = blob.with_extension("verified-open-handle");
+                    if let Err(error) = std::fs::rename(&blob, &displaced)
+                        .and_then(|()| std::fs::write(&blob, &state.replacement))
+                    {
+                        state.error = Some(error.to_string());
+                    }
+                    state.armed_calls = None;
+                }
+            }
             "2026-09-19T22:00:00Z".to_owned()
         }
     }
@@ -3133,6 +3762,382 @@ mod tests {
     }
 
     #[test]
+    fn read_scope_is_bound_to_its_issuing_manager_even_for_the_same_artifact_id() {
+        let first_temp = TempDir::new().unwrap();
+        let second_temp = TempDir::new().unwrap();
+        let mut first = manager(&first_temp);
+        let artifact = first
+            .import_artifact(&import_request(), &mut Cursor::new(b"first".as_slice()))
+            .unwrap();
+        let foreign_scope = first
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+
+        let mut second = manager(&second_temp);
+        let local = second
+            .import_artifact(&import_request(), &mut Cursor::new(b"second".as_slice()))
+            .unwrap();
+        second
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF")
+            .unwrap();
+        second
+            .connection
+            .execute(
+                "UPDATE task_artifacts SET artifact_id=?1 WHERE artifact_id=?2",
+                params![artifact.artifact_id, local.artifact_id],
+            )
+            .unwrap();
+        second
+            .connection
+            .execute(
+                "UPDATE artifacts SET artifact_id=?1,uri=?2 WHERE artifact_id=?3",
+                params![
+                    artifact.artifact_id,
+                    ArtifactUri::new(&artifact.artifact_id).as_str(),
+                    local.artifact_id
+                ],
+            )
+            .unwrap();
+        second
+            .connection
+            .execute_batch("PRAGMA foreign_keys=ON")
+            .unwrap();
+        let local_scope = second
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+        assert!(
+            second
+                .open_artifact_reader(&local_scope, &artifact.artifact_id)
+                .is_ok()
+        );
+        assert!(matches!(
+            second.open_artifact_reader(&foreign_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn cached_read_scope_fails_after_task_or_principal_invalidation() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"private".as_slice()))
+            .unwrap();
+        let principal_scope = manager
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET principal_id='user:changed' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&principal_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET principal_id='user:test' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let lifecycle_scope = manager
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&lifecycle_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn bound_read_scope_fails_after_grant_revocation_or_attempt_supersession() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"bound input".as_slice()),
+            )
+            .unwrap();
+        let program_hash = allocation("unused").semantic_program_hash;
+        let program_json = r#"{"nodes":[{"id":"compose_report","authority_requests":[{"action":"artifact.read","resource":"input"}]}]}"#;
+        manager.connection.execute_batch(&format!(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES ('registry-read','{{}}','2026-09-19T00:00:00Z');
+             INSERT INTO semantic_program_revisions(task_id,program_revision,program_id,ir_version,semantic_hash,registry_snapshot_id,status,program_json,created_at) VALUES ('T-artifact',1,'program-read','0.1','{program_hash}','registry-read','active','{program_json}','2026-09-19T00:00:00Z');
+             UPDATE tasks SET state='RUNNING',active_program_revision=1,active_step_ids_json='[\"compose_report\"]' WHERE task_id='T-artifact';
+             INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at) VALUES ('binding-read','attempt-read','T-artifact','{program_hash}','registry-read','0.1','compose_report','document.compose','provider:reader','1',1,'[\"decision-read\"]','[\"grant-read\"]','profile:test','{{}}','{{}}','2026-09-19T00:00:00Z');
+             INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-read','T-artifact','{program_hash}','registry-read','compose_report','binding-read',1,1,'RUNNING','[\"{}\"]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');
+             INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at) VALUES ('policy-read','task','T-artifact','cedar','sha256:policy','test','1','{{}}','2026-09-19T00:00:00Z');
+             INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES ('request-read','T-artifact','{program_hash}','registry-read','compose_report','document.compose','provider','provider:reader','binding-read','attempt-read','artifact.read','artifact','{}','input','{{}}','2026-09-19T00:00:00Z');
+             INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,reason_codes_json,decision_json,decided_at) VALUES ('decision-read','request-read','T-artifact','{program_hash}','compose_report','provider','provider:reader','artifact.read','artifact','{}','ALLOW','policy-read','[]','{{}}','2026-09-19T00:00:00Z');
+             INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at) VALUES ('grant-read','T-artifact','{program_hash}','compose_report','document.compose','provider','provider:reader','binding-read','attempt-read','decision-read','policy-read','[{{\"action\":\"artifact.read\",\"resource_kind\":\"artifact\",\"resource_id\":\"{}\",\"semantic_selector\":\"input\"}}]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');",
+            artifact.artifact_id,
+            artifact.artifact_id,
+            artifact.artifact_id,
+            artifact.artifact_id,
+        )).unwrap();
+        let revoked_scope = manager
+            .scope_artifact_reads(
+                "T-artifact",
+                Some("binding-read"),
+                &[artifact.artifact_id.clone()],
+            )
+            .unwrap();
+        let mut bound_allocation = allocation("alloc-bound-revocation");
+        bound_allocation.binding_id = Some("binding-read".to_owned());
+        bound_allocation.attempt_id = Some("attempt-read".to_owned());
+        manager.allocate_artifact_output(&bound_allocation).unwrap();
+        let mut bound_writer = manager
+            .open_artifact_output("alloc-bound-revocation")
+            .unwrap();
+        bound_writer.write_all(b"before revocation").unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET state='REVOKED' WHERE grant_id='grant-read'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&revoked_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            bound_writer
+                .write_all(b"after revocation")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET state='ACTIVE' WHERE grant_id='grant-read'",
+                [],
+            )
+            .unwrap();
+        let superseded_scope = manager
+            .scope_artifact_reads(
+                "T-artifact",
+                Some("binding-read"),
+                &[artifact.artifact_id.clone()],
+            )
+            .unwrap();
+        manager.connection.execute_batch(&format!(
+            "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at) VALUES ('binding-later','attempt-later','T-artifact','{program_hash}','registry-read','0.1','compose_report','document.compose','provider:reader','1',2,'[]','[]','profile:test','{{}}','{{}}','2026-09-19T00:01:00Z');
+             INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-artifact','{program_hash}','registry-read','compose_report','binding-later',2,1,'RUNNING','[\"{}\"]','[]','2026-09-19T00:01:00Z','2026-09-19T00:01:00Z');",
+            artifact.artifact_id,
+        )).unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&superseded_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn reader_returns_the_verified_open_handle_across_path_replacement() {
+        let temp = TempDir::new().unwrap();
+        let state = Arc::new(Mutex::new(SwapClockState {
+            armed_calls: None,
+            blob: None,
+            replacement: b"replacement".to_vec(),
+            error: None,
+        }));
+        let mut manager = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(SwapClock {
+                state: Arc::clone(&state),
+            }),
+        )
+        .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "reader swap".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        let original = b"verified bytes";
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(original.as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+        let storage_ref = manager
+            .connection
+            .query_row(
+                "SELECT b.storage_ref FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash WHERE a.artifact_id=?1",
+                [&artifact.artifact_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.blob = Some(manager.artifact_store_root.join(storage_ref));
+            // Point-of-use validation calls the clock first; the second call occurs
+            // after hashing the already-open handle and before it is returned.
+            state.armed_calls = Some(2);
+        }
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+        assert!(state.lock().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn cancelled_allocation_is_rejected_before_open_and_fences_an_open_writer() {
+        let temp = TempDir::new().unwrap();
+        let other_temp = TempDir::new().unwrap();
+        let mut first = manager(&temp);
+        let mut other = manager(&other_temp);
+        first
+            .allocate_artifact_output(&allocation("alloc-cancel-fence"))
+            .unwrap();
+        let mut writer = first.open_artifact_output("alloc-cancel-fence").unwrap();
+        writer.write_all(b"before").unwrap();
+        first
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            writer.write_all(b"after").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        other
+            .allocate_artifact_output(&allocation("alloc-cancel-before-open"))
+            .unwrap();
+        other
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            other.open_artifact_output("alloc-cancel-before-open"),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let mut request = allocation("alloc-after-cancel");
+        request.expires_at = "2026-09-20T00:00:00Z".to_owned();
+        assert!(matches!(
+            other.allocate_artifact_output(&request),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn every_new_content_directory_is_synced_before_publication_metadata() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"directory durability fault";
+        let digest = match hash_reader(&mut Cursor::new(bytes.as_slice())).unwrap().1 {
+            hash if hash.starts_with("sha256:") => hash[7..].to_owned(),
+            _ => unreachable!(),
+        };
+        let first = format!("blobs/sha256/{}", &digest[..2]);
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some(format!("sync:{first}"))));
+        });
+        let result = manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()));
+        let operations =
+            DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        assert!(result.is_err());
+        assert_eq!(
+            operations,
+            vec![
+                "create:blobs".to_owned(),
+                "create:blobs/sha256".to_owned(),
+                format!("create:{first}"),
+                format!("sync:{first}"),
+            ]
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn initial_and_nested_directory_durability_orders_child_before_parent() {
+        let temp = TempDir::new().unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), None));
+        });
+        let manager = manager(&temp);
+        let initial =
+            DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        for required in [
+            ["create-root", "sync-root", "sync-root-parent"],
+            ["create:blobs", "sync:blobs", "sync-parent:."],
+            [
+                "create:blobs/sha256",
+                "sync:blobs/sha256",
+                "sync-parent:blobs",
+            ],
+            ["create:staging", "sync:staging", "sync-parent:."],
+            ["create:quarantine", "sync:quarantine", "sync-parent:."],
+            [
+                "create:blobs/pending",
+                "sync:blobs/pending",
+                "sync-parent:blobs",
+            ],
+        ] {
+            assert!(initial.windows(3).any(|window| window == required));
+        }
+
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), None));
+        });
+        create_durable_ancestors(&manager.artifact_store_dir, "nested/one/two").unwrap();
+        let nested = DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        assert_eq!(
+            nested,
+            [
+                "create:nested",
+                "sync:nested",
+                "sync-parent:.",
+                "create:nested/one",
+                "sync:nested/one",
+                "sync-parent:nested",
+                "create:nested/one/two",
+                "sync:nested/one/two",
+                "sync-parent:nested/one",
+            ]
+        );
+    }
+
+    #[test]
     fn live_writer_cannot_publish_and_can_continue_until_durable_finish() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -3341,6 +4346,9 @@ mod tests {
         request.binding_id = Some("binding-old".to_owned());
         request.attempt_id = Some("attempt-old".to_owned());
         manager.allocate_artifact_output(&request).unwrap();
+        let mut unopened = request.clone();
+        unopened.allocation_id = "alloc-stale-unopened".to_owned();
+        manager.allocate_artifact_output(&unopened).unwrap();
         write_output(&mut manager, "alloc-stale", b"stale");
         manager
             .connection
@@ -3349,6 +4357,16 @@ mod tests {
                  INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,created_at,updated_at) VALUES ('attempt-new','T-artifact','{program_hash}','registry-artifact','compose_report','binding-new',2,1,'RUNNING','2026-09-19T00:01:00Z','2026-09-19T00:01:00Z');"
             ))
             .unwrap();
+        assert!(matches!(
+            manager.open_artifact_output("alloc-stale-unopened"),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let mut stale_new = request.clone();
+        stale_new.allocation_id = "alloc-stale-after".to_owned();
+        assert!(matches!(
+            manager.allocate_artifact_output(&stale_new),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
         let result = manager
             .publish_artifact_output(&publication("pub-stale", "alloc-stale"))
             .unwrap();

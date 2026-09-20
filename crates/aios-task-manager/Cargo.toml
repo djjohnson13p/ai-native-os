@@ -17,6 +17,9 @@ serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 time.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winx.workspace = true
+
 [dev-dependencies]
 tempfile = "3.23.0"
 
