@@ -274,6 +274,36 @@ pub struct ImportArtifactRequest {
     pub max_size_bytes: Option<u64>,
 }
 
+/// Parameters for a trusted control-plane output allocation.
+///
+/// The raw allocation/open/publication entry points are crate-private because an unbound request
+/// is authorized by authenticated control-plane context, not by this serializable DTO. External
+/// provider callers must use the bound entry points, which require a current Execution Binding
+/// and exact grant.
+///
+/// ```compile_fail
+/// use aios_task_manager::{OutputAllocationRequest, TaskManager};
+///
+/// fn forge(manager: &mut TaskManager, request: &OutputAllocationRequest) {
+///     let _ = manager.allocate_artifact_output(request);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use aios_task_manager::TaskManager;
+///
+/// fn forge(manager: &mut TaskManager) {
+///     let _ = manager.open_artifact_output("forged-allocation");
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use aios_task_manager::{ArtifactPublicationRequest, TaskManager};
+///
+/// fn forge(manager: &mut TaskManager, request: &ArtifactPublicationRequest) {
+///     let _ = manager.publish_artifact_output(request);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputAllocationRequest {
     pub schema_version: String,
@@ -809,7 +839,18 @@ impl TaskManager {
             ))
     }
 
-    pub fn allocate_artifact_output(
+    /// Allocates provider output through a current binding and exact write grant.
+    pub fn allocate_bound_artifact_output(
+        &mut self,
+        request: &OutputAllocationRequest,
+    ) -> Result<ArtifactOutputAllocation> {
+        if request.binding_id.is_none() || request.attempt_id.is_none() {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        self.allocate_artifact_output(request)
+    }
+
+    pub(crate) fn allocate_artifact_output(
         &mut self,
         request: &OutputAllocationRequest,
     ) -> Result<ArtifactOutputAllocation> {
@@ -834,11 +875,29 @@ impl TaskManager {
             ))
     }
 
+    /// Opens a provider writer only for an allocation bound to a current attempt.
+    pub fn open_bound_artifact_output(
+        &mut self,
+        allocation_id: &str,
+    ) -> Result<ArtifactStagingWriter> {
+        validate_id(allocation_id, 256, "invalid Artifact allocation ID")?;
+        let allocation = load_allocation_row(&self.connection, allocation_id)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+        )?;
+        if allocation.binding_id.is_none() || allocation.attempt_id.is_none() {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        self.open_artifact_output(allocation_id)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "keeps output admission, file issuance, and one-shot consumption in one transaction"
     )]
-    pub fn open_artifact_output(&mut self, allocation_id: &str) -> Result<ArtifactStagingWriter> {
+    pub(crate) fn open_artifact_output(
+        &mut self,
+        allocation_id: &str,
+    ) -> Result<ArtifactStagingWriter> {
         validate_id(allocation_id, 256, "invalid Artifact allocation ID")?;
         let authority_connection = self.database_locator.open()?;
         authority_connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -947,11 +1006,26 @@ impl TaskManager {
         })
     }
 
+    /// Publishes provider output only from an allocation bound to an execution attempt.
+    pub fn publish_bound_artifact_output(
+        &mut self,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<ArtifactPublicationResult> {
+        validate_publication_request(request)?;
+        let allocation = load_allocation_row(&self.connection, &request.allocation_id)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+        )?;
+        if allocation.binding_id.is_none() || allocation.attempt_id.is_none() {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        self.publish_artifact_output(request)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "publication is one auditable two-resource protocol"
     )]
-    pub fn publish_artifact_output(
+    pub(crate) fn publish_artifact_output(
         &mut self,
         request: &ArtifactPublicationRequest,
     ) -> Result<ArtifactPublicationResult> {
@@ -1451,7 +1525,7 @@ impl TaskManager {
         clippy::too_many_lines,
         reason = "keeps blob, integrity, and staging reconciliation in one fenced startup audit"
     )]
-    pub fn reconcile_artifacts_startup(&mut self) -> Result<ArtifactReconciliationReport> {
+    pub(crate) fn reconcile_artifacts_startup(&mut self) -> Result<ArtifactReconciliationReport> {
         let reconciled_at = self.clock.now();
         let mut findings = Vec::new();
         let blobs = {
@@ -2316,14 +2390,13 @@ fn binding_runtime_authority_valid(
         let Some(grant) = grant else {
             return Ok(false);
         };
-        let consumed_one_shot = grant.25 == "CONSUMED"
-            && grant.11 == "ONE_SHOT"
-            && grant.26 == Some(1)
-            && grant.27 == 1;
-        let binding_lifecycle_valid = (grant.25 == "ACTIVE"
-            && grant.26.is_none_or(|maximum| grant.27 < maximum)
-            && parse_time(&grant.0)? > checked_at)
-            || consumed_one_shot;
+        let consumed_one_shot = consumed_one_shot_grant(&grant.11, &grant.25, grant.26, grant.27);
+        let exhausted_finite = exhausted_finite_grant(&grant.11, &grant.25, grant.26, grant.27);
+        let structurally_exhausted = consumed_one_shot || exhausted_finite;
+        let binding_lifecycle_valid =
+            (grant_available_for_admission(&grant.11, &grant.25, grant.26, grant.27)
+                && parse_time(&grant.0)? > checked_at)
+                || structurally_exhausted;
         if !binding_lifecycle_valid
             || grant.4 != "ALLOW"
             || grant.5 != "provider"
@@ -2365,9 +2438,9 @@ fn binding_runtime_authority_valid(
         match (grant.1.as_deref(), grant.2.as_deref()) {
             (None, None) => {}
             (Some(_), Some(status))
-                if status == "APPROVED" || consumed_one_shot && status == "EXPIRED" =>
+                if status == "APPROVED" || structurally_exhausted && status == "EXPIRED" =>
             {
-                if !consumed_one_shot
+                if !structurally_exhausted
                     && grant.3.as_deref().is_some_and(|expires| {
                         parse_time(expires).map_or(true, |expires| expires <= checked_at)
                     })
@@ -2384,7 +2457,7 @@ fn binding_runtime_authority_valid(
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
                 if approved_until.len() != 1
-                    || !consumed_one_shot
+                    || !structurally_exhausted
                         && approved_until[0].as_deref().is_some_and(|approved_until| {
                             parse_time(approved_until).map_or(true, |expires| expires <= checked_at)
                         })
@@ -2438,6 +2511,60 @@ struct OperationGrantRow {
     state: String,
     max_uses: Option<i64>,
     uses_consumed: i64,
+}
+
+fn consumed_one_shot_grant(
+    scope: &str,
+    state: &str,
+    max_uses: Option<i64>,
+    uses_consumed: i64,
+) -> bool {
+    scope == "ONE_SHOT" && state == "CONSUMED" && max_uses == Some(1) && uses_consumed == 1
+}
+
+fn exhausted_finite_grant(
+    scope: &str,
+    state: &str,
+    max_uses: Option<i64>,
+    uses_consumed: i64,
+) -> bool {
+    matches!(scope, "TASK" | "TIME_LIMITED")
+        && state == "ACTIVE"
+        && max_uses.is_some_and(|maximum| maximum > 0 && uses_consumed == maximum)
+}
+
+fn grant_available_for_admission(
+    scope: &str,
+    state: &str,
+    max_uses: Option<i64>,
+    uses_consumed: i64,
+) -> bool {
+    if state != "ACTIVE" {
+        return false;
+    }
+    match scope {
+        "ONE_SHOT" => max_uses == Some(1) && uses_consumed == 0,
+        "TASK" | "TIME_LIMITED" => match max_uses {
+            Some(maximum) => maximum > 0 && uses_consumed >= 0 && uses_consumed < maximum,
+            None => uses_consumed == 0,
+        },
+        _ => false,
+    }
+}
+
+fn issued_grant_lifecycle_valid(
+    scope: &str,
+    state: &str,
+    max_uses: Option<i64>,
+    uses_consumed: i64,
+) -> bool {
+    consumed_one_shot_grant(scope, state, max_uses, uses_consumed)
+        || matches!(scope, "TASK" | "TIME_LIMITED")
+            && state == "ACTIVE"
+            && match max_uses {
+                Some(maximum) => maximum > 0 && uses_consumed >= 0 && uses_consumed <= maximum,
+                None => uses_consumed == 0,
+            }
 }
 
 #[allow(
@@ -2535,18 +2662,20 @@ fn exact_operation_grant(
         };
         let lifecycle_valid = match admitted {
             Some(admission) if admission.one_shot_consumed => {
-                row.scope == "ONE_SHOT"
-                    && row.state == "CONSUMED"
-                    && row.max_uses == Some(1)
-                    && row.uses_consumed == 1
+                consumed_one_shot_grant(&row.scope, &row.state, row.max_uses, row.uses_consumed)
             }
-            Some(_) => row.state == "ACTIVE",
-            None => {
-                row.state == "ACTIVE"
-                    && row
-                        .max_uses
-                        .is_none_or(|maximum| row.uses_consumed < maximum)
-            }
+            Some(_) => issued_grant_lifecycle_valid(
+                &row.scope,
+                &row.state,
+                row.max_uses,
+                row.uses_consumed,
+            ),
+            None => grant_available_for_admission(
+                &row.scope,
+                &row.state,
+                row.max_uses,
+                row.uses_consumed,
+            ),
         };
         if !lifecycle_valid
             || parse_time(&row.expires_at)? <= checked_at
@@ -4794,6 +4923,259 @@ mod tests {
             first.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, scope_name.as_bytes());
         }
+    }
+
+    #[test]
+    fn exhausted_finite_read_grant_does_not_block_an_independent_read_grant() {
+        for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let first = manager
+                .import_artifact(&import_request(), &mut Cursor::new(b"first".as_slice()))
+                .unwrap();
+            let second = manager
+                .import_artifact(&import_request(), &mut Cursor::new(b"second".as_slice()))
+                .unwrap();
+            let fixture = format!("finite-two-reads-{index}");
+            let (binding_id, _) = install_one_shot_binding(
+                &manager,
+                &fixture,
+                &[first.artifact_id.clone(), second.artifact_id.clone()],
+                &[
+                    ("artifact.read", "artifact", &first.artifact_id),
+                    ("artifact.read", "artifact", &second.artifact_id),
+                ],
+            );
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET scope=?1 WHERE grant_id LIKE ?2",
+                    params![scope_name, format!("grant-{fixture}-%")],
+                )
+                .unwrap();
+            let read_scope = manager
+                .scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[first.artifact_id.clone(), second.artifact_id.clone()],
+                )
+                .unwrap();
+
+            let mut first_reader = manager
+                .open_artifact_reader(&read_scope, &first.artifact_id)
+                .unwrap();
+            assert!(matches!(
+                manager.open_artifact_reader(&read_scope, &first.artifact_id),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET expires_at='2026-09-19T21:00:00Z' WHERE grant_id=?1",
+                    [format!("grant-{fixture}-0")],
+                )
+                .unwrap();
+            assert_eq!(
+                first_reader.read(&mut [0_u8; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "issued {scope_name} handle lost its expiry fence"
+            );
+
+            let mut second_reader = manager
+                .open_artifact_reader(&read_scope, &second.artifact_id)
+                .unwrap();
+            let mut bytes = Vec::new();
+            second_reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"second", "independent {scope_name} read failed");
+            let grants = manager
+                .connection
+                .prepare(
+                    "SELECT uses_consumed,state FROM authority_grants WHERE grant_id LIKE ?1 ORDER BY grant_id",
+                )
+                .unwrap()
+                .query_map([format!("grant-{fixture}-%")], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(grants, [(1, "ACTIVE".to_owned()), (1, "ACTIVE".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn exhausted_finite_read_grant_does_not_block_an_independent_write_grant() {
+        for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let input = manager
+                .import_artifact(&import_request(), &mut Cursor::new(b"input".as_slice()))
+                .unwrap();
+            let fixture = format!("finite-read-write-{index}");
+            let allocation_id = format!("alloc-{fixture}");
+            let (binding_id, attempt_id) = install_one_shot_binding(
+                &manager,
+                &fixture,
+                &[input.artifact_id.clone()],
+                &[
+                    ("artifact.read", "artifact", &input.artifact_id),
+                    ("artifact.write", "output-allocation", &allocation_id),
+                ],
+            );
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET scope=?1 WHERE grant_id LIKE ?2",
+                    params![scope_name, format!("grant-{fixture}-%")],
+                )
+                .unwrap();
+            let mut allocation_request = allocation(&allocation_id);
+            allocation_request.binding_id = Some(binding_id.clone());
+            allocation_request.attempt_id = Some(attempt_id);
+            manager
+                .allocate_bound_artifact_output(&allocation_request)
+                .unwrap();
+            let read_scope = manager
+                .scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[input.artifact_id.clone()],
+                )
+                .unwrap();
+            let _reader = manager
+                .open_artifact_reader(&read_scope, &input.artifact_id)
+                .unwrap();
+            assert!(matches!(
+                manager.open_artifact_reader(&read_scope, &input.artifact_id),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+
+            let mut writer = manager.open_bound_artifact_output(&allocation_id).unwrap();
+            writer.write_all(b"output").unwrap();
+            writer.finish().unwrap();
+            let publication_id = format!("publication-{fixture}");
+            let result = manager
+                .publish_bound_artifact_output(&publication(&publication_id, &allocation_id))
+                .unwrap();
+            assert!(result.published, "independent {scope_name} write failed");
+            let grants = manager
+                .connection
+                .prepare(
+                    "SELECT uses_consumed,state FROM authority_grants WHERE grant_id LIKE ?1 ORDER BY grant_id",
+                )
+                .unwrap()
+                .query_map([format!("grant-{fixture}-%")], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(grants, [(1, "ACTIVE".to_owned()), (1, "ACTIVE".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn malformed_exhausted_sibling_grants_fail_closed() {
+        for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let first = manager
+                .import_artifact(&import_request(), &mut Cursor::new(b"first".as_slice()))
+                .unwrap();
+            let second = manager
+                .import_artifact(&import_request(), &mut Cursor::new(b"second".as_slice()))
+                .unwrap();
+            let fixture = format!("malformed-finite-{index}");
+            let (binding_id, _) = install_one_shot_binding(
+                &manager,
+                &fixture,
+                &[first.artifact_id.clone(), second.artifact_id.clone()],
+                &[
+                    ("artifact.read", "artifact", &first.artifact_id),
+                    ("artifact.read", "artifact", &second.artifact_id),
+                ],
+            );
+            let first_grant = format!("grant-{fixture}-0");
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET scope=?1 WHERE grant_id LIKE ?2",
+                    params![scope_name, format!("grant-{fixture}-%")],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET uses_consumed=1,state='CONSUMED' WHERE grant_id=?1",
+                    [&first_grant],
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[second.artifact_id.clone()]
+                ),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET state='ACTIVE',max_uses=NULL WHERE grant_id=?1",
+                    [&first_grant],
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[second.artifact_id.clone()]
+                ),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET max_uses=1 WHERE grant_id=?1",
+                    [&first_grant],
+                )
+                .unwrap();
+            let scope = manager
+                .scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[second.artifact_id.clone()],
+                )
+                .unwrap();
+            manager
+                .open_artifact_reader(&scope, &second.artifact_id)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn public_bound_output_entry_points_reject_unbound_control_plane_requests() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let request = allocation("alloc-unbound-public");
+        assert!(matches!(
+            manager.allocate_bound_artifact_output(&request),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        manager.allocate_artifact_output(&request).unwrap();
+        assert!(matches!(
+            manager.open_bound_artifact_output(&request.allocation_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert!(matches!(
+            manager.publish_bound_artifact_output(&publication(
+                "publication-unbound-public",
+                &request.allocation_id
+            )),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
     }
 
     #[test]
