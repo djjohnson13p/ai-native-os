@@ -4,7 +4,7 @@
   "status": "candidate",
   "source_ir": {
     "ir_version": "0.1",
-    "semantic_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "semantic_hash": "sha256:beac8904db84998c56eca183c0e979f99746da2cec916f58c600416ee5de3cbf",
     "template_uri": "./demonstration-a.ir.json"
   },
   "inputs": {

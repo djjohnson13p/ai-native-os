@@ -3,14 +3,14 @@
   "valid": true,
   "ir_version": "0.1",
   "program_id": "demo.analyze_numbers.v1",
-  "semantic_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "semantic_hash": "sha256:beac8904db84998c56eca183c0e979f99746da2cec916f58c600416ee5de3cbf",
   "semantic_hash_profile": "aios-ir-v0.1",
   "validator": {
     "id": "org.ainative.aios-ir-validator",
-    "version": "0.0.0-fixture",
+    "version": "0.1.0",
     "build_hash": null
   },
-  "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "registry_snapshot_id": "sha256:5b1e89c974f35a0f3e1e7040bbec8f2e44ea908eb9a12d313ecda40600c6ddbd",
   "diagnostics": [],
   "diagnostics_truncated": false,
   "validated_at": "2026-09-15T00:00:00Z"

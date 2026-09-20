@@ -1,0 +1,380 @@
+[
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {},
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "unit_required": false
+    },
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "unit_required": true,
+      "canonical_unit": "m"
+    },
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "canonical_unit": null,
+      "notes": null
+    },
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "unit_required": null
+    },
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "unit_required": 0
+    },
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/unit_semantics",
+    "value": {
+      "undeclared": true
+    },
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/logical_schema_ref",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/logical_schema_ref",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/media_type",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/media_type",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/schema_ref",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/schema_ref",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/canonicalizer",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/canonicalizer",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/numeric_absolute_tolerance",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/numeric_absolute_tolerance",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/numeric_relative_tolerance",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/equality/numeric_relative_tolerance",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/conformance/suite_version",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/conformance/suite_version",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/conformance/suite_hash",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/conformance/suite_hash",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/nullable",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/nullable",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/zero_copy_candidate",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/representations/0/zero_copy_candidate",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/notes",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/notes",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/conversion_capabilities",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "type",
+    "pointer": "/conversion_capabilities",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "type",
+    "pointer": "/description",
+    "value": "",
+    "valid": false
+  },
+  {
+    "record": "capability",
+    "pointer": "/description",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/description",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "capability",
+    "pointer": "/inputs/source/description",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/inputs/source/description",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "capability",
+    "pointer": "/determinism",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/determinism",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "capability",
+    "pointer": "/description",
+    "value": "",
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/determinism",
+    "value": {},
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/determinism",
+    "value": {
+      "equivalence": null
+    },
+    "valid": false
+  },
+  {
+    "record": "capability",
+    "pointer": "/determinism",
+    "value": {
+      "numeric_absolute_tolerance": null,
+      "numeric_relative_tolerance": null
+    },
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/conformance/suite_version",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/conformance/suite_version",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/conformance/suite_hash",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/conformance/suite_hash",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "capability",
+    "pointer": "/role",
+    "value": null,
+    "valid": false
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/generation",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/generation",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/publisher",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/publisher",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/type_contracts/0/source",
+    "omit": true,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/type_contracts/0/source",
+    "value": null,
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/publisher",
+    "value": {},
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/publisher",
+    "value": {
+      "id": null
+    },
+    "valid": false
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/publisher",
+    "value": {
+      "id": "synthetic",
+      "signature": null
+    },
+    "valid": true
+  },
+  {
+    "record": "snapshot",
+    "pointer": "/notes",
+    "value": null,
+    "valid": false
+  }
+]

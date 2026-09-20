@@ -65,11 +65,12 @@
             "items": {"type": "string", "minLength": 3, "maxLength": 128}
           },
           "egress_mode": {"type": "string", "enum": ["deny", "policy"]},
-          "verification_gate": {"type": "boolean", "default": false}
+          "verification_gate": {"type": "boolean", "default": false, "description": "This node is a verifier operation; not proof that every final output is downstream of this node or satisfies a required assurance claim."}
         }
       }
     },
     "verification_barriers": {
+      "description": "Inventory of verifier node IDs, including unused verifiers. Not a per-output gating, dominance, successful-execution, or assurance proof.",
       "type": "array",
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1, "maxLength": 128}

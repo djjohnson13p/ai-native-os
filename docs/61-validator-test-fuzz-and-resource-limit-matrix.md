@@ -238,6 +238,9 @@ Test vectors must prove:
 - user-visible hash identifier records algorithm explicitly;
 - no other module independently constructs a different semantic-hash prefix/serialization;
 - raw authoring JSON hash cannot be confused with semantic hash.
+- integer values at `2^53 - 1` remain accepted, while `2^53` and adjacent
+  higher values are rejected before JCS serialization so distinct typed values
+  cannot collapse to one ECMAScript number.
 
 ### Program-ID collision tests
 
@@ -389,6 +392,33 @@ For arbitrary bytes/structures:
 - success requires full validation path, never parser acceptance alone.
 
 ## Regression corpus
+
+The Issue #17 R17-01–08 review repair gate additionally consumes:
+
+- `examples/aios-ir/registry-structure-repair-cases.json`: raw schema/typed admission,
+  optional omission/null/empty object/value parity;
+- `examples/aios-ir/review-repair-cases.json`: exact integer lexical equivalence,
+  safe-range/fractional adversaries, tolerance sign/underflow/overflow/subnormals,
+  attacker-named diagnostic properties, discriminator-aware nested `oneOf`
+  diagnostics, and verification inventory versus outputs.
+
+Nested diagnostic cases cover input/node value references and stop/retry/fallback/
+replan failure policies. They lock additional-property, required, pattern, range,
+missing-discriminator, and unknown-discriminator classifications without depending
+on branch order or rendered validator messages.
+
+The R17-07/R17-08 extension distinguishes missing, wrong-JSON-type and unsupported
+string discriminators; preserves every actual family from one selected alternative;
+injects schema-keyword-like unknown properties inside selected alternatives; reverses
+JSON object-member and temporary `oneOf` alternative order; and exercises diagnostic
+truncation. Existing failure-budget, fallback-count and egress-contradiction prechecks
+retain their public precedence.
+
+Integer tests must cover every constraint and retry/replan path without first
+decoding fixture number spellings to floating point. Property tests include
+decimal/exponent equivalents and fractional near-integer rejections. Tolerance
+cases run against both contract classes and both tolerance fields. The original
+bootstrap hashes must still reproduce after the repairs.
 
 Every discovered crash, hash ambiguity, parser discrepancy, or security-significant invalid acceptance becomes a permanent regression fixture.
 

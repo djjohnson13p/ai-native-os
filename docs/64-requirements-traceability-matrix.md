@@ -77,7 +77,7 @@ Issue #17 is the first implementation spike. The following requirements are dire
 | R-IR-006 | retry/fallback/replan budgets are machine-bounded | failure-policy fixtures |
 | R-IR-007 | authority classes + egress declarations are explicit/consistent | effect/authority/egress fixtures |
 | R-IR-008 | verification gates are represented and retained in normalized program/effect summary | Demonstration A + mutation tests |
-| R-IR-009 | canonical semantic identity independent of serialization/runtime binding | equivalence/difference hash tests |
+| R-IR-009 | canonical semantic identity independent of serialization/runtime binding | equivalence/difference hash tests; R17-02 exact decimal/exponent integer corpus in `review-repair-cases.json` |
 | R-IR-010 | concrete provider/grant/sandbox/hardware state is outside semantic IR | schema + negative fixtures |
 | R-IR-011 | validator/normalizer does not widen effects/authority or weaken verification | normalization property/regression tests |
 | R-IR-012 | stable reason-code families | diagnostics tests |
@@ -86,7 +86,7 @@ Issue #17 is the first implementation spike. The following requirements are dire
 | R-CONTRACT-004 | IR authority requests cannot exceed capability contract class | authority semantic tests |
 | R-CONTRACT-005 | types are semantic IDs, not host-language classes | type-contract fixtures |
 | R-CONTRACT-006 | no implicit semantic casts in v0.1 | mismatch fixtures |
-| R-CONTRACT-007 | successful validation identifies registry snapshot | validation-result fixture/tests |
+| R-CONTRACT-007 | successful validation identifies registry snapshot | validation-result fixture/tests; R17-01 structural admission corpus and R17-04 tolerance authoring tests |
 | R-SEC-006 | prompt/script-like data cannot grant authority through program content | adversarial fixture policy boundary |
 | R-SEC-007 | validator correctness is deterministic | no-model/no-provider boundary tests |
 | R-DATA-001 | semantic program uses handles/references rather than unrestricted host paths where applicable | IR/schema examples |

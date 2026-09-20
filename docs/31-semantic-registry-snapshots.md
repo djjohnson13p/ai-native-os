@@ -111,6 +111,13 @@ Registry loading must fail if:
 
 No partially valid registry becomes executable input.
 
+Strict bundle ingestion checks raw record structure against the embedded Snapshot,
+Type Contract and Capability Contract schemas before typed decoding. Optional
+`Option<T>` representation is not evidence that explicit null is schema-valid.
+The R17-01 repair corpus includes omission, null, empty nested objects and valid
+values. Numeric tolerance authoring is additionally constrained by docs72 before
+lossy binary64 interpretation. Semantic cross-record checks remain mandatory.
+
 ## Why snapshots matter
 
 They make several questions answerable:
@@ -317,7 +324,7 @@ The v0.1 registry/IR validator must:
 2. validate structural contract records;
 3. reject duplicate/ambiguous `(ID, major)` entries;
 4. reject snapshot-entry/full-contract version-major mismatch;
-5. verify content hashes once generated values replace placeholders;
+5. verify generated content hashes against the supplied contracts;
 6. build immutable lookup indexes;
 7. resolve every IR semantic type/capability major reference from that snapshot;
 8. never merge conflicting registries silently;
@@ -359,9 +366,9 @@ An unrelated additive registry change should not invalidate every Skill automati
 
 ## v0.1 fixtures
 
-`examples/aios-ir/registry-snapshot.json` identifies the contract fixtures used for Demonstration A.
+`examples/aios-ir/registry-snapshot.json` identifies the contract fixtures used for Demonstration A. Its checked-in contract hashes and snapshot ID are generated semantic identities that the strict loader recomputes and verifies exactly.
 
-Early repository fixtures may contain placeholder content hashes until the reference canonicalizers exist. The implementation must distinguish obvious placeholder architecture fixtures from generated cryptographic evidence and eventually compute/check real contract/snapshot hashes.
+The explicit `BootstrapGenerate` path is non-production development/test tooling for constructing generated identities from deliberately marked placeholder inputs. A registry built through that path remains non-strict and cannot produce executable semantic-program identity through the validator.
 
 Version-resolution fixtures should test:
 

@@ -10,7 +10,14 @@ It distinguishes **architecture questions that are closed** from **mechanical im
 
 **Issue #17 is SPIKE_READY.**
 
-That means architecture/contracts/fixtures are sufficiently constrained to begin implementation. It does **not** mean the validator code, real hashes, or fuzz results already exist.
+That means architecture/contracts/fixtures were sufficiently constrained to begin implementation.
+As of 2026-09-19, the Issue #17 implementation, generated hashes, fixture automation,
+property tests, and resource-limit tests are present on the dedicated implementation branch.
+
+The R17-01–05 review repairs are tracked in
+`docs/issue-17-review-repair-handoff.md`. The branch still requires a second
+independent read-only review before merge; implementation checks are not independent
+sign-off. No Stage-1 work or maturity promotion is included in this repair pass.
 
 ## Closed decisions / repository migrations
 
@@ -46,20 +53,20 @@ That means architecture/contracts/fixtures are sufficiently constrained to begin
 
 These are implementation tasks, not open architecture questions:
 
-- [ ] create Rust workspace/crates/CLI;
-- [ ] implement capability/type/Registry Snapshot structural loaders against the now-aligned schemas;
-- [ ] implement semantic contract consistency checks;
-- [ ] generate real contract hashes and Registry Snapshot identity to replace fixture placeholders;
-- [ ] implement strict duplicate-key parser/resource limits;
-- [ ] implement graph/type/capability/effect/fallback passes;
-- [ ] implement required-vs-allowed authority/effect checks;
-- [ ] implement policy-egress semantic consistency (including `data.egress` destination-class matching) without performing authorization;
-- [ ] implement effect summary;
-- [ ] implement semantic-view normalization/JCS/hash;
-- [ ] automate repository positive/negative/version/hash/edge fixtures;
-- [ ] add property/fuzz smoke targets;
-- [ ] run differential/round-trip canonicalization tests;
-- [ ] reconcile any actual implementation-discovered contradiction through explicit ADR/schema/fixture update.
+- [x] create Rust workspace/crates/CLI;
+- [x] implement capability/type/Registry Snapshot structural loaders against the now-aligned schemas;
+- [x] implement semantic contract consistency checks;
+- [x] generate real contract hashes and Registry Snapshot identity to replace fixture placeholders;
+- [x] implement strict duplicate-key parser/resource limits;
+- [x] implement graph/type/capability/effect/fallback passes;
+- [x] implement required-vs-allowed authority/effect checks;
+- [x] implement policy-egress semantic consistency (including `data.egress` destination-class matching) without performing authorization;
+- [x] implement effect summary;
+- [x] implement semantic-view normalization/JCS/hash;
+- [x] automate repository positive/negative/version/hash/edge fixtures;
+- [x] add property/fuzz smoke targets;
+- [x] run official RFC 8785 test-vector and round-trip canonicalization tests;
+- [x] reconcile the implementation-discovered JCS exact-integer boundary through an explicit ADR/profile/schema/fixture/test update.
 
 ## Pre-spike audit checks
 

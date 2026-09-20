@@ -402,13 +402,17 @@ Before daemon integration, expose a tiny development CLI:
 
 ```text
 aios-ir validate program.json --registry examples/aios-ir/
-aios-ir normalize program.json
+aios-ir normalize program.json --registry <registry-snapshot-directory>
 aios-ir hash program.json --registry examples/aios-ir/
 aios-ir effects program.json --registry examples/aios-ir/
 aios-ir explain-error IR_GRAPH_CYCLE
 ```
 
 This is development tooling, not the final user interface.
+
+`normalize` requires the same explicit immutable Registry Snapshot as the other
+program commands because canonical semantic output is emitted only after full
+semantic validation; structural parsing alone is not a normalization authority.
 
 The CLI calls library semantics; it must not reimplement validation differently.
 

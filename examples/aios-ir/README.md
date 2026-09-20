@@ -31,13 +31,13 @@ This directory exercises the semantic IR and adaptive-execution model described 
 - `provider-conformance-cases.json` — provider declarations tested against provider-independent semantic capability contracts.
 - `canonicalization-cases.json` — paired valid programs that MUST hash equal/different under ADR 0029 plus structural invalidity for forbidden Task identity in semantic IR.
 
-## Placeholder hashes
+## Generated identities
 
-Files such as `registry-snapshot.json`, `validation-result.json`, the derived effect/binding/Skill examples, and other pre-implementation records may contain obvious synthetic placeholder hashes.
-
-They are **not** claims that canonical hashing has been implemented.
-
-The first reference validator/canonicalizer must replace/generated-check these values using the accepted v0.1 profile and test vectors.
+`registry-snapshot.json`, `validation-result.json`, the derived effect summary, and the
+semantic identity fields in the binding/Skill examples contain generated v0.1 identities
+locked by the reference implementation tests. Obvious repeated-digit hashes that remain in
+explicitly synthetic cross-snapshot or runtime-artifact examples are test data, not registry or
+AIOS IR semantic identities.
 
 ## Important distinction
 
@@ -235,6 +235,18 @@ It demonstrates that reusable structure contains:
 - privacy/invalidation metadata.
 
 It does not contain task-specific approval or capability grants.
+
+## Independent-review repair regressions
+
+`registry-structure-repair-cases.json` covers R17-01 optional-value structural
+admission. `review-repair-cases.json` covers R17-02 exact integer spellings,
+R17-03 diagnostic key attacks, R17-04 tolerance numeric bounds and R17-05 verifier
+inventory versus output assurance, plus R17-06 nested discriminated-union diagnostic
+classification. The same corpus covers R17-07 discriminator type/value separation and
+R17-08 deterministic mixed-family emission from uniquely selected alternatives.
+Numeric tokens are stored as strings on purpose:
+tests inject their original bytes rather than rounding them while loading fixtures.
+Both corpora are executed by the offline Rust test gate.
 
 ## No real user data
 

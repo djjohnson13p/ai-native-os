@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ai-native-os.example/specs/aios-ir.schema.json",
   "title": "AIOS Semantic Intermediate Representation",
+  "description": "Semantic integer fields accept exact integral decimal/exponent JSON spellings within their bounds; signed zero is zero. Integrality is checked before binary64 rounding (docs66).",
   "type": "object",
   "additionalProperties": false,
   "required": ["ir_version", "program_id", "kind", "inputs", "nodes", "outputs"],
@@ -230,7 +231,8 @@
         },
         "min_memory_bytes": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 9007199254740991
         },
         "optional": {
           "type": "boolean",
@@ -254,15 +256,18 @@
         },
         "max_latency_ms": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 9007199254740991
         },
         "max_cost_microusd": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 9007199254740991
         },
         "min_memory_bytes": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 9007199254740991
         },
         "accelerator": {
           "$ref": "#/$defs/acceleratorConstraint"

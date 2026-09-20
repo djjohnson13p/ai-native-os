@@ -50,6 +50,24 @@ Warnings do not grant authority and remain bounded by the diagnostic limit.
 
 Schema validators may generate detailed underlying messages, but externally map them to the most specific stable family above.
 
+For closed `oneOf` structures whose alternatives use a common required `const`
+discriminator, classification uses the validator's structured branch contexts.
+A missing common discriminator maps to `IR_SCHEMA_REQUIRED`. When the expected
+branch constants share one JSON type, a discriminator of another JSON type maps to
+`IR_SCHEMA_TYPE`; a value of the expected type matching no constant maps to
+`IR_SCHEMA_ENUM`.
+
+Exactly one discriminator-compatible branch emits its actual structured child
+failures, each classified normally. Mixed families are preserved rather than
+replaced with an invented type failure. The order is deterministic by instance
+path, reason-code string, schema path and structured detail; exact repeated keys
+are emitted once. Only a genuinely non-unique branch selection retains the
+conservative `IR_SCHEMA_TYPE` fallback. Irrelevant alternatives are never emitted,
+and the bounded diagnostic collector stops expansion at its configured ceiling.
+Branch order, object-key order and rendered English messages never select a code.
+A dedicated pre-schema invariant code remains more specific where already defined,
+such as `IR_FAILURE_POLICY_UNBOUNDED` for retry or replan without its finite budget.
+
 ## Resource limits
 
 | Code | Severity | Meaning |
@@ -220,6 +238,10 @@ related[]
 ```
 
 Context supplements the code. It does not change the code's meaning.
+
+Schema classifications use structured error kinds/keywords, never substring
+matching on rendered English messages. In particular, an undeclared property
+named `pattern` or `required property` is still an additional-property violation.
 
 ## Reason-code change control
 

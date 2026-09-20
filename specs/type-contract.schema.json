@@ -84,10 +84,12 @@
           "maxLength": 256
         },
         "numeric_absolute_tolerance": {
+          "description": "Finite nonnegative binary64 tolerance under docs72: reject negative nonzero tokens, overflow and nonzero-to-zero underflow before conversion; exact signed zero is zero.",
           "type": ["number", "null"],
           "minimum": 0
         },
         "numeric_relative_tolerance": {
+          "description": "Finite nonnegative binary64 tolerance under docs72: reject negative nonzero tokens, overflow and nonzero-to-zero underflow before conversion; exact signed zero is zero.",
           "type": ["number", "null"],
           "minimum": 0
         }
