@@ -97,6 +97,29 @@ fn unreadable_program_is_json_and_operational_exit() {
 }
 
 #[test]
+fn registry_load_errors_do_not_expose_host_paths() {
+    let missing_registry = std::env::temp_dir().join(format!(
+        "aios-ir-private-registry-path-{}",
+        std::process::id()
+    ));
+    let output = cli()
+        .arg("validate")
+        .arg(fixture_root().join("demonstration-a.ir.json"))
+        .arg("--registry")
+        .arg(&missing_registry)
+        .output()
+        .expect("run CLI");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let response: Value = serde_json::from_slice(&output.stdout).expect("JSON registry error");
+    assert_eq!(response["error"]["code"], "CLI_REGISTRY_LOAD_FAILED");
+    let serialized = String::from_utf8(output.stdout).unwrap();
+    assert!(!serialized.contains(&missing_registry.display().to_string()));
+    assert!(!serialized.contains("aios-ir-private-registry-path"));
+}
+
+#[test]
 fn all_program_views_succeed_with_json_only_output() {
     let program = fixture_root().join("demonstration-a.ir.json");
     for (command, expected_field) in [

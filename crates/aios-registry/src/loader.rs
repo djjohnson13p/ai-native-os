@@ -231,13 +231,19 @@ pub fn load_registry_bundle(
     let snapshot_bytes = read_bounded(&snapshot_path, options.limits.json.max_bytes)?;
     let mut total_bytes = snapshot_bytes.len();
     enforce_total_bytes(total_bytes, options.limits.max_total_bytes)?;
-    let snapshot: RegistrySnapshot = schema::decode(
+    let snapshot: RegistrySnapshot = schema::decode_with_record_limit(
         &snapshot_bytes,
         options.limits.json,
         RecordKind::Snapshot,
         false,
+        Some(options.limits.max_contracts),
     )
     .map_err(|error| error.at_path(&snapshot_path))?;
+    let snapshot_contract_count = checked_contract_count(
+        snapshot.type_contracts.len(),
+        snapshot.capability_contracts.len(),
+    )?;
+    enforce_contract_count(snapshot_contract_count, options.limits.max_contracts)?;
 
     let type_sources = collect_sources(&snapshot.type_contracts, options.limits.max_source_files)?;
     let capability_sources = collect_sources(
@@ -258,9 +264,18 @@ pub fn load_registry_bundle(
         let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
-        let mut contracts: Vec<TypeContract> =
-            schema::decode(&bytes, options.limits.json, RecordKind::Type, true)
-                .map_err(|error| error.at_path(&path))?;
+        let remaining_contracts = options
+            .limits
+            .max_contracts
+            .saturating_sub(type_contracts.len());
+        let mut contracts: Vec<TypeContract> = schema::decode_with_record_limit(
+            &bytes,
+            options.limits.json,
+            RecordKind::Type,
+            true,
+            Some(remaining_contracts),
+        )
+        .map_err(|error| error.at_path(&path))?;
         type_contracts.append(&mut contracts);
         enforce_contract_count(type_contracts.len(), options.limits.max_contracts)?;
     }
@@ -271,9 +286,20 @@ pub fn load_registry_bundle(
         let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
-        let mut contracts: Vec<CapabilityContract> =
-            schema::decode(&bytes, options.limits.json, RecordKind::Capability, true)
-                .map_err(|error| error.at_path(&path))?;
+        let loaded_contracts =
+            checked_contract_count(type_contracts.len(), capability_contracts.len())?;
+        let remaining_contracts = options
+            .limits
+            .max_contracts
+            .saturating_sub(loaded_contracts);
+        let mut contracts: Vec<CapabilityContract> = schema::decode_with_record_limit(
+            &bytes,
+            options.limits.json,
+            RecordKind::Capability,
+            true,
+            Some(remaining_contracts),
+        )
+        .map_err(|error| error.at_path(&path))?;
         capability_contracts.append(&mut contracts);
         enforce_contract_count(
             type_contracts.len() + capability_contracts.len(),
@@ -747,6 +773,17 @@ pub(crate) fn validate_capability_contract(contract: &CapabilityContract) -> Reg
             )));
         }
     }
+    if contract.inputs.iter().any(|(name, input)| {
+        contract
+            .outputs
+            .get(name)
+            .is_some_and(|output| output.type_ref != input.type_ref)
+    }) {
+        return Err(RegistryError::schema(format!(
+            "capability {} reuses a port name for different input and output types",
+            contract.capability
+        )));
+    }
     unique_values(
         &contract.allowed_execution_classes,
         &format!(
@@ -871,6 +908,19 @@ pub(crate) fn validate_capability_contract(contract: &CapabilityContract) -> Reg
         ));
     }
     let required_effects: BTreeSet<_> = contract.required_effect_classes.iter().copied().collect();
+    for effect in &required_effects {
+        if !matches!(effect, EffectClass::Pure | EffectClass::LegacyOpaque)
+            && !contract
+                .required_authority_classes
+                .iter()
+                .any(|authority| effect_for_authority_class(authority) == Some(*effect))
+        {
+            return Err(RegistryError::schema(format!(
+                "capability {} requires protected effect {effect:?} without its mapped required authority class",
+                contract.capability
+            )));
+        }
+    }
     for authority in &contract.required_authority_classes {
         let Some(implied_effect) = effect_for_authority_class(authority) else {
             return Err(RegistryError::schema(format!(
@@ -1428,6 +1478,58 @@ mod tests {
         assert_eq!(
             error.reason_code(),
             Some(ValidatorReasonCode::RegistryPureEffectContradiction)
+        );
+    }
+
+    #[test]
+    fn protected_required_effects_require_mapped_required_authority() {
+        let (_, _, capabilities) = fixture_records();
+        let mut protected = capabilities
+            .iter()
+            .find(|contract| contract.capability == "artifact.hash")
+            .unwrap()
+            .clone();
+        protected.required_authority_classes.clear();
+        let error = validate_capability_contract(&protected)
+            .expect_err("a protected lower-bound effect cannot be grant-free");
+        assert_eq!(
+            error.reason_code(),
+            Some(ValidatorReasonCode::RegistrySchemaInvalid)
+        );
+
+        let mut opaque = capabilities
+            .iter()
+            .find(|contract| contract.capability == "table.normalize")
+            .unwrap()
+            .clone();
+        opaque.required_effect_classes = vec![EffectClass::LegacyOpaque];
+        opaque.allowed_effect_classes = vec![EffectClass::LegacyOpaque];
+        validate_capability_contract(&opaque)
+            .expect("LEGACY_OPAQUE has no closed-profile authority mapping");
+    }
+
+    #[test]
+    fn bidirectional_port_names_cannot_represent_different_types() {
+        let (_, _, capabilities) = fixture_records();
+        let baseline = capabilities
+            .iter()
+            .find(|contract| contract.capability == "artifact.copy")
+            .unwrap();
+
+        let mut compatible = baseline.clone();
+        compatible
+            .outputs
+            .insert("source".to_owned(), compatible.inputs["source"].clone());
+        validate_capability_contract(&compatible)
+            .expect("the same port name and semantic type is representation-unambiguous");
+
+        let mut ambiguous = compatible;
+        ambiguous.outputs.get_mut("source").unwrap().type_ref = "text.plain@1".to_owned();
+        let error = validate_capability_contract(&ambiguous)
+            .expect_err("directionless provider representations cannot cover two semantic types");
+        assert_eq!(
+            error.reason_code(),
+            Some(ValidatorReasonCode::RegistrySchemaInvalid)
         );
     }
 

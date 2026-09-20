@@ -451,6 +451,33 @@ fn verifier_inventory_does_not_claim_all_outputs_are_gated() {
     );
 }
 
+#[test]
+fn out_of_range_metadata_numbers_are_inert_but_semantic_numbers_stay_bounded() {
+    let validator = validator();
+    let baseline = validator.validate_bytes(&serde_json::to_vec(&program()).unwrap());
+    for node_metadata in [false, true] {
+        let mut input = program();
+        if node_metadata {
+            input["nodes"][0]["metadata"] = json!({"score":"RAW_NUMBER"});
+        } else {
+            input["metadata"] = json!({"score":"RAW_NUMBER"});
+        }
+        let report = validator.validate_bytes(&with_token(&input, "1e9999"));
+        assert!(report.output.validation.valid);
+        assert_eq!(
+            report.output.validation.semantic_hash,
+            baseline.output.validation.semantic_hash
+        );
+        assert_eq!(report.normalized, baseline.normalized);
+    }
+
+    let mut semantic = program();
+    semantic["nodes"][0]["constraints"] = json!({"min_memory_bytes":"RAW_NUMBER"});
+    let report = validator.validate_bytes(&with_token(&semantic, "1e9999"));
+    assert!(!report.output.validation.valid);
+    assert!(report.output.validation.semantic_hash.is_none());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]

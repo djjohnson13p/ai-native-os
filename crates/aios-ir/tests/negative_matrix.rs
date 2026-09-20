@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use aios_contracts::{
-    CapabilityContract, CapabilityRole, EffectClass, EgressMode, RegistrySnapshot, TypeContract,
-    ValidatorReasonCode,
+    CapabilityContract, CapabilityRole, EffectClass, EgressMode, PortContract, RegistrySnapshot,
+    TypeContract, ValidatorReasonCode,
 };
 use aios_ir::{ValidationLimits, ValidationReport, Validator};
 use aios_registry::{
@@ -46,6 +46,60 @@ fn modified_registry(
         .find(|entry| entry.id == capability_id)
         .unwrap();
     PLACEHOLDER.clone_into(&mut snapshot_contract.content_hash);
+    let bootstrap = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions {
+            hash_verification: HashVerificationMode::BootstrapGenerate,
+            ..RegistryBuildOptions::default()
+        },
+    )
+    .unwrap();
+    SemanticRegistry::from_records(
+        bootstrap.snapshot().clone(),
+        bootstrap.type_contracts().cloned().collect(),
+        bootstrap.capability_contracts().cloned().collect(),
+        RegistryBuildOptions::default(),
+    )
+    .unwrap()
+}
+
+fn modified_registry_pair(
+    left_id: &str,
+    right_id: &str,
+    mutate: impl FnOnce(&mut CapabilityContract, &mut CapabilityContract),
+) -> SemanticRegistry {
+    let mut snapshot: RegistrySnapshot = read("registry-snapshot.json");
+    let types: Vec<TypeContract> = read("type-contracts.json");
+    let mut capabilities: Vec<CapabilityContract> = read("capability-contracts.json");
+    let left_index = capabilities
+        .iter()
+        .position(|contract| contract.capability == left_id)
+        .unwrap();
+    let right_index = capabilities
+        .iter()
+        .position(|contract| contract.capability == right_id)
+        .unwrap();
+    assert_ne!(left_index, right_index);
+    let (left, right) = if left_index < right_index {
+        let (before_right, from_right) = capabilities.split_at_mut(right_index);
+        (&mut before_right[left_index], &mut from_right[0])
+    } else {
+        let (before_left, from_left) = capabilities.split_at_mut(left_index);
+        (&mut from_left[0], &mut before_left[right_index])
+    };
+    mutate(left, right);
+
+    PLACEHOLDER.clone_into(&mut snapshot.snapshot_id);
+    for capability_id in [left_id, right_id] {
+        let entry = snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == capability_id)
+            .unwrap();
+        PLACEHOLDER.clone_into(&mut entry.content_hash);
+    }
     let bootstrap = SemanticRegistry::from_records(
         snapshot,
         types,
@@ -193,6 +247,117 @@ fn fallback_port_effect_authority_and_egress_broadening_are_rejected() {
     assert_code(
         &validate(role_registry, &program),
         ValidatorReasonCode::IrCapabilityRoleMismatch,
+    );
+}
+
+#[test]
+fn input_authority_selector_must_name_an_input_consumed_by_the_node() {
+    let mut program = base_copy();
+    program["inputs"]["secret_doc"] = json!({"type":"artifact.file@1"});
+    program["nodes"][0]["authority_requests"][0]["resource"] = json!("input:secret_doc");
+
+    assert_code(
+        &validate(strict_registry(), &program),
+        ValidatorReasonCode::IrReferenceInputNotFound,
+    );
+}
+
+#[test]
+fn fallback_ports_are_checked_against_bindings_and_consumers() {
+    let program = fallback_copy();
+
+    let extra_optional_ports = modified_registry("artifact.copy.compat", |contract| {
+        contract.inputs.insert(
+            "unused_context".to_owned(),
+            PortContract {
+                type_ref: "text.plain@1".to_owned(),
+                required: false,
+                description: None,
+            },
+        );
+        contract.outputs.insert(
+            "unused_debug".to_owned(),
+            PortContract {
+                type_ref: "text.plain@1".to_owned(),
+                required: false,
+                description: None,
+            },
+        );
+    });
+    let report = validate(extra_optional_ports, &program);
+    assert!(
+        report.output.validation.valid,
+        "unused optional fallback ports must not invalidate actual graph bindings: {:?}",
+        report.output.validation.diagnostics
+    );
+
+    let omitted_optional_primary_input = modified_registry("artifact.copy", |contract| {
+        contract.inputs.insert(
+            "optional_context".to_owned(),
+            PortContract {
+                type_ref: "text.plain@1".to_owned(),
+                required: false,
+                description: None,
+            },
+        );
+    });
+    let report = validate(omitted_optional_primary_input, &program);
+    assert!(
+        report.output.validation.valid,
+        "fallback need not declare an omitted optional primary input: {:?}",
+        report.output.validation.diagnostics
+    );
+
+    let differing_unconsumed_primary_output = modified_registry_pair(
+        "artifact.copy",
+        "artifact.copy.compat",
+        |primary, fallback| {
+            primary.outputs.insert(
+                "unused_debug".to_owned(),
+                PortContract {
+                    type_ref: "data.hash@1".to_owned(),
+                    required: false,
+                    description: None,
+                },
+            );
+            fallback.outputs.insert(
+                "unused_debug".to_owned(),
+                PortContract {
+                    type_ref: "text.plain@1".to_owned(),
+                    required: false,
+                    description: None,
+                },
+            );
+        },
+    );
+    let report = validate(differing_unconsumed_primary_output, &program);
+    assert!(
+        report.output.validation.valid,
+        "an unconsumed primary output does not constrain fallback compatibility: {:?}",
+        report.output.validation.diagnostics
+    );
+
+    let unbound_required_input = modified_registry("artifact.copy.compat", |contract| {
+        contract.inputs.insert(
+            "required_context".to_owned(),
+            PortContract {
+                type_ref: "text.plain@1".to_owned(),
+                required: true,
+                description: None,
+            },
+        );
+    });
+    assert_code(
+        &validate(unbound_required_input, &program),
+        ValidatorReasonCode::IrFallbackPortMismatch,
+    );
+
+    let mismatched_bound_input = modified_registry("artifact.copy.compat", |contract| {
+        contract.inputs.get_mut("source").unwrap().type_ref = "text.plain@1".to_owned();
+    });
+    assert_code(
+        &validate(mismatched_bound_input, &program),
+        ValidatorReasonCode::IrFallbackPortMismatch,
     );
 }
 

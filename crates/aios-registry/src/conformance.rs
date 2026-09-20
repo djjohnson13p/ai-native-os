@@ -3,7 +3,7 @@
 use crate::version::{FullVersion, SemanticRef, validate_semantic_id};
 use crate::{SemanticRegistry, effect_for_authority_class};
 use aios_contracts::{
-    CapabilityManifest, EffectClass, EgressMode, NetworkDefault, ProviderCapability,
+    CapabilityManifest, EffectClass, EgressMode, Locality, NetworkDefault, ProviderCapability,
     ProviderReasonCode, SCHEMA_VERSION_V0_1,
 };
 use serde::Serialize;
@@ -268,27 +268,34 @@ fn validate_provider_capability(
         );
     }
 
-    if matches!(
+    let network_default_requires_network = matches!(
         provider.execution.network_default,
         Some(NetworkDefault::Allowlist | NetworkDefault::Internet)
-    ) {
-        if !provider.effect_classes.contains(&EffectClass::Network) {
-            collector.push(
-                ProviderReasonCode::ProviderRequiredEffectMissing,
-                "provider network default requires the NETWORK effect declaration",
-                Some(capability.clone()),
-            );
-        }
-        if !authority_actions
+    );
+    let network_reachable_locality = provider
+        .execution
+        .locality
+        .iter()
+        .any(|locality| *locality != Locality::Local);
+    let declares_network_effect = provider.effect_classes.contains(&EffectClass::Network);
+    if (network_default_requires_network || network_reachable_locality) && !declares_network_effect
+    {
+        collector.push(
+            ProviderReasonCode::ProviderRequiredEffectMissing,
+            "provider network default or remote locality requires the NETWORK effect declaration",
+            Some(capability.clone()),
+        );
+    }
+    if (network_default_requires_network || network_reachable_locality || declares_network_effect)
+        && !authority_actions
             .iter()
             .any(|action| action == "network.connect")
-        {
-            collector.push(
-                ProviderReasonCode::ProviderRequiredAuthorityMissing,
-                "provider network default requires network.connect authority",
-                Some(capability.clone()),
-            );
-        }
+    {
+        collector.push(
+            ProviderReasonCode::ProviderRequiredAuthorityMissing,
+            "provider network declaration requires network.connect authority",
+            Some(capability.clone()),
+        );
     }
 
     let declares_data_egress_effect = provider.effect_classes.contains(&EffectClass::DataEgress);
@@ -621,6 +628,43 @@ mod tests {
             report.diagnostics
         );
         assert!(!report.contains(ProviderReasonCode::ProviderEgressNotAllowed));
+    }
+
+    #[test]
+    fn network_effect_requires_matching_authority_with_no_network_default() {
+        let registry = network_only_deny_registry();
+        let mut manifest = network_summarizer(&registry);
+        let provider = &mut manifest.provides[0];
+        provider.execution.network_default = Some(NetworkDefault::None);
+        provider.authority.as_mut().unwrap().actions.clear();
+
+        let report =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(!report.valid);
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+    }
+
+    #[test]
+    fn network_reachable_locality_requires_network_effect_and_authority() {
+        let registry =
+            SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+        for locality in [Locality::Peer, Locality::Remote, Locality::Hybrid] {
+            let mut manifest = network_summarizer(&registry);
+            let provider = &mut manifest.provides[0];
+            provider.execution.locality = vec![locality];
+            provider.execution.network_default = Some(NetworkDefault::None);
+            provider.effect_classes = vec![EffectClass::Pure];
+            provider.authority.as_mut().unwrap().actions.clear();
+
+            let report = validate_provider_manifest(
+                &registry,
+                &manifest,
+                ProviderConformanceOptions::default(),
+            );
+            assert!(!report.valid, "{locality:?} must be network-declared");
+            assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
+            assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+        }
     }
 
     #[test]

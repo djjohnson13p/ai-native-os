@@ -23,7 +23,7 @@ impl LibraryAdapter {
                 Err(error) if error.is_operational() => {
                     return Err(AdapterError::operational(
                         "CLI_REGISTRY_LOAD_FAILED",
-                        format!("could not load the explicitly supplied registry: {error}"),
+                        "could not load the explicitly supplied registry",
                     ));
                 }
                 Err(error) => {

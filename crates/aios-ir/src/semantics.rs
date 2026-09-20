@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use aios_contracts::{
     AiosIr, CachePolicy, CapabilityContract, CapabilityRole, Diagnostic, EffectClass,
     EffectSummary, EgressMode, ExecutionClass, FailurePolicy, GeneratedBy, Node, NodeEffectSummary,
-    OperationKind, PortContract, ValidatorReasonCode, ValueRef,
+    OperationKind, ValidatorReasonCode, ValueRef,
 };
 use aios_registry::{SemanticRegistry, effect_for_authority_class};
 
@@ -85,19 +85,29 @@ fn validate_references(
                 format!("/nodes/{node_index}/inputs/{}", escape_pointer(port)),
             );
         }
-        for request in &node.authority_requests {
+        let consumed_program_inputs: BTreeSet<&str> = node
+            .inputs
+            .values()
+            .filter_map(|value_ref| match value_ref {
+                ValueRef::Input { name } => Some(name.as_str()),
+                ValueRef::Node { .. } => None,
+            })
+            .collect();
+        for (request_index, request) in node.authority_requests.iter().enumerate() {
             if let Some(input) = request.resource.strip_prefix("input:") {
-                if !program.inputs.contains_key(input) {
+                if !program.inputs.contains_key(input) || !consumed_program_inputs.contains(input) {
                     diagnostics.push(contextual(
                         ValidatorReasonCode::IrReferenceInputNotFound,
                         format!(
-                            "authority selector '{}' names an unknown program input",
+                            "authority selector '{}' does not name a program input consumed by this node",
                             request.resource
                         ),
                         Some(&node.id),
                         None,
                         Some(&node.operation.capability),
-                        Some(format!("/nodes/{node_index}/authority_requests")),
+                        Some(format!(
+                            "/nodes/{node_index}/authority_requests/{request_index}/resource"
+                        )),
                     ));
                 }
             }
@@ -729,13 +739,11 @@ fn validate_fallbacks(
                 continue;
             };
 
-            if !semantic_ports_equal(&fallback.inputs, &primary.inputs)
-                || !semantic_ports_equal(&fallback.outputs, &primary.outputs)
-            {
+            if !fallback_ports_compatible(program, node, primary, fallback) {
                 diagnostics.push(contextual(
                     ValidatorReasonCode::IrFallbackPortMismatch,
                     format!(
-                        "fallback capability '{fallback_ref}' does not have identical semantic ports"
+                        "fallback capability '{fallback_ref}' cannot satisfy the node's bound inputs or graph-consumed outputs"
                     ),
                     Some(&node.id),
                     None,
@@ -826,16 +834,58 @@ fn validate_fallbacks(
     }
 }
 
-fn semantic_ports_equal(
-    left: &BTreeMap<String, PortContract>,
-    right: &BTreeMap<String, PortContract>,
+fn fallback_ports_compatible(
+    program: &AiosIr,
+    node: &Node,
+    primary: &CapabilityContract,
+    fallback: &CapabilityContract,
 ) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(name, port)| {
-            right.get(name).is_some_and(|other| {
-                port.type_ref == other.type_ref && port.required == other.required
-            })
+    let bound_inputs_match = node.inputs.iter().all(|(name, value_ref)| {
+        let Some(primary_port) = primary.inputs.get(name) else {
+            return false;
+        };
+        let Some(fallback_port) = fallback.inputs.get(name) else {
+            return false;
+        };
+        if fallback_port.type_ref != primary_port.type_ref {
+            return false;
+        }
+
+        !fallback_port.required
+            || !matches!(
+                value_ref,
+                ValueRef::Input { name }
+                    if program.inputs.get(name).is_some_and(|input| !input.required)
+            )
+    });
+    let required_fallback_inputs_are_bound = fallback
+        .inputs
+        .iter()
+        .all(|(name, port)| !port.required || node.inputs.contains_key(name));
+    let consumed_outputs_match = program
+        .nodes
+        .iter()
+        .flat_map(|consumer| consumer.inputs.values())
+        .chain(program.outputs.values())
+        .filter_map(|value_ref| match value_ref {
+            ValueRef::Node {
+                node: producer,
+                port,
+            } if producer == &node.id => Some(port),
+            ValueRef::Input { .. } | ValueRef::Node { .. } => None,
         })
+        .all(|port| {
+            let expected_type = node
+                .outputs
+                .get(port)
+                .expect("references were validated before fallback analysis");
+            fallback
+                .outputs
+                .get(port)
+                .is_some_and(|fallback_port| fallback_port.type_ref == *expected_type)
+        });
+
+    bound_inputs_match && required_fallback_inputs_are_bound && consumed_outputs_match
 }
 
 fn warn_unused_pure_nodes(

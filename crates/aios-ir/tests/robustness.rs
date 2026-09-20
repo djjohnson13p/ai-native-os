@@ -362,6 +362,7 @@ fn remaining_semantic_program_fields_change_validated_identity() {
     source_a["inputs"]["alternate"] = json!({"type":"artifact.file@1"});
     let mut source_b = source_a.clone();
     source_b["nodes"][0]["inputs"]["source"]["name"] = json!("alternate");
+    source_b["nodes"][0]["authority_requests"][0]["resource"] = json!("input:alternate");
     assert_ne!(semantic_hash(&source_a), semantic_hash(&source_b));
 
     let mut constrained = base.clone();
@@ -545,6 +546,10 @@ fn failure_graph_port_and_egress_edges_are_regression_locked() {
     let mut self_cycle = base.clone();
     self_cycle["nodes"][0]["inputs"]["source"] =
         json!({"source":"node","node":"copy","port":"copy"});
+    // Keep this mutation focused on cycle detection. The node no longer
+    // consumes the top-level input, so input:source would be independently
+    // invalid under the node-local authority-scope rule.
+    self_cycle["nodes"][0]["authority_requests"] = json!([]);
     assert!(has_code(
         &validate(&self_cycle),
         ValidatorReasonCode::IrGraphCycle
@@ -555,6 +560,7 @@ fn failure_graph_port_and_egress_edges_are_regression_locked() {
         .as_object_mut()
         .unwrap()
         .remove("source");
+    missing_port["nodes"][0]["authority_requests"] = json!([]);
     assert!(has_code(
         &validate(&missing_port),
         ValidatorReasonCode::IrCapabilityPortMismatch
