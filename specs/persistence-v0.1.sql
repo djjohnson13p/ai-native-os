@@ -662,6 +662,15 @@ CREATE TABLE IF NOT EXISTS recovery_assessments (
     FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS recovery_unknown_operations (
+    assessment_id            TEXT NOT NULL,
+    ordinal                  INTEGER NOT NULL CHECK (ordinal >= 0),
+    operation_id             TEXT NOT NULL,
+    PRIMARY KEY (assessment_id, ordinal),
+    UNIQUE (assessment_id, operation_id),
+    FOREIGN KEY (assessment_id) REFERENCES recovery_assessments(assessment_id) ON DELETE CASCADE
+);
+
 -- ---------------------------------------------------------------------------
 -- Skills / adaptive reuse metadata
 -- ---------------------------------------------------------------------------
@@ -745,6 +754,14 @@ ON execution_bindings(task_id, semantic_program_hash, node_id, attempt);
 
 CREATE INDEX IF NOT EXISTS ix_step_executions_task_state
 ON step_executions(task_id, state);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_step_executions_attempt_tuple
+ON step_executions(
+    task_id,
+    semantic_program_hash,
+    node_id,
+    attempt_number
+);
 
 CREATE INDEX IF NOT EXISTS ix_provider_invocations_task_status
 ON provider_invocations(task_id, status);
