@@ -555,6 +555,13 @@ pub struct ArtifactReader {
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
 
+struct PreparedArtifactReader {
+    file: File,
+    handle: ArtifactHandle,
+    authority_connection: Connection,
+    database_identity: Option<StoreIdentity>,
+}
+
 impl ArtifactReader {
     pub fn handle(&self) -> &ArtifactHandle {
         &self.handle
@@ -1808,15 +1815,11 @@ impl TaskManager {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "keeps integrity verification and exact authority admission before reader issuance"
-    )]
-    pub fn open_artifact_reader(
+    fn prepare_artifact_reader(
         &mut self,
         scope: &ArtifactReadScope,
         artifact_id: &str,
-    ) -> Result<ArtifactReader> {
+    ) -> Result<PreparedArtifactReader> {
         let now = self.clock.now();
         if scope.issuer_id != self.artifact_scope_issuer
             || !scope.artifact_ids.contains(artifact_id)
@@ -1831,16 +1834,6 @@ impl TaskManager {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        let expected_grant_id = match &scope.authority.execution {
-            Some(execution) => Some((
-                execution,
-                scope
-                    .grant_ids
-                    .get(artifact_id)
-                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?,
-            )),
-            None => None,
-        };
         let handle = self
             .get_artifact(artifact_id)?
             .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_NOT_FOUND"))?;
@@ -1869,9 +1862,6 @@ impl TaskManager {
                     && size == handle.size_bytes
                     && hash == expected_hash =>
             {
-                let admitted_at = self.clock.now();
-                let lease_owner = self.lease_owner.clone();
-                let lease_epoch = self.lease_epoch;
                 file.seek(SeekFrom::Start(0))?;
                 reader_setup_step()?;
                 let authority_connection = self.database_locator.open()?;
@@ -1880,77 +1870,11 @@ impl TaskManager {
                 if let Some(identity) = database_identity.as_ref() {
                     verify_database_identity(&authority_connection, identity)?;
                 }
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-                let integrity_current = transaction.query_row(
-                    "SELECT a.integrity_state,b.durability_state FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash WHERE a.artifact_id=?1",
-                    [artifact_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )?;
-                if integrity_current.0 == "failed"
-                    || matches!(integrity_current.1.as_str(), "CORRUPT" | "MISSING")
-                {
-                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
-                }
-                let grant_admission = if let Some((execution, grant_id)) = expected_grant_id {
-                    let current = load_execution_authority(
-                        &transaction,
-                        &scope.task_id,
-                        &execution.binding_id,
-                        &admitted_at,
-                    )?;
-                    if current != *execution
-                        || !artifact_read_authorized(
-                            &transaction,
-                            &scope.task_id,
-                            &scope.authority,
-                            artifact_id,
-                        )?
-                    {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-                    }
-                    Some(admit_operation_grant(
-                        &transaction,
-                        &scope.task_id,
-                        execution,
-                        "artifact.read",
-                        "artifact",
-                        artifact_id,
-                        &admitted_at,
-                        grant_id,
-                    )?)
-                } else {
-                    if capture_read_authority(&transaction, &scope.task_id, None, &admitted_at)?
-                        != scope.authority
-                        || !artifact_read_authorized(
-                            &transaction,
-                            &scope.task_id,
-                            &scope.authority,
-                            artifact_id,
-                        )?
-                    {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-                    }
-                    None
-                };
-                transaction.execute("UPDATE artifacts SET integrity_state='verified',integrity_verified_at=?2,integrity_verifier='artifact-store:sha256' WHERE artifact_id=?1",params![artifact_id,admitted_at])?;
-                transaction.execute("UPDATE artifact_blobs SET durability_state='DURABLE',verified_at=?2 WHERE content_hash=?1",params![expected_hash,admitted_at])?;
-                transaction.commit()?;
-                Ok(ArtifactReader {
+                Ok(PreparedArtifactReader {
                     file,
                     handle,
                     authority_connection,
-                    clock: Arc::clone(&self.clock),
-                    lease_owner,
-                    lease_epoch,
                     database_identity,
-                    task_id: scope.task_id.clone(),
-                    authority: scope.authority.clone(),
-                    artifact_id: artifact_id.to_owned(),
-                    grant_admission,
-                    _store_cleanup: self.artifact_store_cleanup.clone(),
                 })
             }
             _ => {
@@ -1958,6 +1882,43 @@ impl TaskManager {
                 Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
             }
         }
+    }
+
+    pub fn open_artifact_reader(
+        &mut self,
+        scope: &ArtifactReadScope,
+        artifact_id: &str,
+    ) -> Result<ArtifactReader> {
+        let prepared = self.prepare_artifact_reader(scope, artifact_id)?;
+        let admitted_at = self.clock.now();
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        let grant_admission = admit_prepared_artifact_reader(
+            &transaction,
+            scope,
+            artifact_id,
+            &prepared.handle,
+            &admitted_at,
+        )?;
+        transaction.commit()?;
+        Ok(ArtifactReader {
+            file: prepared.file,
+            handle: prepared.handle,
+            authority_connection: prepared.authority_connection,
+            clock: Arc::clone(&self.clock),
+            lease_owner,
+            lease_epoch,
+            database_identity: prepared.database_identity,
+            task_id: scope.task_id.clone(),
+            authority: scope.authority.clone(),
+            artifact_id: artifact_id.to_owned(),
+            grant_admission,
+            _store_cleanup: self.artifact_store_cleanup.clone(),
+        })
     }
 
     /// Seals a provider export writer to the exact Artifact, destination class, attempt, and
@@ -2150,9 +2111,10 @@ impl TaskManager {
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ));
         }
-        let mut reader = self.open_artifact_reader(scope, artifact_id)?;
-        if reader.handle.size_bytes > intent.max_size_bytes
-            || reader.handle.content_hash.tagged() != intent.content_hash
+        export_reservation_race_step()?;
+        let prepared_reader = self.prepare_artifact_reader(scope, artifact_id)?;
+        if prepared_reader.handle.size_bytes > intent.max_size_bytes
+            || prepared_reader.handle.content_hash.tagged() != intent.content_hash
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
@@ -2185,6 +2147,13 @@ impl TaskManager {
                 admitted_at,
             ],
         )?;
+        let reader_grant_admission = admit_prepared_artifact_reader(
+            &transaction,
+            scope,
+            artifact_id,
+            &prepared_reader.handle,
+            &admitted_at,
+        )?;
         destination.grant_admission = match (
             scope.authority.execution.as_ref(),
             destination.expected_grant_id.as_deref(),
@@ -2216,6 +2185,20 @@ impl TaskManager {
         };
         transaction.commit()?;
         destination.consumed = true;
+        let mut reader = ArtifactReader {
+            file: prepared_reader.file,
+            handle: prepared_reader.handle,
+            authority_connection: prepared_reader.authority_connection,
+            clock: Arc::clone(&self.clock),
+            lease_owner: self.lease_owner.clone(),
+            lease_epoch: self.lease_epoch,
+            database_identity: prepared_reader.database_identity,
+            task_id: scope.task_id.clone(),
+            authority: scope.authority.clone(),
+            artifact_id: artifact_id.to_owned(),
+            grant_admission: reader_grant_admission,
+            _store_cleanup: self.artifact_store_cleanup.clone(),
+        };
         let exported = match copy_export_bounded(
             &mut reader,
             &mut destination.writer,
@@ -3838,6 +3821,74 @@ fn admit_operation_grant(
         grant_id: expected_grant_id.to_owned(),
         one_shot_consumed,
     })
+}
+
+fn admit_prepared_artifact_reader(
+    connection: &Connection,
+    scope: &ArtifactReadScope,
+    artifact_id: &str,
+    handle: &ArtifactHandle,
+    admitted_at: &str,
+) -> Result<Option<GrantAdmission>> {
+    let integrity_current = connection.query_row(
+        "SELECT a.integrity_state,b.durability_state
+         FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+         WHERE a.artifact_id=?1",
+        [artifact_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    if integrity_current.0 == "failed"
+        || matches!(integrity_current.1.as_str(), "CORRUPT" | "MISSING")
+    {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
+    }
+    let grant_admission = if let Some(execution) = &scope.authority.execution {
+        let grant_id = scope
+            .grant_ids
+            .get(artifact_id)
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let current = load_execution_authority(
+            connection,
+            &scope.task_id,
+            &execution.binding_id,
+            admitted_at,
+        )?;
+        if current != *execution
+            || !artifact_read_authorized(connection, &scope.task_id, &scope.authority, artifact_id)?
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        Some(admit_operation_grant(
+            connection,
+            &scope.task_id,
+            execution,
+            "artifact.read",
+            "artifact",
+            artifact_id,
+            admitted_at,
+            grant_id,
+        )?)
+    } else {
+        if capture_read_authority(connection, &scope.task_id, None, admitted_at)? != scope.authority
+            || !artifact_read_authorized(connection, &scope.task_id, &scope.authority, artifact_id)?
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        None
+    };
+    connection.execute(
+        "UPDATE artifacts
+         SET integrity_state='verified',integrity_verified_at=?2,
+             integrity_verifier='artifact-store:sha256'
+         WHERE artifact_id=?1",
+        params![artifact_id, admitted_at],
+    )?;
+    connection.execute(
+        "UPDATE artifact_blobs SET durability_state='DURABLE',verified_at=?2
+         WHERE content_hash=?1",
+        params![handle.content_hash.tagged(), admitted_at],
+    )?;
+    Ok(grant_admission)
 }
 
 fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
@@ -5532,10 +5583,22 @@ type ExportCompletionTestHook = Box<dyn FnOnce() -> Result<()>>;
 
 #[cfg(test)]
 thread_local! {
+    static EXPORT_RESERVATION_RACE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_COMPLETION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn export_reservation_race_step() -> Result<()> {
+    EXPORT_RESERVATION_RACE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -5556,6 +5619,15 @@ fn export_completion_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test race injection shares the production reservation boundary"
+)]
+fn export_reservation_race_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -6674,6 +6746,124 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "constructs both racing admissions and verifies every rolled-back side effect"
+    )]
+    fn export_reservation_race_consumes_neither_losing_grant() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"race fenced".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "export-reservation-race",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut losing_destination = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export-race-loser",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                Vec::new(),
+            )
+            .unwrap();
+        let owner_scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let competing_destination = manager
+            .issue_owned_artifact_export_destination(
+                &owner_scope,
+                "export-race-winner",
+                &artifact.artifact_id,
+                "user-selected-file",
+                2_048,
+                Vec::new(),
+            )
+            .unwrap();
+        let competing_intent_json = competing_destination.intent_json.clone();
+        let competing_intent: ArtifactExportIntent =
+            serde_json::from_str(&competing_intent_json).unwrap();
+        EXPORT_RESERVATION_RACE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let connection = Connection::open(database)?;
+                connection.execute(
+                    "INSERT INTO operations(
+                        operation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,
+                        transaction_class,effect_class,idempotency_key,state,outcome_certainty,
+                        external_receipt,details_json,prepared_at,started_at,finished_at
+                     ) VALUES (
+                        'export-race-winner',?1,?2,?3,NULL,NULL,
+                        'irreversible_external','DATA_EGRESS','export-race-winner',
+                        'UNKNOWN','OUTCOME_UNKNOWN',NULL,?4,?5,?5,?5
+                     )",
+                    params![
+                        competing_intent.task_id,
+                        competing_intent.semantic_program_hash,
+                        competing_intent.node_id,
+                        competing_intent_json,
+                        "2026-09-19T22:00:00Z",
+                    ],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut losing_destination,),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert!(losing_destination.writer.is_empty());
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id='export-race-loser'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        for grant_id in [
+            "grant-export-reservation-race-0",
+            "grant-export-reservation-race-1",
+        ] {
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                        [grant_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]
