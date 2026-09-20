@@ -1356,6 +1356,50 @@ impl TaskManager {
         Ok(results)
     }
 
+    /// Persists immutable recovery reporting for newly discovered consequential evidence on a
+    /// terminal Task without changing its lifecycle state.
+    pub(crate) fn persist_terminal_recovery_inventory_for_task(
+        &mut self,
+        task_id: &str,
+    ) -> Result<String> {
+        let (revision, state) = self
+            .connection
+            .query_row(
+                "SELECT revision,state FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "terminal recovery Task does not exist",
+            ))?;
+        if !matches!(
+            state.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
+        ) {
+            return Err(TaskManagerError::InvalidRecord(
+                "terminal recovery inventory requires a terminal Task",
+            ));
+        }
+        let revision = u64::try_from(revision)
+            .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+        let inventory = unresolved_execution_ids(&self.connection, task_id)?;
+        if inventory.is_empty() {
+            return Err(TaskManagerError::InvalidRecord(
+                "terminal recovery inventory requires consequential evidence",
+            ));
+        }
+        let recovery_ref = recovery_operations_ref(task_id, revision, &inventory)?;
+        self.persist_recovery_inventory(
+            &recovery_ref,
+            task_id,
+            revision,
+            &inventory,
+            &self.clock.now(),
+        )?;
+        Ok(recovery_ref)
+    }
+
     /// Performs a trusted, evidence-derived live reconciliation handoff.
     ///
     /// # Errors

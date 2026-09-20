@@ -552,6 +552,67 @@ struct ArtifactExportIntent {
     grant_id: Option<String>,
 }
 
+/// Exact durable export identity presented to a trusted external-outcome verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ArtifactExportReconciliationSubject {
+    pub(crate) operation_id: String,
+    pub(crate) task_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) content_hash: String,
+    pub(crate) destination_class: String,
+    pub(crate) max_size_bytes: u64,
+    pub(crate) principal_kind: String,
+    pub(crate) principal_id: String,
+    pub(crate) semantic_program_hash: Option<String>,
+    pub(crate) node_id: Option<String>,
+    pub(crate) binding_id: Option<String>,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) grant_id: Option<String>,
+}
+
+/// Authenticated durable observation returned only by a trusted reconciliation adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedArtifactExportNoEffect {
+    pub(crate) subject: ArtifactExportReconciliationSubject,
+    pub(crate) evidence_ref: String,
+    pub(crate) proof_hash: String,
+    pub(crate) observed_at: String,
+}
+
+/// Trusted adapter boundary for independently checking external destination state.
+///
+/// The adapter receives the Task Manager's stored immutable subject and must retrieve and verify
+/// durable evidence independently. Callers cannot supply a serializable evidence assertion to the
+/// Task Manager reconciliation method.
+pub(crate) trait ArtifactExportOutcomeVerifier {
+    fn verifier_id(&self) -> &str;
+
+    fn verify_no_effect(
+        &self,
+        subject: &ArtifactExportReconciliationSubject,
+    ) -> Result<VerifiedArtifactExportNoEffect>;
+}
+
+impl ArtifactExportReconciliationSubject {
+    fn from_intent(operation_id: &str, intent: &ArtifactExportIntent) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+            task_id: intent.task_id.clone(),
+            artifact_id: intent.artifact_id.clone(),
+            content_hash: intent.content_hash.clone(),
+            destination_class: intent.destination_class.clone(),
+            max_size_bytes: intent.max_size_bytes,
+            principal_kind: intent.principal_kind.clone(),
+            principal_id: intent.principal_id.clone(),
+            semantic_program_hash: intent.semantic_program_hash.clone(),
+            node_id: intent.node_id.clone(),
+            binding_id: intent.binding_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            grant_id: intent.grant_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GrantAdmission {
     grant_id: String,
@@ -2778,12 +2839,15 @@ impl TaskManager {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if state
-            .as_deref()
-            .is_some_and(|state| matches!(state, "RUNNING" | "VERIFYING" | "PAUSED"))
-        {
-            live_recovery_handoff_step()?;
-            self.reconcile_live_execution(task_id)?;
+        match state.as_deref() {
+            Some("RUNNING" | "VERIFYING" | "PAUSED") => {
+                live_recovery_handoff_step()?;
+                self.reconcile_live_execution(task_id)?;
+            }
+            Some("COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK") => {
+                self.persist_terminal_recovery_inventory_for_task(task_id)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2828,14 +2892,9 @@ impl TaskManager {
     pub(crate) fn reconcile_unknown_artifact_export_no_effect(
         &mut self,
         operation_id: &str,
-        evidence_ref: &str,
+        verifier: &dyn ArtifactExportOutcomeVerifier,
     ) -> Result<()> {
         validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
-        validate_id(
-            evidence_ref,
-            256,
-            "invalid Artifact export reconciliation evidence",
-        )?;
         let row = self
             .connection
             .query_row(
@@ -2862,20 +2921,77 @@ impl TaskManager {
                 "stored Artifact export operation is invalid",
             ));
         }
-        let recovery_ref = self
+        let subject = ArtifactExportReconciliationSubject::from_intent(operation_id, &intent);
+        let observation = verifier.verify_no_effect(&subject)?;
+        if observation.subject != subject {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation proof does not match its immutable subject",
+            ));
+        }
+        validate_id(
+            verifier.verifier_id(),
+            256,
+            "invalid Artifact export reconciliation verifier",
+        )?;
+        validate_id(
+            &observation.evidence_ref,
+            256,
+            "invalid Artifact export reconciliation evidence reference",
+        )?;
+        validate_hash(&observation.proof_hash)?;
+        parse_time(&observation.observed_at)?;
+        let subject_json = canonical_json(&subject)?;
+        let mut subject_hasher = Sha256::new();
+        subject_hasher.update(b"AIOS-ARTIFACT-EXPORT-RECONCILIATION-SUBJECT\0v1\0");
+        subject_hasher.update(subject_json.as_bytes());
+        let subject_hash = tagged_digest(subject_hasher);
+        let inventory_id = format!("operation:{operation_id}");
+        let task = self
             .connection
             .query_row(
-                "SELECT json_extract(recovery_json,'$.unknown_operations_ref') FROM tasks
-                 WHERE task_id=?1 AND state='RECOVERING'",
+                "SELECT state,revision,json_extract(recovery_json,'$.unknown_operations_ref')
+                 FROM tasks WHERE task_id=?1",
                 [&row.0],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .flatten()
             .ok_or(TaskManagerError::InvalidRecord(
-                "Artifact export reconciliation requires an active recovery epoch",
+                "Artifact export reconciliation Task does not exist",
             ))?;
-        let inventory_id = format!("operation:{operation_id}");
+        let recovery_ref = if task.0 == "RECOVERING" {
+            task.2.ok_or(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation requires an active recovery epoch",
+            ))?
+        } else if matches!(
+            task.0.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
+        ) {
+            self.connection
+                .query_row(
+                    "SELECT r.assessment_id
+                     FROM recovery_assessments r
+                     JOIN recovery_unknown_operations u ON u.assessment_id=r.assessment_id
+                     WHERE r.task_id=?1 AND r.subject_kind='task' AND r.basis_revision=?2
+                       AND u.operation_id=?3
+                     ORDER BY r.created_at DESC,r.assessment_id DESC LIMIT 1",
+                    params![row.0, task.1, inventory_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "terminal Artifact export lacks persisted recovery inventory",
+                ))?
+        } else {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation requires recovery inventory",
+            ));
+        };
         let inventoried = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
             params![recovery_ref, inventory_id],
@@ -2886,7 +3002,10 @@ impl TaskManager {
                 "Artifact export reconciliation evidence is outside the recovery inventory",
             ));
         }
-        let event_identity = format!("{operation_id}:{evidence_ref}");
+        let event_identity = format!(
+            "{operation_id}:{}:{}",
+            observation.evidence_ref, observation.proof_hash
+        );
         let reconciliation_event_id = event_id("artifact-export-reconciled", &event_identity);
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
@@ -2894,12 +3013,39 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let existing_event = transaction.query_row(
-            "SELECT event_json,timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
-            params![row.0,reconciliation_event_id],
-            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
-        ).optional()?;
-        let observed_at = existing_event
+        let replayed_proof = transaction
+            .query_row(
+                "SELECT task_id,event_id,event_json FROM provenance_events
+                 WHERE event_type='execution.completed' AND (
+                   json_extract(event_json,'$.details.export_reconciliation.proof_hash')=?1 OR
+                   json_extract(event_json,'$.details.export_reconciliation.evidence_ref')=?2
+                 ) ORDER BY task_id,event_id LIMIT 1",
+                params![observation.proof_hash, observation.evidence_ref],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if replayed_proof
+            .as_ref()
+            .is_some_and(|stored| stored.0 != row.0 || stored.1 != reconciliation_event_id)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation proof was replayed for another subject",
+            ));
+        }
+        let existing_event = transaction
+            .query_row(
+                "SELECT event_json,timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
+                params![row.0,reconciliation_event_id],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
+            )
+            .optional()?;
+        let event_timestamp = existing_event
             .as_ref()
             .map_or_else(|| self.clock.now(), |stored| stored.1.clone());
         let event = json!({
@@ -2907,13 +3053,20 @@ impl TaskManager {
             "event_id":reconciliation_event_id,
             "task_id":row.0,
             "event_type":"execution.completed",
-            "timestamp":observed_at,
+            "timestamp":event_timestamp,
             "actor":{"kind":"system-service","id":"service:recovery"},
             "status":"failure",
             "details":{
                 "operation_id":operation_id,
-                "evidence_ref":evidence_ref,
-                "certainty":"FAILED_NO_EFFECT"
+                "certainty":"FAILED_NO_EFFECT",
+                "export_reconciliation":{
+                    "verifier_id":verifier.verifier_id(),
+                    "evidence_ref":observation.evidence_ref,
+                    "proof_hash":observation.proof_hash,
+                    "observed_at":observation.observed_at,
+                    "subject_hash":subject_hash,
+                    "recovery_ref":recovery_ref
+                }
             }
         });
         if let Some((stored_event, _)) = existing_event {
@@ -2930,7 +3083,7 @@ impl TaskManager {
         let changed = transaction.execute(
             "UPDATE operations SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',finished_at=COALESCE(finished_at,?2)
              WHERE operation_id=?1 AND state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'",
-            params![operation_id,observed_at],
+            params![operation_id,observation.observed_at],
         )?;
         if changed == 0 && !(row.1 == "FAILED" && row.2.as_deref() == Some("FAILED_NO_EFFECT")) {
             return Err(TaskManagerError::InvalidRecord(
@@ -6704,6 +6857,74 @@ mod tests {
         }
     }
 
+    struct TestExportOutcomeVerifier {
+        verifier_id: &'static str,
+        evidence_ref: String,
+        proof_hash: String,
+        subject_mutation: TestExportSubjectMutation,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestExportSubjectMutation {
+        None,
+        Task,
+        Artifact,
+        Destination,
+        Principal,
+        Binding,
+        Attempt,
+    }
+
+    impl ArtifactExportOutcomeVerifier for TestExportOutcomeVerifier {
+        fn verifier_id(&self) -> &str {
+            self.verifier_id
+        }
+
+        fn verify_no_effect(
+            &self,
+            subject: &ArtifactExportReconciliationSubject,
+        ) -> Result<VerifiedArtifactExportNoEffect> {
+            let mut verified_subject = subject.clone();
+            match self.subject_mutation {
+                TestExportSubjectMutation::None => {}
+                TestExportSubjectMutation::Task => verified_subject.task_id.push_str(":forged"),
+                TestExportSubjectMutation::Artifact => {
+                    verified_subject.artifact_id.push_str(":forged");
+                }
+                TestExportSubjectMutation::Destination => {
+                    verified_subject.destination_class.push_str(":forged");
+                }
+                TestExportSubjectMutation::Principal => {
+                    verified_subject.principal_id.push_str(":forged");
+                }
+                TestExportSubjectMutation::Binding => {
+                    verified_subject.binding_id = Some("binding:forged".to_owned());
+                }
+                TestExportSubjectMutation::Attempt => {
+                    verified_subject.attempt_id = Some("attempt:forged".to_owned());
+                }
+            }
+            Ok(VerifiedArtifactExportNoEffect {
+                subject: verified_subject,
+                evidence_ref: self.evidence_ref.clone(),
+                proof_hash: self.proof_hash.clone(),
+                observed_at: "2026-09-19T22:00:00Z".to_owned(),
+            })
+        }
+    }
+
+    fn export_no_effect_verifier(
+        evidence_ref: &str,
+        proof_digit: char,
+    ) -> TestExportOutcomeVerifier {
+        TestExportOutcomeVerifier {
+            verifier_id: "adapter:test-destination-status",
+            evidence_ref: evidence_ref.to_owned(),
+            proof_hash: format!("sha256:{}", proof_digit.to_string().repeat(64)),
+            subject_mutation: TestExportSubjectMutation::None,
+        }
+    }
+
     struct SwapClock {
         state: Arc<Mutex<SwapClockState>>,
     }
@@ -8300,18 +8521,13 @@ mod tests {
             0
         );
 
+        let verifier = export_no_effect_verifier("evidence:destination-unchanged", 'a');
         manager
-            .reconcile_unknown_artifact_export_no_effect(
-                "export-finalize-recovery",
-                "evidence:destination-unchanged",
-            )
+            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier)
             .unwrap();
         // A response-loss retry authenticates and reuses the immutable resolution event.
         manager
-            .reconcile_unknown_artifact_export_no_effect(
-                "export-finalize-recovery",
-                "evidence:destination-unchanged",
-            )
+            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier)
             .unwrap();
         assert_eq!(
             manager
@@ -8443,15 +8659,210 @@ mod tests {
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
+        let forged = TestExportOutcomeVerifier {
+            verifier_id: "adapter:test-destination-status",
+            evidence_ref: "evidence:forged".to_owned(),
+            proof_hash: "sha256:not-a-proof".to_owned(),
+            subject_mutation: TestExportSubjectMutation::None,
+        };
+        assert!(
+            manager
+                .reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &forged)
+                .is_err()
+        );
+        for mutation in [
+            TestExportSubjectMutation::Task,
+            TestExportSubjectMutation::Artifact,
+            TestExportSubjectMutation::Destination,
+            TestExportSubjectMutation::Principal,
+            TestExportSubjectMutation::Binding,
+            TestExportSubjectMutation::Attempt,
+        ] {
+            let mut mismatched = export_no_effect_verifier("evidence:mismatched", 'b');
+            mismatched.subject_mutation = mutation;
+            assert!(matches!(
+                manager.reconcile_unknown_artifact_export_no_effect(
+                    "export-owner-resolution",
+                    &mismatched,
+                ),
+                Err(TaskManagerError::InvalidRecord(
+                    "Artifact export reconciliation proof does not match its immutable subject"
+                ))
+            ));
+        }
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-owner-resolution'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert!(matches!(
+            manager.scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()]),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        let verifier = export_no_effect_verifier("evidence:owner-destination-unchanged", 'c');
         manager
-            .reconcile_unknown_artifact_export_no_effect(
-                "export-owner-resolution",
-                "evidence:destination-unchanged",
-            )
+            .reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &verifier)
             .unwrap();
         let transaction = manager.connection.unchecked_transaction().unwrap();
         assert!(crate::recovery_allows_exit(&transaction, "T-artifact").unwrap());
         transaction.rollback().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers terminal immutable recovery inventory, exact proof release, and cross-operation proof replay"
+    )]
+    fn terminal_owner_export_reconciliation_preserves_state_and_rejects_proof_replay() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"retained terminal bytes".as_slice()),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='COMPLETED',completed_at='2026-09-19T22:00:00Z'
+                 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut first = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-terminal-first",
+                &artifact.artifact_id,
+                "terminal-file-one",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut first),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || (recovery_json IS NULL) FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "COMPLETED:1"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-terminal-first'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            manager.scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()]),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+
+        let first_proof = export_no_effect_verifier("evidence:terminal-first", 'd');
+        manager
+            .reconcile_unknown_artifact_export_no_effect("export-terminal-first", &first_proof)
+            .unwrap();
+        manager
+            .reconcile_unknown_artifact_export_no_effect("export-terminal-first", &first_proof)
+            .unwrap();
+        let second_scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&second_scope, &artifact.artifact_id)
+            .unwrap();
+        let mut retained = Vec::new();
+        reader.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, b"retained terminal bytes");
+        drop(reader);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "COMPLETED"
+        );
+
+        let mut second = manager
+            .issue_owned_artifact_export_destination(
+                &second_scope,
+                "export-terminal-second",
+                &artifact.artifact_id,
+                "terminal-file-two",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&second_scope, &artifact.artifact_id, &mut second),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert!(matches!(
+            manager.reconcile_unknown_artifact_export_no_effect(
+                "export-terminal-second",
+                &first_proof,
+            ),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation proof was replayed for another subject"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-terminal-second'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        let second_proof = export_no_effect_verifier("evidence:terminal-second", 'e');
+        manager
+            .reconcile_unknown_artifact_export_no_effect("export-terminal-second", &second_proof)
+            .unwrap();
+        assert!(
+            manager
+                .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id])
+                .is_ok()
+        );
     }
 
     #[test]
