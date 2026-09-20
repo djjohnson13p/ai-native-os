@@ -3797,6 +3797,7 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<()> {
         let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
         let final_ref = format!("{parent_ref}/{digest}");
         create_durable_ancestors(store, &parent_ref)?;
+        recovery_pending_placement_step(store, &pending_ref)?;
         match store.hard_link(
             safe_internal_ref(&pending_ref)?,
             store,
@@ -4054,6 +4055,8 @@ type PendingPlacementTestHook = Box<dyn FnOnce(&Dir, &str) -> Result<()>>;
 thread_local! {
     static PENDING_PLACEMENT_TEST_HOOK: std::cell::RefCell<Option<PendingPlacementTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static RECOVERY_PENDING_PLACEMENT_TEST_HOOK: std::cell::RefCell<Option<PendingPlacementTestHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -4072,6 +4075,25 @@ fn pending_placement_step(store: &Dir, pending_ref: &str) -> Result<()> {
     reason = "test path replacement injection shares the production call signature"
 )]
 fn pending_placement_step(_store: &Dir, _pending_ref: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn recovery_pending_placement_step(store: &Dir, pending_ref: &str) -> Result<()> {
+    RECOVERY_PENDING_PLACEMENT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(store, pending_ref)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "recovery path replacement injection shares the production call signature"
+)]
+fn recovery_pending_placement_step(_store: &Dir, _pending_ref: &str) -> Result<()> {
     Ok(())
 }
 
@@ -4472,6 +4494,23 @@ mod tests {
                 .unwrap(),
             "PUBLISHED"
         );
+    }
+
+    fn assert_no_created_artifact_metadata(manager: &TaskManager) {
+        for query in [
+            "SELECT COUNT(*) FROM artifacts",
+            "SELECT COUNT(*) FROM task_artifacts WHERE role='output'",
+            "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.created'",
+            "SELECT COUNT(*) FROM artifact_publications WHERE state='COMMITTED'",
+        ] {
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(query, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     fn write_manual_seal(manager: &TaskManager, allocation_id: &str, staging_ref: &str) {
@@ -6797,6 +6836,77 @@ mod tests {
             bytes
         );
         assert!(!manager.artifact_store_root.join(pending_ref).exists());
+    }
+
+    #[test]
+    fn recovery_pending_path_replacement_cannot_promote_substituted_bytes() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"verified-recovery-candidate";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let pending_ref = format!("blobs/pending/{digest}-interrupted-race");
+        let displaced_ref = format!("{pending_ref}.verified-displaced");
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+
+        let root = manager.artifact_store_root.clone();
+        let expected_pending_ref = pending_ref.clone();
+        RECOVERY_PENDING_PLACEMENT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_store, observed_pending_ref| {
+                assert_eq!(observed_pending_ref, expected_pending_ref);
+                let pending = root.join(safe_internal_ref(observed_pending_ref)?);
+                let displaced = root.join(safe_internal_ref(&format!(
+                    "{observed_pending_ref}.verified-displaced"
+                ))?);
+                std::fs::rename(&pending, displaced)?;
+                std::fs::write(&pending, b"substituted-recovery-bytes")?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.reconcile_artifacts_startup(),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(&pending_ref)).unwrap(),
+            b"substituted-recovery-bytes"
+        );
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(&displaced_ref)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifact_blobs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_no_created_artifact_metadata(&manager);
+
+        // The failed pass retains both pending paths. A later recovery promotes the
+        // still-valid candidate as an orphan and leaves the invalid residue pending.
+        let report = manager.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobOrphaned
+                && finding.content_hash.as_deref() == Some(hash.as_str())
+        }));
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
+            bytes
+        );
+        assert!(manager.artifact_store_root.join(&pending_ref).exists());
+        assert!(!manager.artifact_store_root.join(&displaced_ref).exists());
+        assert_no_created_artifact_metadata(&manager);
     }
 
     #[test]
