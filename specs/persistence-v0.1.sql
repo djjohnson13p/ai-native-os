@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_id            TEXT,
     original_intent         TEXT NOT NULL,
     normalized_intent_json  TEXT,
+    intent_commitment_nonce BLOB NOT NULL DEFAULT (randomblob(32)),
     active_plan_revision    INTEGER,
     active_program_revision INTEGER,
     active_step_ids_json     TEXT NOT NULL DEFAULT '[]',
@@ -75,6 +76,13 @@ CREATE TABLE IF NOT EXISTS task_transitions (
     provenance_event_id     TEXT,
     requested_at            TEXT NOT NULL,
     committed_at            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_manager_lease (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    owner_id     TEXT NOT NULL,
+    fence_epoch  INTEGER NOT NULL CHECK (fence_epoch >= 1),
+    acquired_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plan_revisions (
@@ -522,7 +530,7 @@ CREATE TABLE IF NOT EXISTS step_executions (
     provider_id              TEXT,
     provider_version         TEXT,
     invocation_id            TEXT,
-    attempt_number           INTEGER NOT NULL CHECK (attempt_number >= 1),
+    attempt_number           INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 100),
     revision                 INTEGER NOT NULL CHECK (revision >= 1),
     state                    TEXT NOT NULL CHECK (state IN (
         'PENDING', 'BLOCKED', 'READY', 'STARTING', 'RUNNING',
@@ -648,6 +656,7 @@ CREATE TABLE IF NOT EXISTS recovery_assessments (
     assessment_id            TEXT PRIMARY KEY,
     recovery_epoch_id        TEXT NOT NULL,
     task_id                  TEXT NOT NULL,
+    basis_revision           INTEGER NOT NULL CHECK (basis_revision >= 1),
     subject_kind             TEXT NOT NULL,
     subject_id               TEXT NOT NULL,
     certainty                TEXT NOT NULL CHECK (certainty IN (
@@ -789,6 +798,20 @@ CREATE TRIGGER IF NOT EXISTS execution_bindings_no_delete
 BEFORE DELETE ON execution_bindings
 BEGIN
     SELECT RAISE(ABORT, 'execution_bindings are retained for audit/recovery');
+END;
+
+CREATE TRIGGER IF NOT EXISTS step_executions_attempt_number_insert_guard
+BEFORE INSERT ON step_executions
+WHEN NEW.attempt_number NOT BETWEEN 1 AND 100
+BEGIN
+    SELECT RAISE(ABORT, 'step attempt_number must be between 1 and 100');
+END;
+
+CREATE TRIGGER IF NOT EXISTS step_executions_attempt_number_update_guard
+BEFORE UPDATE OF attempt_number ON step_executions
+WHEN NEW.attempt_number NOT BETWEEN 1 AND 100
+BEGIN
+    SELECT RAISE(ABORT, 'step attempt_number must be between 1 and 100');
 END;
 
 CREATE TRIGGER IF NOT EXISTS provenance_events_no_update

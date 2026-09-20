@@ -1,0 +1,58 @@
+{
+  "profile": "aios-task-manager-architecture-security-v0.1",
+  "cases": [
+    {
+      "name": "creation-intent-commitment-is-private-and-versioned",
+      "setup": "create a Task with synthetic intent and a fresh 32-byte OS-CSPRNG nonce",
+      "expected": [
+        "private Task storage contains the raw intent and nonce",
+        "task.created provenance contains only v1 field commitment objects",
+        "normal provenance export contains neither raw intent nor nonce"
+      ]
+    },
+    {
+      "name": "legacy-missing-or-mismatched-commitment-is-quarantined",
+      "setup": "open a legacy Task whose nonce is missing, malformed, or does not verify its committed creation evidence",
+      "expected": [
+        "Task remains inspect-only",
+        "scheduling and recovery mutation are denied",
+        "privacy-safe export is explicitly legacy-redacted"
+      ]
+    },
+    {
+      "name": "second-live-owner-cannot-run-migration-or-recovery",
+      "setup": "a second daemon with different temporary-directory settings opens the same store, including through a symbolic link, hard link, case variant, or short-path alias, while the first daemon holds its kernel lock",
+      "expected": [
+        "the lock is bound to the database file object or an identity-bound stream rather than a path-derived sidecar or process-selected directory",
+        "second daemon cannot acquire ownership",
+        "store_fencing_epoch is not advanced by the second daemon",
+        "no Task, provenance, migration, or recovery record changes"
+      ]
+    },
+    {
+      "name": "stale-owner-is-fenced-on-every-mutation",
+      "setup": "a store handle presents an epoch older than durable store_fencing_epoch",
+      "expected": [
+        "ordinary transition, migration, recovery, and maintenance writes roll back",
+        "no provenance or idempotency receipt is appended"
+      ]
+    },
+    {
+      "name": "public-recovery-impersonation-is-rejected",
+      "setup": "submit public RUNNING to RECOVERING requests using system-service actor, recovery-like ID/prefix, and internal=true variants",
+      "expected": [
+        "every public request is rejected",
+        "no Task revision or provenance head changes"
+      ]
+    },
+    {
+      "name": "private-live-recovery-derives-evidence",
+      "setup": "trusted coordinator detects uncertainty for RUNNING, VERIFYING, and PAUSED Tasks while daemon remains live",
+      "expected": [
+        "private entry accepts only those three source states with exact revision and fence",
+        "subject inventory and certainty are derived from trusted records",
+        "caller-supplied evidence or certainty cannot override the result"
+      ]
+    }
+  ]
+}

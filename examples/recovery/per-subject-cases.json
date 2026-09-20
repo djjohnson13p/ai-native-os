@@ -1,0 +1,61 @@
+{
+  "profile": "aios-recovery-per-subject-v0.1",
+  "cases": [
+    {
+      "name": "completed-artifact-does-not-prove-external-operation",
+      "task_id": "T-mixed-subject-fixture",
+      "subjects": [
+        {
+          "kind": "artifact-publication",
+          "id": "publication:fixture-output",
+          "evidence": ["committed publication receipt", "verified blob hash"],
+          "expected_certainty": "COMPLETED",
+          "expected_safe_action": "RECONCILE_STATE"
+        },
+        {
+          "kind": "external-operation",
+          "id": "operation:fixture-send",
+          "evidence": ["dispatch persisted", "provider status unavailable", "no authoritative result receipt"],
+          "expected_certainty": "OUTCOME_UNKNOWN",
+          "expected_safe_action": "REQUIRE_EXTERNAL_RECONCILIATION"
+        }
+      ],
+      "expected_task_behavior": "remain RECOVERING; do not complete or retry the external operation"
+    },
+    {
+      "name": "missing-result-is-not-proof-of-not-started",
+      "task_id": "T-missing-result-fixture",
+      "subjects": [
+        {
+          "kind": "attempt",
+          "id": "attempt:fixture-1",
+          "evidence": ["binding persisted", "launch receipt missing", "supervisor status unavailable"],
+          "expected_certainty": "OUTCOME_UNKNOWN",
+          "expected_safe_action": "REQUIRE_EXTERNAL_RECONCILIATION"
+        }
+      ],
+      "forbidden_inference": "NOT_STARTED"
+    },
+    {
+      "name": "sibling-attempt-evidence-is-not-transferable",
+      "task_id": "T-sibling-attempt-fixture",
+      "subjects": [
+        {
+          "kind": "attempt",
+          "id": "attempt:fixture-complete",
+          "evidence": ["matching provider result receipt"],
+          "expected_certainty": "COMPLETED",
+          "expected_safe_action": "RECONCILE_STATE"
+        },
+        {
+          "kind": "attempt",
+          "id": "attempt:fixture-unknown",
+          "evidence": ["contradictory durable/runtime state"],
+          "expected_certainty": "OUTCOME_UNKNOWN",
+          "expected_safe_action": "REQUIRE_EXTERNAL_RECONCILIATION"
+        }
+      ],
+      "expected_task_behavior": "preserve both assessments and block optimistic retry/completion"
+    }
+  ]
+}

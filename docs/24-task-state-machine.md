@@ -30,6 +30,8 @@ States are control-plane facts. A model may recommend a transition but cannot wr
 ### CREATED
 
 Task identity exists and original intent/input references have been durably recorded.
+The private Task record retains the intent; append-only provenance retains only
+the versioned, nonce-bound creation-intent commitment defined by doc 73.
 
 No provider execution may begin in this state.
 
@@ -81,6 +83,12 @@ Pause may be user-requested, policy-driven, resource-driven, or due to system sh
 After daemon/device restart or uncertain provider failure, the control plane is reconciling persisted state with real execution/artifact state.
 
 No uncertain side effect should be blindly repeated while the task is in `RECOVERING`.
+
+Entry is a trusted coordinator operation, including while the daemon remains
+live. It is accepted only from `RUNNING`, `VERIFYING`, or `PAUSED`. The public
+transition-request surface cannot request this state. Actor strings, reserved
+transition-ID prefixes, and caller-supplied `internal` booleans are descriptive
+data rather than proof that the caller is the recovery coordinator.
 
 ### ROLLING_BACK
 
@@ -185,9 +193,10 @@ The persisted Task Manager should enforce an explicit table rather than accept a
 
 Implementation may model pre-final cancellation compensation by entering `ROLLING_BACK` before committing `CANCELLED`, or may record the desired terminal outcome separately. The semantics must be explicit and tested.
 
-The `RUNNING/VERIFYING -> RECOVERING` edges are reserved for deterministic
-startup/reconciliation when the prior process can no longer establish the
-in-flight state directly. Ordinary workers must not use them as a retry shortcut.
+The `RUNNING/VERIFYING/PAUSED -> RECOVERING` edges are reserved for deterministic
+startup or live reconciliation through the private trusted coordinator entry.
+That entry derives evidence from durable records and performs the normal
+revision CAS; ordinary workers cannot use recovery as a retry shortcut.
 
 ## Transition transaction
 
@@ -304,17 +313,19 @@ Models may produce a user-friendly explanation from this record, but the structu
 
 ## Restart recovery algorithm — v0.1
 
-On `aiosd` startup:
+After `aiosd` has acquired exclusive kernel-held ownership of the local store
+and advanced its durable fencing epoch, startup recovery:
 
 1. load tasks whose state is nonterminal;
-2. transition uncertain `RUNNING`/`VERIFYING` tasks to `RECOVERING` in a durable transaction;
-3. inspect persisted execution attempts and provider supervisor state;
-4. determine whether each attempt completed, failed, is still alive, or is unknown;
+2. select only `RUNNING`, `VERIFYING`, and `PAUSED` tasks whose durable facts require reconciliation and enter `RECOVERING` through the private coordinator operation;
+3. inspect persisted execution attempts, operations, allocations/publications, grants, and provider supervisor state;
+4. classify each attempt, external operation, Artifact publication, and other recovery subject independently from evidence for that exact subject;
 5. validate output artifact hashes/commit markers;
 6. reconstruct ready/blocked plan nodes;
 7. expire invalid grants;
 8. move task to `RUNNABLE`, `WAITING_FOR_*`, `PAUSED`, or `FAILED` as appropriate;
-9. never assume an unrecorded external side effect can simply be repeated.
+9. never infer one subject's certainty from another subject or assume missing evidence means an effect did not start;
+10. never assume an unrecorded external side effect can simply be repeated.
 
 ## v0.1 tests
 
@@ -329,7 +340,11 @@ At minimum:
 - cancel a task with one running and one pending step;
 - provider failure triggers safe retry/alternate-provider path;
 - verification failure returns to repair path without publishing false final output;
-- terminal state cannot be silently reopened.
+- terminal state cannot be silently reopened;
+- public transitions to `RECOVERING` fail even when the actor string or transition ID claims to be internal;
+- trusted live reconciliation accepts only `RUNNING`, `VERIFYING`, or `PAUSED` and derives its own evidence;
+- two local-store owners cannot both mutate or run recovery, and a stale fencing epoch cannot commit;
+- mixed per-subject evidence does not collapse into an optimistic Task-level retry decision.
 
 ## Non-goal
 
