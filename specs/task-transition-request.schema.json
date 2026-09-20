@@ -89,6 +89,7 @@
             "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
             "step_id": {"type": ["string", "null"], "maxLength": 128},
             "provider_id": {"type": ["string", "null"], "maxLength": 256},
+            "execution_binding_id": {"type": ["string", "null"], "maxLength": 256},
             "retryable": {"type": "boolean"},
             "safe_to_replan": {"type": "boolean"},
             "unknown_side_effects": {"type": "boolean"},
@@ -111,6 +112,7 @@
               "maxItems": 128,
               "items": {"type": "string", "maxLength": 256}
             },
+            "unknown_operations_ref": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
             "last_known_daemon_instance": {"type": ["string", "null"], "maxLength": 256}
           }
         }

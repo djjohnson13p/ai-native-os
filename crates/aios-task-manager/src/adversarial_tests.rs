@@ -392,10 +392,14 @@ fn spoofed_rollback_metadata_and_rejected_admission_are_durable_and_idempotent()
     failed.mutation.failure = Some(FailureRecord {
         code: "FAILED".to_owned(),
         summary: "no rollback".to_owned(),
+        step_id: None,
+        provider_id: None,
+        execution_binding_id: None,
         retryable: false,
         safe_to_replan: false,
         unknown_side_effects: false,
         rollback_available: false,
+        provenance_event_ids: Vec::new(),
     });
     assert!(manager.transition(&failed).unwrap().applied);
     let mut spoof = request(
@@ -680,6 +684,28 @@ fn seed_completion_fixture(
     verification_artifacts: &[&str],
     publication_state: &str,
 ) {
+    seed_completion_fixture_with_identity(
+        manager,
+        verification_hash,
+        "snapshot-completion",
+        "validation-completion",
+        verification_artifacts,
+        publication_state,
+    );
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds one complete durable completion fixture across related tables"
+)]
+fn seed_completion_fixture_with_identity(
+    manager: &mut TaskManager,
+    verification_hash: &str,
+    verification_snapshot: &str,
+    verification_validation: &str,
+    verification_artifacts: &[&str],
+    publication_state: &str,
+) {
     manager.create_task(&create("T-completion")).unwrap();
     manager
         .connection
@@ -752,12 +778,13 @@ fn seed_completion_fixture(
              INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
                  binding_id, attempt_id, sensitivity, retention, state,
-                 published_artifact_id, created_at, expires_at
+                 publication_id, published_artifact_id, created_at, expires_at
              ) VALUES (
                  'allocation-completion', 'T-completion',
                  'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                  'node-completion', 'binding-completion',
                  'attempt-completion', 'local', 'task', 'PUBLISHED',
+                 'publication-completion',
                  'artifact-output', '2026-09-19T00:00:00Z',
                  '2026-09-20T00:00:00Z'
              );
@@ -791,6 +818,13 @@ fn seed_completion_fixture(
             [publication_state],
         )
         .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT OR IGNORE INTO registry_snapshots (snapshot_id, manifest_json, created_at) VALUES (?1, '{}', '2026-09-19T00:00:00Z')",
+            [verification_snapshot],
+        )
+        .unwrap();
     let transaction = manager.connection.transaction().unwrap();
     let verification = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -800,6 +834,8 @@ fn seed_completion_fixture(
         "timestamp": "2026-09-19T00:00:00Z",
         "actor": {"kind":"system-service","id":"service:verifier"},
         "semantic_program_hash": verification_hash,
+        "registry_snapshot_id": verification_snapshot,
+        "validation_result_id": verification_validation,
         "input_artifacts": verification_artifacts,
         "output_artifacts": [],
         "status": "success"
@@ -928,6 +964,26 @@ fn provenance_verification_detects_previous_hash_event_json_and_sequence_tamperi
             "sequence",
             "UPDATE provenance_events SET sequence = 3 WHERE task_id = 'T-tamper' AND sequence = 2",
         ),
+        (
+            "event-id-column",
+            "UPDATE provenance_events SET event_id = 'event:tampered-column' WHERE task_id = 'T-tamper' AND sequence = 2",
+        ),
+        (
+            "stream-column",
+            "UPDATE provenance_events SET stream_id = 'task:other' WHERE task_id = 'T-tamper' AND sequence = 2",
+        ),
+        (
+            "timestamp-column",
+            "UPDATE provenance_events SET timestamp = '2026-09-20T00:00:00Z' WHERE task_id = 'T-tamper' AND sequence = 2",
+        ),
+        (
+            "event-type-column",
+            "UPDATE provenance_events SET event_type = 'task.failed' WHERE task_id = 'T-tamper' AND sequence = 2",
+        ),
+        (
+            "status-column",
+            "UPDATE provenance_events SET status = 'failure' WHERE task_id = 'T-tamper' AND sequence = 2",
+        ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         manager.create_task(&create("T-tamper")).unwrap();
@@ -1008,4 +1064,504 @@ fn recovering_to_running_rechecks_durable_approval_blockers_before_admission() {
             .state,
         StepState::Ready
     );
+}
+
+fn failure_record(unknown_side_effects: bool) -> FailureRecord {
+    FailureRecord {
+        code: "PROVIDER_FAILED".to_owned(),
+        summary: "provider failed".to_owned(),
+        step_id: Some("node-1".to_owned()),
+        provider_id: Some("provider:test".to_owned()),
+        execution_binding_id: Some("binding-1".to_owned()),
+        retryable: false,
+        safe_to_replan: false,
+        unknown_side_effects,
+        rollback_available: false,
+        provenance_event_ids: vec!["event:provider-failed".to_owned()],
+    }
+}
+
+#[test]
+fn task_and_step_creation_reject_schema_invalid_shapes_and_binding_mismatches() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let mut invalid_task = create("T-invalid-create");
+    invalid_task.normalized_intent = Some(serde_json::json!("scalar"));
+    invalid_task.active_step_ids = vec!["node-1".to_owned(), "node-1".to_owned()];
+    assert!(manager.create_task(&invalid_task).is_err());
+
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    let mismatched = CreateStepExecution {
+        attempt_id: "attempt-other".to_owned(),
+        task_id: "T-completion".to_owned(),
+        semantic_program_hash: HASH.to_owned(),
+        registry_snapshot_id: Some("snapshot-completion".to_owned()),
+        node_id: "node-completion".to_owned(),
+        binding_id: Some("binding-completion".to_owned()),
+        provider_id: Some("provider:test".to_owned()),
+        provider_version: Some("0.1.0".to_owned()),
+        attempt_number: 1,
+        state: StepState::Ready,
+        operation_id: None,
+        idempotency_key: None,
+        outcome_certainty: Some(OutcomeCertainty::NotStarted),
+        input_artifacts: vec!["duplicate".to_owned(), "duplicate".to_owned()],
+        output_artifacts: Vec::new(),
+        failure: None,
+        started_at: None,
+        finished_at: None,
+    };
+    assert!(manager.create_step_execution(&mismatched).is_err());
+    let mut bounded_but_mismatched = mismatched;
+    bounded_but_mismatched.input_artifacts = Vec::new();
+    assert!(
+        manager
+            .create_step_execution(&bounded_but_mismatched)
+            .is_err()
+    );
+}
+
+#[test]
+fn task_record_returns_active_program_envelope_and_only_live_current_bindings() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute(
+            "UPDATE step_executions SET state = 'READY' WHERE attempt_id = 'attempt-completion'",
+            [],
+        )
+        .unwrap();
+    let task = manager.get_task("T-completion").unwrap().unwrap();
+    let active_program = task.active_program.unwrap();
+    assert_eq!(active_program["program_id"], "program-completion");
+    assert_eq!(active_program["semantic_hash"], HASH);
+    assert_eq!(
+        active_program["registry_snapshot_id"],
+        "snapshot-completion"
+    );
+    assert_eq!(
+        active_program["validation_result_id"],
+        "validation-completion"
+    );
+    assert!(active_program.get("nodes").is_none());
+    assert_eq!(
+        task.active_execution_binding_ids,
+        vec!["binding-completion"]
+    );
+    manager
+        .connection
+        .execute(
+            "UPDATE step_executions SET state = 'SUCCEEDED' WHERE attempt_id = 'attempt-completion'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        manager
+            .get_task("T-completion")
+            .unwrap()
+            .unwrap()
+            .active_execution_binding_ids
+            .is_empty()
+    );
+}
+
+#[test]
+fn completion_rejects_unknown_attempt_wrong_allocation_identity_and_verification_identity() {
+    let mut unknown = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut unknown, HASH, &["artifact-output"], "COMMITTED");
+    unknown.connection.execute(
+        "INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-unknown', 'T-completion', ?1, 'node-other', 1, 1, 'UNKNOWN', 'OUTCOME_UNKNOWN', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z')",
+        [HASH],
+    ).unwrap();
+    assert_eq!(
+        unknown
+            .transition(&completion_request("tr-unknown-attempt"))
+            .unwrap()
+            .reason_code,
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+    );
+
+    let mut wrong_allocation =
+        TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(
+        &mut wrong_allocation,
+        HASH,
+        &["artifact-output"],
+        "COMMITTED",
+    );
+    wrong_allocation
+        .connection
+        .execute(
+            "UPDATE artifact_output_allocations SET node_id = 'node-other' WHERE allocation_id = 'allocation-completion'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        wrong_allocation
+            .transition(&completion_request("tr-wrong-allocation"))
+            .unwrap()
+            .reason_code,
+        "TASK_COMPLETION_GATE_FAILED"
+    );
+
+    let mut stale_identity = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture_with_identity(
+        &mut stale_identity,
+        HASH,
+        "snapshot-stale",
+        "validation-stale",
+        &["artifact-output"],
+        "COMMITTED",
+    );
+    assert_eq!(
+        stale_identity
+            .transition(&completion_request("tr-stale-identity"))
+            .unwrap()
+            .reason_code,
+        "TASK_COMPLETION_GATE_FAILED"
+    );
+}
+
+#[test]
+fn completion_requires_completed_certainty_no_proposed_blocker_and_coherent_plan() {
+    let mut certainty = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut certainty, HASH, &["artifact-output"], "COMMITTED");
+    certainty
+        .connection
+        .execute(
+            "UPDATE step_executions SET outcome_certainty = 'FAILED_PARTIAL_EFFECT' WHERE attempt_id = 'attempt-completion'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        certainty
+            .transition(&completion_request("tr-bad-certainty"))
+            .unwrap()
+            .reason_code,
+        "TASK_COMPLETION_GATE_FAILED"
+    );
+
+    let mut blocker = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut blocker, HASH, &["artifact-output"], "COMMITTED");
+    let mut completion_with_blocker = completion_request("tr-proposed-blocker");
+    completion_with_blocker.mutation.waiting_on = Some(vec![WaitingOn {
+        kind: WaitingKind::Input,
+        id: "input:missing".to_owned(),
+        message: None,
+    }]);
+    assert_eq!(
+        blocker
+            .transition(&completion_with_blocker)
+            .unwrap()
+            .reason_code,
+        "TASK_COMPLETION_GATE_FAILED"
+    );
+
+    let mut plan = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut plan, HASH, &["artifact-output"], "COMMITTED");
+    plan.connection.execute_batch(
+        "INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 1, 'plan-1', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 2, 'plan-2', '{}', '2026-09-19T00:00:00Z');
+         UPDATE semantic_program_revisions SET created_from_plan_revision = 1 WHERE task_id = 'T-completion' AND program_revision = 1;",
+    ).unwrap();
+    let mut incoherent = completion_request("tr-plan-mismatch");
+    incoherent.mutation.active_plan = Some(ActivePlan {
+        plan_id: "plan-2".to_owned(),
+        revision: 2,
+    });
+    assert_eq!(
+        plan.transition(&incoherent).unwrap().reason_code,
+        "TASK_PROGRAM_NOT_RUNNABLE"
+    );
+}
+
+#[test]
+fn cancellation_and_failure_preserve_live_or_unknown_effects() {
+    let mut cancellation = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut cancellation, HASH, &["artifact-output"], "COMMITTED");
+    cancellation.connection.execute(
+        "INSERT INTO operations (operation_id, task_id, semantic_program_hash, node_id, effect_class, state, outcome_certainty, prepared_at) VALUES ('operation-live', 'T-completion', ?1, 'node-completion', 'NETWORK', 'STARTED', 'STARTED_NO_EFFECT', '2026-09-19T00:00:00Z')",
+        [HASH],
+    ).unwrap();
+    assert_eq!(
+        cancellation
+            .transition(&request(
+                "tr-cancel-live",
+                "T-completion",
+                2,
+                TaskState::Verifying,
+                TaskState::Cancelled,
+            ))
+            .unwrap()
+            .reason_code,
+        "TASK_TRANSITION_GUARD_FAILED"
+    );
+
+    let mut failure = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    failure.create_task(&create("T-unknown-failure")).unwrap();
+    failure.connection.execute(
+        "INSERT INTO operations (operation_id, task_id, semantic_program_hash, node_id, effect_class, state, outcome_certainty, prepared_at) VALUES ('operation-unknown-failure', 'T-unknown-failure', ?1, 'node-1', 'NETWORK', 'UNKNOWN', 'OUTCOME_UNKNOWN', '2026-09-19T00:00:00Z')",
+        [HASH],
+    ).unwrap();
+    let mut denied = request(
+        "tr-unknown-failed",
+        "T-unknown-failure",
+        1,
+        TaskState::Created,
+        TaskState::Failed,
+    );
+    denied.mutation.failure = Some(failure_record(false));
+    assert_eq!(
+        failure.transition(&denied).unwrap().reason_code,
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+    );
+    let mut override_recorded = denied;
+    override_recorded.transition_id = "tr-unknown-failed-override".to_owned();
+    override_recorded.mutation.failure = Some(failure_record(true));
+    assert!(failure.transition(&override_recorded).unwrap().applied);
+}
+
+#[test]
+fn every_cancellation_source_requires_durable_effect_containment() {
+    for (name, state) in [
+        ("paused", TaskState::Paused),
+        ("runnable", TaskState::Runnable),
+        ("waiting-input", TaskState::WaitingForInput),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-cancel-source")).unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET revision = 2, state = ?1 WHERE task_id = 'T-cancel-source'",
+                [state.as_str()],
+            )
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO operations (operation_id, task_id, semantic_program_hash, node_id, effect_class, state, outcome_certainty, prepared_at) VALUES ('operation-live', 'T-cancel-source', ?1, 'node-1', 'NETWORK', 'STARTED', 'STARTED_NO_EFFECT', '2026-09-19T00:00:00Z')",
+            [HASH],
+        ).unwrap();
+        let result = manager
+            .transition(&request(
+                &format!("tr-cancel-{name}"),
+                "T-cancel-source",
+                2,
+                state,
+                TaskState::Cancelled,
+            ))
+            .unwrap();
+        assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+    }
+}
+
+#[test]
+fn terminal_step_state_with_unknown_certainty_still_blocks_indirect_cancellation() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager
+        .create_task(&create("T-cancel-unknown-step"))
+        .unwrap();
+    manager
+        .connection
+        .execute_batch(
+            "UPDATE tasks SET revision = 2, state = 'PAUSED'
+             WHERE task_id = 'T-cancel-unknown-step';
+             INSERT INTO step_executions (
+                 attempt_id, task_id, semantic_program_hash, node_id,
+                 attempt_number, revision, state, outcome_certainty,
+                 input_artifacts_json, output_artifacts_json,
+                 created_at, updated_at
+             ) VALUES (
+                 'attempt-uncertain-terminal', 'T-cancel-unknown-step',
+                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'node-1', 1, 2, 'SUCCEEDED', 'OUTCOME_UNKNOWN', '[]', '[]',
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
+             );",
+        )
+        .unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-cancel-unknown-step",
+            "T-cancel-unknown-step",
+            2,
+            TaskState::Paused,
+            TaskState::Cancelled,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+}
+
+#[test]
+fn failure_identity_changes_are_not_idempotent_and_are_committed_to_provenance() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.create_task(&create("T-failure-identity")).unwrap();
+    let mut first = request(
+        "tr-failure-identity",
+        "T-failure-identity",
+        1,
+        TaskState::Created,
+        TaskState::Failed,
+    );
+    first.mutation.failure = Some(failure_record(false));
+    assert!(manager.transition(&first).unwrap().applied);
+    let event_json: String = manager
+        .connection
+        .query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id = 'T-failure-identity' ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: Value = serde_json::from_str(&event_json).unwrap();
+    assert_eq!(
+        event.pointer("/committed_mutation/failure/step_id"),
+        Some(&serde_json::json!("node-1"))
+    );
+    let mut reused = first;
+    reused.mutation.failure.as_mut().unwrap().step_id = Some("node-2".to_owned());
+    assert_eq!(
+        manager.transition(&reused).unwrap().reason_code,
+        "TASK_TRANSITION_ID_REUSE_CONFLICT"
+    );
+}
+
+#[test]
+fn expired_or_revoked_exact_grants_block_point_of_admission() {
+    for (name, state, expires_at) in [
+        ("revoked", "REVOKED", "2026-09-20T00:00:00Z"),
+        ("expired", "ACTIVE", "2026-09-18T00:00:00Z"),
+        (
+            "positive-offset-expired",
+            "ACTIVE",
+            "2026-09-19T01:00:00+02:00",
+        ),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        manager.connection.execute_batch(
+            "UPDATE tasks SET state = 'RECOVERING', waiting_on_json = '[]' WHERE task_id = 'T-completion';
+             UPDATE step_executions SET state = 'READY' WHERE attempt_id = 'attempt-completion';
+             DROP TRIGGER execution_bindings_no_update;
+             UPDATE execution_bindings SET grant_refs_json = '[\"grant-admission\"]' WHERE binding_id = 'binding-completion';
+             INSERT INTO policy_snapshots (snapshot_id, scope_kind, scope_id, policy_language, policy_set_hash, engine_id, engine_version, snapshot_json, created_at) VALUES ('policy-snapshot', 'task', 'T-completion', 'fixture', 'sha256:policy', 'engine:test', '0.1', '{}', '2026-09-19T00:00:00Z');
+             INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, request_json, requested_at) VALUES ('authority-admission', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'test.execute', 'resource', 'resource-1', '{}', '2026-09-19T00:00:00Z');
+             INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-admission', 'authority-admission', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'provider', 'provider:test', 'test.execute', 'resource', 'resource-1', 'ALLOW', 'policy-snapshot', '[]', '{}', '2026-09-19T00:00:00Z');",
+        ).unwrap();
+        manager.connection.execute(
+            "INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-admission', 'T-completion', ?1, 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-admission', 'policy-snapshot', '[]', 'ONE_SHOT', 1, 0, ?2, '2026-09-19T00:00:00Z', ?3)",
+            rusqlite::params![HASH, state, expires_at],
+        ).unwrap();
+        assert_eq!(
+            manager
+                .transition(&request(
+                    &format!("tr-grant-{name}"),
+                    "T-completion",
+                    2,
+                    TaskState::Recovering,
+                    TaskState::Running,
+                ))
+                .unwrap()
+                .reason_code,
+            "TASK_TRANSITION_GUARD_FAILED",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn migration_quarantines_pending_receipts_and_rejects_checksum_mismatch() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("checksum.sqlite3");
+    {
+        let _manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_migrations SET checksum = 'wrong' WHERE migration_id = '0002_task_manager_contract_reconciliation'",
+            [],
+        )
+        .unwrap();
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+
+    let legacy = directory.path().join("pending.sqlite3");
+    let connection = Connection::open(&legacy).unwrap();
+    connection.execute_batch(
+        "CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
+         CREATE TABLE tasks (task_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, state TEXT NOT NULL, state_reason_json TEXT, principal_kind TEXT NOT NULL, principal_id TEXT NOT NULL, workspace_id TEXT, original_intent TEXT NOT NULL, normalized_intent_json TEXT, active_program_revision INTEGER, constraints_json TEXT, failure_json TEXT, recovery_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+         CREATE TABLE task_transitions (transition_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, expected_revision INTEGER NOT NULL, expected_state TEXT NOT NULL, to_state TEXT NOT NULL, result_revision INTEGER, result_state TEXT, outcome TEXT NOT NULL, reason_code TEXT NOT NULL, request_json TEXT NOT NULL, result_json TEXT, provenance_event_id TEXT, requested_at TEXT NOT NULL, committed_at TEXT, FOREIGN KEY (task_id) REFERENCES tasks(task_id));
+         INSERT INTO tasks (task_id, revision, state, principal_kind, principal_id, original_intent, created_at, updated_at) VALUES ('T-pending', 1, 'CREATED', 'user', 'user:test', 'pending', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
+         INSERT INTO task_transitions (transition_id, task_id, expected_revision, expected_state, to_state, outcome, reason_code, request_json, requested_at) VALUES ('tr-pending', 'T-pending', 1, 'CREATED', 'PLANNING', 'PENDING', 'STATE_CHANGE_REQUESTED', '{}', '2026-09-19T00:00:00Z');",
+    ).unwrap();
+    drop(connection);
+    assert!(TaskManager::open_with_clock(&legacy, Box::new(FixedClock)).is_err());
+    let connection = Connection::open(&legacy).unwrap();
+    let (outcome, result): (String, Option<String>) = connection
+        .query_row(
+            "SELECT outcome, result_json FROM task_transitions WHERE transition_id = 'tr-pending'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "REJECTED");
+    assert!(result.is_some());
+}
+
+#[test]
+fn startup_recovery_namespace_and_bounded_unknown_reference_resist_squatting_and_scale() {
+    let maximum_task_id = "t".repeat(256);
+    let bounded_id = startup_recovery_transition_id(&maximum_task_id, u64::MAX);
+    assert!(bounded_id.len() <= 256);
+    assert_eq!(
+        bounded_id,
+        startup_recovery_transition_id(&maximum_task_id, u64::MAX)
+    );
+    assert_ne!(
+        bounded_id,
+        startup_recovery_transition_id(&maximum_task_id, u64::MAX - 1)
+    );
+
+    let mut in_memory = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let reserved = request(
+        "__aios_internal:startup-recovery:attacker",
+        "missing",
+        1,
+        TaskState::Running,
+        TaskState::Recovering,
+    );
+    assert!(in_memory.transition(&reserved).is_err());
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("many-unknown.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        seed_nonterminal_history(&mut manager, "T-many-unknown", TaskState::Running);
+        let transaction = manager.connection.transaction().unwrap();
+        for index in 0..140 {
+            transaction.execute(
+                "INSERT INTO operations (operation_id, task_id, semantic_program_hash, node_id, effect_class, state, outcome_certainty, prepared_at) VALUES (?1, 'T-many-unknown', ?2, 'node-1', 'NETWORK', 'UNKNOWN', 'OUTCOME_UNKNOWN', '2026-09-19T00:00:00Z')",
+                rusqlite::params![format!("operation-{index:03}"), HASH],
+            ).unwrap();
+        }
+        transaction.execute(
+            "INSERT INTO task_transitions (transition_id, task_id, expected_revision, expected_state, to_state, outcome, reason_code, request_json, result_json, requested_at, committed_at) VALUES ('startup-recovery:T-many-unknown:4', 'T-many-unknown', 4, 'RUNNING', 'RECOVERING', 'REJECTED', 'TASK_TRANSITION_GUARD_FAILED', '{}', '{}', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z')",
+            [],
+        ).unwrap();
+        transaction.commit().unwrap();
+    }
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let task = manager.get_task("T-many-unknown").unwrap().unwrap();
+    assert_eq!(task.state, TaskState::Recovering);
+    let recovery = task.recovery.unwrap();
+    assert!(recovery.get("unknown_operation_ids").is_none());
+    let recovery_ref = recovery["unknown_operations_ref"].as_str().unwrap();
+    assert!(recovery_ref.starts_with("recovery-operations:sha256:"));
+    let resolved = manager
+        .recovery_unknown_operation_ids(recovery_ref)
+        .unwrap()
+        .unwrap();
+    let expected = (0..140)
+        .map(|index| format!("operation-{index:03}"))
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 140);
+    assert_eq!(resolved, expected);
 }
