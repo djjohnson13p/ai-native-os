@@ -80,13 +80,27 @@ fn push_schema_diagnostic(
     diagnostics: &mut DiagnosticCollector,
 ) {
     let instance_path = error.instance_path().as_str();
-    let mut diagnostic = Diagnostic::new(code, error.to_string());
+    let mut diagnostic = Diagnostic::new(code, sanitized_schema_message(code));
     diagnostic.json_pointer = Some(if instance_path.is_empty() {
         "/".to_owned()
     } else {
         instance_path.to_owned()
     });
     diagnostics.push(diagnostic);
+}
+
+fn sanitized_schema_message(code: ValidatorReasonCode) -> &'static str {
+    match code {
+        ValidatorReasonCode::IrSchemaRequired => "a required property is missing",
+        ValidatorReasonCode::IrSchemaPattern => "a value does not match the required pattern",
+        ValidatorReasonCode::IrSchemaAdditionalProperty => {
+            "an object contains an unsupported property"
+        }
+        ValidatorReasonCode::IrSchemaEnum => "a value is outside the allowed set",
+        ValidatorReasonCode::IrSchemaRange => "a value is outside the allowed bounds",
+        ValidatorReasonCode::IrSchemaType => "a value has an invalid JSON type or structure",
+        _ => "the document violates the AIOS IR schema",
+    }
 }
 
 fn classify_schema_failure(error: &jsonschema::ValidationError<'_>) -> ValidatorReasonCode {

@@ -13,8 +13,9 @@ use aios_contracts::{
     CapabilityContract, ContractRef, EffectClass, RegistrySnapshot, SCHEMA_VERSION_V0_1,
     TypeContract, ValidatorReasonCode,
 };
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, File};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::{Read, Take};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -210,7 +211,7 @@ impl SemanticRegistry {
 ///
 /// Returns an operational error for local I/O failures or a coded registry
 /// error when the bundle violates its schema, identities, or invariants.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn load_registry_bundle(
     directory: impl AsRef<Path>,
     options: RegistryLoadOptions,
@@ -225,10 +226,18 @@ pub fn load_registry_bundle(
             RegistryError::operational("registry bundle path is not a directory").at_path(root),
         );
     }
+    let bundle = Dir::open_ambient_dir(&root, ambient_authority()).map_err(|error| {
+        RegistryError::operational(format!("cannot open registry directory: {error}"))
+            .at_path(&root)
+    })?;
 
-    validate_relative_source(&options.snapshot_file)?;
-    let snapshot_path = resolve_local_source(&root, &options.snapshot_file)?;
-    let snapshot_bytes = read_bounded(&snapshot_path, options.limits.json.max_bytes)?;
+    let (snapshot_path, snapshot_file) = open_local_source(&bundle, &root, &options.snapshot_file)?;
+    let snapshot_limit = options
+        .limits
+        .json
+        .max_bytes
+        .min(options.limits.max_total_bytes);
+    let snapshot_bytes = read_bounded(snapshot_file, &snapshot_path, snapshot_limit)?;
     let mut total_bytes = snapshot_bytes.len();
     enforce_total_bytes(total_bytes, options.limits.max_total_bytes)?;
     let snapshot: RegistrySnapshot = schema::decode_with_record_limit(
@@ -260,8 +269,10 @@ pub fn load_registry_bundle(
 
     let mut type_contracts = Vec::new();
     for source in type_sources {
-        let path = resolve_local_source(&root, &source)?;
-        let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
+        let (path, file) = open_local_source(&bundle, &root, &source)?;
+        let remaining_bytes = options.limits.max_total_bytes.saturating_sub(total_bytes);
+        let read_limit = options.limits.json.max_bytes.min(remaining_bytes);
+        let bytes = read_bounded(file, &path, read_limit)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
         let remaining_contracts = options
@@ -282,8 +293,10 @@ pub fn load_registry_bundle(
 
     let mut capability_contracts = Vec::new();
     for source in capability_sources {
-        let path = resolve_local_source(&root, &source)?;
-        let bytes = read_bounded(&path, options.limits.json.max_bytes)?;
+        let (path, file) = open_local_source(&bundle, &root, &source)?;
+        let remaining_bytes = options.limits.max_total_bytes.saturating_sub(total_bytes);
+        let read_limit = options.limits.json.max_bytes.min(remaining_bytes);
+        let bytes = read_bounded(file, &path, read_limit)?;
         total_bytes =
             checked_total_bytes(total_bytes, bytes.len(), options.limits.max_total_bytes)?;
         let loaded_contracts =
@@ -999,9 +1012,12 @@ fn validate_cross_references(
     capabilities: &BTreeMap<(String, u64), Arc<CapabilityContract>>,
 ) -> RegistryResult<()> {
     for contract in types.values() {
+        let declaring_version = FullVersion::parse(&contract.version)?;
+        let declaring_family = (&contract.type_id, declaring_version.major);
         for reference in &contract.conversion_capabilities {
             let reference = SemanticRef::parse(reference)?;
-            if !capabilities.contains_key(&(reference.id.clone(), reference.major)) {
+            let Some(capability) = capabilities.get(&(reference.id.clone(), reference.major))
+            else {
                 return Err(RegistryError::validation(
                     ValidatorReasonCode::RegistryEntryNotFound,
                     format!(
@@ -1009,6 +1025,20 @@ fn validate_cross_references(
                         contract.type_id, reference.id, reference.major
                     ),
                 ));
+            };
+            let transports_declaring_type = capability
+                .inputs
+                .values()
+                .chain(capability.outputs.values())
+                .map(|port| SemanticRef::parse(&port.type_ref))
+                .collect::<RegistryResult<Vec<_>>>()?
+                .iter()
+                .any(|port_type| (&port_type.id, port_type.major) == declaring_family);
+            if !transports_declaring_type {
+                return Err(RegistryError::schema(format!(
+                    "type {} conversion capability {}@{} has no port in the declaring type family",
+                    contract.type_id, reference.id, reference.major
+                )));
             }
         }
     }
@@ -1206,29 +1236,27 @@ fn validate_relative_source(source: &Path) -> RegistryResult<()> {
     Ok(())
 }
 
-fn resolve_local_source(root: &Path, source: &Path) -> RegistryResult<PathBuf> {
+fn open_local_source(bundle: &Dir, root: &Path, source: &Path) -> RegistryResult<(PathBuf, File)> {
     validate_relative_source(source)?;
     let candidate = root.join(source);
-    let resolved = candidate.canonicalize().map_err(|error| {
+    let file = bundle.open(source).map_err(|error| {
         RegistryError::operational(format!("cannot open registry source: {error}"))
             .at_path(&candidate)
     })?;
-    if !resolved.starts_with(root) {
-        return Err(RegistryError::schema(format!(
-            "registry source {} resolves outside the supplied bundle",
-            source.display()
-        )));
+    if !file
+        .metadata()
+        .map_err(|error| {
+            RegistryError::operational(format!("cannot inspect registry source: {error}"))
+                .at_path(&candidate)
+        })?
+        .is_file()
+    {
+        return Err(RegistryError::operational("registry source is not a file").at_path(&candidate));
     }
-    if !resolved.is_file() {
-        return Err(RegistryError::operational("registry source is not a file").at_path(resolved));
-    }
-    Ok(resolved)
+    Ok((candidate, file))
 }
 
-fn read_bounded(path: &Path, maximum: usize) -> RegistryResult<Vec<u8>> {
-    let file = File::open(path).map_err(|error| {
-        RegistryError::operational(format!("cannot read registry source: {error}")).at_path(path)
-    })?;
+fn read_bounded(file: File, path: &Path, maximum: usize) -> RegistryResult<Vec<u8>> {
     let maximum_plus_one = maximum.saturating_add(1);
     let mut reader: Take<File> = file.take(u64::try_from(maximum_plus_one).unwrap_or(u64::MAX));
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
@@ -1482,6 +1510,72 @@ mod tests {
     }
 
     #[test]
+    fn source_reads_use_only_the_remaining_aggregate_byte_budget() {
+        let snapshot_bytes = usize::try_from(
+            std::fs::metadata(fixture_root().join("registry-snapshot.json"))
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+        let error = SemanticRegistry::load_bundle(
+            fixture_root(),
+            RegistryLoadOptions {
+                limits: RegistryLimits {
+                    json: StrictJsonLimits {
+                        max_bytes: 1024 * 1024,
+                        ..StrictJsonLimits::default()
+                    },
+                    max_total_bytes: snapshot_bytes + 1,
+                    ..RegistryLimits::default()
+                },
+                ..RegistryLoadOptions::default()
+            },
+        )
+        .expect_err("the next source must be bounded to the one remaining byte");
+        assert_eq!(
+            error.reason_code(),
+            Some(ValidatorReasonCode::RegistrySchemaInvalid)
+        );
+        assert!(error.message.contains("configured 1-byte limit"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_source_open_rejects_symlinks_outside_the_directory_capability() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "aios-registry-capability-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::copy(
+            fixture_root().join("registry-snapshot.json"),
+            scratch.join("registry-snapshot.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            fixture_root().join("capability-contracts.json"),
+            scratch.join("capability-contracts.json"),
+        )
+        .unwrap();
+        symlink(
+            fixture_root().join("type-contracts.json"),
+            scratch.join("type-contracts.json"),
+        )
+        .unwrap();
+
+        let error = SemanticRegistry::load_bundle(&scratch, RegistryLoadOptions::default())
+            .expect_err("a source symlink escaping the retained directory handle must fail");
+        assert!(error.is_operational());
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
     fn protected_required_effects_require_mapped_required_authority() {
         let (_, _, capabilities) = fixture_records();
         let mut protected = capabilities
@@ -1685,6 +1779,38 @@ mod tests {
         };
         let error = SemanticRegistry::load_bundle(fixture_root(), below_limit)
             .expect_err("one contract above the configured limit must fail");
+        assert_eq!(
+            error.reason_code(),
+            Some(ValidatorReasonCode::RegistrySchemaInvalid)
+        );
+    }
+
+    #[test]
+    fn conversion_capability_must_transport_the_declaring_type_family() {
+        let (_, mut types, capabilities) = fixture_records();
+        let target = types
+            .iter_mut()
+            .find(|contract| contract.type_id == "artifact.table")
+            .unwrap();
+        target.conversion_capabilities = vec!["report.summarize@1".to_owned()];
+
+        let types = types
+            .into_iter()
+            .map(|contract| {
+                let major = FullVersion::parse(&contract.version).unwrap().major;
+                ((contract.type_id.clone(), major), Arc::new(contract))
+            })
+            .collect();
+        let capabilities = capabilities
+            .into_iter()
+            .map(|contract| {
+                let major = FullVersion::parse(&contract.version).unwrap().major;
+                ((contract.capability.clone(), major), Arc::new(contract))
+            })
+            .collect();
+
+        let error = validate_cross_references(&types, &capabilities)
+            .expect_err("an unrelated existing capability is not a conversion edge");
         assert_eq!(
             error.reason_code(),
             Some(ValidatorReasonCode::RegistrySchemaInvalid)

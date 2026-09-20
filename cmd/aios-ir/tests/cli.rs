@@ -161,6 +161,45 @@ fn deterministic_rejection_uses_exit_two_and_never_emits_identity() {
 }
 
 #[test]
+fn schema_rejections_do_not_echo_invalid_instance_values() {
+    let secret = "Bearer sk-test-super-secret-do-not-log";
+    let base: Value = serde_json::from_slice(
+        &std::fs::read(fixture_root().join("demonstration-a.ir.json")).unwrap(),
+    )
+    .unwrap();
+    for (label, pointer) in [
+        ("secret-program-id", "/program_id"),
+        (
+            "secret-authority-resource",
+            "/nodes/0/authority_requests/0/resource",
+        ),
+    ] {
+        let mut program = base.clone();
+        *program.pointer_mut(pointer).unwrap() = Value::String(secret.to_owned());
+        let path = temporary_program(label, &serde_json::to_vec(&program).unwrap());
+        let output = run_program("validate", &path);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["validation"]["diagnostics"][0]["code"],
+            "IR_SCHEMA_PATTERN"
+        );
+        assert!(response["validation"]["semantic_hash"].is_null());
+        assert!(
+            !serde_json::to_string(&response["validation"]["diagnostics"])
+                .unwrap()
+                .contains(secret)
+        );
+        if label == "secret-authority-resource" {
+            assert!(!String::from_utf8(output.stdout).unwrap().contains(secret));
+        }
+    }
+}
+
+#[test]
 fn oversized_input_is_bounded_and_rejected() {
     let program = temporary_program("oversized", &vec![b' '; 1_048_577]);
     let output = run_program("validate", &program);

@@ -452,6 +452,36 @@ fn verifier_inventory_does_not_claim_all_outputs_are_gated() {
 }
 
 #[test]
+fn schema_diagnostics_never_echo_invalid_instance_values() {
+    let validator = validator();
+    let secret = "Bearer sk-test-super-secret-do-not-log";
+    for (pointer, expected) in [
+        ("/program_id", ValidatorReasonCode::IrSchemaPattern),
+        (
+            "/nodes/0/authority_requests/0/resource",
+            ValidatorReasonCode::IrSchemaPattern,
+        ),
+    ] {
+        let mut input = program();
+        *input.pointer_mut(pointer).unwrap() = json!(secret);
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+
+        assert_eq!(diagnostic_codes(&report), [expected]);
+        assert!(report.output.validation.semantic_hash.is_none());
+        let rendered = serde_json::to_string(&report.output.validation.diagnostics).unwrap();
+        assert!(!rendered.contains(secret), "secret leaked for {pointer}");
+        assert!(
+            report
+                .output
+                .validation
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains(secret))
+        );
+    }
+}
+
+#[test]
 fn out_of_range_metadata_numbers_are_inert_but_semantic_numbers_stay_bounded() {
     let validator = validator();
     let baseline = validator.validate_bytes(&serde_json::to_vec(&program()).unwrap());

@@ -4,7 +4,7 @@ use crate::version::{FullVersion, SemanticRef, validate_semantic_id};
 use crate::{SemanticRegistry, effect_for_authority_class};
 use aios_contracts::{
     CapabilityManifest, EffectClass, EgressMode, Locality, NetworkDefault, ProviderCapability,
-    ProviderReasonCode, SCHEMA_VERSION_V0_1,
+    ProviderReasonCode, ProviderRuntimeKind, SCHEMA_VERSION_V0_1,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -101,7 +101,13 @@ pub fn validate_provider_manifest(
             );
             continue;
         }
-        validate_provider_capability(registry, provider_capability, options, &mut collector);
+        validate_provider_capability(
+            registry,
+            provider_capability,
+            manifest.runtime.kind,
+            options,
+            &mut collector,
+        );
     }
 
     collector.finish()
@@ -111,6 +117,7 @@ pub fn validate_provider_manifest(
 fn validate_provider_capability(
     registry: &SemanticRegistry,
     provider: &ProviderCapability,
+    runtime_kind: ProviderRuntimeKind,
     options: ProviderConformanceOptions,
     collector: &mut DiagnosticCollector,
 ) {
@@ -277,23 +284,22 @@ fn validate_provider_capability(
         .locality
         .iter()
         .any(|locality| *locality != Locality::Local);
-    let declares_network_effect = provider.effect_classes.contains(&EffectClass::Network);
-    if (network_default_requires_network || network_reachable_locality) && !declares_network_effect
-    {
+    let remote_runtime = runtime_kind == ProviderRuntimeKind::Remote;
+    let local_only_capability = provider.execution.locality == [Locality::Local];
+    if remote_runtime && local_only_capability {
         collector.push(
-            ProviderReasonCode::ProviderRequiredEffectMissing,
-            "provider network default or remote locality requires the NETWORK effect declaration",
+            ProviderReasonCode::ProviderDeclarationInvalid,
+            "remote provider runtime contradicts a local-only capability declaration",
             Some(capability.clone()),
         );
     }
-    if (network_default_requires_network || network_reachable_locality || declares_network_effect)
-        && !authority_actions
-            .iter()
-            .any(|action| action == "network.connect")
-    {
+    let remote_execution = remote_runtime || network_reachable_locality;
+    let requires_network_envelope = network_default_requires_network || remote_execution;
+    let declares_network_effect = provider.effect_classes.contains(&EffectClass::Network);
+    if requires_network_envelope && !declares_network_effect {
         collector.push(
-            ProviderReasonCode::ProviderRequiredAuthorityMissing,
-            "provider network declaration requires network.connect authority",
+            ProviderReasonCode::ProviderRequiredEffectMissing,
+            "provider network default or remote execution requires the NETWORK effect declaration",
             Some(capability.clone()),
         );
     }
@@ -302,18 +308,40 @@ fn validate_provider_capability(
     let declares_data_egress_authority = authority_actions
         .iter()
         .any(|action| action == "data.egress");
-    if declares_data_egress_effect && !declares_data_egress_authority {
+    let remote_required_input =
+        remote_execution && contract.inputs.values().any(|input| input.required);
+    if remote_required_input && !declares_data_egress_effect {
         collector.push(
-            ProviderReasonCode::ProviderRequiredAuthorityMissing,
-            "provider DATA_EGRESS effect requires data.egress authority",
+            ProviderReasonCode::ProviderRequiredEffectMissing,
+            "remote execution with required inputs requires the DATA_EGRESS effect declaration",
             Some(capability.clone()),
         );
     }
-    let provider_egress = if declares_data_egress_effect || declares_data_egress_authority {
-        EgressMode::Policy
-    } else {
-        EgressMode::Deny
-    };
+    let missing_protected_effect_authority = provider
+        .effect_classes
+        .iter()
+        .copied()
+        .chain(requires_network_envelope.then_some(EffectClass::Network))
+        .chain(remote_required_input.then_some(EffectClass::DataEgress))
+        .filter(|effect| !matches!(effect, EffectClass::Pure | EffectClass::LegacyOpaque))
+        .any(|effect| {
+            !authority_actions
+                .iter()
+                .any(|action| effect_for_authority_class(action) == Some(effect))
+        });
+    if missing_protected_effect_authority {
+        collector.push(
+            ProviderReasonCode::ProviderRequiredAuthorityMissing,
+            "provider protected effects require their mapped authority actions",
+            Some(capability.clone()),
+        );
+    }
+    let provider_egress =
+        if remote_required_input || declares_data_egress_effect || declares_data_egress_authority {
+            EgressMode::Policy
+        } else {
+            EgressMode::Deny
+        };
     if !contract.allowed_egress_modes.contains(&provider_egress) {
         collector.push(
             ProviderReasonCode::ProviderEgressNotAllowed,
@@ -507,15 +535,13 @@ mod tests {
         parse_strict_json(&bytes, StrictJsonLimits::default()).unwrap()
     }
 
-    fn network_only_deny_registry() -> SemanticRegistry {
+    fn modified_report_registry(mutate: impl FnOnce(&mut CapabilityContract)) -> SemanticRegistry {
         let (mut snapshot, types, mut capabilities) = fixture_records();
         let contract = capabilities
             .iter_mut()
             .find(|contract| contract.capability == "report.summarize")
             .unwrap();
-        contract.allowed_effect_classes = vec![EffectClass::Network];
-        contract.allowed_authority_classes = vec!["network.connect".to_owned()];
-        contract.allowed_egress_modes = vec![EgressMode::Deny];
+        mutate(contract);
 
         let contract_hash = capability_contract_hash(contract).unwrap().to_string();
         snapshot
@@ -555,6 +581,14 @@ mod tests {
             RegistryBuildOptions::default(),
         )
         .unwrap()
+    }
+
+    fn network_only_deny_registry() -> SemanticRegistry {
+        modified_report_registry(|contract| {
+            contract.allowed_effect_classes = vec![EffectClass::Network];
+            contract.allowed_authority_classes = vec!["network.connect".to_owned()];
+            contract.allowed_egress_modes = vec![EgressMode::Deny];
+        })
     }
 
     fn network_summarizer(registry: &SemanticRegistry) -> CapabilityManifest {
@@ -645,6 +679,40 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_protected_effect_requires_its_mapped_authority() {
+        for (effect, authority) in [
+            (EffectClass::ArtifactRead, "artifact.read"),
+            (EffectClass::ArtifactWrite, "artifact.write"),
+            (EffectClass::ExternalMessage, "external.send"),
+            (EffectClass::SecretAccess, "secret.use"),
+            (EffectClass::PersistentState, "state.write"),
+            (EffectClass::DeviceAccess, "device.use"),
+            (EffectClass::SystemChange, "system.change"),
+        ] {
+            let registry = modified_report_registry(|contract| {
+                contract.allowed_effect_classes.push(effect);
+                contract
+                    .allowed_authority_classes
+                    .push(authority.to_owned());
+            });
+            let mut manifest = network_summarizer(&registry);
+            manifest.provides[0].effect_classes.push(effect);
+
+            let report = validate_provider_manifest(
+                &registry,
+                &manifest,
+                ProviderConformanceOptions::default(),
+            );
+            assert!(!report.valid, "{effect:?} must require {authority}");
+            assert!(
+                report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing),
+                "missing reverse authority check for {effect:?}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn network_reachable_locality_requires_network_effect_and_authority() {
         let registry =
             SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
@@ -665,6 +733,52 @@ mod tests {
             assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
             assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
         }
+    }
+
+    #[test]
+    fn remote_runtime_rejects_local_only_capability_and_requires_network() {
+        let registry =
+            SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+        let mut manifest = provider_cases().remove(0).provider;
+        manifest.runtime.kind = ProviderRuntimeKind::Remote;
+
+        let report =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(!report.valid);
+        assert!(report.contains(ProviderReasonCode::ProviderDeclarationInvalid));
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+        assert!(report.contains(ProviderReasonCode::ProviderEgressNotAllowed));
+    }
+
+    #[test]
+    fn remote_required_inputs_require_data_egress_policy() {
+        let registry =
+            SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+        let mut manifest = network_summarizer(&registry);
+        manifest.provides[0].execution.locality = vec![Locality::Remote];
+
+        let report =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(!report.valid);
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+
+        let provider = &mut manifest.provides[0];
+        provider.effect_classes.push(EffectClass::DataEgress);
+        provider
+            .authority
+            .as_mut()
+            .unwrap()
+            .actions
+            .push("data.egress".to_owned());
+        let repaired =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(
+            repaired.valid,
+            "complete remote egress envelope must conform: {:?}",
+            repaired.diagnostics
+        );
     }
 
     #[test]
