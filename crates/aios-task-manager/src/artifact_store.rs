@@ -694,6 +694,7 @@ impl ArtifactStagingWriter {
         seal.write_all(&bytes)?;
         seal.flush()?;
         seal.sync_all()?;
+        durability_step("sync-staging-seal")?;
         sync_cap_directory(&self.store, "staging")?;
         Ok(self.written)
     }
@@ -820,7 +821,7 @@ pub(super) fn initialize_root(
         )
     };
     durability_step("create-root")?;
-    let created = match std::fs::create_dir(&root) {
+    let created = match create_store_root(&root) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error.into()),
@@ -884,6 +885,19 @@ pub(super) fn initialize_root(
         params![database_identity, canonical_text, root_identity, OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| TaskManagerError::InvalidRecord("Artifact store binding time could not be formatted"))?],
     )?;
     Ok((canonical_root, directory, cleanup))
+}
+
+#[cfg(unix)]
+fn create_store_root(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(root)
+}
+
+#[cfg(not(unix))]
+fn create_store_root(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(root)
 }
 
 #[cfg(unix)]
@@ -1115,10 +1129,15 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class AiosOpenedDirectorySecurityResult {
+public sealed class AiosOpenedDirectorySecurityResult : IDisposable {
   public UInt32 VolumeSerialNumber { get; set; }
   public UInt64 FileIndex { get; set; }
   public byte[] Descriptor { get; set; }
+  internal SafeFileHandle RootHandle { get; set; }
+
+  public void Dispose() {
+    if (RootHandle != null) RootHandle.Dispose();
+  }
 }
 
 public static class AiosOpenedDirectorySecurity {
@@ -1163,17 +1182,20 @@ public static class AiosOpenedDirectorySecurity {
   public static AiosOpenedDirectorySecurityResult Inspect(string path) {
     const UInt32 READ_CONTROL = 0x00020000;
     const UInt32 FILE_READ_ATTRIBUTES = 0x00000080;
-    const UInt32 SHARE_ALL = 0x00000007;
+    // Excluding FILE_SHARE_DELETE pins the authenticated root directory entry
+    // while PowerShell traverses descendants through its path.
+    const UInt32 SHARE_READ_WRITE = 0x00000003;
     const UInt32 OPEN_EXISTING = 3;
     const UInt32 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     const UInt32 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     const UInt32 SE_FILE_OBJECT = 1;
     const UInt32 OWNER_AND_DACL = 0x00000001 | 0x00000004;
 
-    using (SafeFileHandle handle = CreateFileW(
-      path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL, IntPtr.Zero,
+    SafeFileHandle handle = CreateFileW(
+      path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_READ_WRITE, IntPtr.Zero,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-      IntPtr.Zero)) {
+      IntPtr.Zero);
+    try {
       if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
       BY_HANDLE_FILE_INFORMATION information;
       if (!GetFileInformationByHandle(handle, out information))
@@ -1190,11 +1212,15 @@ public static class AiosOpenedDirectorySecurity {
         return new AiosOpenedDirectorySecurityResult {
           VolumeSerialNumber = information.VolumeSerialNumber,
           FileIndex = ((UInt64)information.FileIndexHigh << 32) | information.FileIndexLow,
-          Descriptor = bytes
+          Descriptor = bytes,
+          RootHandle = handle
         };
       } finally {
         LocalFree(descriptor);
       }
+    } catch {
+      handle.Dispose();
+      throw;
     }
   }
 }
@@ -1202,29 +1228,51 @@ public static class AiosOpenedDirectorySecurity {
 $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $root = Get-Item -LiteralPath $env:AIOS_ARTIFACT_STORE_ROOT -Force
 $opened = [AiosOpenedDirectorySecurity]::Inspect($root.FullName)
+$openedEntries = New-Object 'System.Collections.Generic.List[System.IDisposable]'
+try {
 $rootAcl = New-Object Security.AccessControl.DirectorySecurity
 $rootAcl.SetSecurityDescriptorBinaryForm($opened.Descriptor)
 $rootOwner = $rootAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
 $rootRules = @($rootAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
   [PSCustomObject]@{ identity = $_.IdentityReference.Value; kind = $_.AccessControlType.ToString() }
 })
-$entries = @([PSCustomObject]@{
+$entries = New-Object System.Collections.ArrayList
+[void]$entries.Add([PSCustomObject]@{
   owner = $rootOwner; protected = $rootAcl.AreAccessRulesProtected; rules = $rootRules
-}) + @(Get-ChildItem -LiteralPath $root.FullName -Force -Recurse | ForEach-Object {
-  $acl = Get-Acl -LiteralPath $_.FullName
-  $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
-  $rules = @($acl.Access | ForEach-Object {
+})
+$paths = @(Get-ChildItem -LiteralPath $root.FullName -Force -Recurse |
+  ForEach-Object { $_.FullName } | Sort-Object)
+foreach ($path in $paths) {
+  # Authenticate every descendant's descriptor through its opened handle and
+  # retain all handles until a stable second enumeration completes. This
+  # prevents a path decoy from replacing any inspected entry mid-traversal.
+  $entry = [AiosOpenedDirectorySecurity]::Inspect($path)
+  $openedEntries.Add($entry)
+  $acl = New-Object Security.AccessControl.FileSecurity
+  $acl.SetSecurityDescriptorBinaryForm($entry.Descriptor)
+  $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
     $identity = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
     [PSCustomObject]@{ identity = $identity; kind = $_.AccessControlType.ToString() }
   })
-  [PSCustomObject]@{ owner = $owner; protected = $acl.AreAccessRulesProtected; rules = $rules }
-})
-[PSCustomObject]@{
+  [void]$entries.Add([PSCustomObject]@{ owner = $owner; protected = $acl.AreAccessRulesProtected; rules = $rules })
+}
+$pathsAfter = @(Get-ChildItem -LiteralPath $root.FullName -Force -Recurse |
+  ForEach-Object { $_.FullName } | Sort-Object)
+if (@(Compare-Object -ReferenceObject $paths -DifferenceObject $pathsAfter).Count -ne 0) {
+  throw 'Artifact store descendants changed during ACL inspection'
+}
+$report = [PSCustomObject]@{
   current = $current
   volume_serial_number = [UInt64]$opened.VolumeSerialNumber
   file_index = [UInt64]$opened.FileIndex
   entries = $entries
 } | ConvertTo-Json -Compress -Depth 5
+} finally {
+  foreach ($entry in $openedEntries) { $entry.Dispose() }
+  $opened.Dispose()
+}
+$report
 "#;
     validate_trusted_windows_executable(Path::new(POWERSHELL))?;
     let output = std::process::Command::new(POWERSHELL)
@@ -1346,6 +1394,7 @@ impl TaskManager {
         if session.issuer_id != self.artifact_scope_issuer {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        ensure_no_unknown_artifact_export(&self.connection, &session.task_id)?;
         Ok(())
     }
 
@@ -1371,6 +1420,7 @@ impl TaskManager {
         if !task_accepts_artifact_import(&task_state) {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        ensure_no_unknown_artifact_export(&self.connection, &request.task_id)?;
         let token = random_token(&self.connection)?;
         let staging_ref = format!("staging/import-{token}");
         let maximum = request
@@ -1483,6 +1533,7 @@ impl TaskManager {
         request: &OutputAllocationRequest,
     ) -> Result<ArtifactOutputAllocation> {
         validate_allocation_request(request, &self.clock.now())?;
+        ensure_no_unknown_artifact_export(&self.connection, &request.task_id)?;
         let created_at = self.clock.now();
         let staging_ref = format!("staging/output-{}", random_token(&self.connection)?);
         let lease_owner = self.lease_owner.clone();
@@ -1521,6 +1572,59 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         self.open_artifact_output(allocation_id)
+    }
+
+    /// Retries the durable finalization boundary after a lost response or directory-sync error.
+    pub fn retry_bound_artifact_output_finish(
+        &mut self,
+        session: &ProviderArtifactSession,
+        allocation_id: &str,
+    ) -> Result<u64> {
+        self.validate_provider_artifact_session(session)?;
+        validate_id(allocation_id, 256, "invalid Artifact allocation ID")?;
+        let allocation = load_allocation_row(&self.connection, allocation_id)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+        )?;
+        if allocation.task_id != session.task_id
+            || allocation.binding_id.as_deref() != Some(session.authority.binding_id.as_str())
+            || allocation.attempt_id.as_deref() != Some(session.authority.attempt_id.as_str())
+            || allocation.state != "WRITING"
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        validate_writer_fence(
+            &self.connection,
+            allocation_id,
+            &self.clock.now(),
+            &self.lease_owner,
+            self.lease_epoch,
+            allocation.writer_grant_admission.as_ref(),
+        )?;
+        let staging_ref =
+            allocation
+                .staging_ref
+                .as_deref()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                ))?;
+        let seal = self
+            .artifact_store_dir
+            .open(safe_internal_ref(&seal_ref(staging_ref))?)?;
+        let mut seal_bytes = Vec::new();
+        seal.take(16 * 1024).read_to_end(&mut seal_bytes)?;
+        let sealed: SealedStaging = serde_json::from_slice(&seal_bytes)
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))?;
+        let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
+        if sealed.version != SEALED_STAGING_VERSION
+            || sealed.allocation_id != allocation_id
+            || sealed.size_bytes != size
+            || sealed.content_hash != hash
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+        }
+        durability_step("sync-staging-seal")?;
+        sync_cap_directory(&self.artifact_store_dir, "staging")?;
+        Ok(size)
     }
 
     #[allow(
@@ -2022,6 +2126,7 @@ impl TaskManager {
         artifact_ids: &[String],
     ) -> Result<ArtifactReadScope> {
         validate_id(task_id, 256, "invalid Artifact read Task")?;
+        ensure_no_unknown_artifact_export(&self.connection, task_id)?;
         if artifact_ids.is_empty() || artifact_ids.len() > 256 || !all_unique(artifact_ids) {
             return Err(TaskManagerError::InvalidRecord(
                 "invalid Artifact read scope",
@@ -2371,6 +2476,7 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         let intent: ArtifactExportIntent = serde_json::from_str(&destination.intent_json)?;
+        ensure_no_unknown_artifact_export(&self.connection, &intent.task_id)?;
         if unresolved_export_effect_exists(&self.connection, &intent)? {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
@@ -2464,11 +2570,11 @@ impl TaskManager {
         destination.writer = if let Ok(writer) = writer_factory() {
             Some(writer)
         } else {
-            let _ = self.finish_unknown_export_operation(
+            self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
                 &destination.task_id,
-            );
+            )?;
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ));
@@ -2521,7 +2627,9 @@ impl TaskManager {
                         false,
                     )
                 };
-                return if uncertain || recorded.is_err() {
+                return if let Err(error) = recorded {
+                    Err(error)
+                } else if uncertain {
                     Err(TaskManagerError::InvalidRecord(
                         "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
                     ))
@@ -2537,7 +2645,17 @@ impl TaskManager {
             .ok_or(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
             ))?;
-        if writer.finalize().is_err()
+        export_pre_finalize_step()?;
+        if validate_export_destination_fence(
+            &self.connection,
+            &self.clock,
+            &destination.task_id,
+            &destination.authority,
+            &destination.destination_class,
+            destination.grant_admission.as_ref(),
+        )
+        .is_err()
+            || writer.finalize().is_err()
             || validate_export_destination_fence(
                 &self.connection,
                 &self.clock,
@@ -2548,11 +2666,11 @@ impl TaskManager {
             )
             .is_err()
         {
-            let _ = self.finish_unknown_export_operation(
+            self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
                 &destination.task_id,
-            );
+            )?;
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ));
@@ -2634,11 +2752,11 @@ impl TaskManager {
         if let Ok(exported) = completion {
             Ok(exported)
         } else {
-            let _ = self.finish_unknown_export_operation(
+            self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
                 &destination.task_id,
-            );
+            )?;
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ))
@@ -2664,6 +2782,7 @@ impl TaskManager {
             .as_deref()
             .is_some_and(|state| matches!(state, "RUNNING" | "VERIFYING" | "PAUSED"))
         {
+            live_recovery_handoff_step()?;
             self.reconcile_live_execution(task_id)?;
         }
         Ok(())
@@ -2699,6 +2818,127 @@ impl TaskManager {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Records trusted external evidence that an unknown export had no external effect.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps export evidence authentication, idempotent provenance, and certainty transition atomic"
+    )]
+    pub(crate) fn reconcile_unknown_artifact_export_no_effect(
+        &mut self,
+        operation_id: &str,
+        evidence_ref: &str,
+    ) -> Result<()> {
+        validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
+        validate_id(
+            evidence_ref,
+            256,
+            "invalid Artifact export reconciliation evidence",
+        )?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT task_id,state,outcome_certainty,details_json FROM operations
+                 WHERE operation_id=?1 AND transaction_class='irreversible_external'
+                   AND effect_class='DATA_EGRESS'",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation operation does not exist",
+            ))?;
+        let intent: ArtifactExportIntent = serde_json::from_str(&row.3)?;
+        if intent.task_id != row.0 || canonical_json(&intent)? != row.3 {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored Artifact export operation is invalid",
+            ));
+        }
+        let recovery_ref = self
+            .connection
+            .query_row(
+                "SELECT json_extract(recovery_json,'$.unknown_operations_ref') FROM tasks
+                 WHERE task_id=?1 AND state='RECOVERING'",
+                [&row.0],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .ok_or(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation requires an active recovery epoch",
+            ))?;
+        let inventory_id = format!("operation:{operation_id}");
+        let inventoried = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
+            params![recovery_ref, inventory_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !inventoried {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation evidence is outside the recovery inventory",
+            ));
+        }
+        let event_identity = format!("{operation_id}:{evidence_ref}");
+        let reconciliation_event_id = event_id("artifact-export-reconciled", &event_identity);
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        let existing_event = transaction.query_row(
+            "SELECT event_json,timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
+            params![row.0,reconciliation_event_id],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
+        ).optional()?;
+        let observed_at = existing_event
+            .as_ref()
+            .map_or_else(|| self.clock.now(), |stored| stored.1.clone());
+        let event = json!({
+            "schema_version":SCHEMA_VERSION,
+            "event_id":reconciliation_event_id,
+            "task_id":row.0,
+            "event_type":"execution.completed",
+            "timestamp":observed_at,
+            "actor":{"kind":"system-service","id":"service:recovery"},
+            "status":"failure",
+            "details":{
+                "operation_id":operation_id,
+                "evidence_ref":evidence_ref,
+                "certainty":"FAILED_NO_EFFECT"
+            }
+        });
+        if let Some((stored_event, _)) = existing_event {
+            if serde_json::from_str::<serde_json::Value>(&stored_event)? != event
+                || !super::verify_provenance_through(&transaction, &row.0, None)?
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Artifact export reconciliation evidence conflicts with provenance",
+                ));
+            }
+        } else {
+            append_event(&transaction, &row.0, &event)?;
+        }
+        let changed = transaction.execute(
+            "UPDATE operations SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',finished_at=COALESCE(finished_at,?2)
+             WHERE operation_id=?1 AND state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'",
+            params![operation_id,observed_at],
+        )?;
+        if changed == 0 && !(row.1 == "FAILED" && row.2.as_deref() == Some("FAILED_NO_EFFECT")) {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation operation is not unknown",
+            ));
+        }
+        transaction.commit()?;
+        self.reconcile_recovery_subject(&recovery_ref, &inventory_id)
     }
 
     pub(crate) fn reconcile_export_operations_startup(&mut self) -> Result<()> {
@@ -3288,11 +3528,17 @@ impl TaskManager {
         if !exact {
             return Ok(failed());
         }
+        publication_replay_hash_step()?;
         match hash_internal_file(&self.artifact_store_dir, &row.23) {
             Ok((actual_size, actual_hash)) if actual_size == size && actual_hash == row.1 => {
                 Ok(result)
             }
-            _ => {
+            Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.mark_content_hash_failed(&row.1, "MISSING")?;
+                Ok(failed())
+            }
+            Err(error) => Err(error),
+            Ok(_) => {
                 self.mark_integrity_failed(&row.0, &request.task_id, &row.1)?;
                 Ok(failed())
             }
@@ -3527,6 +3773,7 @@ fn validate_writer_fence(
     let allocation = load_allocation_row(connection, allocation_id)?.ok_or(
         TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
     )?;
+    ensure_no_unknown_artifact_export(connection, &allocation.task_id)?;
     if allocation.state != "WRITING" || parse_time(&allocation.expires_at)? <= parse_time(now)? {
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
     }
@@ -4346,6 +4593,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
     if !owns_fence {
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
     }
+    ensure_no_unknown_artifact_export(&reader.authority_connection, &reader.task_id)?;
     let intact = reader.authority_connection.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM artifacts a
@@ -5475,6 +5723,30 @@ fn unresolved_export_effect_exists(
         .map_err(Into::into)
 }
 
+fn ensure_no_unknown_artifact_export(connection: &Connection, task_id: &str) -> Result<()> {
+    let unresolved = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM operations
+             WHERE task_id=?1
+               AND transaction_class='irreversible_external'
+               AND effect_class='DATA_EGRESS'
+               AND state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'
+               AND json_extract(details_json,'$.version')=1
+               AND json_type(details_json,'$.artifact_id')='text'
+               AND json_type(details_json,'$.destination_class')='text'
+         )",
+        [task_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if unresolved {
+        Err(TaskManagerError::InvalidRecord(
+            "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "replay authenticates the complete operation intent, receipt, and provenance row"
@@ -6119,7 +6391,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static EXPORT_PRE_FINALIZE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_COMPLETION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static PUBLICATION_REPLAY_HASH_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static LIVE_RECOVERY_HANDOFF_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -6153,6 +6431,36 @@ fn export_completion_step() -> Result<()> {
     })
 }
 
+#[cfg(test)]
+fn export_pre_finalize_step() -> Result<()> {
+    EXPORT_PRE_FINALIZE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn publication_replay_hash_step() -> Result<()> {
+    PUBLICATION_REPLAY_HASH_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn live_recovery_handoff_step() -> Result<()> {
+    LIVE_RECOVERY_HANDOFF_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(not(test))]
 #[allow(
     clippy::unnecessary_wraps,
@@ -6177,6 +6485,33 @@ fn export_copy_step() -> Result<()> {
     reason = "test crash injection shares the production completion boundary"
 )]
 fn export_completion_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test authority race injection shares the production pre-finalize boundary"
+)]
+fn export_pre_finalize_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test transient I/O injection shares the publication replay hash boundary"
+)]
+fn publication_replay_hash_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test failure injection shares the live recovery handoff boundary"
+)]
+fn live_recovery_handoff_step() -> Result<()> {
     Ok(())
 }
 
@@ -6345,6 +6680,27 @@ mod tests {
             Err(std::io::Error::other(
                 "injected destination finalization failure",
             ))
+        }
+    }
+
+    struct FinalizeTrackingWriter {
+        finalized: Arc<AtomicUsize>,
+    }
+
+    impl Write for FinalizeTrackingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for FinalizeTrackingWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            self.finalized.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -7441,31 +7797,12 @@ mod tests {
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
-        let replacement_scope = manager
-            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
-            .unwrap();
-        let mut replacement_admission = manager
-            .issue_bound_artifact_export_destination(
-                &session,
-                &replacement_scope,
-                "export-partial-write-replacement-admission",
-                &artifact.artifact_id,
-                "user-selected-file",
-                4_096,
-                deferred(Vec::new()),
-            )
-            .unwrap();
         assert!(matches!(
-            manager.export_artifact(
-                &replacement_scope,
-                &artifact.artifact_id,
-                &mut replacement_admission,
-            ),
+            manager.scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id)),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
-        assert!(replacement_admission.writer.is_none());
         for grant_id in [
             "grant-export-replacement-admission-0",
             "grant-export-replacement-admission-1",
@@ -7497,31 +7834,44 @@ mod tests {
             0
         );
 
-        let mut flush = manager
+        let flush_temp = TempDir::new().unwrap();
+        let mut flush_manager = self::manager(&flush_temp);
+        let flush_artifact = flush_manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"confidential".as_slice()),
+            )
+            .unwrap();
+        let flush_scope = flush_manager
+            .scope_owned_artifact_reads("T-artifact", &[flush_artifact.artifact_id.clone()])
+            .unwrap();
+        let mut flush = flush_manager
             .issue_owned_artifact_export_destination(
-                &scope,
+                &flush_scope,
                 "export-flush-failure",
-                &artifact.artifact_id,
+                &flush_artifact.artifact_id,
                 "backup-file",
                 1_024,
                 deferred(FlushFailureWriter::default()),
             )
             .unwrap();
         assert!(matches!(
-            manager.export_artifact(&scope, &artifact.artifact_id, &mut flush),
+            flush_manager.export_artifact(&flush_scope, &flush_artifact.artifact_id, &mut flush),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
         assert_eq!(flush.writer.as_ref().unwrap().bytes, b"confidential");
 
-        let empty = manager
+        let empty_temp = TempDir::new().unwrap();
+        let mut empty_manager = self::manager(&empty_temp);
+        let empty = empty_manager
             .import_artifact(&import_request(), &mut Cursor::new([]))
             .unwrap();
-        let empty_scope = manager
+        let empty_scope = empty_manager
             .scope_owned_artifact_reads("T-artifact", &[empty.artifact_id.clone()])
             .unwrap();
-        let mut empty_flush = manager
+        let mut empty_flush = empty_manager
             .issue_owned_artifact_export_destination(
                 &empty_scope,
                 "export-empty-flush-failure",
@@ -7532,20 +7882,19 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            manager.export_artifact(&empty_scope, &empty.artifact_id, &mut empty_flush),
+            empty_manager.export_artifact(&empty_scope, &empty.artifact_id, &mut empty_flush),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
         assert!(empty_flush.writer.as_ref().unwrap().bytes.is_empty());
-        for operation_id in [
-            "export-partial-write",
-            "export-flush-failure",
-            "export-empty-flush-failure",
+        for (connection, operation_id) in [
+            (&manager.connection, "export-partial-write"),
+            (&flush_manager.connection, "export-flush-failure"),
+            (&empty_manager.connection, "export-empty-flush-failure"),
         ] {
             assert_eq!(
-                manager
-                    .connection
+                connection
                     .query_row(
                         "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id=?1",
                         [operation_id],
@@ -7555,17 +7904,22 @@ mod tests {
                 "UNKNOWN:OUTCOME_UNKNOWN"
             );
         }
-        assert_eq!(
-            manager
-                .connection
-                .query_row(
-                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.exported'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0
-        );
+        for connection in [
+            &manager.connection,
+            &flush_manager.connection,
+            &empty_manager.connection,
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.exported'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -7866,6 +8220,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers unknown export persistence, recovery routing, trusted resolution, and response-loss replay"
+    )]
     fn finalize_failure_is_unknown_and_routes_live_task_to_recovery() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -7941,6 +8299,205 @@ mod tests {
                 .unwrap(),
             0
         );
+
+        manager
+            .reconcile_unknown_artifact_export_no_effect(
+                "export-finalize-recovery",
+                "evidence:destination-unchanged",
+            )
+            .unwrap();
+        // A response-loss retry authenticates and reuses the immutable resolution event.
+        manager
+            .reconcile_unknown_artifact_export_no_effect(
+                "export-finalize-recovery",
+                "evidence:destination-unchanged",
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-finalize-recovery'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "FAILED:FAILED_NO_EFFECT"
+        );
+        let subject = manager
+            .connection
+            .query_row(
+                "SELECT certainty || ':' || safe_action FROM recovery_assessments
+                 WHERE task_id='T-artifact' AND subject_kind='external-operation'
+                   AND subject_id='operation:export-finalize-recovery'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(subject, "FAILED_NO_EFFECT:MARK_ATTEMPT_FAILED");
+    }
+
+    #[test]
+    fn failed_live_recovery_handoff_propagates_and_fences_artifact_operations() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"handoff fence".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "export-handoff-failure",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut destination = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export-handoff-failure",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        LIVE_RECOVERY_HANDOFF_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::InvalidRecord(
+                    "injected live recovery handoff failure",
+                ))
+            }));
+        });
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "injected live recovery handoff failure"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-handoff-failure'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert!(matches!(
+            manager.scope_artifact_reads(&session, &[artifact.artifact_id]),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+    }
+
+    #[test]
+    fn authenticated_unknown_export_resolution_releases_recovery_when_all_subjects_are_safe() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"resolve me".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-owner-resolution",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PAUSED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        manager
+            .reconcile_unknown_artifact_export_no_effect(
+                "export-owner-resolution",
+                "evidence:destination-unchanged",
+            )
+            .unwrap();
+        let transaction = manager.connection.unchecked_transaction().unwrap();
+        assert!(crate::recovery_allows_exit(&transaction, "T-artifact").unwrap());
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn authority_is_rechecked_before_effectful_destination_finalize() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"final fence".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-pre-finalize-fence",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeTrackingWriter {
+                    finalized: Arc::clone(&finalized),
+                }),
+            )
+            .unwrap();
+        EXPORT_PRE_FINALIZE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET principal_id='user:revoked-before-finalize' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(finalized.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -10818,6 +11375,81 @@ mod tests {
     }
 
     #[test]
+    fn sealed_staging_finish_replays_after_directory_sync_failure_and_response_loss() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-finish-replay";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "finish-replay",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, allocation_id);
+        writer.write_all(b"one shot output").unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some("sync-staging-seal".to_owned())));
+        });
+        assert!(matches!(writer.finish(), Err(TaskManagerError::Io(_))));
+        DURABILITY_TEST_CONTROL.with(|control| {
+            control.borrow_mut().take();
+        });
+        assert_eq!(
+            manager
+                .get_artifact_output_allocation(allocation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactAllocationState::Writing
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, allocation_id)
+                .unwrap(),
+            15
+        );
+        // Response-loss retries authenticate the same seal and do not consume another grant use.
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, allocation_id)
+                .unwrap(),
+            15
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-finish-replay-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_store_root_is_created_atomically_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("atomic-private-root");
+        create_store_root(&root).unwrap();
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn initial_and_nested_directory_durability_orders_child_before_parent() {
         let temp = TempDir::new().unwrap();
         DURABILITY_TEST_CONTROL.with(|control| {
@@ -11062,6 +11694,27 @@ mod tests {
         let root_text = root.to_str().unwrap();
         let output = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
             .args([root_text, "/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(matches!(
+            TaskManager::open_with_clock(&database, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store ownership or ACL is untrusted"
+            ))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn descendant_acl_is_authenticated_from_its_pinned_open_handle() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let manager = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let staging = manager.artifact_store_root.join("staging");
+        drop(manager);
+        let output = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            .args([staging.to_str().unwrap(), "/grant", "*S-1-1-0:(OI)(CI)R"])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -11522,6 +12175,32 @@ mod tests {
                 ],
             )
             .unwrap();
+        PUBLICATION_REPLAY_HASH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected transient replay read failure",
+                )))
+            }));
+        });
+        assert!(matches!(
+            manager.publish_artifact_output(&request),
+            Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT a.integrity_state || ':' || b.durability_state
+                     FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+                     WHERE a.artifact_id=?1",
+                    [original.artifact_id.as_deref().unwrap()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "verified:DURABLE"
+        );
+        assert_eq!(manager.publish_artifact_output(&request).unwrap(), original);
         manager
             .connection
             .execute(
