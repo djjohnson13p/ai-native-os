@@ -14,6 +14,7 @@
       "type": "string",
       "enum": [
         "task.created",
+        "task.transitioned",
         "task.paused",
         "task.resumed",
         "task.cancelled",
@@ -71,6 +72,26 @@
           "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]
         },
         "id": {"type": "string", "minLength": 1}
+      }
+    },
+    "task_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transition_id",
+        "previous_state",
+        "new_state",
+        "previous_revision",
+        "new_revision",
+        "reason_code"
+      ],
+      "properties": {
+        "transition_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "previous_state": {"$ref": "#/$defs/taskState"},
+        "new_state": {"$ref": "#/$defs/taskState"},
+        "previous_revision": {"type": "integer", "minimum": 1},
+        "new_revision": {"type": "integer", "minimum": 2},
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"}
       }
     },
     "semantic_program_hash": {
@@ -138,5 +159,25 @@
     },
     "previous_event_hash": {"type": ["string", "null"]},
     "event_hash": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"event_type": {"const": "task.transitioned"}},
+        "required": ["event_type"]
+      },
+      "then": {"required": ["task_transition"]},
+      "else": {"properties": {"task_transition": false}}
+    }
+  ],
+  "$defs": {
+    "taskState": {
+      "type": "string",
+      "enum": [
+        "CREATED", "PLANNING", "WAITING_FOR_INPUT", "WAITING_FOR_AUTH",
+        "RUNNABLE", "RUNNING", "VERIFYING", "PAUSED", "RECOVERING",
+        "ROLLING_BACK", "COMPLETED", "FAILED", "CANCELLED", "ROLLED_BACK"
+      ]
+    }
   }
 }

@@ -25,8 +25,8 @@
     "current_state": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskState"}]},
     "previous_revision": {"type": ["integer", "null"], "minimum": 1},
     "current_revision": {"type": ["integer", "null"], "minimum": 1},
-    "observed_state": {"$ref": "#/$defs/taskState"},
-    "observed_revision": {"type": "integer", "minimum": 1},
+    "observed_state": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskState"}]},
+    "observed_revision": {"type": ["integer", "null"], "minimum": 1},
     "provenance_event_id": {"type": ["string", "null"], "maxLength": 256},
     "provenance_event_hash": {
       "type": ["string", "null"],
@@ -53,6 +53,48 @@
           "current_revision": {"type": "integer", "minimum": 2},
           "provenance_event_id": {"type": "string", "minLength": 1},
           "provenance_event_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"reason_code": {"const": "TASK_NOT_FOUND"}},
+        "required": ["reason_code"]
+      },
+      "then": {
+        "properties": {
+          "applied": {"const": false},
+          "observed_state": {"type": "null"},
+          "observed_revision": {"type": "null"}
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {"reason_code": {"const": "TASK_TRANSITION_ID_REUSE_CONFLICT"}},
+          "required": ["reason_code"]
+        },
+        "then": {
+          "properties": {"applied": {"const": false}},
+          "anyOf": [
+            {
+              "properties": {
+                "observed_state": {"type": "null"},
+                "observed_revision": {"type": "null"}
+              }
+            },
+            {
+              "properties": {
+                "observed_state": {"$ref": "#/$defs/taskState"},
+                "observed_revision": {"type": "integer", "minimum": 1}
+              }
+            }
+          ]
+        },
+        "else": {
+          "properties": {
+            "observed_state": {"$ref": "#/$defs/taskState"},
+            "observed_revision": {"type": "integer", "minimum": 1}
+          }
         }
       }
     }

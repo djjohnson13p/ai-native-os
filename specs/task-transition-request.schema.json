@@ -75,7 +75,7 @@
             "additionalProperties": false,
             "required": ["kind", "id"],
             "properties": {
-              "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider"]},
+              "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider", "validation"]},
               "id": {"type": "string", "minLength": 1, "maxLength": 256},
               "message": {"type": ["string", "null"], "maxLength": 2048}
             }

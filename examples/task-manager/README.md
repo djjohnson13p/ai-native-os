@@ -17,5 +17,6 @@ The fixture set is intentionally about deterministic state/CAS/recovery behavior
 
 - `transition-cases.json` — legal/illegal/CAS/idempotency/completion/recovery cases.
 - `step-outcome-cases.json` — provider-attempt and external-effect certainty cases.
+- `schema-cases.json` — reconciled blocker, missing-Task result, and typed transition-provenance boundaries.
 
 All IDs/data are synthetic.

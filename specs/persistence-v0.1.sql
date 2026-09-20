@@ -46,7 +46,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_id            TEXT,
     original_intent         TEXT NOT NULL,
     normalized_intent_json  TEXT,
+    active_plan_revision    INTEGER,
     active_program_revision INTEGER,
+    active_step_ids_json     TEXT NOT NULL DEFAULT '[]',
+    waiting_on_json          TEXT NOT NULL DEFAULT '[]',
     constraints_json        TEXT,
     failure_json            TEXT,
     recovery_json           TEXT,
@@ -71,8 +74,7 @@ CREATE TABLE IF NOT EXISTS task_transitions (
     result_json             TEXT,
     provenance_event_id     TEXT,
     requested_at            TEXT NOT NULL,
-    committed_at            TEXT,
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+    committed_at            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS plan_revisions (
@@ -808,3 +810,6 @@ COMMIT;
 --    them against the corresponding schema before persistence/use.
 -- 5. Filesystem/blob durability is coordinated with DB metadata through the
 --    publication/recovery protocol; SQLite ACID does not make blob writes atomic.
+-- 6. task_transitions intentionally has no tasks foreign key: rejected requests
+--    for absent task IDs are retained for global transition-ID idempotency.
+--    COMMITTED transition/task identity is enforced by the Task Manager transaction.

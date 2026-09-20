@@ -1,0 +1,105 @@
+{
+  "request_cases": [
+    {
+      "name": "validation-blocker-is-a-transition-mutation-kind",
+      "expected_valid": true,
+      "value": {
+        "schema_version": "0.1",
+        "transition_id": "tr-validation-blocker",
+        "task_id": "T-schema-fixture",
+        "expected_revision": 2,
+        "expected_state": "PLANNING",
+        "to_state": "WAITING_FOR_INPUT",
+        "requested_by": {"kind": "system-service", "id": "service:task-manager"},
+        "reason": {"code": "VALIDATION_BLOCKED"},
+        "mutation": {"waiting_on": [{"kind": "validation", "id": "validation:fixture"}]}
+      }
+    }
+  ],
+  "result_cases": [
+    {
+      "name": "not-found-has-null-observations",
+      "expected_valid": true,
+      "value": {
+        "schema_version": "0.1",
+        "transition_id": "tr-missing",
+        "task_id": "T-absent",
+        "applied": false,
+        "reason_code": "TASK_NOT_FOUND",
+        "observed_state": null,
+        "observed_revision": null,
+        "resulted_at": "2026-09-19T00:00:00Z"
+      }
+    },
+    {
+      "name": "absent-task-id-reuse-has-paired-null-observations",
+      "expected_valid": true,
+      "value": {
+        "schema_version": "0.1",
+        "transition_id": "tr-missing",
+        "task_id": "T-other-absent",
+        "applied": false,
+        "reason_code": "TASK_TRANSITION_ID_REUSE_CONFLICT",
+        "observed_state": null,
+        "observed_revision": null,
+        "resulted_at": "2026-09-19T00:00:00Z"
+      }
+    },
+    {
+      "name": "reuse-observations-cannot-be-half-populated",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "transition_id": "tr-half",
+        "task_id": "T-fixture",
+        "applied": false,
+        "reason_code": "TASK_TRANSITION_ID_REUSE_CONFLICT",
+        "observed_state": "CREATED",
+        "observed_revision": null,
+        "resulted_at": "2026-09-19T00:00:00Z"
+      }
+    }
+  ],
+  "provenance_cases": [
+    {
+      "name": "typed-task-transition-is-required-and-valid",
+      "expected_valid": true,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:fixture",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-fixture",
+          "previous_state": "CREATED",
+          "new_state": "PLANNING",
+          "previous_revision": 1,
+          "new_revision": 2,
+          "reason_code": "PLANNING_REQUESTED"
+        }
+      }
+    },
+    {
+      "name": "unrelated-event-cannot-carry-task-transition",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:created:misleading",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.created",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "user", "id": "user:fixture"},
+        "task_transition": {
+          "transition_id": "tr-misleading",
+          "previous_state": "CREATED",
+          "new_state": "COMPLETED",
+          "previous_revision": 1,
+          "new_revision": 2,
+          "reason_code": "MODEL_SAYS_DONE"
+        }
+      }
+    }
+  ]
+}

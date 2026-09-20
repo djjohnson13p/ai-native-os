@@ -24,6 +24,9 @@ For v0.1:
 9. Terminal states are immutable except the explicitly guarded `FAILED -> ROLLING_BACK` compensation path.
 10. Step/provider-attempt state is stored separately from the coarse Task state and has its own identity/revision/attempt semantics.
 11. Unknown external side-effect outcome is first-class and blocks unsafe blind retry/completion.
+12. Transition IDs are global idempotency identities, including rejected
+    requests for absent Tasks; durable rejection records therefore do not depend
+    on a Task-row foreign key.
 
 Detailed semantics are in `docs/74-v0.1-task-manager-transition-and-cas-contract.md`.
 

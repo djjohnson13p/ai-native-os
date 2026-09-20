@@ -25,6 +25,9 @@ For v0.1:
 8. Stream verification is deterministic and requires no AI/model/provider/network access.
 9. The local hash chain is described as **tamper-evident**, not tamper-proof against an attacker capable of rewriting the full database and all trusted checkpoints.
 10. Later signed/remote checkpoints may strengthen evidence without changing historical event identity.
+11. Every material Task state transition is represented by `task.transitioned`
+    with a required typed transition identity object; free-form event details do
+    not carry the authoritative transition identity.
 
 The detailed profile is `docs/73-v0.1-provenance-journal-and-hash-chain.md`.
 

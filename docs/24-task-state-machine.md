@@ -173,8 +173,8 @@ The persisted Task Manager should enforce an explicit table rather than accept a
 | WAITING_FOR_INPUT | PLANNING, CANCELLED, PAUSED, FAILED |
 | WAITING_FOR_AUTH | PLANNING, RUNNABLE, CANCELLED, PAUSED, FAILED |
 | RUNNABLE | RUNNING, PLANNING, PAUSED, CANCELLED, FAILED |
-| RUNNING | RUNNABLE, PLANNING, WAITING_FOR_INPUT, WAITING_FOR_AUTH, VERIFYING, PAUSED, FAILED, CANCELLED, ROLLING_BACK |
-| VERIFYING | COMPLETED, RUNNING, PLANNING, PAUSED, FAILED, CANCELLED, ROLLING_BACK |
+| RUNNING | RUNNABLE, PLANNING, WAITING_FOR_INPUT, WAITING_FOR_AUTH, VERIFYING, PAUSED, RECOVERING, FAILED, CANCELLED, ROLLING_BACK |
+| VERIFYING | COMPLETED, RUNNING, PLANNING, PAUSED, RECOVERING, FAILED, CANCELLED, ROLLING_BACK |
 | PAUSED | PLANNING, RUNNABLE, RECOVERING, CANCELLED, FAILED |
 | RECOVERING | PLANNING, RUNNABLE, RUNNING, WAITING_FOR_INPUT, WAITING_FOR_AUTH, PAUSED, FAILED, ROLLING_BACK |
 | ROLLING_BACK | ROLLED_BACK, FAILED |
@@ -184,6 +184,10 @@ The persisted Task Manager should enforce an explicit table rather than accept a
 | ROLLED_BACK | none |
 
 Implementation may model pre-final cancellation compensation by entering `ROLLING_BACK` before committing `CANCELLED`, or may record the desired terminal outcome separately. The semantics must be explicit and tested.
+
+The `RUNNING/VERIFYING -> RECOVERING` edges are reserved for deterministic
+startup/reconciliation when the prior process can no longer establish the
+in-flight state directly. Ordinary workers must not use them as a retry shortcut.
 
 ## Transition transaction
 
