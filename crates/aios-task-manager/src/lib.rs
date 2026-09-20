@@ -20,7 +20,8 @@ pub use artifact_store::{
     ArtifactOutputAllocation, ArtifactPublicationRequest, ArtifactPublicationResult,
     ArtifactReadScope, ArtifactReader, ArtifactReconciliationFinding, ArtifactReconciliationKind,
     ArtifactReconciliationReport, ArtifactRetention, ArtifactStagingWriter, ArtifactUri,
-    ContentHash, ImportArtifactRequest, OutputAllocationRequest, RetentionClass, Sensitivity,
+    ContentHash, ImportArtifactRequest, OutputAllocationRequest, ProviderArtifactSession,
+    RetentionClass, Sensitivity,
 };
 
 use std::fmt;
@@ -451,6 +452,7 @@ pub struct TaskManager {
     artifact_store_root: PathBuf,
     artifact_store_dir: cap_std::fs::Dir,
     store_lock: Option<StoreLock>,
+    artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
 }
 
 pub trait Clock: Send + Sync {
@@ -756,7 +758,7 @@ impl TaskManager {
         let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
-        let (artifact_store_root, artifact_store_dir) =
+        let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
             artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
         let artifact_scope_issuer =
             connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
@@ -770,7 +772,9 @@ impl TaskManager {
             artifact_store_root,
             artifact_store_dir,
             store_lock,
+            artifact_store_cleanup,
         };
+        manager.verify_all_provenance_chains()?;
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
         Ok(manager)
@@ -2297,6 +2301,24 @@ impl TaskManager {
     /// Returns an error when event JSON cannot be read or canonicalized.
     pub fn verify_provenance(&self, task_id: &str) -> Result<bool> {
         verify_provenance_through(&self.connection, task_id, None)
+    }
+
+    fn verify_all_provenance_chains(&self) -> Result<()> {
+        let task_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT task_id FROM tasks ORDER BY task_id")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for task_id in task_ids {
+            if !verify_provenance_through(&self.connection, &task_id, None)? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Task provenance chain is missing or invalid before startup reconciliation",
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

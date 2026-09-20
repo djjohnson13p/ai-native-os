@@ -44,7 +44,7 @@
         },
         "representation_of_object_ids": {
           "type": "array",
-          "maxItems": 64,
+          "maxItems": 0,
           "uniqueItems": true,
           "items": {"type": "string", "pattern": "^object://", "maxLength": 1024}
         }
