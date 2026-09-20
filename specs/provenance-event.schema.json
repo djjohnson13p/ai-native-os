@@ -46,6 +46,7 @@
         "egress.completed",
         "artifact.imported",
         "artifact.created",
+        "artifact.exported",
         "artifact.verified",
         "artifact.integrity-failed",
         "verification.started",
@@ -250,6 +251,21 @@
         }
       },
       "else": {"properties": {"task_transition": false, "committed_mutation": false}}
+    },
+    {
+      "if": {
+        "properties": {"event_type": {"const": "artifact.exported"}},
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["input_artifacts", "output_artifacts", "external_transfer", "status", "details"],
+        "properties": {
+          "input_artifacts": {"minItems": 1},
+          "output_artifacts": {"maxItems": 0},
+          "external_transfer": {"type": "object"},
+          "status": {"const": "success"}
+        }
+      }
     }
   ],
   "$defs": {

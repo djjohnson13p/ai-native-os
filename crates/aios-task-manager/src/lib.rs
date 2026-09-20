@@ -15,8 +15,8 @@
 mod artifact_store;
 
 pub use artifact_store::{
-    ArtifactAllocationState, ArtifactExpectedState, ArtifactHandle, ArtifactIntegrity,
-    ArtifactIntegrityState, ArtifactLineage, ArtifactOrigin, ArtifactOriginKind,
+    ArtifactAllocationState, ArtifactExpectedState, ArtifactExportDestination, ArtifactHandle,
+    ArtifactIntegrity, ArtifactIntegrityState, ArtifactLineage, ArtifactOrigin, ArtifactOriginKind,
     ArtifactOutputAllocation, ArtifactPublicationRequest, ArtifactPublicationResult,
     ArtifactReadScope, ArtifactReader, ArtifactReconciliationFinding, ArtifactReconciliationKind,
     ArtifactReconciliationReport, ArtifactRetention, ArtifactStagingWriter, ArtifactUri,
