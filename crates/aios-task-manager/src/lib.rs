@@ -15,7 +15,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -434,7 +434,7 @@ pub struct TaskManager {
     clock: Box<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
-    _store_lock: Option<File>,
+    _store_lock: Option<StoreLock>,
 }
 
 pub trait Clock: Send + Sync {
@@ -451,14 +451,60 @@ impl Clock for SystemClock {
     }
 }
 
-fn acquire_store_lock(path: &Path) -> Result<File> {
+struct StoreLock {
+    _database_file: File,
+    _lock_file: File,
+    identity: StoreIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreIdentity {
+    canonical_path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    creation_time: u64,
+}
+
+fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+            creation_time: metadata.creation_time(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+        })
+    }
+}
+
+fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
     // Materialize the database before acquiring an identity-bound lock.
-    OpenOptions::new()
+    let database_file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
+    let identity = store_identity(path, &database_file)?;
     #[cfg(windows)]
     let lock_path = {
         // An NTFS alternate data stream belongs to the underlying file, so all
@@ -477,7 +523,32 @@ fn acquire_store_lock(path: &Path) -> Result<File> {
         .write(true)
         .open(lock_path)?;
     file.try_lock_exclusive()?;
-    Ok(file)
+    Ok(StoreLock {
+        _database_file: database_file,
+        _lock_file: file,
+        identity,
+    })
+}
+
+fn verify_locked_store_identity(path: &Path, lock: &StoreLock) -> Result<()> {
+    let reopened = OpenOptions::new().read(true).write(true).open(path)?;
+    if store_identity(path, &reopened)? != lock.identity {
+        return Err(TaskManagerError::InvalidRecord(
+            "database path changed identity after acquiring the store lock",
+        ));
+    }
+    Ok(())
+}
+
+fn open_locked_store<F>(path: &Path, clock: Box<dyn Clock>, after_lock: F) -> Result<TaskManager>
+where
+    F: FnOnce(&Path),
+{
+    let lock = acquire_store_lock(path)?;
+    after_lock(path);
+    let connection = Connection::open(path)?;
+    verify_locked_store_identity(path, &lock)?;
+    TaskManager::initialize(connection, clock, Some(lock))
 }
 
 fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {
@@ -534,9 +605,7 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let lock = acquire_store_lock(path)?;
-        let connection = Connection::open(path)?;
-        Self::initialize(connection, Box::new(SystemClock), Some(lock))
+        open_locked_store(path, Box::new(SystemClock), |_| {})
     }
 
     /// Opens an isolated in-memory store with the production clock.
@@ -553,8 +622,7 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open_with_clock(path: impl AsRef<Path>, clock: Box<dyn Clock>) -> Result<Self> {
         let path = path.as_ref();
-        let lock = acquire_store_lock(path)?;
-        Self::initialize(Connection::open(path)?, clock, Some(lock))
+        open_locked_store(path, clock, |_| {})
     }
 
     /// Opens an in-memory store with an injected trusted clock.
@@ -568,7 +636,7 @@ impl TaskManager {
     fn initialize(
         connection: Connection,
         clock: Box<dyn Clock>,
-        store_lock: Option<File>,
+        store_lock: Option<StoreLock>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_migration_state(&connection)?;
@@ -611,16 +679,16 @@ impl TaskManager {
             .len()
             == request.active_step_ids.len();
         if request.task_id.is_empty()
-            || request.task_id.len() > 256
+            || request.task_id.chars().count() > 256
             || request.original_intent.is_empty()
             || request.original_intent.chars().count() > 65_536
             || request.principal.id.is_empty()
-            || request.principal.id.len() > 256
+            || request.principal.id.chars().count() > 256
             || !matches!(request.principal.kind.as_str(), "user" | "system-service")
             || request
                 .workspace_id
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 256)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 256)
             || request
                 .normalized_intent
                 .as_ref()
@@ -630,7 +698,7 @@ impl TaskManager {
             || request
                 .active_step_ids
                 .iter()
-                .any(|value| value.is_empty() || value.len() > 128)
+                .any(|value| value.is_empty() || value.chars().count() > 128)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "invalid Task creation record",
@@ -939,7 +1007,7 @@ impl TaskManager {
         let unique_outputs = all_unique(&request.output_artifacts);
         let valid_failure = request.failure.as_ref().is_none_or(|failure| {
             !failure.code.is_empty()
-                && failure.code.len() <= 128
+                && failure.code.chars().count() <= 128
                 && !failure.summary.is_empty()
                 && failure.summary.chars().count() <= 4096
         });
@@ -949,11 +1017,11 @@ impl TaskManager {
             .chain(request.finished_at.iter())
             .all(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).is_ok());
         if request.attempt_id.is_empty()
-            || request.attempt_id.len() > 256
+            || request.attempt_id.chars().count() > 256
             || request.task_id.is_empty()
-            || request.task_id.len() > 256
+            || request.task_id.chars().count() > 256
             || request.node_id.is_empty()
-            || request.node_id.len() > 128
+            || request.node_id.chars().count() > 128
             || request.attempt_number == 0
             || request.attempt_number > 100
             || !is_sha256(&request.semantic_program_hash)
@@ -961,27 +1029,27 @@ impl TaskManager {
             || request
                 .registry_snapshot_id
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 256)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 256)
             || request
                 .binding_id
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 256)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 256)
             || request
                 .provider_id
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 256)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 256)
             || request
                 .provider_version
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 128)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 128)
             || request
                 .operation_id
                 .as_ref()
-                .is_some_and(|value| value.len() > 512)
+                .is_some_and(|value| value.chars().count() > 512)
             || request
                 .idempotency_key
                 .as_ref()
-                .is_some_and(|value| value.len() > 512)
+                .is_some_and(|value| value.chars().count() > 512)
             || request.input_artifacts.len() > 256
             || request.output_artifacts.len() > 256
             || !unique_inputs
@@ -990,7 +1058,7 @@ impl TaskManager {
                 .input_artifacts
                 .iter()
                 .chain(&request.output_artifacts)
-                .any(|value| value.len() > 512)
+                .any(|value| value.chars().count() > 512)
             || !valid_failure
             || !valid_timestamps
         {
@@ -1420,8 +1488,10 @@ impl TaskManager {
             let mut material_active_program: Option<Value> = None;
             let mut material_active_program_digest: Option<String> = None;
             let mut material_steps = Vec::<String>::new();
-            let mut material_waiting = Vec::<WaitingOn>::new();
-            let mut material_failure: Option<FailureRecord> = None;
+            let mut material_waiting = json!([]);
+            let mut material_waiting_commitments = json!([]);
+            let mut material_failure: Option<Value> = None;
+            let mut material_failure_commitment: Option<Value> = None;
             let mut material_recovery: Option<Value> = None;
             let mut material_state_reason: Option<Value> = None;
             let mut material_updated_at: Option<String> = None;
@@ -1510,10 +1580,24 @@ impl TaskManager {
                     material_steps = serde_json::from_value(value.clone())?;
                 }
                 if let Some(value) = mutation.get("waiting_on").filter(|value| !value.is_null()) {
-                    material_waiting = serde_json::from_value(value.clone())?;
+                    material_waiting = value.clone();
+                    material_waiting_commitments = event
+                        .pointer("/details/mutation_text_commitments/waiting_on")
+                        .cloned()
+                        .ok_or(TaskManagerError::InvalidRecord(
+                            "waiting message commitments are missing",
+                        ))?;
                 }
                 if let Some(value) = mutation.get("failure").filter(|value| !value.is_null()) {
-                    material_failure = Some(serde_json::from_value(value.clone())?);
+                    material_failure = Some(value.clone());
+                    material_failure_commitment = event
+                        .pointer("/details/mutation_text_commitments/failure_summary")
+                        .cloned();
+                    if material_failure_commitment.is_none() {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "failure summary commitment is missing",
+                        ));
+                    }
                 }
                 if let Some(value) = mutation.get("recovery").filter(|value| !value.is_null()) {
                     material_recovery = Some(value.clone());
@@ -1581,14 +1665,24 @@ impl TaskManager {
                 .optional()?
                 .map(|program_json| program_content_digest(&program_json))
                 .transpose()?;
+            let expected_waiting = provenance_waiting_on(&task.waiting_on);
+            let expected_waiting_commitments =
+                provenance_waiting_commitments(&task.waiting_on, &intent_nonce);
+            let expected_failure = task.failure.as_ref().map(provenance_failure);
+            let expected_failure_commitment = task
+                .failure
+                .as_ref()
+                .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
             if material_creation.as_ref() != Some(&expected_creation)
                 || task.updated_at != material_updated_at.unwrap_or_default()
                 || task.active_plan != material_active_plan
                 || task.active_program != material_active_program
                 || active_program_digest != material_active_program_digest
                 || task.active_step_ids != material_steps
-                || task.waiting_on != material_waiting
-                || task.failure != material_failure
+                || expected_waiting != material_waiting
+                || expected_waiting_commitments != material_waiting_commitments
+                || expected_failure != material_failure
+                || expected_failure_commitment != material_failure_commitment
                 || task.recovery != material_recovery
                 || task.state_reason != material_state_reason
             {
@@ -1619,19 +1713,16 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        if let Some((stored_request, stored_result)) = transaction
+        if let Some(stored_request) = transaction
             .query_row(
-                "SELECT request_json, result_json FROM task_transitions WHERE transition_id = ?1",
+                "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
                 [&request.transition_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
         {
             if stored_request == request_json {
-                let result = stored_result.ok_or(TaskManagerError::InvalidRecord(
-                    "stored transition has no result",
-                ))?;
-                return Ok(serde_json::from_str(&result)?);
+                return authenticated_transition_result(&transaction, &request.transition_id);
             }
             let observed = load_observed(&transaction, &request.task_id)?;
             return Ok(rejected(
@@ -1780,6 +1871,32 @@ impl TaskManager {
                 },
             )
             .transpose()?;
+        let intent_nonce = transaction.query_row(
+            "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
+            [&request.task_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        if intent_nonce.len() != 32 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task provenance commitment nonce is invalid",
+            ));
+        }
+        let provenance_waiting = request
+            .mutation
+            .waiting_on
+            .as_ref()
+            .map(|values| provenance_waiting_on(values));
+        let waiting_commitments = request
+            .mutation
+            .waiting_on
+            .as_ref()
+            .map(|values| provenance_waiting_commitments(values, &intent_nonce));
+        let provenance_failure = request.mutation.failure.as_ref().map(provenance_failure);
+        let failure_commitment = request
+            .mutation
+            .failure
+            .as_ref()
+            .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
         let event_id = transition_event_id(&request.transition_id);
         let event = json!({
             "schema_version": SCHEMA_VERSION,
@@ -1804,14 +1921,18 @@ impl TaskManager {
             "committed_mutation": {
                 "active_plan": request.mutation.active_plan,
                 "active_step_ids": request.mutation.active_step_ids,
-                "waiting_on": request.mutation.waiting_on,
-                "failure": request.mutation.failure,
+                "waiting_on": provenance_waiting,
+                "failure": provenance_failure,
                 "recovery": request.mutation.recovery,
             },
             "details": {
                 "related_ids": request.reason.related_ids,
                 "reason_message": request.reason.message,
-                "active_program": active_program_event
+                "active_program": active_program_event,
+                "mutation_text_commitments": {
+                    "waiting_on": waiting_commitments,
+                    "failure_summary": failure_commitment,
+                }
             }
         });
         if fail_provenance {
@@ -2114,6 +2235,55 @@ fn task_field_commitment(secret_nonce: &[u8], field: &str, bytes: &[u8]) -> Valu
     json!({"kind":"task-field-commitment","version":"v1","algorithm":"sha256-keyed-prefix","field":field,"commitment":format!("sha256:{hex}")})
 }
 
+fn provenance_waiting_on(values: &[WaitingOn]) -> Value {
+    Value::Array(
+        values
+            .iter()
+            .map(|value| {
+                json!({
+                    "kind": value.kind,
+                    "id": value.id,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn provenance_waiting_commitments(values: &[WaitingOn], secret_nonce: &[u8]) -> Value {
+    Value::Array(
+        values
+            .iter()
+            .map(|value| {
+                json!({
+                    "kind": value.kind,
+                    "id": value.id,
+                    "message_ref": value.message.as_ref().map(|message| {
+                        task_field_commitment(secret_nonce, "waiting_message", message.as_bytes())
+                    })
+                })
+            })
+            .collect(),
+    )
+}
+
+fn provenance_failure(failure: &FailureRecord) -> Value {
+    json!({
+        "code": failure.code,
+        "step_id": failure.step_id,
+        "provider_id": failure.provider_id,
+        "execution_binding_id": failure.execution_binding_id,
+        "provenance_event_ids": failure.provenance_event_ids,
+        "retryable": failure.retryable,
+        "safe_to_replan": failure.safe_to_replan,
+        "unknown_side_effects": failure.unknown_side_effects,
+        "rollback_available": failure.rollback_available,
+    })
+}
+
+fn provenance_failure_commitment(failure: &FailureRecord, secret_nonce: &[u8]) -> Value {
+    task_field_commitment(secret_nonce, "failure_summary", failure.summary.as_bytes())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "mirrors the closed v0.1 transition-request schema at the storage boundary"
@@ -2155,7 +2325,7 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
         == request.reason.related_ids.len();
     let valid_plan = request.mutation.active_plan.as_ref().is_none_or(|plan| {
         !plan.plan_id.is_empty()
-            && plan.plan_id.len() <= 256
+            && plan.plan_id.chars().count() <= 256
             && plan.revision > 0
             && i64::try_from(plan.revision).is_ok()
     });
@@ -2166,12 +2336,12 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
         .is_none_or(|values| {
             values
                 .iter()
-                .all(|value| !value.is_empty() && value.len() <= 128)
+                .all(|value| !value.is_empty() && value.chars().count() <= 128)
         });
     let valid_waiting = request.mutation.waiting_on.as_ref().is_none_or(|values| {
         values.iter().all(|value| {
             !value.id.is_empty()
-                && value.id.len() <= 256
+                && value.id.chars().count() <= 256
                 && value
                     .message
                     .as_ref()
@@ -2180,34 +2350,34 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
     });
     let valid_failure = request.mutation.failure.as_ref().is_none_or(|failure| {
         !failure.code.is_empty()
-            && failure.code.len() <= 128
+            && failure.code.chars().count() <= 128
             && !failure.summary.is_empty()
             && failure.summary.chars().count() <= 4096
             && failure
                 .step_id
                 .as_ref()
-                .is_none_or(|value| value.len() <= 128)
+                .is_none_or(|value| value.chars().count() <= 128)
             && failure
                 .provider_id
                 .as_ref()
-                .is_none_or(|value| value.len() <= 256)
+                .is_none_or(|value| value.chars().count() <= 256)
             && failure
                 .execution_binding_id
                 .as_ref()
-                .is_none_or(|value| value.len() <= 256)
+                .is_none_or(|value| value.chars().count() <= 256)
             && failure.provenance_event_ids.len() <= 64
             && all_unique(&failure.provenance_event_ids)
             && failure
                 .provenance_event_ids
                 .iter()
-                .all(|value| value.len() <= 256)
+                .all(|value| value.chars().count() <= 256)
     });
     let valid_recovery = request.mutation.recovery.as_ref().is_none_or(|recovery| {
         recovery.unknown_operation_ids.len() <= 128
             && recovery
                 .unknown_operation_ids
                 .iter()
-                .all(|value| value.len() <= 256)
+                .all(|value| value.chars().count() <= 256)
             && recovery
                 .unknown_operation_ids
                 .iter()
@@ -2217,26 +2387,26 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
             && recovery
                 .last_known_daemon_instance
                 .as_ref()
-                .is_none_or(|value| value.len() <= 256)
+                .is_none_or(|value| value.chars().count() <= 256)
             && recovery
                 .unknown_operations_ref
                 .as_ref()
-                .is_none_or(|value| !value.is_empty() && value.len() <= 256)
+                .is_none_or(|value| !value.is_empty() && value.chars().count() <= 256)
     });
     if request.schema_version != SCHEMA_VERSION
         || request.transition_id.is_empty()
-        || request.transition_id.len() > 256
+        || request.transition_id.chars().count() > 256
         || (request.transition_id.starts_with("__aios_internal:") && !internal_recovery)
         || (internal_recovery && !request.transition_id.starts_with("__aios_internal:"))
         || request.task_id.is_empty()
-        || request.task_id.len() > 256
+        || request.task_id.chars().count() > 256
         || request.expected_revision == 0
         || i64::try_from(request.expected_revision).is_err()
         || !valid_actor
         || request.requested_by.id.is_empty()
-        || request.requested_by.id.len() > 256
+        || request.requested_by.id.chars().count() > 256
         || request.reason.code.is_empty()
-        || request.reason.code.len() > 128
+        || request.reason.code.chars().count() > 128
         || !valid_reason
         || request
             .reason
@@ -2249,7 +2419,7 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
             .reason
             .related_ids
             .iter()
-            .any(|value| value.len() > 512)
+            .any(|value| value.chars().count() > 512)
         || request
             .mutation
             .active_step_ids
@@ -2352,6 +2522,19 @@ fn transition_event_id(transition_id: &str) -> String {
     )
 }
 
+fn attempt_admitted_event_id(attempt_id: &str, binding_id: &str) -> String {
+    let framed = format!(
+        "{}:{attempt_id}{}:{binding_id}",
+        attempt_id.len(),
+        binding_id.len()
+    );
+    hashed_event_id(
+        "event:attempt-admitted:v1:sha256:",
+        b"AIOS-ATTEMPT-ADMITTED-EVENT-ID\0v1\0",
+        &framed,
+    )
+}
+
 fn task_created_event_id(task_id: &str) -> String {
     hashed_event_id(
         "event:task-created:v1:sha256:",
@@ -2394,7 +2577,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -2417,6 +2600,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0003_task_manager_recovery_fencing_privacy",
         "task-manager-recovery-fencing-privacy-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0004_task_manager_review_hardening",
+        "task-manager-review-hardening-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -2481,6 +2669,11 @@ fn migrate_task_manager_schema(
         connection,
         "0003_task_manager_recovery_fencing_privacy",
         "task-manager-recovery-fencing-privacy-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0004_task_manager_review_hardening",
+        "task-manager-review-hardening-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -2553,6 +2746,32 @@ fn migrate_task_manager_schema(
             "UPDATE recovery_assessments SET basis_revision = (SELECT revision FROM tasks WHERE tasks.task_id = recovery_assessments.task_id) WHERE basis_revision IS NULL",
             [],
         )?;
+        let invalid_recovery_basis = connection.query_row(
+            "SELECT COUNT(*) FROM recovery_assessments WHERE basis_revision IS NULL OR basis_revision < 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_recovery_basis != 0 {
+            return Err(TaskManagerError::InvalidRecord(
+                "invalid recovery assessment basis revisions require operator quarantine",
+            ));
+        }
+        connection.execute_batch(
+            "DROP TRIGGER IF EXISTS recovery_assessments_basis_insert;
+             DROP TRIGGER IF EXISTS recovery_assessments_basis_update;
+             CREATE TRIGGER recovery_assessments_basis_insert
+             BEFORE INSERT ON recovery_assessments
+             WHEN NEW.basis_revision IS NULL OR NEW.basis_revision < 1
+             BEGIN SELECT RAISE(ABORT, 'recovery basis revision must be at least 1'); END;
+             CREATE TRIGGER recovery_assessments_basis_update
+             BEFORE UPDATE OF basis_revision ON recovery_assessments
+             WHEN NEW.basis_revision IS NULL OR NEW.basis_revision < 1
+             BEGIN SELECT RAISE(ABORT, 'recovery basis revision must be at least 1'); END;",
+        )?;
+        if !table_has_column(connection, "approval_decisions", "approved_until")? {
+            connection
+                .execute_batch("ALTER TABLE approval_decisions ADD COLUMN approved_until TEXT;")?;
+        }
         let duplicate_publications = connection.query_row(
             "SELECT COUNT(*) FROM (SELECT allocation_id FROM artifact_publications GROUP BY allocation_id HAVING COUNT(*) > 1)",
             [],
@@ -2579,6 +2798,10 @@ fn migrate_task_manager_schema(
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0003_task_manager_recovery_fencing_privacy', 'task-manager-recovery-fencing-privacy-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0004_task_manager_review_hardening', 'task-manager-review-hardening-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -2771,6 +2994,36 @@ fn reconstruct_committed_transition(
     let expected_actor = serde_json::to_value(&stored_request.requested_by)?;
     let expected_reason_message = serde_json::to_value(&stored_request.reason.message)?;
     let expected_related_ids = serde_json::to_value(&stored_request.reason.related_ids)?;
+    let intent_nonce = connection.query_row(
+        "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
+        [task_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    if intent_nonce.len() != 32 {
+        return Err(TaskManagerError::InvalidRecord(
+            "Task provenance commitment nonce is invalid",
+        ));
+    }
+    let expected_waiting = stored_request
+        .mutation
+        .waiting_on
+        .as_ref()
+        .map(|values| provenance_waiting_on(values));
+    let expected_waiting_commitments = stored_request
+        .mutation
+        .waiting_on
+        .as_ref()
+        .map(|values| provenance_waiting_commitments(values, &intent_nonce));
+    let expected_failure = stored_request
+        .mutation
+        .failure
+        .as_ref()
+        .map(provenance_failure);
+    let expected_failure_commitment = stored_request
+        .mutation
+        .failure
+        .as_ref()
+        .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
     let computed_hash = provenance_hash(
         task_id,
         u64::try_from(event_row.0)
@@ -2801,12 +3054,16 @@ fn reconstruct_committed_transition(
             != Some(stored_request.reason.code.as_str())
         || event.pointer("/details/reason_message") != Some(&expected_reason_message)
         || event.pointer("/details/related_ids") != Some(&expected_related_ids)
+        || event.pointer("/details/mutation_text_commitments/waiting_on")
+            != Some(&serde_json::to_value(&expected_waiting_commitments)?)
+        || event.pointer("/details/mutation_text_commitments/failure_summary")
+            != Some(&serde_json::to_value(&expected_failure_commitment)?)
         || event.get("committed_mutation")
             != Some(&json!({
                 "active_plan": stored_request.mutation.active_plan,
                 "active_step_ids": stored_request.mutation.active_step_ids,
-                "waiting_on": stored_request.mutation.waiting_on,
-                "failure": stored_request.mutation.failure,
+                "waiting_on": expected_waiting,
+                "failure": expected_failure,
                 "recovery": stored_request.mutation.recovery,
             }))
         || new_revision != row_revision
@@ -2905,7 +3162,10 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
               WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))
              UNION ALL
              SELECT 'provider-invocation:' || invocation_id FROM provider_invocations
-              WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'PROVIDER_FAILURE', 'CANCELLED', 'OUTPUT_FINALIZATION_FAILED', 'AUTHORITY_REVOKED')
+              WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED')
+             UNION ALL
+             SELECT 'credential-use:' || request_id FROM credential_use_records
+              WHERE task_id = ?1 AND (completed_at IS NULL OR result_json IS NULL OR status IS NULL OR status = 'OUTCOME_UNKNOWN')
              UNION ALL
              SELECT 'publication:' || publication_id FROM artifact_publications
               WHERE task_id = ?1 AND state = 'PENDING'
@@ -2923,7 +3183,8 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
                (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'PROVIDER_FAILURE', 'CANCELLED', 'OUTPUT_FINALIZATION_FAILED', 'AUTHORITY_REVOKED'))",
+               (SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED')) +
+               (SELECT COUNT(*) FROM credential_use_records WHERE task_id = ?1 AND (completed_at IS NULL OR result_json IS NULL OR status IS NULL OR status = 'OUTCOME_UNKNOWN'))",
             [task_id],
             |row| row.get::<_, i64>(0),
         )
@@ -2969,8 +3230,8 @@ fn load_recovery_subjects(
     {
         let mut statement = transaction.prepare(
             "SELECT attempt_id, outcome_certainty, state, started_at FROM step_executions
-             WHERE task_id = ?1 AND (state IN ('PENDING','BLOCKED','READY','STARTING','RUNNING','UNKNOWN')
-                OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')) ORDER BY attempt_id",
+             WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')
+                OR (state IN ('STARTING','RUNNING','UNKNOWN') AND outcome_certainty IS NULL)) ORDER BY attempt_id",
         )?;
         let rows = statement.query_map([task_id], |row| {
             Ok((
@@ -3026,7 +3287,7 @@ fn load_recovery_subjects(
     {
         let mut statement = transaction.prepare(
             "SELECT invocation_id, status, started_at FROM provider_invocations
-             WHERE task_id = ?1 AND status IN ('PENDING','STARTING','RUNNING','OUTCOME_UNKNOWN','TIMED_OUT','PROVIDER_FAILURE','CANCELLED','OUTPUT_FINALIZATION_FAILED','AUTHORITY_REVOKED') ORDER BY invocation_id",
+             WHERE task_id = ?1 AND status IN ('PENDING','STARTING','RUNNING','OUTCOME_UNKNOWN','TIMED_OUT','AUTHORITY_REVOKED') ORDER BY invocation_id",
         )?;
         let rows = statement.query_map([task_id], |row| {
             Ok((
@@ -3037,11 +3298,7 @@ fn load_recovery_subjects(
         })?;
         for row in rows {
             let (id, status, started_at) = row?;
-            let certainty = if status == "PENDING" && started_at.is_none() {
-                "NOT_STARTED".to_owned()
-            } else {
-                "OUTCOME_UNKNOWN".to_owned()
-            };
+            let certainty = "OUTCOME_UNKNOWN".to_owned();
             let (safe_action, reason_code) = recovery_disposition(&certainty);
             subjects.push(RecoverySubject {
                 kind: "external-operation",
@@ -3052,6 +3309,35 @@ fn load_recovery_subjects(
                 reason_code,
                 observation: format!(
                     "durable provider invocation status={status}; started_at={started_at:?}"
+                ),
+            });
+        }
+    }
+    {
+        let mut statement = transaction.prepare(
+            "SELECT request_id, status, requested_at, completed_at FROM credential_use_records
+             WHERE task_id = ?1 AND (completed_at IS NULL OR result_json IS NULL OR status IS NULL OR status = 'OUTCOME_UNKNOWN')
+             ORDER BY request_id",
+        )?;
+        let rows = statement.query_map([task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, status, requested_at, completed_at) = row?;
+            subjects.push(RecoverySubject {
+                kind: "external-operation",
+                id: format!("credential-use:{id}"),
+                evidence_kind: "credential-record",
+                certainty: "OUTCOME_UNKNOWN".to_owned(),
+                safe_action: "REQUIRE_EXTERNAL_RECONCILIATION",
+                reason_code: "RECOVERY_OUTCOME_UNKNOWN",
+                observation: format!(
+                    "durable credential use status={status:?}; requested_at={requested_at}; completed_at={completed_at:?}"
                 ),
             });
         }
@@ -3249,6 +3535,139 @@ fn load_observed(transaction: &Transaction<'_>, task_id: &str) -> Result<Option<
     .transpose()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticates every replayed receipt field against its transition row and provenance"
+)]
+fn authenticated_transition_result(
+    transaction: &Transaction<'_>,
+    transition_id: &str,
+) -> Result<TransitionResult> {
+    let row = transaction.query_row(
+        "SELECT task_id,expected_revision,expected_state,to_state,result_revision,result_state,outcome,reason_code,result_json,provenance_event_id,requested_at,committed_at FROM task_transitions WHERE transition_id=?1",
+        [transition_id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?, row.get::<_, String>(10)?, row.get::<_, Option<String>>(11)?,
+        )),
+    )?;
+    let result_json = row.8.ok_or(TaskManagerError::InvalidRecord(
+        "stored transition has no result",
+    ))?;
+    let result: TransitionResult = serde_json::from_str(&result_json)?;
+    let expected_revision = u64::try_from(row.1)
+        .map_err(|_| TaskManagerError::InvalidRecord("stored transition revision is invalid"))?;
+    let expected_state = TaskState::parse(&row.2)?;
+    let to_state = TaskState::parse(&row.3)?;
+    let result_revision = row.4.and_then(|value| u64::try_from(value).ok());
+    let result_state = row.5.as_deref().map(TaskState::parse).transpose()?;
+    let resulted_at = row.11.as_deref().unwrap_or(&row.10);
+    if result.schema_version != SCHEMA_VERSION
+        || result.transition_id != transition_id
+        || result.task_id != row.0
+        || result.reason_code != row.7
+        || result.resulted_at != resulted_at
+        || result.observed_revision != result_revision
+        || result.observed_state != result_state
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored transition result conflicts with its durable row",
+        ));
+    }
+    match row.6.as_str() {
+        "COMMITTED" => {
+            let Some(event_id) = row.9.as_deref() else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "committed transition result has no provenance identity",
+                ));
+            };
+            // Reuse the full request-to-event authentication performed for
+            // legacy receipt reconstruction. This binds actor, reason, and
+            // every privacy-safe mutation field before replaying a receipt.
+            reconstruct_committed_transition(
+                transaction,
+                transition_id,
+                &row.0,
+                row.4,
+                row.5.as_deref(),
+                Some(event_id),
+            )?;
+            let event_row = transaction
+                .query_row(
+                    "SELECT sequence,previous_event_hash,event_hash,event_json,timestamp FROM provenance_events WHERE event_id=?1 AND task_id=?2 AND event_type='task.transitioned'",
+                    params![event_id, row.0],
+                    |event| Ok((event.get::<_, i64>(0)?,event.get::<_, Option<String>>(1)?,event.get::<_, String>(2)?,event.get::<_, String>(3)?,event.get::<_, String>(4)?)),
+                )
+                .optional()?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "committed transition result provenance is missing",
+                ))?;
+            let sequence = u64::try_from(event_row.0)
+                .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance sequence"))?;
+            let event: Value = serde_json::from_str(&event_row.3)?;
+            if !result.applied
+                || result.reason_code != "TASK_TRANSITION_APPLIED"
+                || result.previous_revision != Some(expected_revision)
+                || result.previous_state != Some(expected_state)
+                || result.current_revision != result_revision
+                || result.current_state != Some(to_state)
+                || result.provenance_event_id.as_deref() != Some(event_id)
+                || result.provenance_event_hash.as_deref() != Some(event_row.2.as_str())
+                || result.resulted_at != event_row.4
+                || event
+                    .pointer("/task_transition/transition_id")
+                    .and_then(Value::as_str)
+                    != Some(transition_id)
+                || event
+                    .pointer("/task_transition/previous_revision")
+                    .and_then(Value::as_u64)
+                    != Some(expected_revision)
+                || event
+                    .pointer("/task_transition/new_revision")
+                    .and_then(Value::as_u64)
+                    != result_revision
+                || event
+                    .pointer("/task_transition/previous_state")
+                    .and_then(Value::as_str)
+                    != Some(expected_state.as_str())
+                || event
+                    .pointer("/task_transition/new_state")
+                    .and_then(Value::as_str)
+                    != Some(to_state.as_str())
+                || provenance_hash(&row.0, sequence, event_row.1.as_deref(), &event)? != event_row.2
+                || !verify_provenance_through(transaction, &row.0, Some(event_row.0))?
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "stored transition result conflicts with committed provenance",
+                ));
+            }
+        }
+        "REJECTED" => {
+            if result.applied
+                || result.previous_state.is_some()
+                || result.current_state.is_some()
+                || result.previous_revision.is_some()
+                || result.current_revision.is_some()
+                || result.provenance_event_id.is_some()
+                || result.provenance_event_hash.is_some()
+                || row.9.is_some()
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "stored rejection result conflicts with its durable row",
+                ));
+            }
+        }
+        _ => {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored transition has no replayable terminal outcome",
+            ));
+        }
+    }
+    Ok(result)
+}
+
 fn rejected(
     request: &TransitionRequest,
     code: &str,
@@ -3417,18 +3836,36 @@ fn admit_active_steps(
     if active_steps.is_empty() {
         return Ok(false);
     }
+    let mut admitted = 0_usize;
     for node_id in active_steps {
-        if latest_active_attempt_count(transaction, task_id, node_id)? != 1 {
+        let ready_latest = transaction.query_row(
+            "SELECT COUNT(*) FROM step_executions s JOIN tasks t ON t.task_id=s.task_id JOIN semantic_program_revisions p ON p.task_id=t.task_id AND p.program_revision=t.active_program_revision AND p.semantic_hash=s.semantic_program_hash AND p.registry_snapshot_id=s.registry_snapshot_id WHERE s.task_id=?1 AND s.node_id=?2 AND s.state='READY' AND s.attempt_number=(SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id=s.task_id AND s2.node_id=s.node_id AND s2.semantic_program_hash=s.semantic_program_hash AND s2.registry_snapshot_id=s.registry_snapshot_id)",
+            params![task_id, node_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if ready_latest == 0 {
+            continue;
+        }
+        if ready_latest != 1 || latest_active_attempt_count(transaction, task_id, node_id)? != 1 {
             return Ok(false);
         }
         let candidate = transaction
             .query_row(
-                "SELECT s.attempt_id, b.binding_id, s.semantic_program_hash, b.grant_refs_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'READY' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
+                "SELECT s.attempt_id, b.binding_id, s.semantic_program_hash, b.grant_refs_json, b.registry_snapshot_id, b.provider_id, b.provider_version FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'READY' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, node_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?)),
             )
             .optional()?;
-        let Some((attempt_id, binding_id, semantic_hash, grant_refs)) = candidate else {
+        let Some((
+            attempt_id,
+            binding_id,
+            semantic_hash,
+            grant_refs,
+            registry_snapshot_id,
+            provider_id,
+            provider_version,
+        )) = candidate
+        else {
             return Ok(false);
         };
         let check = BindingGrantCheck {
@@ -3452,8 +3889,30 @@ fn admit_active_steps(
         if changed != 1 {
             return Ok(false);
         }
+        let event = json!({
+            "schema_version": SCHEMA_VERSION,
+            "event_id": attempt_admitted_event_id(&attempt_id, &binding_id),
+            "task_id": task_id,
+            "event_type": "execution.started",
+            "timestamp": admitted_at,
+            "actor": {"kind":"provider","id":provider_id},
+            "status": "success",
+            "semantic_program_hash": semantic_hash,
+            "registry_snapshot_id": registry_snapshot_id,
+            "step_id": node_id,
+            "execution_binding_id": binding_id,
+            "provider_id": provider_id,
+            "provider_version": provider_version,
+            "details": {
+                "attempt_id": attempt_id,
+                "binding_id": binding_id,
+                "node_id": node_id,
+            }
+        });
+        append_event(transaction, task_id, &event)?;
+        admitted += 1;
     }
-    Ok(true)
+    Ok(admitted > 0)
 }
 
 struct BindingGrantCheck<'a> {
@@ -3659,7 +4118,7 @@ fn binding_grants_valid(
     for grant_id in grant_ids {
         let grant = transaction
             .query_row(
-                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id FROM authority_grants g JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
+                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id, g.scope FROM authority_grants g JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
                 params![grant_id, check.task_id, check.semantic_hash, check.node_id, check.binding_id, check.attempt_id],
                 |row| {
                     Ok((
@@ -3673,6 +4132,7 @@ fn binding_grants_valid(
                         row.get::<_, String>(14)?, row.get::<_, String>(15)?,
                         row.get::<_, String>(16)?, row.get::<_, Option<String>>(17)?,
                         row.get::<_, Option<String>>(18)?,
+                        row.get::<_, String>(19)?,
                     ))
                 },
             )
@@ -3719,6 +4179,7 @@ fn binding_grants_valid(
         if expires_at <= checked_at {
             return Ok(false);
         }
+        let grant_scope = &grant.19;
         match (&grant.17, &grant.18) {
             (None, None) => {}
             (Some(approval_id), Some(decision_approval_id))
@@ -3726,7 +4187,7 @@ fn binding_grants_valid(
             {
                 let approval = transaction
                     .query_row(
-                        "SELECT a.expires_at, COUNT(ad.decision_id)
+                        "SELECT a.expires_at, COUNT(ad.decision_id), MIN(ad.scope), MIN(ad.approved_until)
                      FROM approval_requests a
                      JOIN authority_requests ar ON ar.request_id = a.authority_request_id
                      LEFT JOIN approval_decisions ad ON ad.approval_id = a.approval_id
@@ -3746,19 +4207,41 @@ fn binding_grants_valid(
                             request.5,
                             request.6
                         ],
-                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
                     )
                     .optional()?;
-                let Some((approval_expires_at, decisions)) = approval else {
+                let Some((approval_expires_at, decisions, decision_scope, approved_until)) =
+                    approval
+                else {
                     return Ok(false);
                 };
                 if decisions != 1
+                    || decision_scope.as_deref() != Some(grant_scope.as_str())
                     || approval_expires_at.as_ref().is_some_and(|value| {
                         OffsetDateTime::parse(value, &Rfc3339)
                             .map_or(true, |expires| expires <= checked_at)
                     })
                 {
                     return Ok(false);
+                }
+                if grant_scope == "TIME_LIMITED" && approved_until.is_none() {
+                    return Ok(false);
+                }
+                if let Some(approved_until) = approved_until {
+                    let Ok(approved_until) = OffsetDateTime::parse(&approved_until, &Rfc3339)
+                    else {
+                        return Ok(false);
+                    };
+                    if approved_until <= checked_at || expires_at > approved_until {
+                        return Ok(false);
+                    }
                 }
             }
             _ => return Ok(false),
@@ -3885,28 +4368,6 @@ fn active_step_completion_facts(
     Ok(Some(published_artifacts))
 }
 
-fn active_candidate_output_count(
-    transaction: &Transaction<'_>,
-    task_id: &str,
-    active_steps: &[String],
-) -> Result<usize> {
-    let mut count = 0_usize;
-    for node_id in active_steps {
-        let output_json = transaction
-            .query_row(
-                "SELECT s.output_artifacts_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'SUCCEEDED' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
-                params![task_id, node_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-        if let Some(output_json) = output_json {
-            count += serde_json::from_str::<Vec<String>>(&output_json)?.len();
-        }
-    }
-    Ok(count)
-}
-
 fn has_current_verification(
     transaction: &Transaction<'_>,
     task_id: &str,
@@ -3928,11 +4389,42 @@ fn has_current_verification(
         return Ok(false);
     }
     let mut statement = transaction.prepare(
-        "SELECT event_json FROM provenance_events WHERE task_id = ?1 AND event_type = 'verification.completed' AND status = 'success' ORDER BY sequence DESC",
+        "SELECT sequence, previous_event_hash, event_hash, event_json, timestamp, event_id, status FROM provenance_events WHERE task_id = ?1 AND event_type = 'verification.completed' AND status = 'success' ORDER BY sequence DESC",
     )?;
-    let rows = statement.query_map([task_id], |row| row.get::<_, String>(0))?;
+    let rows = statement.query_map([task_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
     for row in rows {
-        let event: Value = serde_json::from_str(&row?)?;
+        let (sequence, previous_hash, stored_hash, event_json, timestamp, event_id, status) = row?;
+        let Ok(sequence) = u64::try_from(sequence) else {
+            return Ok(false);
+        };
+        let event: Value = serde_json::from_str(&event_json)?;
+        if status != "success"
+            || event_string(&event, "event_id") != Some(event_id.as_str())
+            || event_string(&event, "task_id") != Some(task_id)
+            || event_string(&event, "event_type") != Some("verification.completed")
+            || event_string(&event, "timestamp") != Some(timestamp.as_str())
+            || event_string(&event, "status") != Some("success")
+            || provenance_hash(task_id, sequence, previous_hash.as_deref(), &event)? != stored_hash
+            || !verify_provenance_through(
+                transaction,
+                task_id,
+                Some(i64::try_from(sequence).map_err(|_| {
+                    TaskManagerError::InvalidRecord("verification sequence exceeds SQLite range")
+                })?),
+            )?
+        {
+            return Ok(false);
+        }
         if event.get("semantic_program_hash").and_then(Value::as_str)
             != Some(semantic_hash.as_str())
             || event.get("registry_snapshot_id").and_then(Value::as_str)
@@ -3968,7 +4460,7 @@ fn has_current_verification(
 
 fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Result<bool> {
     let live_attempts = transaction.query_row(
-        "SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (state IN ('PENDING', 'BLOCKED', 'READY', 'STARTING', 'RUNNING', 'UNKNOWN') OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN'))",
+        "SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (state IN ('STARTING', 'RUNNING', 'UNKNOWN') OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN'))",
         [task_id],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3983,11 +4475,89 @@ fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Resul
         |row| row.get::<_, i64>(0),
     )?;
     let live_invocations = transaction.query_row(
-        "SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'PROVIDER_FAILURE', 'CANCELLED', 'OUTPUT_FINALIZATION_FAILED', 'AUTHORITY_REVOKED')",
+        "SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED')",
         [task_id],
         |row| row.get::<_, i64>(0),
     )?;
-    Ok(live_attempts == 0 && live_grants == 0 && live_effects == 0 && live_invocations == 0)
+    let live_credential_uses = transaction.query_row(
+        "SELECT COUNT(*) FROM credential_use_records WHERE task_id = ?1 AND (completed_at IS NULL OR result_json IS NULL OR status IS NULL OR status = 'OUTCOME_UNKNOWN')",
+        [task_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(live_attempts == 0
+        && live_grants == 0
+        && live_effects == 0
+        && live_invocations == 0
+        && live_credential_uses == 0)
+}
+
+fn resolved_recovery_subject(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    inventory_id: &str,
+) -> Result<bool> {
+    if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
+        let certainty = transaction
+            .query_row(
+                "SELECT outcome_certainty FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
+                params![task_id, attempt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        return Ok(certainty
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "OUTCOME_UNKNOWN" | "FAILED_PARTIAL_EFFECT")));
+    }
+    if let Some(publication_id) = inventory_id.strip_prefix("publication:") {
+        return transaction
+            .query_row(
+                "SELECT state <> 'PENDING' FROM artifact_publications WHERE task_id=?1 AND publication_id=?2",
+                params![task_id, publication_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(Into::into);
+    }
+    if let Some(grant_id) = inventory_id.strip_prefix("grant:") {
+        return transaction
+            .query_row(
+                "SELECT state <> 'ACTIVE' FROM authority_grants WHERE task_id=?1 AND grant_id=?2",
+                params![task_id, grant_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(Into::into);
+    }
+    if let Some(request_id) = inventory_id.strip_prefix("credential-use:") {
+        return transaction
+            .query_row(
+                "SELECT completed_at IS NOT NULL AND result_json IS NOT NULL AND status IS NOT NULL AND status <> 'OUTCOME_UNKNOWN' FROM credential_use_records WHERE task_id=?1 AND request_id=?2",
+                params![task_id, request_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(Into::into);
+    }
+    if inventory_id.starts_with("provider-invocation:") {
+        // Provider invocation rows lack an authenticated outcome-certainty
+        // field, so even terminal-looking runtime statuses cannot prove safety.
+        return Ok(false);
+    }
+    let certainty = transaction
+        .query_row(
+            "SELECT outcome_certainty FROM operations WHERE task_id=?1 AND operation_id=?2",
+            params![task_id, inventory_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(certainty
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "OUTCOME_UNKNOWN" | "FAILED_PARTIAL_EFFECT")))
 }
 
 #[allow(
@@ -4041,13 +4611,17 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
         recovery_ref,
     )?;
-    if unresolved_execution_ids(transaction, task_id)? != inventory
-        || recovery_operations_ref(task_id, basis_revision, &inventory)? != recovery_ref
-        || matches!(
-            certainty.as_str(),
-            "OUTCOME_UNKNOWN" | "FAILED_PARTIAL_EFFECT"
-        )
-        || safe_action == "REQUIRE_EXTERNAL_RECONCILIATION"
+    if recovery_operations_ref(task_id, basis_revision, &inventory)? != recovery_ref {
+        return Ok(false);
+    }
+    let current_unresolved = unresolved_execution_ids(transaction, task_id)?;
+    let inventory_set = inventory
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if current_unresolved
+        .iter()
+        .any(|subject| !inventory_set.contains(subject))
     {
         return Ok(false);
     }
@@ -4066,7 +4640,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         || aggregate_json
             .get("external_reconciliation_required")
             .and_then(Value::as_bool)
-            .unwrap_or(true)
+            .is_none()
     {
         return Ok(false);
     }
@@ -4107,11 +4681,6 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         };
         if recovery_subject_assessment_id(recovery_ref, &subject_kind, &subject_id) != assessment_id
             || !covered_inventory.insert(inventory_id)
-            || matches!(
-                subject_certainty.as_str(),
-                "OUTCOME_UNKNOWN" | "FAILED_PARTIAL_EFFECT"
-            )
-            || subject_action == "REQUIRE_EXTERNAL_RECONCILIATION"
             || subject.get("assessment_id").and_then(Value::as_str) != Some(assessment_id.as_str())
             || subject.pointer("/subject/kind").and_then(Value::as_str)
                 != Some(subject_kind.as_str())
@@ -4121,12 +4690,34 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
             || subject
                 .get("external_reconciliation_required")
                 .and_then(Value::as_bool)
-                .unwrap_or(true)
+                != Some(subject_action == "REQUIRE_EXTERNAL_RECONCILIATION")
         {
             return Ok(false);
         }
     }
-    Ok(covered_inventory == inventory.into_iter().collect())
+    if covered_inventory != inventory_set {
+        return Ok(false);
+    }
+    let stored_aggregate_safe = !matches!(
+        certainty.as_str(),
+        "OUTCOME_UNKNOWN" | "FAILED_PARTIAL_EFFECT"
+    ) && safe_action != "REQUIRE_EXTERNAL_RECONCILIATION"
+        && !aggregate_json
+            .get("external_reconciliation_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+    if stored_aggregate_safe {
+        return Ok(current_unresolved.is_empty());
+    }
+    if inventory.is_empty() || !current_unresolved.is_empty() {
+        return Ok(false);
+    }
+    for subject in &inventory {
+        if !resolved_recovery_subject(transaction, task_id, subject)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn plan_program_coherent(
@@ -4182,6 +4773,15 @@ fn guard_failure(
     // propose a replacement list, but it cannot use that uncommitted proposal
     // as evidence that runnable/running/completion prerequisites already hold.
     let active_steps: Vec<String> = serde_json::from_str(stored_steps)?;
+    let approval_scope_steps = if request.to_state == TaskState::WaitingForAuth {
+        request
+            .mutation
+            .active_step_ids
+            .as_ref()
+            .unwrap_or(&active_steps)
+    } else {
+        &active_steps
+    };
     let valid_program = active_program.is_some()
         && transaction.query_row(
             "SELECT COUNT(*) FROM semantic_program_revisions p JOIN validation_results v ON v.validation_result_id = p.validation_result_id WHERE p.task_id = ?1 AND p.program_revision = ?2 AND p.status = 'active' AND v.valid = 1 AND v.semantic_hash = p.semantic_hash AND v.registry_snapshot_id = p.registry_snapshot_id",
@@ -4212,7 +4812,7 @@ fn guard_failure(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .filter(|(_, node_id, expires_at)| {
-                active_steps.contains(node_id)
+                approval_scope_steps.contains(node_id)
                     && expires_at.as_ref().is_none_or(|expires_at| {
                         OffsetDateTime::parse(expires_at, &Rfc3339)
                             .is_ok_and(|expires_at| expires_at > checked_instant)
@@ -4303,7 +4903,7 @@ fn guard_failure(
         TaskState::Runnable
             if !valid_program
                 || active_steps.is_empty()
-                || usize::try_from(ready_steps).ok() != Some(active_steps.len())
+                || ready_steps == 0
                 || effective_waiting
                 || pending_approvals > 0
                 || durable_nonapproval_blocker =>
@@ -4316,14 +4916,14 @@ fn guard_failure(
                 || pending_approvals > 0
                 || durable_nonapproval_blocker
                 || active_steps.is_empty()
-                || usize::try_from(bound_ready_steps).ok() != Some(active_steps.len()) =>
+                || bound_ready_steps == 0 =>
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
         }
         TaskState::Verifying => {
-            let candidate_outputs =
-                active_candidate_output_count(transaction, &request.task_id, &active_steps)?;
-            (candidate_outputs == 0).then_some("TASK_TRANSITION_GUARD_FAILED")
+            active_step_completion_facts(transaction, &request.task_id, &active_steps)?
+                .is_none()
+                .then_some("TASK_TRANSITION_GUARD_FAILED")
         }
         TaskState::Completed => {
             let published_outputs =

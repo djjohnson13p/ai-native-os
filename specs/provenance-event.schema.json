@@ -95,14 +95,74 @@
       }
     },
     "committed_mutation": {
+      "description": "Canonical privacy-safe projection of the Task mutation committed at this revision. Free-form waiting messages and failure summaries are intentionally excluded.",
       "type": "object",
       "additionalProperties": false,
+      "required": ["active_plan", "active_step_ids", "waiting_on", "failure", "recovery"],
       "properties": {
-        "active_plan": {"type": ["object", "null"]},
-        "active_step_ids": {"type": ["array", "null"], "items": {"type": "string"}, "uniqueItems": true},
-        "waiting_on": {"type": ["array", "null"], "items": {"type": "object"}},
-        "failure": {"type": ["object", "null"]},
-        "recovery": {"type": ["object", "null"]}
+        "active_plan": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["plan_id", "revision"],
+          "properties": {
+            "plan_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "revision": {"type": "integer", "minimum": 1}
+          }
+        },
+        "active_step_ids": {
+          "type": ["array", "null"],
+          "maxItems": 512,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128},
+          "uniqueItems": true
+        },
+        "waiting_on": {
+          "type": ["array", "null"],
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id"],
+            "properties": {
+              "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+          }
+        },
+        "failure": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["code", "retryable", "safe_to_replan", "unknown_side_effects", "rollback_available"],
+          "properties": {
+            "code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
+            "step_id": {"type": ["string", "null"], "maxLength": 128},
+            "provider_id": {"type": ["string", "null"], "maxLength": 256},
+            "execution_binding_id": {"type": ["string", "null"], "maxLength": 256},
+            "retryable": {"type": "boolean"},
+            "safe_to_replan": {"type": "boolean"},
+            "unknown_side_effects": {"type": "boolean"},
+            "rollback_available": {"type": "boolean"},
+            "provenance_event_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 64,
+              "items": {"type": "string", "maxLength": 256}
+            }
+          }
+        },
+        "recovery": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "unknown_operation_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 128,
+              "items": {"type": "string", "maxLength": 256}
+            },
+            "unknown_operations_ref": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+            "last_known_daemon_instance": {"type": ["string", "null"], "maxLength": 256}
+          }
+        }
       }
     },
     "semantic_program_hash": {
@@ -177,8 +237,8 @@
         "properties": {"event_type": {"const": "task.transitioned"}},
         "required": ["event_type"]
       },
-      "then": {"required": ["task_transition"]},
-      "else": {"properties": {"task_transition": false}}
+      "then": {"required": ["task_transition", "committed_mutation"]},
+      "else": {"properties": {"task_transition": false, "committed_mutation": false}}
     }
   ],
   "$defs": {

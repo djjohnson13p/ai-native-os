@@ -62,7 +62,7 @@
   ],
   "provenance_cases": [
     {
-      "name": "typed-task-transition-is-required-and-valid",
+      "name": "canonical-task-transition-with-committed-mutation-is-valid",
       "expected_valid": true,
       "value": {
         "schema_version": "0.1",
@@ -78,7 +78,161 @@
           "previous_revision": 1,
           "new_revision": 2,
           "reason_code": "PLANNING_REQUESTED"
+        },
+        "committed_mutation": {
+          "active_plan": null,
+          "active_step_ids": null,
+          "waiting_on": null,
+          "failure": null,
+          "recovery": null
         }
+      }
+    },
+    {
+      "name": "task-transition-missing-committed-mutation-is-rejected",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:missing-mutation",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-missing-mutation",
+          "previous_state": "CREATED",
+          "new_state": "PLANNING",
+          "previous_revision": 1,
+          "new_revision": 2,
+          "reason_code": "PLANNING_REQUESTED"
+        }
+      }
+    },
+    {
+      "name": "privacy-safe-structured-committed-mutation-is-valid",
+      "expected_valid": true,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:structured-mutation",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-structured-mutation",
+          "previous_state": "RUNNING",
+          "new_state": "FAILED",
+          "previous_revision": 8,
+          "new_revision": 9,
+          "reason_code": "PROVIDER_FAILED"
+        },
+        "committed_mutation": {
+          "active_plan": {"plan_id": "plan:fixture", "revision": 3},
+          "active_step_ids": ["step:fixture"],
+          "waiting_on": [{"kind": "provider", "id": "provider:fixture"}],
+          "failure": {
+            "code": "PROVIDER_FAILED",
+            "step_id": "step:fixture",
+            "provider_id": "provider:fixture",
+            "execution_binding_id": "binding:fixture",
+            "retryable": false,
+            "safe_to_replan": false,
+            "unknown_side_effects": true,
+            "rollback_available": false,
+            "provenance_event_ids": ["event:execution:fixture"]
+          },
+          "recovery": {
+            "unknown_operation_ids": [],
+            "unknown_operations_ref": "recovery:fixture",
+            "last_known_daemon_instance": "daemon:fixture"
+          }
+        }
+      }
+    },
+    {
+      "name": "committed-waiting-mutation-rejects-free-form-message",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:private-waiting-text",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-private-waiting-text",
+          "previous_state": "PLANNING",
+          "new_state": "WAITING_FOR_INPUT",
+          "previous_revision": 2,
+          "new_revision": 3,
+          "reason_code": "INPUT_REQUIRED"
+        },
+        "committed_mutation": {
+          "active_plan": null,
+          "active_step_ids": null,
+          "waiting_on": [{"kind": "input", "id": "input:fixture", "message": "synthetic private request text"}],
+          "failure": null,
+          "recovery": null
+        }
+      }
+    },
+    {
+      "name": "committed-failure-mutation-rejects-free-form-summary",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:private-failure-text",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-private-failure-text",
+          "previous_state": "RUNNING",
+          "new_state": "FAILED",
+          "previous_revision": 8,
+          "new_revision": 9,
+          "reason_code": "PROVIDER_FAILED"
+        },
+        "committed_mutation": {
+          "active_plan": null,
+          "active_step_ids": null,
+          "waiting_on": null,
+          "failure": {
+            "code": "PROVIDER_FAILED",
+            "summary": "synthetic free-form failure text",
+            "step_id": "step:fixture",
+            "provider_id": "provider:fixture",
+            "execution_binding_id": "binding:fixture",
+            "retryable": false,
+            "safe_to_replan": false,
+            "unknown_side_effects": true,
+            "rollback_available": false,
+            "provenance_event_ids": ["event:execution:fixture"]
+          },
+          "recovery": null
+        }
+      }
+    },
+    {
+      "name": "committed-mutation-requires-canonical-five-field-envelope",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:partial-mutation",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-partial-mutation",
+          "previous_state": "CREATED",
+          "new_state": "PLANNING",
+          "previous_revision": 1,
+          "new_revision": 2,
+          "reason_code": "PLANNING_REQUESTED"
+        },
+        "committed_mutation": {"active_plan": null}
       }
     },
     {
@@ -98,6 +252,25 @@
           "previous_revision": 1,
           "new_revision": 2,
           "reason_code": "MODEL_SAYS_DONE"
+        }
+      }
+    },
+    {
+      "name": "unrelated-event-cannot-carry-committed-mutation",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:created:mutation",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.created",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "user", "id": "user:fixture"},
+        "committed_mutation": {
+          "active_plan": null,
+          "active_step_ids": null,
+          "waiting_on": null,
+          "failure": null,
+          "recovery": null
         }
       }
     }

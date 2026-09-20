@@ -404,6 +404,7 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
     decided_by_kind          TEXT NOT NULL,
     decided_by_id            TEXT NOT NULL,
     scope                    TEXT NOT NULL,
+    approved_until           TEXT,
     decision_json            TEXT NOT NULL,
     decided_at               TEXT NOT NULL,
     FOREIGN KEY (approval_id) REFERENCES approval_requests(approval_id),
