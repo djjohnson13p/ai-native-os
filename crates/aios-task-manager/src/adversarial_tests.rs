@@ -5,9 +5,10 @@ use std::process::Command;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
-const HASH: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const HASH: &str = "sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50";
 const CONTRACT_HASH: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+const SUITE_HASH: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 const TEST_TIME: &str = "2026-09-19T00:00:00Z";
 
 struct FixedClock;
@@ -69,6 +70,7 @@ fn request(
 fn seed_nonterminal_history(manager: &mut TaskManager, task_id: &str, final_state: TaskState) {
     manager.create_task(&create(task_id)).unwrap();
     let path: &[TaskState] = match final_state {
+        TaskState::Runnable => &[TaskState::Planning, TaskState::Runnable],
         TaskState::Running => &[TaskState::Planning, TaskState::Runnable, TaskState::Running],
         TaskState::Verifying => &[
             TaskState::Planning,
@@ -82,7 +84,9 @@ fn seed_nonterminal_history(manager: &mut TaskManager, task_id: &str, final_stat
             TaskState::Running,
             TaskState::Paused,
         ],
-        _ => panic!("fixture only supports running or verifying"),
+        TaskState::WaitingForInput => &[TaskState::Planning, TaskState::WaitingForInput],
+        TaskState::WaitingForAuth => &[TaskState::Planning, TaskState::WaitingForAuth],
+        _ => panic!("fixture only supports nonterminal recovery candidate states"),
     };
     let transaction = manager.connection.transaction().unwrap();
     let mut from = TaskState::Created;
@@ -282,6 +286,13 @@ fn startup_recovery_moves_running_and_verifying_tasks_through_cas_provenance() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_nonterminal_history(&mut manager, "T-running", TaskState::Running);
     seed_nonterminal_history(&mut manager, "T-verifying", TaskState::Verifying);
+    for task_id in ["T-running", "T-verifying"] {
+        manager.connection.execute(
+            "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at)
+             VALUES (?1,?2,?3,'node-recovery','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?4)",
+            rusqlite::params![format!("operation-{task_id}"), task_id, HASH, TEST_TIME],
+        ).unwrap();
+    }
     let results = manager.recover_startup().unwrap();
     assert_eq!(results.len(), 2);
     for task_id in ["T-running", "T-verifying"] {
@@ -675,7 +686,7 @@ fn caller_cannot_clear_pending_approval_or_invent_active_steps_for_admission() {
                  result_json, validated_at
              ) VALUES (
                  'validation-1', 'T-guard-spoof', 1,
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-1', 'validator:test', '0.1', '{}',
                  '2026-09-19T00:00:00Z'
              );
@@ -685,7 +696,7 @@ fn caller_cannot_clear_pending_approval_or_invent_active_steps_for_admission() {
                  status, program_json, created_at
              ) VALUES (
                  'T-guard-spoof', 1, 'program-1', '0.1',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-1', 'validation-1', 'active', '{}',
                  '2026-09-19T00:00:00Z'
              );
@@ -703,7 +714,7 @@ fn caller_cannot_clear_pending_approval_or_invent_active_steps_for_admission() {
                  resolved_resource_id, request_json, requested_at
              ) VALUES (
                  'authority-1', 'T-guard-spoof',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-1', 'node-real', 'test.capability', 'user',
                  'user:adversarial', 'test.execute', 'test-resource',
                  'resource-1', '{}', '2026-09-19T00:00:00Z'
@@ -714,7 +725,7 @@ fn caller_cannot_clear_pending_approval_or_invent_active_steps_for_admission() {
                  request_json, created_at
              ) VALUES (
                  'approval-1', 'authority-1', 'T-guard-spoof',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-real', 'test.execute', 'PENDING', '{}',
                  '2026-09-19T00:00:00Z'
              );
@@ -724,7 +735,7 @@ fn caller_cannot_clear_pending_approval_or_invent_active_steps_for_admission() {
                  output_artifacts_json, created_at, updated_at
              ) VALUES (
                  'attempt-ready', 'T-guard-spoof',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-real', 1, 1, 'READY', '[]', '[]',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );",
@@ -850,13 +861,14 @@ fn seed_completion_fixture_with_identity(
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO validation_results (
-                 validation_result_id, task_id, valid, semantic_hash,
+                 validation_result_id, task_id, program_id, ir_version, valid, semantic_hash,
                  registry_snapshot_id, validator_id, validator_version,
                  result_json, validated_at
              ) VALUES (
-                 'validation-completion', 'T-completion', 1,
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
-                 'snapshot-completion', 'validator:test', '0.1', '{}',
+                 'validation-completion', 'T-completion', 'program-completion', '0.1', 1,
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
+                 'snapshot-completion', 'validator:test', '0.1',
+                 '{\"diagnostics\":[],\"diagnostics_truncated\":false,\"ir_version\":\"0.1\",\"program_id\":\"program-completion\",\"registry_snapshot_id\":\"snapshot-completion\",\"schema_version\":\"0.1\",\"semantic_hash\":\"sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50\",\"semantic_hash_profile\":\"aios-ir-v0.1\",\"valid\":true,\"validated_at\":\"2026-09-19T00:00:00Z\",\"validator\":{\"build_hash\":null,\"id\":\"validator:test\",\"version\":\"0.1\"}}',
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO semantic_program_revisions (
@@ -865,9 +877,9 @@ fn seed_completion_fixture_with_identity(
                  created_from_plan_revision, status, program_json, created_at
              ) VALUES (
                  'T-completion', 1, 'program-completion', '0.1',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', 'validation-completion', 1, 'active',
-                 '{\"nodes\":[{\"id\":\"node-completion\",\"operation\":{\"kind\":\"invoke\",\"capability\":\"test.complete@1\"},\"outputs\":{\"report\":\"artifact.report@1\"},\"authority_requests\":[]}]}',
+                 '{\"inputs\":{},\"ir_version\":\"0.1\",\"kind\":\"task_graph\",\"nodes\":[{\"authority_requests\":[],\"cache\":\"never\",\"egress\":{\"mode\":\"deny\"},\"execution_class\":\"deterministic\",\"failure\":{\"on_error\":\"stop\"},\"id\":\"node-completion\",\"inputs\":{},\"operation\":{\"capability\":\"test.complete@1\",\"kind\":\"invoke\"},\"outputs\":{\"report\":\"artifact.report@1\"}}],\"outputs\":{\"report\":{\"node\":\"node-completion\",\"port\":\"report\",\"source\":\"node\"}},\"program_id\":\"program-completion\"}',
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO provider_registrations (
@@ -881,10 +893,12 @@ fn seed_completion_fixture_with_identity(
              );
              INSERT INTO provider_conformance_evidence (
                  evidence_id, registration_id, capability, contract_hash,
-                 status, evidence_json, tested_at
+                 suite_id, suite_hash, status, evidence_json, tested_at
              ) VALUES (
                  'evidence-completion', 'registration-completion',
-                 'test.complete@1', 'sha256:2222222222222222222222222222222222222222222222222222222222222222', 'pass', '{}',
+                 'test.complete@1', 'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+                 'suite:test', 'sha256:3333333333333333333333333333333333333333333333333333333333333333', 'pass',
+                 '{\"conformance_suite\":{\"hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"id\":\"suite:test\",\"version\":\"0.1\"},\"executed_at\":\"2026-09-19T00:00:00Z\",\"expires_at\":\"2026-09-20T00:00:00Z\",\"harness\":{\"build_hash\":null,\"id\":\"harness:test\",\"version\":\"0.1\"},\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"sha256:build\"},\"provider_id\":\"provider:test\",\"provider_version\":\"0.1.0\",\"result\":\"pass\",\"result_id\":\"evidence-completion\",\"schema_version\":\"0.1\",\"semantic_capability_ref\":\"test.complete@1\",\"semantic_contract_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"semantic_contract_version\":\"1.0\"}',
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO execution_bindings (
@@ -897,12 +911,12 @@ fn seed_completion_fixture_with_identity(
                  execution_profile_ref, placement_json, binding_json, created_at
              ) VALUES (
                  'binding-completion', 'attempt-completion', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', '0.1', 'node-completion',
                  'test.complete@1', 'sha256:2222222222222222222222222222222222222222222222222222222222222222', 'registration-completion',
                  'provider:test', '0.1.0', 'sha256:manifest', 'sha256:build', 1,
                  '[]', '[]', 'profile:test', '{\"locality\":\"local\"}',
-                 '{\"attempt\":1,\"attempt_id\":\"attempt-completion\",\"authority\":{\"grant_refs\":[]},\"binding_id\":\"binding-completion\",\"capability\":\"test.complete@1\",\"capability_contract_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"created_at\":\"2026-09-19T00:00:00Z\",\"execution_profile\":{\"profile_ref\":\"profile:test\"},\"inputs\":{},\"ir_version\":\"0.1\",\"node_id\":\"node-completion\",\"outputs\":{\"report\":{\"allocation_ref\":\"allocation-completion\",\"semantic_type\":\"artifact.report@1\"}},\"placement\":{\"locality\":\"local\"},\"policy_decision_refs\":[],\"provider\":{\"id\":\"provider:test\",\"manifest_hash\":\"sha256:manifest\",\"package_or_build_hash\":\"sha256:build\",\"version\":\"0.1.0\"},\"registry_snapshot_id\":\"snapshot-completion\",\"schema_version\":\"0.1\",\"semantic_program_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"task_id\":\"T-completion\"}',
+                 '{\"attempt\":1,\"attempt_id\":\"attempt-completion\",\"authority\":{\"grant_refs\":[]},\"binding_id\":\"binding-completion\",\"capability\":\"test.complete@1\",\"capability_contract_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"created_at\":\"2026-09-19T00:00:00Z\",\"execution_profile\":{\"profile_ref\":\"profile:test\"},\"inputs\":{},\"ir_version\":\"0.1\",\"node_id\":\"node-completion\",\"outputs\":{\"report\":{\"allocation_ref\":\"allocation-completion\",\"semantic_type\":\"artifact.report@1\"}},\"placement\":{\"locality\":\"local\"},\"policy_decision_refs\":[],\"provider\":{\"id\":\"provider:test\",\"manifest_hash\":\"sha256:manifest\",\"package_or_build_hash\":\"sha256:build\",\"version\":\"0.1.0\"},\"registry_snapshot_id\":\"snapshot-completion\",\"schema_version\":\"0.1\",\"semantic_program_hash\":\"sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50\",\"task_id\":\"T-completion\"}',
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO step_executions (
@@ -914,7 +928,7 @@ fn seed_completion_fixture_with_identity(
                  created_at, updated_at
              ) VALUES (
                  'attempt-completion', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', 'node-completion',
                  'binding-completion', 'provider:test', '0.1.0', 1, 3,
                  'SUCCEEDED', 'COMPLETED', '[]', '[\"artifact-output\"]',
@@ -929,14 +943,14 @@ fn seed_completion_fixture_with_identity(
                  'DURABLE', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifacts (
-                 artifact_id, uri, semantic_type, media_type, sensitivity, origin_kind,
+                 artifact_id, uri, semantic_type, media_type, sensitivity, retention_class, origin_kind,
                  origin_task_id, origin_program_hash, origin_node_id,
                  origin_binding_id, origin_provider_id, size_bytes, content_hash,
                  integrity_state, integrity_verified_at, created_at
              ) VALUES (
                  'artifact-output', 'artifact://completion/output', 'artifact.report@1',
-                 'application/json', 'local', 'provider', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'application/json', 'local', 'task', 'provider', 'T-completion',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'provider:test',
                  42, 'sha256:artifact-output', 'verified',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
@@ -947,7 +961,7 @@ fn seed_completion_fixture_with_identity(
                  publication_id, published_artifact_id, created_at, expires_at
              ) VALUES (
                  'allocation-completion', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion',
                  'attempt-completion', 'report', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
                  'publication-completion',
@@ -1260,7 +1274,7 @@ fn recovering_to_running_rechecks_durable_approval_blockers_before_admission() {
                  resolved_resource_id, request_json, requested_at
              ) VALUES (
                  'authority-recovery', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', 'node-completion', 'test.complete',
                  'user', 'user:adversarial', 'test.execute', 'test-resource',
                  'resource-recovery', '{}', '2026-09-19T00:00:00Z'
@@ -1271,7 +1285,7 @@ fn recovering_to_running_rechecks_durable_approval_blockers_before_admission() {
                  request_json, created_at
              ) VALUES (
                  'approval-recovery', 'authority-recovery', 'T-completion',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'test.execute', 'PENDING', '{}',
                  '2026-09-19T00:00:00Z'
              );",
@@ -1636,7 +1650,7 @@ fn terminal_step_state_with_unknown_certainty_still_blocks_indirect_cancellation
                  created_at, updated_at
              ) VALUES (
                  'attempt-uncertain-terminal', 'T-cancel-unknown-step',
-                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-1', 1, 2, 'SUCCEEDED', 'OUTCOME_UNKNOWN', '[]', '[]',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );",
@@ -1652,6 +1666,62 @@ fn terminal_step_state_with_unknown_certainty_still_blocks_indirect_cancellation
         ))
         .unwrap();
     assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+}
+
+#[test]
+fn running_cannot_relabel_live_authority_as_runnable_or_waiting() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute_batch(
+            "UPDATE tasks SET state='RUNNING' WHERE task_id='T-completion';
+         UPDATE step_executions SET state='READY',outcome_certainty='NOT_STARTED',finished_at=NULL
+          WHERE attempt_id='attempt-completion';
+         PRAGMA foreign_keys=OFF;
+         INSERT INTO authority_grants(
+             grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,
+             principal_id,execution_binding_id,attempt_id,policy_decision_id,
+             policy_snapshot_id,grants_json,scope,state,issued_at,expires_at
+         ) VALUES (
+             'grant-live-relabel','T-completion',
+             'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
+             'node-completion','test.complete@1','provider','provider:test',
+             'binding-completion','attempt-completion','decision:fixture','policy:fixture',
+             '[]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z'
+         );
+         PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    let runnable = manager
+        .transition(&request(
+            "tr-running-back-to-runnable-live",
+            "T-completion",
+            2,
+            TaskState::Running,
+            TaskState::Runnable,
+        ))
+        .unwrap();
+    assert!(!runnable.applied);
+    assert_eq!(runnable.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+
+    let mut waiting = request(
+        "tr-running-waiting-live",
+        "T-completion",
+        2,
+        TaskState::Running,
+        TaskState::WaitingForInput,
+    );
+    waiting.mutation.waiting_on = Some(vec![WaitingOn {
+        kind: WaitingKind::Input,
+        id: "input:required".to_owned(),
+        message: None,
+    }]);
+    let waiting = manager.transition(&waiting).unwrap();
+    assert!(!waiting.applied);
+    assert_eq!(waiting.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    let task = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!((task.state, task.revision), (TaskState::Running, 2));
 }
 
 #[test]
@@ -1708,8 +1778,8 @@ fn expired_or_revoked_exact_grants_block_point_of_admission() {
              DROP TRIGGER execution_bindings_no_update;
              UPDATE execution_bindings SET grant_refs_json = '[\"grant-admission\"]' WHERE binding_id = 'binding-completion';
              INSERT INTO policy_snapshots (snapshot_id, scope_kind, scope_id, policy_language, policy_set_hash, engine_id, engine_version, snapshot_json, created_at) VALUES ('policy-snapshot', 'task', 'T-completion', 'fixture', 'sha256:policy', 'engine:test', '0.1', '{}', '2026-09-19T00:00:00Z');
-             INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-admission', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'test.execute', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
-             INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-admission', 'authority-admission', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'provider', 'provider:test', 'test.execute', 'artifact', 'artifact:one', 'ALLOW', 'policy-snapshot', '[]', '{}', '2026-09-19T00:00:00Z');",
+             INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-admission', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'test.execute', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
+             INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-admission', 'authority-admission', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'provider', 'provider:test', 'test.execute', 'artifact', 'artifact:one', 'ALLOW', 'policy-snapshot', '[]', '{}', '2026-09-19T00:00:00Z');",
         ).unwrap();
         manager.connection.execute(
             "INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-admission', 'T-completion', ?1, 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-admission', 'policy-snapshot', '[{\"action\":\"test.execute\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:one\",\"semantic_selector\":\"resource:one\"}]', 'ONE_SHOT', 1, 0, ?2, '2026-09-19T00:00:00Z', ?3)",
@@ -2161,8 +2231,8 @@ fn runnable_readiness_uses_each_active_nodes_latest_attempt_once() {
     seed_completion_fixture(&mut stale, HASH, &["artifact-output"], "COMMITTED");
     stale.connection.execute_batch(
         "UPDATE tasks SET state = 'PLANNING' WHERE task_id = 'T-completion';
-         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-old', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
-         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-failed-new', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 3, 1, 'FAILED', 'FAILED_NO_EFFECT', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-old', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-failed-new', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 3, 1, 'FAILED', 'FAILED_NO_EFFECT', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
     ).unwrap();
     assert_eq!(
         stale
@@ -2182,8 +2252,8 @@ fn runnable_readiness_uses_each_active_nodes_latest_attempt_once() {
     seed_completion_fixture(&mut compensated, HASH, &["artifact-output"], "COMMITTED");
     compensated.connection.execute_batch(
         "UPDATE tasks SET state = 'PLANNING', active_step_ids_json = '[\"node-completion\",\"node-missing\"]' WHERE task_id = 'T-completion';
-         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-2', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
-         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-3', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 3, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-2', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-3', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 3, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
     ).unwrap();
     assert!(
         compensated
@@ -2207,8 +2277,8 @@ fn running_and_admission_reject_duplicate_latest_exact_bound_attempts() {
         "DROP INDEX ux_step_executions_attempt_tuple;
          UPDATE tasks SET state = 'RECOVERING' WHERE task_id = 'T-completion';
          UPDATE step_executions SET state = 'READY', outcome_certainty = 'NOT_STARTED' WHERE attempt_id = 'attempt-completion';
-         INSERT INTO execution_bindings (binding_id, attempt_id, task_id, semantic_program_hash, registry_snapshot_id, ir_version, node_id, capability, provider_id, provider_version, attempt, policy_decision_refs_json, grant_refs_json, execution_profile_ref, placement_json, binding_json, created_at) VALUES ('binding-duplicate-latest', 'attempt-duplicate-latest', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', '0.1', 'node-completion', 'test.complete', 'provider:test', '0.1.0', 2, '[]', '[]', 'profile:test', '{}', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, binding_id, provider_id, provider_version, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-duplicate-latest', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'binding-duplicate-latest', 'provider:test', '0.1.0', 1, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+         INSERT INTO execution_bindings (binding_id, attempt_id, task_id, semantic_program_hash, registry_snapshot_id, ir_version, node_id, capability, provider_id, provider_version, attempt, policy_decision_refs_json, grant_refs_json, execution_profile_ref, placement_json, binding_json, created_at) VALUES ('binding-duplicate-latest', 'attempt-duplicate-latest', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', '0.1', 'node-completion', 'test.complete', 'provider:test', '0.1.0', 2, '[]', '[]', 'profile:test', '{}', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, binding_id, provider_id, provider_version, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-duplicate-latest', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 'binding-duplicate-latest', 'provider:test', '0.1.0', 1, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
     ).unwrap();
 
     let transaction = manager
@@ -2267,7 +2337,7 @@ fn completion_uses_program_ports_and_rejects_self_report_or_artifact_aliasing() 
     seed_completion_fixture(&mut alias, HASH, &["artifact-output"], "COMMITTED");
     alias.connection.execute_batch(
         "UPDATE semantic_program_revisions SET program_json = '{\"nodes\":[{\"id\":\"node-completion\",\"outputs\":{\"report\":\"artifact.report@1\",\"receipt\":\"artifact.report@1\"}}]}' WHERE task_id = 'T-completion' AND program_revision = 1;
-         INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', 'artifact-output', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
+         INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', 'artifact-output', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
          INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at, committed_at) VALUES ('publication-alias', 'allocation-alias', 'T-completion', 'artifact-output', '{}', 'COMMITTED', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
     ).unwrap();
     assert_eq!(
@@ -2360,8 +2430,8 @@ fn pause_failure_and_stale_approval_guards_use_durable_current_scope() {
          INSERT INTO approval_requests (approval_id, authority_request_id, task_id, semantic_program_hash, node_id, action, status, request_json, created_at) VALUES ('approval-stale', 'authority-stale-approval', 'T-completion', 'sha256:2222222222222222222222222222222222222222222222222222222222222222', 'node-old', 'old.execute', 'PENDING', '{}', '2026-09-19T00:00:00Z');",
     ).unwrap();
     stale.connection.execute_batch(
-        "INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, request_json, requested_at) VALUES ('authority-inactive-node', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-inactive', 'test.old@1', 'user', 'user:test', 'old.execute', 'resource', 'old', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO approval_requests (approval_id, authority_request_id, task_id, semantic_program_hash, node_id, action, status, request_json, created_at) VALUES ('approval-inactive-node', 'authority-inactive-node', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-inactive', 'old.execute', 'PENDING', '{}', '2026-09-19T00:00:00Z');",
+        "INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, request_json, requested_at) VALUES ('authority-inactive-node', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-inactive', 'test.old@1', 'user', 'user:test', 'old.execute', 'resource', 'old', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO approval_requests (approval_id, authority_request_id, task_id, semantic_program_hash, node_id, action, status, request_json, created_at) VALUES ('approval-inactive-node', 'authority-inactive-node', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-inactive', 'old.execute', 'PENDING', '{}', '2026-09-19T00:00:00Z');",
     ).unwrap();
     assert!(
         stale
@@ -2403,9 +2473,9 @@ fn actual_admission_requires_complete_program_derived_authority_and_keeps_ready_
         "DROP TRIGGER execution_bindings_no_update;
          UPDATE execution_bindings SET grant_refs_json = '[\"grant-partial\"]' WHERE binding_id = 'binding-completion';
          INSERT INTO policy_snapshots (snapshot_id, scope_kind, scope_id, policy_language, policy_set_hash, engine_id, engine_version, snapshot_json, created_at) VALUES ('policy-partial', 'task', 'T-completion', 'fixture', 'sha256:policy', 'engine:test', '0.1', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-partial', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.one', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-partial', 'authority-partial', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'provider', 'provider:test', 'action.one', 'artifact', 'artifact:one', 'ALLOW', 'policy-partial', '[]', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-partial', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-partial', 'policy-partial', '[{\"action\":\"action.one\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:one\",\"semantic_selector\":\"resource:one\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');",
+         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-partial', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.one', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-partial', 'authority-partial', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'provider', 'provider:test', 'action.one', 'artifact', 'artifact:one', 'ALLOW', 'policy-partial', '[]', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-partial', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-partial', 'policy-partial', '[{\"action\":\"action.one\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:one\",\"semantic_selector\":\"resource:one\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');",
     ).unwrap();
     let partial = manager
         .transition(&request(
@@ -2450,12 +2520,12 @@ fn binding_grants_exactly_cover_current_authority_requests() {
     manager.connection.execute_batch(
         "UPDATE semantic_program_revisions SET program_json = '{\"nodes\":[{\"id\":\"node-completion\",\"operation\":{\"kind\":\"invoke\",\"capability\":\"test.complete@1\"},\"outputs\":{\"report\":\"artifact.report@1\"},\"authority_requests\":[{\"action\":\"action.one\",\"resource\":\"resource:one\"},{\"action\":\"action.two\",\"resource\":\"resource:two\"}]}]}' WHERE task_id = 'T-completion' AND program_revision = 1;
          INSERT INTO policy_snapshots (snapshot_id, scope_kind, scope_id, policy_language, policy_set_hash, engine_id, engine_version, snapshot_json, created_at) VALUES ('policy-coverage', 'task', 'T-completion', 'fixture', 'sha256:policy', 'engine:test', '0.1', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-cover-1', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.one', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-cover-2', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.two', 'artifact', 'artifact:two', 'resource:two', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-cover-1', 'authority-cover-1', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'provider', 'provider:test', 'action.one', 'artifact', 'artifact:one', 'ALLOW', 'policy-coverage', '[]', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-cover-2', 'authority-cover-2', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'provider', 'provider:test', 'action.two', 'artifact', 'artifact:two', 'ALLOW', 'policy-coverage', '[]', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-cover-1', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-cover-1', 'policy-coverage', '[{\"action\":\"action.one\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:one\",\"semantic_selector\":\"resource:one\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
-         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-cover-2', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-cover-2', 'policy-coverage', '[{\"action\":\"action.two\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:two\",\"semantic_selector\":\"resource:two\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');",
+         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-cover-1', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.one', 'artifact', 'artifact:one', 'resource:one', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO authority_requests (request_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, action, resolved_resource_kind, resolved_resource_id, semantic_selector, request_json, requested_at) VALUES ('authority-cover-2', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'action.two', 'artifact', 'artifact:two', 'resource:two', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-cover-1', 'authority-cover-1', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'provider', 'provider:test', 'action.one', 'artifact', 'artifact:one', 'ALLOW', 'policy-coverage', '[]', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO policy_decisions (decision_id, authority_request_id, task_id, semantic_program_hash, node_id, principal_kind, principal_id, action, resolved_resource_kind, resolved_resource_id, decision, policy_snapshot_id, reason_codes_json, decision_json, decided_at) VALUES ('decision-cover-2', 'authority-cover-2', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'provider', 'provider:test', 'action.two', 'artifact', 'artifact:two', 'ALLOW', 'policy-coverage', '[]', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-cover-1', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-cover-1', 'policy-coverage', '[{\"action\":\"action.one\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:one\",\"semantic_selector\":\"resource:one\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
+         INSERT INTO authority_grants (grant_id, task_id, semantic_program_hash, node_id, capability, principal_kind, principal_id, execution_binding_id, attempt_id, policy_decision_id, policy_snapshot_id, grants_json, scope, max_uses, uses_consumed, state, issued_at, expires_at) VALUES ('grant-cover-2', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'test.complete@1', 'provider', 'provider:test', 'binding-completion', 'attempt-completion', 'decision-cover-2', 'policy-coverage', '[{\"action\":\"action.two\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:two\",\"semantic_selector\":\"resource:two\"}]', 'TASK', 10, 0, 'ACTIVE', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');",
     ).unwrap();
     set_completion_binding_refs(
         &manager,
@@ -2562,12 +2632,12 @@ fn approval_backed_grants_revalidate_status_expiry_decision_and_identity() {
          DROP TRIGGER execution_bindings_no_update;
          UPDATE execution_bindings SET grant_refs_json='["grant-approved"]' WHERE binding_id='binding-completion';
          INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at) VALUES ('policy-approved','task','T-completion','fixture','sha256:policy','engine:test','0.1','{}','2026-09-19T00:00:00Z');
-         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES ('authority-approved','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','snapshot-completion','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','action.approved','artifact','artifact:approved','resource:approved','{}','2026-09-19T00:00:00Z');
-         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-approved','authority-approved','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','action.approved','APPROVED','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
-         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-other','authority-approved','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','action.approved','APPROVED','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
+         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES ('authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','action.approved','artifact','artifact:approved','resource:approved','{}','2026-09-19T00:00:00Z');
+         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-approved','authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','action.approved','APPROVED','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
+         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-other','authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','action.approved','APPROVED','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
          INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at) VALUES ('approval-decision','approval-approved','T-completion','APPROVE','user','user:approver','ONE_SHOT','2026-09-20T00:00:00Z','{}','2026-09-19T00:00:00Z');
-         INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,approval_request_id,reason_codes_json,decision_json,decided_at) VALUES ('policy-decision-approved','authority-approved','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','provider','provider:test','action.approved','artifact','artifact:approved','ALLOW','policy-approved','approval-approved','[]','{}','2026-09-19T00:00:00Z');
-         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES ('grant-approved','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','policy-decision-approved','policy-approved','approval-approved','[{"action":"action.approved","resource_kind":"artifact","resource_id":"artifact:approved","semantic_selector":"resource:approved"}]','ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"#,
+         INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,approval_request_id,reason_codes_json,decision_json,decided_at) VALUES ('policy-decision-approved','authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','provider','provider:test','action.approved','artifact','artifact:approved','ALLOW','policy-approved','approval-approved','[]','{}','2026-09-19T00:00:00Z');
+         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES ('grant-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','policy-decision-approved','policy-approved','approval-approved','[{"action":"action.approved","resource_kind":"artifact","resource_id":"artifact:approved","semantic_selector":"resource:approved"}]','ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"#,
     ).unwrap();
     set_completion_binding_refs(&manager, &["policy-decision-approved"], &["grant-approved"]);
     let check = |transaction: &Transaction<'_>| {
@@ -2630,7 +2700,7 @@ fn startup_replay_rejects_security_view_tampering_and_receipt_request_forgery() 
         ),
         (
             "active-program",
-            "INSERT INTO registry_snapshots (snapshot_id, manifest_json, created_at) VALUES ('snapshot-forged', '{}', '2026-09-19T00:00:00Z'); INSERT INTO validation_results (validation_result_id, task_id, valid, semantic_hash, registry_snapshot_id, validator_id, validator_version, result_json, validated_at) VALUES ('validation-forged', 'T-replay', 1, 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-forged', 'validator:test', '0.1', '{}', '2026-09-19T00:00:00Z'); INSERT INTO semantic_program_revisions (task_id, program_revision, program_id, ir_version, semantic_hash, registry_snapshot_id, validation_result_id, status, program_json, created_at) VALUES ('T-replay', 1, 'program-forged', '0.1', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-forged', 'validation-forged', 'active', '{}', '2026-09-19T00:00:00Z'); UPDATE tasks SET active_program_revision = 1 WHERE task_id = 'T-replay'",
+            "INSERT INTO registry_snapshots (snapshot_id, manifest_json, created_at) VALUES ('snapshot-forged', '{}', '2026-09-19T00:00:00Z'); INSERT INTO validation_results (validation_result_id, task_id, valid, semantic_hash, registry_snapshot_id, validator_id, validator_version, result_json, validated_at) VALUES ('validation-forged', 'T-replay', 1, 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-forged', 'validator:test', '0.1', '{}', '2026-09-19T00:00:00Z'); INSERT INTO semantic_program_revisions (task_id, program_revision, program_id, ir_version, semantic_hash, registry_snapshot_id, validation_result_id, status, program_json, created_at) VALUES ('T-replay', 1, 'program-forged', '0.1', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-forged', 'validation-forged', 'active', '{}', '2026-09-19T00:00:00Z'); UPDATE tasks SET active_program_revision = 1 WHERE task_id = 'T-replay'",
         ),
         (
             "active-steps",
@@ -2804,8 +2874,8 @@ fn startup_replay_binds_creation_payload_and_active_program_content() {
             manager.create_task(&create("T-program-content")).unwrap();
             manager.connection.execute_batch(
                 "INSERT INTO registry_snapshots (snapshot_id, manifest_json, created_at) VALUES ('snapshot-program-content', '{}', '2026-09-19T00:00:00Z');
-                 INSERT INTO validation_results (validation_result_id, task_id, valid, semantic_hash, registry_snapshot_id, validator_id, validator_version, result_json, validated_at) VALUES ('validation-program-content', 'T-program-content', 1, 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-program-content', 'validator:test', '0.1', '{}', '2026-09-19T00:00:00Z');
-                 INSERT INTO semantic_program_revisions (task_id, program_revision, program_id, ir_version, semantic_hash, registry_snapshot_id, validation_result_id, status, program_json, created_at) VALUES ('T-program-content', 1, 'program-content', '0.1', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-program-content', 'validation-program-content', 'active', '{\"nodes\":[{\"id\":\"node-secure\",\"operation\":{\"kind\":\"invoke\",\"capability\":\"test.secure@1\"},\"outputs\":{\"result\":\"artifact.report@1\"},\"authority_requests\":[{\"action\":\"artifact.read\",\"resource\":\"input:source\"}]}]}', '2026-09-19T00:00:00Z');
+                 INSERT INTO validation_results (validation_result_id, task_id, valid, semantic_hash, registry_snapshot_id, validator_id, validator_version, result_json, validated_at) VALUES ('validation-program-content', 'T-program-content', 1, 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-program-content', 'validator:test', '0.1', '{}', '2026-09-19T00:00:00Z');
+                 INSERT INTO semantic_program_revisions (task_id, program_revision, program_id, ir_version, semantic_hash, registry_snapshot_id, validation_result_id, status, program_json, created_at) VALUES ('T-program-content', 1, 'program-content', '0.1', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-program-content', 'validation-program-content', 'active', '{\"nodes\":[{\"id\":\"node-secure\",\"operation\":{\"kind\":\"invoke\",\"capability\":\"test.secure@1\"},\"outputs\":{\"result\":\"artifact.report@1\"},\"authority_requests\":[{\"action\":\"artifact.read\",\"resource\":\"input:source\"}]}]}', '2026-09-19T00:00:00Z');
                  UPDATE tasks SET active_program_revision = 1 WHERE task_id = 'T-program-content';",
             ).unwrap();
             assert!(
@@ -3184,7 +3254,7 @@ fn recovery_is_per_subject_and_empty_inventory_never_proves_not_started() {
     manager.connection.execute_batch(
         "UPDATE step_executions SET state = 'RUNNING', outcome_certainty = NULL WHERE attempt_id = 'attempt-completion';
          INSERT INTO operations (operation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, effect_class, state, outcome_certainty, prepared_at)
-         VALUES ('operation-recovery', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'node-completion', 'binding-completion', 'attempt-completion', 'NETWORK', 'UNKNOWN', NULL, '2026-09-19T00:00:00Z');
+         VALUES ('operation-recovery', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'NETWORK', 'UNKNOWN', NULL, '2026-09-19T00:00:00Z');
          INSERT INTO provider_invocations (invocation_id, attempt_id, binding_id, task_id, provider_id, provider_version, status, request_json)
          VALUES ('invocation-recovery', 'attempt-completion', 'binding-completion', 'T-completion', 'provider:test', '0.1.0', 'PENDING', '{}');",
     ).unwrap();
@@ -3268,6 +3338,298 @@ fn recovery_is_per_subject_and_empty_inventory_never_proves_not_started() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "keeps historical inventory, immutable receipt authentication, and ambiguous terminal outcomes together"
+)]
+fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_invocations(
+            invocation_id,attempt_id,binding_id,task_id,provider_id,provider_version,
+            status,request_json,started_at
+         ) VALUES ('invocation-terminal','attempt-completion','binding-completion',
+            'T-completion','provider:test','0.1.0','PENDING','{}',?1)",
+            [TEST_TIME],
+        )
+        .unwrap();
+    let inventory = unresolved_execution_ids(&manager.connection, "T-completion").unwrap();
+    assert_eq!(inventory, vec!["provider-invocation:invocation-terminal"]);
+    let recovery_ref = recovery_operations_ref("T-completion", 2, &inventory).unwrap();
+    manager
+        .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
+        .unwrap();
+    let result = canonical_json(&serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "result_id":"provider-result-terminal",
+        "invocation_id":"invocation-terminal",
+        "task_id":"T-completion",
+        "execution_binding_id":"binding-completion",
+        "node_id":"node-completion",
+        "provider":{"id":"provider:test","version":"0.1.0","package_or_build_hash":"sha256:build"},
+        "status":"SUCCEEDED",
+        "reason_codes":["PROVIDER_SUCCEEDED"],
+        "outputs":{},
+        "started_at":TEST_TIME,
+        "completed_at":TEST_TIME
+    }))
+    .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE provider_invocations SET status='SUCCEEDED',result_json=?1,completed_at=?2
+         WHERE invocation_id='invocation-terminal'",
+            rusqlite::params![result, TEST_TIME],
+        )
+        .unwrap();
+    for (field, forged) in [
+        ("id", "provider:forged"),
+        ("package_or_build_hash", "sha256:forged-build"),
+    ] {
+        let mut forged_provider: Value = serde_json::from_str(&result).unwrap();
+        forged_provider["provider"][field] = Value::String(forged.to_owned());
+        manager.connection.execute(
+            "UPDATE provider_invocations SET result_json=?1 WHERE invocation_id='invocation-terminal'",
+            [canonical_json(&forged_provider).unwrap()],
+        ).unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            provider_invocation_resolution(&transaction, "T-completion", "invocation-terminal")
+                .unwrap()
+                .is_none(),
+            "{field}"
+        );
+    }
+    manager.connection.execute(
+        "UPDATE provider_invocations SET result_json=?1 WHERE invocation_id='invocation-terminal'",
+        [&result],
+    ).unwrap();
+    manager
+        .connection
+        .execute_batch(
+            "DROP TRIGGER execution_bindings_no_update;
+             UPDATE execution_bindings
+             SET provider_build_hash=NULL
+             WHERE binding_id='binding-completion';",
+        )
+        .unwrap();
+    let mut null_build_hash: Value = serde_json::from_str(&result).unwrap();
+    null_build_hash["provider"]["package_or_build_hash"] = Value::Null;
+    manager
+        .connection
+        .execute(
+            "UPDATE provider_invocations SET result_json=?1 WHERE invocation_id='invocation-terminal'",
+            [canonical_json(&null_build_hash).unwrap()],
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            provider_invocation_resolution(&transaction, "T-completion", "invocation-terminal")
+                .unwrap()
+                .is_some()
+        );
+    }
+    null_build_hash["provider"]
+        .as_object_mut()
+        .unwrap()
+        .remove("package_or_build_hash");
+    manager
+        .connection
+        .execute(
+            "UPDATE provider_invocations SET result_json=?1 WHERE invocation_id='invocation-terminal'",
+            [canonical_json(&null_build_hash).unwrap()],
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            provider_invocation_resolution(&transaction, "T-completion", "invocation-terminal")
+                .unwrap()
+                .is_none(),
+            "an omitted build identity must not equal an explicitly null binding identity"
+        );
+    }
+    manager
+        .connection
+        .execute(
+            "UPDATE execution_bindings SET provider_build_hash='sha256:build'
+             WHERE binding_id='binding-completion'",
+            [],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE provider_invocations SET result_json=?1
+             WHERE invocation_id='invocation-terminal'",
+            [&result],
+        )
+        .unwrap();
+    manager
+        .reconcile_recovery_subject(&recovery_ref, "provider-invocation:invocation-terminal")
+        .unwrap();
+    let (certainty, action): (String, String) = manager
+        .connection
+        .query_row(
+            "SELECT certainty,safe_action FROM recovery_assessments
+         WHERE task_id='T-completion' AND subject_id='provider-invocation:invocation-terminal'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (certainty.as_str(), action.as_str()),
+        ("COMPLETED", "RECONCILE_STATE")
+    );
+    manager.connection.execute(
+        "UPDATE tasks SET state='RECOVERING',recovery_json=?1 WHERE task_id='T-completion'",
+        [serde_json::json!({"unknown_operations_ref":recovery_ref,"last_known_daemon_instance":null}).to_string()],
+    ).unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(recovery_allows_exit(&transaction, "T-completion").unwrap());
+    transaction.rollback().unwrap();
+
+    for (status, reason_code) in [
+        ("PROVIDER_FAILURE", "PROVIDER_RUNTIME_FAILURE"),
+        ("SEMANTIC_FAILURE", "PROVIDER_SEMANTIC_FAILURE"),
+    ] {
+        let ambiguous = canonical_json(&serde_json::json!({
+            "schema_version":SCHEMA_VERSION,"result_id":"provider-result-terminal",
+            "invocation_id":"invocation-terminal","task_id":"T-completion",
+            "execution_binding_id":"binding-completion","node_id":"node-completion",
+            "provider":{"id":"provider:test","version":"0.1.0"},
+            "status":status,"reason_codes":[reason_code],
+            "outputs":{},"started_at":TEST_TIME,"completed_at":TEST_TIME
+        }))
+        .unwrap();
+        manager.connection.execute(
+            "UPDATE provider_invocations SET status=?1,result_json=?2 WHERE invocation_id='invocation-terminal'",
+            rusqlite::params![status, ambiguous],
+        ).unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            provider_invocation_resolution(&transaction, "T-completion", "invocation-terminal")
+                .unwrap()
+                .is_none(),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "compares canonical, malformed, and ambiguous terminal provider receipts across reopen"
+)]
+fn terminal_provider_receipts_drive_inventory_containment_and_startup_recovery() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("provider-terminal-recovery.sqlite3");
+    let cases = [
+        ("safe", "SUCCEEDED", true),
+        ("malformed", "SUCCEEDED", false),
+        ("ambiguous", "PROVIDER_FAILURE", false),
+    ];
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        for (name, status, canonical_safe) in cases {
+            let task_id = format!("T-provider-{name}");
+            let attempt_id = format!("attempt-{name}");
+            let binding_id = format!("binding-{name}");
+            let invocation_id = format!("invocation-{name}");
+            seed_nonterminal_history(&mut manager, &task_id, TaskState::Paused);
+            let result_json = if name == "malformed" {
+                "{}".to_owned()
+            } else {
+                canonical_json(&serde_json::json!({
+                    "schema_version":SCHEMA_VERSION,
+                    "result_id":format!("result-{name}"),
+                    "invocation_id":invocation_id,
+                    "task_id":task_id,
+                    "execution_binding_id":binding_id,
+                    "node_id":"node-provider",
+                    "provider":{
+                        "id":"provider:test","version":"0.1.0",
+                        "package_or_build_hash":"sha256:build"
+                    },
+                    "status":status,
+                    "reason_codes":[if canonical_safe {"PROVIDER_SUCCEEDED"} else {"PROVIDER_RUNTIME_FAILURE"}],
+                    "outputs":{},"started_at":TEST_TIME,"completed_at":TEST_TIME
+                }))
+                .unwrap()
+            };
+            manager
+                .connection
+                .execute_batch("PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO execution_bindings(
+                    binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                    ir_version,node_id,capability,provider_id,provider_version,
+                    provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+                    execution_profile_ref,placement_json,binding_json,created_at
+                 ) VALUES (?1,?2,?3,?4,'snapshot:fixture','0.1','node-provider',
+                    'test.provider@1','provider:test','0.1.0','sha256:build',1,
+                    '[]','[]','profile:fixture','{}','{}',?5)",
+                    rusqlite::params![binding_id, attempt_id, task_id, HASH, TEST_TIME],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO provider_invocations(
+                    invocation_id,attempt_id,binding_id,task_id,provider_id,provider_version,
+                    status,request_json,result_json,started_at,completed_at
+                 ) VALUES (?1,?2,?3,?4,'provider:test','0.1.0',?5,'{}',?6,?7,?7)",
+                    rusqlite::params![
+                        invocation_id,
+                        attempt_id,
+                        binding_id,
+                        task_id,
+                        status,
+                        result_json,
+                        TEST_TIME
+                    ],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch("PRAGMA foreign_keys=ON;")
+                .unwrap();
+            let inventory = unresolved_execution_ids(&manager.connection, &task_id).unwrap();
+            assert_eq!(inventory.is_empty(), canonical_safe, "pre-reopen {name}");
+            let transaction = manager.connection.transaction().unwrap();
+            assert_eq!(
+                execution_is_contained(&transaction, &task_id).unwrap(),
+                canonical_safe,
+                "pre-reopen {name}"
+            );
+        }
+    }
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    for (name, _, canonical_safe) in cases {
+        let task = manager
+            .get_task(&format!("T-provider-{name}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.state,
+            if canonical_safe {
+                TaskState::Paused
+            } else {
+                TaskState::Recovering
+            },
+            "post-reopen {name}"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "keeps the provider-status containment matrix and startup recovery assertion together"
 )]
 fn paused_startup_recovery_and_all_planning_entries_require_containment() {
@@ -3327,22 +3689,22 @@ fn paused_startup_recovery_and_all_planning_entries_require_containment() {
             "PROVIDER_FAILURE",
             TaskState::Running,
             TaskState::Failed,
-            true,
-            true,
+            false,
+            false,
         ),
         (
             "CANCELLED",
             TaskState::Verifying,
             TaskState::Planning,
-            true,
-            true,
+            false,
+            false,
         ),
         (
             "OUTPUT_FINALIZATION_FAILED",
             TaskState::Paused,
             TaskState::Planning,
-            true,
-            true,
+            false,
+            false,
         ),
         (
             "AUTHORITY_REVOKED",
@@ -4068,11 +4430,10 @@ fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager.connection.execute_batch(
-        r#"UPDATE semantic_program_revisions SET program_json='{"nodes":[{"id":"node-completion","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"report":"artifact.report@1"},"authority_requests":[]},{"id":"node-later","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"later":"artifact.report@1"},"authority_requests":[]}]}' WHERE task_id='T-completion';
-           UPDATE tasks SET state='RUNNABLE', active_step_ids_json='["node-completion","node-later"]' WHERE task_id='T-completion';
+        r"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
            UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
            UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
-           INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','snapshot-completion','node-later',1,1,'PENDING','NOT_STARTED','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');"#,
+           INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-later',1,1,'PENDING','NOT_STARTED','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
     ).unwrap();
     let result = manager
         .transition(&request(
@@ -4143,7 +4504,7 @@ fn historical_recovery_inventory_can_exit_only_after_affirmative_resolution() {
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager.connection.execute_batch(
         "UPDATE tasks SET state='RUNNING' WHERE task_id='T-completion';
-         INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at,started_at) VALUES ('operation-resolve','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','NETWORK','STARTED','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
+         INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at,started_at) VALUES ('operation-resolve','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','NETWORK','STARTED','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
     ).unwrap();
     assert!(
         manager
@@ -4235,7 +4596,7 @@ fn verifying_requires_exact_durable_candidate_outputs_for_every_active_port() {
     manager.connection.execute_batch(
         r#"UPDATE semantic_program_revisions SET program_json='{"nodes":[{"id":"node-completion","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"report":"artifact.report@1"},"authority_requests":[]},{"id":"node-later","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"later":"artifact.report@1"},"authority_requests":[]}]}' WHERE task_id='T-completion';
            UPDATE tasks SET state='RUNNING', active_step_ids_json='["node-completion","node-later"]' WHERE task_id='T-completion';
-           INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','snapshot-completion','node-later',1,1,'RUNNING',NULL,'[]','["artifact-does-not-exist"]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');"#,
+           INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-later',1,1,'RUNNING',NULL,'[]','["artifact-does-not-exist"]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');"#,
     ).unwrap();
     let result = manager
         .transition(&request(
@@ -4309,6 +4670,33 @@ fn locked_store_identity_rejects_path_retarget_before_connection_use() {
         })
         .is_err()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn locked_store_identity_checks_sqlite_main_after_path_swap_back() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().unwrap();
+    let original = directory.path().join("identity-original.sqlite3");
+    let alternate = directory.path().join("identity-alternate.sqlite3");
+    let path = directory.path().join("identity-link.sqlite3");
+    Connection::open(&original)
+        .unwrap()
+        .execute_batch("CREATE TABLE original_marker(value TEXT);")
+        .unwrap();
+    Connection::open(&alternate)
+        .unwrap()
+        .execute_batch("CREATE TABLE alternate_marker(value TEXT);")
+        .unwrap();
+    symlink(&original, &path).unwrap();
+    let lock = acquire_store_lock(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    symlink(&alternate, &path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    symlink(&original, &path).unwrap();
+    assert!(verify_locked_store_identity(&connection, &lock).is_err());
 }
 
 #[test]
@@ -4457,8 +4845,8 @@ fn proposed_active_steps_scope_initial_waiting_for_auth_lookup() {
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager.connection.execute_batch(
         "UPDATE tasks SET state='PLANNING', active_step_ids_json='[]' WHERE task_id='T-completion';
-         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,request_json,requested_at) VALUES ('authority-proposed','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','snapshot-completion','node-completion','test.complete@1','user','user:adversarial','test.approve','artifact','artifact:one','{}','2026-09-19T00:00:00Z');
-         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-proposed','authority-proposed','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','test.approve','PENDING','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');",
+         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,request_json,requested_at) VALUES ('authority-proposed','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-completion','test.complete@1','user','user:adversarial','test.approve','artifact','artifact:one','{}','2026-09-19T00:00:00Z');
+         INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-proposed','authority-proposed','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.approve','PENDING','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');",
     ).unwrap();
     let mut transition = request(
         "tr-proposed-auth",
@@ -4534,36 +4922,68 @@ fn unicode_identifier_limits_count_scalars_instead_of_utf8_bytes() {
 }
 
 #[test]
-fn clean_paused_task_does_not_enter_startup_recovery() {
+fn clean_nonterminal_execution_states_do_not_enter_empty_startup_recovery() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    manager.create_task(&create("T-paused-clean")).unwrap();
-    assert!(
-        manager
-            .transition(&request(
-                "tr-paused-plan",
-                "T-paused-clean",
-                1,
-                TaskState::Created,
-                TaskState::Planning,
-            ))
-            .unwrap()
-            .applied
-    );
-    assert!(
-        manager
-            .transition(&request(
-                "tr-paused-clean",
-                "T-paused-clean",
-                2,
-                TaskState::Planning,
-                TaskState::Paused,
-            ))
-            .unwrap()
-            .applied
-    );
+    for (task_id, state) in [
+        ("T-runnable-clean", TaskState::Runnable),
+        ("T-running-clean", TaskState::Running),
+        ("T-verifying-clean", TaskState::Verifying),
+        ("T-paused-clean", TaskState::Paused),
+        ("T-waiting-input-clean", TaskState::WaitingForInput),
+        ("T-waiting-auth-clean", TaskState::WaitingForAuth),
+    ] {
+        seed_nonterminal_history(&mut manager, task_id, state);
+    }
     assert!(manager.recover_startup().unwrap().is_empty());
-    let task = manager.get_task("T-paused-clean").unwrap().unwrap();
-    assert_eq!((task.state, task.revision), (TaskState::Paused, 3));
+    for (task_id, state) in [
+        ("T-runnable-clean", TaskState::Runnable),
+        ("T-running-clean", TaskState::Running),
+        ("T-verifying-clean", TaskState::Verifying),
+        ("T-paused-clean", TaskState::Paused),
+        ("T-waiting-input-clean", TaskState::WaitingForInput),
+        ("T-waiting-auth-clean", TaskState::WaitingForAuth),
+    ] {
+        assert_eq!(manager.get_task(task_id).unwrap().unwrap().state, state);
+    }
+}
+
+#[test]
+fn startup_quarantines_legacy_runnable_and_waiting_states_with_live_work() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-waiting-recovery.sqlite3");
+    let candidates = [
+        ("T-runnable-live", TaskState::Runnable),
+        ("T-waiting-input-live", TaskState::WaitingForInput),
+        ("T-waiting-auth-live", TaskState::WaitingForAuth),
+    ];
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        for (task_id, state) in candidates {
+            seed_nonterminal_history(&mut manager, task_id, state);
+            manager.connection.execute(
+                "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at)
+                 VALUES (?1,?2,?3,'node-live','NETWORK','STARTED',NULL,?4)",
+                rusqlite::params![format!("operation-{task_id}"), task_id, HASH, TEST_TIME],
+            ).unwrap();
+        }
+    }
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let connection = Connection::open(&path).unwrap();
+    for (task_id, state) in candidates {
+        let stored_state: String = connection
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_state, state.as_str(), "{task_id}");
+        assert_eq!(
+            unresolved_execution_ids(&connection, task_id).unwrap(),
+            vec![format!("operation:operation-{task_id}")],
+            "{task_id}"
+        );
+    }
 }
 
 #[test]
@@ -4571,8 +4991,8 @@ fn prepared_operations_have_typed_collision_free_recovery_subjects() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     manager.create_task(&create("T-operation-prefix")).unwrap();
     manager.connection.execute_batch(
-        "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,prepared_at) VALUES ('attempt:same','T-operation-prefix','sha256:1111111111111111111111111111111111111111111111111111111111111111','node','NETWORK','PREPARED','2026-09-19T00:00:00Z');
-         INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('same','T-operation-prefix','sha256:1111111111111111111111111111111111111111111111111111111111111111','node',1,1,'RUNNING','OUTCOME_UNKNOWN','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
+        "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,prepared_at) VALUES ('attempt:same','T-operation-prefix','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node','NETWORK','PREPARED','2026-09-19T00:00:00Z');
+         INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('same','T-operation-prefix','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node',1,1,'RUNNING','OUTCOME_UNKNOWN','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
     ).unwrap();
     let inventory = unresolved_execution_ids(&manager.connection, "T-operation-prefix").unwrap();
     assert_eq!(inventory, vec!["attempt:same", "operation:attempt:same"]);
@@ -4595,7 +5015,7 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     manager.create_task(&create("T-recovery-auth")).unwrap();
     manager.connection.execute_batch(
-        "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at) VALUES ('op','T-recovery-auth','sha256:1111111111111111111111111111111111111111111111111111111111111111','node','NETWORK','UNKNOWN','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z');",
+        "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at) VALUES ('op','T-recovery-auth','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node','NETWORK','UNKNOWN','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z');",
     ).unwrap();
     let inventory = unresolved_execution_ids(&manager.connection, "T-recovery-auth").unwrap();
     let recovery_ref = recovery_operations_ref("T-recovery-auth", 1, &inventory).unwrap();
@@ -4801,6 +5221,18 @@ fn binding_admission_authenticates_immutable_shape_snapshot_contract_and_allocat
         checked_at: TEST_TIME,
     };
     let transaction = manager.connection.transaction().unwrap();
+    let program_json: String = transaction
+        .query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-completion'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        aios_ir::recompute_semantic_hash(program_json.as_bytes()).unwrap(),
+        HASH
+    );
+    assert!(active_program_validation_valid(&transaction, "T-completion", HASH).unwrap());
     assert!(binding_grants_valid(&transaction, &check).unwrap());
     assert!(output_allocations_ready(&transaction, &check).unwrap());
     transaction
@@ -5090,6 +5522,382 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
     }
 }
 
+fn prepare_completion_for_admission(manager: &TaskManager) {
+    manager
+        .connection
+        .execute_batch(
+            "UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
+             UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
+             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+        )
+        .unwrap();
+}
+
+fn mutate_json_column(
+    manager: &TaskManager,
+    select: &str,
+    update: &str,
+    pointer: &str,
+    replacement: Value,
+) {
+    let raw = manager
+        .connection
+        .query_row(select, [], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mut value: Value = serde_json::from_str(&raw).unwrap();
+    *value.pointer_mut(pointer).unwrap() = replacement;
+    manager
+        .connection
+        .execute(update, [canonical_json(&value).unwrap()])
+        .unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "table-driven adversarial coverage authenticates every conformance receipt field"
+)]
+fn admission_authenticates_complete_conformance_evidence_and_timestamps() {
+    enum Tamper {
+        Json(&'static str, Value),
+        Malformed,
+        SuiteColumn,
+        InvalidExecutedAt,
+    }
+    let cases = vec![
+        ("malformed", Tamper::Malformed),
+        (
+            "provider-id",
+            Tamper::Json("/provider_id", serde_json::json!("provider:forged")),
+        ),
+        (
+            "provider-version",
+            Tamper::Json("/provider_version", serde_json::json!("9.9.9")),
+        ),
+        (
+            "provider-build",
+            Tamper::Json(
+                "/provider_build_identity/value",
+                serde_json::json!("sha256:forged"),
+            ),
+        ),
+        (
+            "capability",
+            Tamper::Json(
+                "/semantic_capability_ref",
+                serde_json::json!("test.forged@1"),
+            ),
+        ),
+        (
+            "contract-version",
+            Tamper::Json("/semantic_contract_version", serde_json::json!("1.1")),
+        ),
+        (
+            "contract-hash",
+            Tamper::Json(
+                "/semantic_contract_hash",
+                serde_json::json!(
+                    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ),
+            ),
+        ),
+        (
+            "suite-id",
+            Tamper::Json("/conformance_suite/id", serde_json::json!("suite:forged")),
+        ),
+        (
+            "suite-hash",
+            Tamper::Json(
+                "/conformance_suite/hash",
+                serde_json::json!(
+                    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ),
+            ),
+        ),
+        ("suite-column", Tamper::SuiteColumn),
+        ("result", Tamper::Json("/result", serde_json::json!("fail"))),
+        (
+            "expired",
+            Tamper::Json("/expires_at", serde_json::json!(TEST_TIME)),
+        ),
+        ("invalid-executed-at", Tamper::InvalidExecutedAt),
+    ];
+    for (name, tamper) in cases {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        let evidence: Value = serde_json::from_str(
+            &manager
+                .connection
+                .query_row(
+                    "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence
+                .pointer("/conformance_suite/hash")
+                .and_then(Value::as_str),
+            Some(SUITE_HASH)
+        );
+        prepare_completion_for_admission(&manager);
+        match tamper {
+            Tamper::Json(pointer, replacement) => mutate_json_column(
+                &manager,
+                "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+                "UPDATE provider_conformance_evidence SET evidence_json=?1 WHERE evidence_id='evidence-completion'",
+                pointer,
+                replacement,
+            ),
+            Tamper::Malformed => {
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE provider_conformance_evidence SET evidence_json='{}' WHERE evidence_id='evidence-completion'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            Tamper::SuiteColumn => {
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE provider_conformance_evidence SET suite_id='suite:forged' WHERE evidence_id='evidence-completion'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            Tamper::InvalidExecutedAt => {
+                mutate_json_column(
+                    &manager,
+                    "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+                    "UPDATE provider_conformance_evidence SET evidence_json=?1 WHERE evidence_id='evidence-completion'",
+                    "/executed_at",
+                    serde_json::json!("not-rfc3339"),
+                );
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE provider_conformance_evidence SET tested_at='not-rfc3339' WHERE evidence_id='evidence-completion'",
+                        [],
+                    )
+                    .unwrap();
+            }
+        }
+        let task_before = manager.get_task("T-completion").unwrap().unwrap();
+        let step_before = manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap();
+        let result = manager
+            .transition(&request(
+                &format!("tr-conformance-{name}"),
+                "T-completion",
+                2,
+                TaskState::Runnable,
+                TaskState::Running,
+            ))
+            .unwrap();
+        assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+        assert_eq!(
+            manager.get_task("T-completion").unwrap().unwrap(),
+            task_before
+        );
+        assert_eq!(
+            manager
+                .get_step_execution("attempt-completion")
+                .unwrap()
+                .unwrap(),
+            step_before
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps validation receipt and program-byte tampering across admission and completion together"
+)]
+fn program_validation_receipt_and_program_bytes_gate_runnable_admission_and_completion() {
+    for (name, tamper_program) in [("receipt", false), ("program", true), ("timestamp", false)] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        prepare_completion_for_admission(&manager);
+        if tamper_program {
+            mutate_json_column(
+                &manager,
+                "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-completion'",
+                "UPDATE semantic_program_revisions SET program_json=?1 WHERE task_id='T-completion'",
+                "/nodes/0/execution_class",
+                serde_json::json!("opaque_external"),
+            );
+        } else if name == "timestamp" {
+            mutate_json_column(
+                &manager,
+                "SELECT result_json FROM validation_results WHERE validation_result_id='validation-completion'",
+                "UPDATE validation_results SET result_json=?1 WHERE validation_result_id='validation-completion'",
+                "/validated_at",
+                serde_json::json!("not-rfc3339"),
+            );
+            manager
+                .connection
+                .execute(
+                    "UPDATE validation_results SET validated_at='not-rfc3339' WHERE validation_result_id='validation-completion'",
+                    [],
+                )
+                .unwrap();
+        } else {
+            mutate_json_column(
+                &manager,
+                "SELECT result_json FROM validation_results WHERE validation_result_id='validation-completion'",
+                "UPDATE validation_results SET result_json=?1 WHERE validation_result_id='validation-completion'",
+                "/validator/id",
+                serde_json::json!("validator:forged"),
+            );
+        }
+        let task_before = manager.get_task("T-completion").unwrap().unwrap();
+        let step_before = manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager
+                .transition(&request(
+                    &format!("tr-validation-{name}"),
+                    "T-completion",
+                    2,
+                    TaskState::Runnable,
+                    TaskState::Running,
+                ))
+                .unwrap()
+                .reason_code,
+            "TASK_TRANSITION_GUARD_FAILED"
+        );
+        assert_eq!(
+            manager.get_task("T-completion").unwrap().unwrap(),
+            task_before
+        );
+        assert_eq!(
+            manager
+                .get_step_execution("attempt-completion")
+                .unwrap()
+                .unwrap(),
+            step_before
+        );
+    }
+
+    for (name, source, target) in [
+        ("runnable", TaskState::Planning, TaskState::Runnable),
+        ("completion", TaskState::Verifying, TaskState::Completed),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state=?1 WHERE task_id='T-completion'",
+                [source.as_str()],
+            )
+            .unwrap();
+        mutate_json_column(
+            &manager,
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-completion'",
+            "UPDATE semantic_program_revisions SET program_json=?1 WHERE task_id='T-completion'",
+            "/nodes/0/execution_class",
+            serde_json::json!("opaque_external"),
+        );
+        let transition = if target == TaskState::Completed {
+            completion_request(&format!("tr-tampered-program-{name}"))
+        } else {
+            request(
+                &format!("tr-tampered-program-{name}"),
+                "T-completion",
+                2,
+                source,
+                target,
+            )
+        };
+        let result = manager.transition(&transition).unwrap();
+        assert!(!result.applied, "{name}");
+        assert_eq!(
+            manager.get_task("T-completion").unwrap().unwrap().state,
+            source
+        );
+    }
+}
+
+#[test]
+fn failure_code_must_match_machine_reason_code_pattern() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.create_task(&create("T-failure-code")).unwrap();
+    let mut failed = request(
+        "tr-failure-code",
+        "T-failure-code",
+        1,
+        TaskState::Created,
+        TaskState::Failed,
+    );
+    failed.mutation.failure.as_mut().unwrap().code = "secret-shaped failure".to_owned();
+    assert!(manager.transition(&failed).is_err());
+    assert_eq!(
+        manager.get_task("T-failure-code").unwrap().unwrap().state,
+        TaskState::Created
+    );
+    let schema: Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../specs/task-transition-request.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&serde_json::to_value(&failed).unwrap())
+    );
+}
+
+#[test]
+fn completion_enforces_every_output_allocation_constraint() {
+    for (name, mutation) in [
+        (
+            "max-size",
+            "UPDATE artifact_output_allocations SET max_size_bytes=41 WHERE allocation_id='allocation-completion'",
+        ),
+        (
+            "media-type",
+            "UPDATE artifact_output_allocations SET allowed_media_types_json='[\"text/plain\"]' WHERE allocation_id='allocation-completion'",
+        ),
+        (
+            "malformed-media-types",
+            "UPDATE artifact_output_allocations SET allowed_media_types_json='{}' WHERE allocation_id='allocation-completion'",
+        ),
+        (
+            "sensitivity",
+            "UPDATE artifact_output_allocations SET sensitivity='secret' WHERE allocation_id='allocation-completion'",
+        ),
+        (
+            "retention",
+            "UPDATE artifact_output_allocations SET retention='persistent' WHERE allocation_id='allocation-completion'",
+        ),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        manager.connection.execute(mutation, []).unwrap();
+        let result = manager
+            .transition(&completion_request(&format!("tr-allocation-{name}")))
+            .unwrap();
+        assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED", "{name}");
+        assert_eq!(
+            manager.get_task("T-completion").unwrap().unwrap().state,
+            TaskState::Verifying
+        );
+    }
+}
+
 #[test]
 fn superseded_plan_or_program_cannot_be_used_for_execution() {
     for column in ["plan_revisions", "semantic_program_revisions"] {
@@ -5336,9 +6144,9 @@ fn reconciled_aborted_revoked_and_denied_subjects_keep_failure_dispositions() {
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "PENDING");
     manager.connection.execute_batch(
         "INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at) VALUES ('policy-recovery','task','T-completion','fixture','sha256:policy','engine:test','0.1','{}','2026-09-19T00:00:00Z');
-         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES ('authority-recovery','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','snapshot-completion','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','test.execute','artifact','artifact:one','resource:one','{}','2026-09-19T00:00:00Z');
-         INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,reason_codes_json,decision_json,decided_at) VALUES ('decision-recovery','authority-recovery','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','provider','provider:test','test.execute','artifact','artifact:one','ALLOW','policy-recovery','[]','{}','2026-09-19T00:00:00Z');
-         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at) VALUES ('grant-recovery','T-completion','sha256:1111111111111111111111111111111111111111111111111111111111111111','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','decision-recovery','policy-recovery','[]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
+         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES ('authority-recovery','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','test.execute','artifact','artifact:one','resource:one','{}','2026-09-19T00:00:00Z');
+         INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,reason_codes_json,decision_json,decided_at) VALUES ('decision-recovery','authority-recovery','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','provider','provider:test','test.execute','artifact','artifact:one','ALLOW','policy-recovery','[]','{}','2026-09-19T00:00:00Z');
+         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at) VALUES ('grant-recovery','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','decision-recovery','policy-recovery','[]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
          INSERT INTO credential_handles(credential_id,owner_principal_kind,owner_principal_id,credential_class,exportability,status,metadata_json,secure_store_ref,created_at) VALUES ('credential://recovery','provider','provider:test','api-token','broker-only','ACTIVE','{}','secure://credential-recovery','2026-09-19T00:00:00Z');
          INSERT INTO credential_use_records(request_id,task_id,credential_id,execution_binding_id,authority_grant_id,principal_kind,principal_id,use_mode,request_json,requested_at) VALUES ('credential-use-recovery','T-completion','credential://recovery','binding-completion','grant-recovery','provider','provider:test','inject','{}','2026-09-19T00:00:00Z');",
     ).unwrap();
@@ -5414,6 +6222,109 @@ fn reconciled_aborted_revoked_and_denied_subjects_keep_failure_dispositions() {
             Some("provenance")
         );
     }
+}
+
+#[test]
+fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_proof() {
+    for (name, mutation) in [
+        (
+            "missing-blob",
+            "UPDATE artifact_blobs SET durability_state='MISSING'
+             WHERE content_hash='sha256:artifact-output'",
+        ),
+        (
+            "unverified-artifact",
+            "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id='artifact-output'",
+        ),
+        (
+            "publication-hash-missing",
+            "UPDATE artifact_publications SET content_hash=NULL
+             WHERE publication_id='publication-completion'",
+        ),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "PENDING");
+        let inventory = unresolved_execution_ids(&manager.connection, "T-completion").unwrap();
+        assert!(inventory.contains(&"publication:publication-completion".to_owned()));
+        manager.connection.execute(
+            "UPDATE artifact_publications SET state='COMMITTED',committed_at=?1 WHERE publication_id='publication-completion'",
+            [TEST_TIME],
+        ).unwrap();
+        {
+            let transaction = manager.connection.transaction().unwrap();
+            assert!(
+                resolved_recovery_subject(
+                    &transaction,
+                    "T-completion",
+                    "publication:publication-completion"
+                )
+                .unwrap()
+                .is_some(),
+                "valid:{name}"
+            );
+        }
+        manager.connection.execute(mutation, []).unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(
+                &transaction,
+                "T-completion",
+                "publication:publication-completion"
+            )
+            .unwrap()
+            .is_none(),
+            "{name}"
+        );
+    }
+
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute_batch(
+            "INSERT INTO artifact_output_allocations (
+                 allocation_id, task_id, semantic_program_hash, node_id,
+                 binding_id, attempt_id, output_port, expected_semantic_type,
+                 sensitivity, retention, state, publication_id,
+                 published_artifact_id, created_at, expires_at
+             ) VALUES (
+                 'allocation-rogue', 'T-completion',
+                 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
+                 'node-completion', 'binding-completion', 'attempt-completion',
+                 'rogue', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
+                 'publication-rogue', 'artifact-output',
+                 '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z'
+             );
+             INSERT INTO artifact_publications (
+                 publication_id, allocation_id, task_id, artifact_id, content_hash,
+                 request_json, state, requested_at, committed_at
+             ) VALUES (
+                 'publication-rogue', 'allocation-rogue', 'T-completion',
+                 'artifact-output', 'sha256:artifact-output', '{}', 'COMMITTED',
+                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
+             );",
+        )
+        .unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(
+        resolved_recovery_subject(
+            &transaction,
+            "T-completion",
+            "publication:publication-completion"
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        resolved_recovery_subject(
+            &transaction,
+            "T-completion",
+            "publication:publication-rogue"
+        )
+        .unwrap()
+        .is_none(),
+        "a committed publication using a legitimate artifact cannot resolve unless its exact allocation is the selected active output"
+    );
 }
 
 #[test]

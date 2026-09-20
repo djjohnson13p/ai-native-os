@@ -531,11 +531,22 @@ fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
     })
 }
 
-fn verify_locked_store_identity(path: &Path, lock: &StoreLock) -> Result<()> {
-    let reopened = OpenOptions::new().read(true).write(true).open(path)?;
-    if store_identity(path, &reopened)? != lock.identity {
+fn verify_locked_store_identity(connection: &Connection, lock: &StoreLock) -> Result<()> {
+    let main_filename = connection.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    if main_filename.is_empty() {
         return Err(TaskManagerError::InvalidRecord(
-            "database path changed identity after acquiring the store lock",
+            "SQLite main database has no durable file identity",
+        ));
+    }
+    let main_path = PathBuf::from(main_filename);
+    let main_file = OpenOptions::new().read(true).write(true).open(&main_path)?;
+    if store_identity(&main_path, &main_file)? != lock.identity {
+        return Err(TaskManagerError::InvalidRecord(
+            "SQLite main database identity does not match the locked store",
         ));
     }
     Ok(())
@@ -548,7 +559,7 @@ where
     let lock = acquire_store_lock(path)?;
     after_lock(path);
     let connection = Connection::open(path)?;
-    verify_locked_store_identity(path, &lock)?;
+    verify_locked_store_identity(&connection, &lock)?;
     TaskManager::initialize(connection, clock, Some(lock))
 }
 
@@ -1007,8 +1018,7 @@ impl TaskManager {
         let unique_inputs = all_unique(&request.input_artifacts);
         let unique_outputs = all_unique(&request.output_artifacts);
         let valid_failure = request.failure.as_ref().is_none_or(|failure| {
-            !failure.code.is_empty()
-                && failure.code.chars().count() <= 128
+            reason_code_valid(&failure.code)
                 && !failure.summary.is_empty()
                 && failure.summary.chars().count() <= 4096
         });
@@ -1126,7 +1136,7 @@ impl TaskManager {
         self.verify_nonterminal_heads()?;
         let candidates = {
             let mut statement = self.connection.prepare(
-                "SELECT task_id, revision, state FROM tasks WHERE state IN ('RUNNING', 'VERIFYING', 'PAUSED') ORDER BY task_id",
+                "SELECT task_id, revision, state FROM tasks WHERE state IN ('RUNNABLE', 'RUNNING', 'VERIFYING', 'PAUSED', 'WAITING_FOR_INPUT', 'WAITING_FOR_AUTH') ORDER BY task_id",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
@@ -1143,10 +1153,19 @@ impl TaskManager {
                 .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
             let state = TaskState::parse(&state)?;
             let unknown_operation_ids = unresolved_execution_ids(&self.connection, &task_id)?;
-            // PAUSED is a quiescent state. A paused Task with no durable
-            // unresolved subject has no startup uncertainty to reconcile.
-            if state == TaskState::Paused && unknown_operation_ids.is_empty() {
+            // A nonterminal materialized state alone is not evidence of an
+            // uncertain operation. Never create an empty recovery epoch that
+            // cannot be reconciled; durable consequential subjects drive entry.
+            if unknown_operation_ids.is_empty() {
                 continue;
+            }
+            if matches!(
+                state,
+                TaskState::Runnable | TaskState::WaitingForInput | TaskState::WaitingForAuth
+            ) {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy non-executing Task retains unresolved execution and requires quarantine",
+                ));
             }
             let recovery_ref = recovery_operations_ref(&task_id, revision, &unknown_operation_ids)?;
             let assessed_at = self.clock.now();
@@ -2448,6 +2467,18 @@ fn provenance_failure_commitment(failure: &FailureRecord, secret_nonce: &[u8]) -
     task_field_commitment(secret_nonce, "failure_summary", failure.summary.as_bytes())
 }
 
+fn reason_code_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_uppercase()
+            } else {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+            }
+        })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "mirrors the closed v0.1 transition-request schema at the storage boundary"
@@ -2457,18 +2488,7 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
         request.requested_by.kind.as_str(),
         "user" | "agent" | "provider" | "system-service" | "policy-engine" | "peer-node"
     );
-    let valid_reason = request
-        .reason
-        .code
-        .bytes()
-        .enumerate()
-        .all(|(index, byte)| {
-            if index == 0 {
-                byte.is_ascii_uppercase()
-            } else {
-                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
-            }
-        });
+    let valid_reason = reason_code_valid(&request.reason.code);
     let unique_steps = request
         .mutation
         .active_step_ids
@@ -2513,8 +2533,7 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
         })
     });
     let valid_failure = request.mutation.failure.as_ref().is_none_or(|failure| {
-        !failure.code.is_empty()
-            && failure.code.chars().count() <= 128
+        reason_code_valid(&failure.code)
             && !failure.summary.is_empty()
             && failure.summary.chars().count() <= 4096
             && failure
@@ -3432,6 +3451,61 @@ struct StoredCredentialUse {
     requested_at: String,
 }
 
+struct StoredProviderInvocation {
+    invocation_id: String,
+    attempt_id: String,
+    binding_id: String,
+    provider_id: String,
+    provider_version: String,
+    status: String,
+    result_json: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    binding_attempt_id: Option<String>,
+    binding_task_id: Option<String>,
+    node_id: Option<String>,
+    binding_provider_id: Option<String>,
+    binding_provider_version: Option<String>,
+    binding_provider_build_hash: Option<String>,
+}
+
+fn stored_provider_invocations(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<StoredProviderInvocation>> {
+    let mut statement = connection.prepare(
+        "SELECT invocation.invocation_id, invocation.attempt_id, invocation.binding_id,
+                invocation.provider_id, invocation.provider_version, invocation.status,
+                invocation.result_json, invocation.started_at, invocation.completed_at,
+                binding.attempt_id, binding.task_id, binding.node_id,
+                binding.provider_id, binding.provider_version, binding.provider_build_hash
+         FROM provider_invocations invocation
+         LEFT JOIN execution_bindings binding ON binding.binding_id = invocation.binding_id
+         WHERE invocation.task_id=?1 ORDER BY invocation.invocation_id",
+    )?;
+    let rows = statement.query_map([task_id], |row| {
+        Ok(StoredProviderInvocation {
+            invocation_id: row.get(0)?,
+            attempt_id: row.get(1)?,
+            binding_id: row.get(2)?,
+            provider_id: row.get(3)?,
+            provider_version: row.get(4)?,
+            status: row.get(5)?,
+            result_json: row.get(6)?,
+            started_at: row.get(7)?,
+            completed_at: row.get(8)?,
+            binding_attempt_id: row.get(9)?,
+            binding_task_id: row.get(10)?,
+            node_id: row.get(11)?,
+            binding_provider_id: row.get(12)?,
+            binding_provider_version: row.get(13)?,
+            binding_provider_build_hash: row.get(14)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn stored_credential_uses(
     connection: &Connection,
     task_id: &str,
@@ -3488,6 +3562,22 @@ fn unresolved_credential_use_ids(connection: &Connection, task_id: &str) -> Resu
         .collect())
 }
 
+fn unresolved_provider_invocation_ids(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    Ok(stored_provider_invocations(connection, task_id)?
+        .into_iter()
+        .filter(|record| {
+            authenticated_provider_invocation_resolution(task_id, record)
+                .ok()
+                .flatten()
+                .is_none()
+        })
+        .map(|record| format!("provider-invocation:{}", record.invocation_id))
+        .collect())
+}
+
 fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Vec<String>> {
     let mut ids = query_strings(
         connection,
@@ -3498,9 +3588,6 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
              SELECT 'attempt:' || attempt_id FROM step_executions
               WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))
              UNION ALL
-             SELECT 'provider-invocation:' || invocation_id FROM provider_invocations
-              WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED')
-             UNION ALL
              SELECT 'publication:' || publication_id FROM artifact_publications
               WHERE task_id = ?1 AND state = 'PENDING'
              UNION ALL
@@ -3509,18 +3596,18 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
         ) ORDER BY recovery_id",
         task_id,
     )?;
+    ids.extend(unresolved_provider_invocation_ids(connection, task_id)?);
     ids.extend(unresolved_credential_use_ids(connection, task_id)?);
     ids.sort();
     Ok(ids)
 }
 
 fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> Result<i64> {
-    let unresolved_without_credentials = transaction
+    let unresolved_without_receipts = transaction
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('PREPARED', 'STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED'))",
+               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL)))",
             [task_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -3528,7 +3615,13 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
         unresolved_credential_use_ids(transaction, task_id)?.len(),
     )
     .map_err(|_| TaskManagerError::InvalidRecord("credential-use count exceeds supported range"))?;
-    Ok(unresolved_without_credentials + unresolved_credentials)
+    let unresolved_invocations = i64::try_from(
+        unresolved_provider_invocation_ids(transaction, task_id)?.len(),
+    )
+    .map_err(|_| {
+        TaskManagerError::InvalidRecord("provider-invocation count exceeds supported range")
+    })?;
+    Ok(unresolved_without_receipts + unresolved_credentials + unresolved_invocations)
 }
 
 struct RecoverySubject {
@@ -3631,30 +3724,22 @@ fn load_recovery_subjects(
         }
     }
     {
-        let mut statement = transaction.prepare(
-            "SELECT invocation_id, status, started_at FROM provider_invocations
-             WHERE task_id = ?1 AND status IN ('PENDING','STARTING','RUNNING','OUTCOME_UNKNOWN','TIMED_OUT','AUTHORITY_REVOKED') ORDER BY invocation_id",
-        )?;
-        let rows = statement.query_map([task_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, status, started_at) = row?;
+        for record in stored_provider_invocations(transaction, task_id)? {
+            if authenticated_provider_invocation_resolution(task_id, &record)?.is_some() {
+                continue;
+            }
             let certainty = "OUTCOME_UNKNOWN".to_owned();
             let (safe_action, reason_code) = recovery_disposition(&certainty);
             subjects.push(RecoverySubject {
                 kind: "external-operation",
-                id: format!("provider-invocation:{id}"),
+                id: format!("provider-invocation:{}", record.invocation_id),
                 evidence_kind: "provider-runtime",
                 certainty,
                 safe_action,
                 reason_code,
                 observation: format!(
-                    "durable provider invocation status={status}; started_at={started_at:?}"
+                    "durable provider invocation status={}; started_at={:?}",
+                    record.status, record.started_at
                 ),
             });
         }
@@ -4213,7 +4298,8 @@ fn admit_active_steps(
             grant_refs_json: &grant_refs,
             checked_at: admitted_at,
         };
-        if !binding_grants_valid(transaction, &check)?
+        if !active_program_validation_valid(transaction, task_id, &semantic_hash)?
+            || !binding_grants_valid(transaction, &check)?
             || !output_allocations_ready(transaction, &check)?
         {
             return Ok(false);
@@ -4280,6 +4366,153 @@ struct BindingEvidence {
     placement_json: String,
     binding_json: String,
     created_at: String,
+    conformance_evidence_id: String,
+    conformance_suite_id: Option<String>,
+    conformance_suite_hash: Option<String>,
+    conformance_status: String,
+    conformance_json: String,
+    conformance_tested_at: Option<String>,
+}
+
+struct SnapshotContract {
+    version: String,
+    content_hash: String,
+}
+
+fn validation_result_validator() -> Result<&'static jsonschema::Validator> {
+    static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    match VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../specs/ir-validation-result.schema.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(validator) => Ok(validator),
+        Err(_) => Err(TaskManagerError::InvalidRecord(
+            "IR validation result schema cannot be compiled",
+        )),
+    }
+}
+
+fn provider_conformance_result_validator() -> Result<&'static jsonschema::Validator> {
+    static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    match VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../specs/provider-conformance-result.schema.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(validator) => Ok(validator),
+        Err(_) => Err(TaskManagerError::InvalidRecord(
+            "provider conformance result schema cannot be compiled",
+        )),
+    }
+}
+
+fn active_program_validation_valid(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    semantic_hash: &str,
+) -> Result<bool> {
+    let evidence = transaction
+        .query_row(
+            "SELECT p.program_json,p.program_id,p.ir_version,p.semantic_hash,p.registry_snapshot_id,
+                    v.task_id,v.program_id,v.ir_version,v.valid,v.semantic_hash,v.registry_snapshot_id,
+                    v.validator_id,v.validator_version,v.validator_build_hash,v.result_json,v.validated_at
+             FROM tasks t
+             JOIN semantic_program_revisions p ON p.task_id=t.task_id
+                AND p.program_revision=t.active_program_revision AND p.status='active'
+             JOIN validation_results v ON v.validation_result_id=p.validation_result_id
+             WHERE t.task_id=?1 AND p.semantic_hash=?2",
+            params![task_id, semantic_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, bool>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        program_json,
+        program_id,
+        ir_version,
+        stored_hash,
+        snapshot_id,
+        validation_task_id,
+        validation_program_id,
+        validation_ir_version,
+        validation_valid,
+        validation_hash,
+        validation_snapshot_id,
+        validator_id,
+        validator_version,
+        validator_build_hash,
+        result_json,
+        validated_at,
+    )) = evidence
+    else {
+        return Ok(false);
+    };
+    let Ok(result) = serde_json::from_str::<Value>(&result_json) else {
+        return Ok(false);
+    };
+    let recomputed_hash = aios_ir::recompute_semantic_hash(program_json.as_bytes()).ok();
+    let timestamp_valid = OffsetDateTime::parse(&validated_at, &Rfc3339).is_ok();
+    Ok(timestamp_valid
+        && validation_result_validator()?.is_valid(&result)
+        && validation_task_id.as_deref() == Some(task_id)
+        && validation_program_id.as_deref() == Some(program_id.as_str())
+        && validation_ir_version.as_deref() == Some(ir_version.as_str())
+        && validation_valid
+        && validation_hash.as_deref() == Some(stored_hash.as_str())
+        && validation_snapshot_id.as_deref() == Some(snapshot_id.as_str())
+        && recomputed_hash.as_deref() == Some(stored_hash.as_str())
+        && result.get("valid").and_then(Value::as_bool) == Some(true)
+        && result.get("program_id").and_then(Value::as_str) == Some(program_id.as_str())
+        && result.get("ir_version").and_then(Value::as_str) == Some(ir_version.as_str())
+        && result.get("semantic_hash").and_then(Value::as_str) == Some(stored_hash.as_str())
+        && result.get("semantic_hash_profile").and_then(Value::as_str) == Some("aios-ir-v0.1")
+        && result.get("registry_snapshot_id").and_then(Value::as_str) == Some(snapshot_id.as_str())
+        && result.pointer("/validator/id").and_then(Value::as_str) == Some(validator_id.as_str())
+        && result.pointer("/validator/version").and_then(Value::as_str)
+            == Some(validator_version.as_str())
+        && match validator_build_hash.as_deref() {
+            Some(expected) => {
+                result
+                    .pointer("/validator/build_hash")
+                    .and_then(Value::as_str)
+                    == Some(expected)
+            }
+            None => result
+                .pointer("/validator/build_hash")
+                .is_none_or(Value::is_null),
+        }
+        && result.get("validated_at").and_then(Value::as_str) == Some(validated_at.as_str()))
 }
 
 fn canonical_version_component(value: &str) -> bool {
@@ -4329,10 +4562,10 @@ fn contract_content_hash(value: &str) -> bool {
         && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn snapshot_contract_hash(value: &Value, capability: &str) -> Option<String> {
+fn snapshot_contract(value: &Value, capability: &str) -> Option<SnapshotContract> {
     let (requested_id, requested_major) = capability_selector(capability)?;
     let contracts = value.get("capability_contracts")?.as_array()?;
-    let mut matched_hash = None;
+    let mut matched = None;
     for contract in contracts {
         let contract = contract.as_object()?;
         let id = contract.get("id")?.as_str()?;
@@ -4343,12 +4576,87 @@ fn snapshot_contract_hash(value: &Value, capability: &str) -> Option<String> {
         }
         if id == requested_id
             && full_version_major(version)? == requested_major
-            && matched_hash.replace(content_hash.to_owned()).is_some()
+            && matched
+                .replace(SnapshotContract {
+                    version: version.to_owned(),
+                    content_hash: content_hash.to_owned(),
+                })
+                .is_some()
         {
             return None;
         }
     }
-    matched_hash
+    matched
+}
+
+fn snapshot_contract_hash(value: &Value, capability: &str) -> Option<String> {
+    snapshot_contract(value, capability).map(|contract| contract.content_hash)
+}
+
+fn conformance_evidence_valid(
+    binding: &BindingEvidence,
+    contract: &SnapshotContract,
+    checked_at: &str,
+) -> Result<bool> {
+    let Ok(evidence) = serde_json::from_str::<Value>(&binding.conformance_json) else {
+        return Ok(false);
+    };
+    if !provider_conformance_result_validator()?.is_valid(&evidence) {
+        return Ok(false);
+    }
+    let executed_at_valid = binding
+        .conformance_tested_at
+        .as_deref()
+        .is_some_and(|tested_at| OffsetDateTime::parse(tested_at, &Rfc3339).is_ok());
+    let not_expired = match evidence.get("expires_at") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(expires_at)) => {
+            let Ok(expires_at) = OffsetDateTime::parse(expires_at, &Rfc3339) else {
+                return Ok(false);
+            };
+            let Ok(checked_at) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
+                return Ok(false);
+            };
+            expires_at > checked_at
+        }
+        Some(_) => false,
+    };
+    Ok(executed_at_valid
+        && not_expired
+        && evidence.get("result_id").and_then(Value::as_str)
+            == Some(binding.conformance_evidence_id.as_str())
+        && evidence.get("provider_id").and_then(Value::as_str)
+            == Some(binding.principal_id.as_str())
+        && evidence.get("provider_version").and_then(Value::as_str)
+            == Some(binding.provider_version.as_str())
+        && evidence
+            .pointer("/provider_build_identity/value")
+            .and_then(Value::as_str)
+            == binding.provider_build_hash.as_deref()
+        && evidence
+            .get("semantic_capability_ref")
+            .and_then(Value::as_str)
+            == Some(binding.capability.as_str())
+        && evidence
+            .get("semantic_contract_version")
+            .and_then(Value::as_str)
+            == Some(contract.version.as_str())
+        && evidence
+            .get("semantic_contract_hash")
+            .and_then(Value::as_str)
+            == Some(contract.content_hash.as_str())
+        && evidence
+            .pointer("/conformance_suite/id")
+            .and_then(Value::as_str)
+            == binding.conformance_suite_id.as_deref()
+        && evidence
+            .pointer("/conformance_suite/hash")
+            .and_then(Value::as_str)
+            == binding.conformance_suite_hash.as_deref()
+        && evidence.get("result").and_then(Value::as_str)
+            == Some(binding.conformance_status.as_str())
+        && evidence.get("executed_at").and_then(Value::as_str)
+            == binding.conformance_tested_at.as_deref())
 }
 
 fn binding_json_matches(binding: &BindingEvidence, check: &BindingGrantCheck<'_>) -> Result<bool> {
@@ -4495,7 +4803,8 @@ fn binding_grants_valid(
                     b.provider_version, b.provider_manifest_hash, b.provider_build_hash,
                     b.provider_registration_id, b.attempt, b.policy_decision_refs_json,
                     b.grant_refs_json, b.execution_profile_ref, b.placement_json,
-                    b.binding_json, b.created_at
+                    b.binding_json, b.created_at, c.evidence_id, c.suite_id,
+                    c.suite_hash, c.status, c.evidence_json, c.tested_at
              FROM execution_bindings b
              JOIN tasks t ON t.task_id = b.task_id
              JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.status = 'active'
@@ -4511,7 +4820,12 @@ fn binding_grants_valid(
                 AND c.status = 'pass'
              WHERE b.binding_id = ?1 AND b.attempt_id = ?2 AND b.task_id = ?3
                 AND b.semantic_program_hash = ?4 AND b.node_id = ?5
-                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash",
+                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash
+                AND (SELECT COUNT(*) FROM provider_conformance_evidence c2
+                     WHERE c2.registration_id=r.registration_id
+                       AND c2.capability=b.capability
+                       AND c2.contract_hash=b.capability_contract_hash
+                       AND c2.status='pass')=1",
             params![check.binding_id, check.attempt_id, check.task_id, check.semantic_hash, check.node_id],
             |row| {
                 Ok(BindingEvidence {
@@ -4524,6 +4838,10 @@ fn binding_grants_valid(
                     policy_decision_refs_json: row.get(12)?, grant_refs_json: row.get(13)?,
                     execution_profile_ref: row.get(14)?, placement_json: row.get(15)?,
                     binding_json: row.get(16)?, created_at: row.get(17)?,
+                    conformance_evidence_id: row.get(18)?,
+                    conformance_suite_id: row.get(19)?, conformance_suite_hash: row.get(20)?,
+                    conformance_status: row.get(21)?, conformance_json: row.get(22)?,
+                    conformance_tested_at: row.get(23)?,
                 })
             },
         )
@@ -4538,7 +4856,12 @@ fn binding_grants_valid(
         return Ok(false);
     }
     let snapshot: Value = serde_json::from_str(&binding.snapshot_manifest_json)?;
-    if snapshot_contract_hash(&snapshot, &binding.capability) != binding.contract_hash {
+    let Some(contract) = snapshot_contract(&snapshot, &binding.capability) else {
+        return Ok(false);
+    };
+    if Some(contract.content_hash.as_str()) != binding.contract_hash.as_deref()
+        || !conformance_evidence_valid(&binding, &contract, check.checked_at)?
+    {
         return Ok(false);
     }
     let capability = binding.capability;
@@ -4777,6 +5100,12 @@ fn binding_grants_valid(
         && covered_decisions == policy_refs.into_iter().collect())
 }
 
+#[derive(Default)]
+struct ActiveStepCompletionFacts {
+    artifact_ids: std::collections::BTreeSet<String>,
+    publication_tuples: std::collections::BTreeSet<(String, String, String)>,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "audits the full program-port, attempt, publication, artifact, and blob integrity join"
@@ -4785,17 +5114,20 @@ fn active_step_completion_facts(
     transaction: &Transaction<'_>,
     task_id: &str,
     active_steps: &[String],
-) -> Result<Option<std::collections::BTreeSet<String>>> {
-    let program_json = transaction
+) -> Result<Option<ActiveStepCompletionFacts>> {
+    let program = transaction
         .query_row(
-            "SELECT p.program_json FROM tasks t JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision JOIN validation_results v ON v.validation_result_id = p.validation_result_id AND v.valid = 1 AND v.semantic_hash = p.semantic_hash AND v.registry_snapshot_id = p.registry_snapshot_id WHERE t.task_id = ?1 AND p.status = 'active'",
+            "SELECT p.program_json,p.semantic_hash FROM tasks t JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision WHERE t.task_id = ?1 AND p.status = 'active'",
             [task_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some(program_json) = program_json else {
+    let Some((program_json, program_hash)) = program else {
         return Ok(None);
     };
+    if !active_program_validation_valid(transaction, task_id, &program_hash)? {
+        return Ok(None);
+    }
     let program: Value = serde_json::from_str(&program_json)?;
     let Some(nodes) = program.get("nodes").and_then(Value::as_array) else {
         return Ok(None);
@@ -4829,7 +5161,7 @@ fn active_step_completion_facts(
     {
         return Ok(None);
     }
-    let mut published_artifacts = std::collections::BTreeSet::new();
+    let mut completion_facts = ActiveStepCompletionFacts::default();
     for (node_id, output_port, semantic_type) in expected_ports {
         if latest_active_attempt_count(transaction, task_id, &node_id)? != 1 {
             return Ok(None);
@@ -4857,7 +5189,10 @@ fn active_step_completion_facts(
         }
         let artifacts = {
             let mut statement = transaction.prepare(
-                "SELECT a.published_artifact_id
+                "SELECT a.allocation_id, p.publication_id, a.published_artifact_id,
+                        f.media_type, f.size_bytes,
+                        f.sensitivity, f.retention_class, a.allowed_media_types_json,
+                        a.max_size_bytes, a.sensitivity, a.retention
                  FROM artifact_output_allocations a
                  JOIN artifact_publications p ON p.publication_id = a.publication_id
                     AND p.allocation_id = a.allocation_id AND p.task_id = a.task_id
@@ -4888,15 +5223,63 @@ fn active_step_completion_facts(
                     output_port,
                     semantic_type
                 ],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        if artifacts.len() != 1 || !published_artifacts.insert(artifacts[0].clone()) {
+        if artifacts.len() != 1 {
+            return Ok(None);
+        }
+        let (
+            allocation_id,
+            publication_id,
+            artifact_id,
+            media_type,
+            size_bytes,
+            artifact_sensitivity,
+            artifact_retention,
+            allowed_media_types_json,
+            max_size_bytes,
+            allocation_sensitivity,
+            allocation_retention,
+        ) = &artifacts[0];
+        let media_allowed = if let Some(allowed_media_types_json) = allowed_media_types_json {
+            let Ok(allowed) = serde_json::from_str::<Vec<String>>(allowed_media_types_json) else {
+                return Ok(None);
+            };
+            allowed.len() <= 32 && all_unique(&allowed) && allowed.contains(media_type)
+        } else {
+            true
+        };
+        if !media_allowed
+            || max_size_bytes.is_some_and(|maximum| *size_bytes > maximum)
+            || artifact_sensitivity != allocation_sensitivity
+            || artifact_retention.as_deref() != Some(allocation_retention.as_str())
+            || !completion_facts.artifact_ids.insert(artifact_id.clone())
+            || !completion_facts.publication_tuples.insert((
+                publication_id.clone(),
+                allocation_id.clone(),
+                artifact_id.clone(),
+            ))
+        {
             return Ok(None);
         }
     }
-    Ok(Some(published_artifacts))
+    Ok(Some(completion_facts))
 }
 
 fn has_current_verification(
@@ -5006,11 +5389,7 @@ fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Resul
         [task_id],
         |row| row.get::<_, i64>(0),
     )?;
-    let live_invocations = transaction.query_row(
-        "SELECT COUNT(*) FROM provider_invocations WHERE task_id = ?1 AND status IN ('PENDING', 'STARTING', 'RUNNING', 'OUTCOME_UNKNOWN', 'TIMED_OUT', 'AUTHORITY_REVOKED')",
-        [task_id],
-        |row| row.get::<_, i64>(0),
-    )?;
+    let live_invocations = unresolved_provider_invocation_ids(transaction, task_id)?.len();
     let live_credential_uses = unresolved_credential_use_ids(transaction, task_id)?.len();
     Ok(live_attempts == 0
         && live_grants == 0
@@ -5147,6 +5526,157 @@ fn credential_use_result_validator() -> Result<&'static jsonschema::Validator> {
     }
 }
 
+fn provider_invocation_result_validator() -> Result<&'static jsonschema::Validator> {
+    static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    match VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../specs/provider-invocation-result.schema.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(validator) => Ok(validator),
+        Err(_) => Err(TaskManagerError::InvalidRecord(
+            "provider-invocation result schema cannot be compiled",
+        )),
+    }
+}
+
+fn provider_invocation_resolution(
+    connection: &Connection,
+    task_id: &str,
+    invocation_id: &str,
+) -> Result<Option<RecoveryResolution>> {
+    let records = stored_provider_invocations(connection, task_id)?;
+    let Some(record) = records
+        .iter()
+        .find(|record| record.invocation_id == invocation_id)
+    else {
+        return Ok(None);
+    };
+    authenticated_provider_invocation_resolution(task_id, record)
+}
+
+fn authenticated_provider_invocation_resolution(
+    task_id: &str,
+    record: &StoredProviderInvocation,
+) -> Result<Option<RecoveryResolution>> {
+    let (
+        Some(result_json),
+        Some(started_at),
+        Some(completed_at),
+        Some(binding_attempt_id),
+        Some(binding_task_id),
+        Some(node_id),
+        Some(binding_provider_id),
+        Some(binding_provider_version),
+    ) = (
+        record.result_json.as_deref(),
+        record.started_at.as_deref(),
+        record.completed_at.as_deref(),
+        record.binding_attempt_id.as_deref(),
+        record.binding_task_id.as_deref(),
+        record.node_id.as_deref(),
+        record.binding_provider_id.as_deref(),
+        record.binding_provider_version.as_deref(),
+    )
+    else {
+        return Ok(None);
+    };
+    let Ok(result) = serde_json::from_str::<Value>(result_json) else {
+        return Ok(None);
+    };
+    let expected_build_hash = record
+        .binding_provider_build_hash
+        .as_ref()
+        .map_or(Value::Null, |hash| Value::String(hash.clone()));
+    if !provider_invocation_result_validator()?.is_valid(&result)
+        || canonical_json(&result)? != result_json
+        || binding_attempt_id != record.attempt_id
+        || binding_task_id != task_id
+        || binding_provider_id != record.provider_id
+        || binding_provider_version != record.provider_version
+        || result.get("invocation_id").and_then(Value::as_str)
+            != Some(record.invocation_id.as_str())
+        || result.get("task_id").and_then(Value::as_str) != Some(task_id)
+        || result.get("execution_binding_id").and_then(Value::as_str)
+            != Some(record.binding_id.as_str())
+        || result.get("node_id").and_then(Value::as_str) != Some(node_id)
+        || result.pointer("/provider/id").and_then(Value::as_str)
+            != Some(record.provider_id.as_str())
+        || result.pointer("/provider/version").and_then(Value::as_str)
+            != Some(record.provider_version.as_str())
+        || result.pointer("/provider/package_or_build_hash") != Some(&expected_build_hash)
+        || result.get("status").and_then(Value::as_str) != Some(record.status.as_str())
+        || result.get("started_at").and_then(Value::as_str) != Some(started_at)
+        || result.get("completed_at").and_then(Value::as_str) != Some(completed_at)
+    {
+        return Ok(None);
+    }
+    Ok(match record.status.as_str() {
+        "SUCCEEDED" => recovery_resolution("COMPLETED".to_owned()),
+        "START_FAILED" => recovery_resolution("NOT_STARTED".to_owned()),
+        // Every other status, including a declared semantic failure, lacks
+        // explicit v0.1 effect certainty and therefore remains unresolved.
+        _ => None,
+    })
+}
+
+fn resolved_publication_recovery_subject(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    publication_id: &str,
+) -> Result<Option<RecoveryResolution>> {
+    let publication = transaction
+        .query_row(
+            "SELECT state,allocation_id,artifact_id FROM artifact_publications WHERE task_id=?1 AND publication_id=?2",
+            params![task_id, publication_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match publication {
+        Some((state, _, _)) if state == "ABORTED" => Some(RecoveryResolution {
+            certainty: "FAILED_NO_EFFECT".to_owned(),
+            safe_action: "CLEAN_STAGING",
+            reason_code: "RECOVERY_FAILED_NO_EFFECT",
+            event_status: "cancelled",
+        }),
+        Some((state, allocation_id, Some(artifact_id))) if state == "COMMITTED" => {
+            let active_steps = transaction
+                .query_row(
+                    "SELECT active_step_ids_json FROM tasks WHERE task_id=?1",
+                    [task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|steps| serde_json::from_str::<Vec<String>>(&steps).ok());
+            let Some(active_steps) = active_steps else {
+                return Ok(None);
+            };
+            active_step_completion_facts(transaction, task_id, &active_steps)?
+                .filter(|facts| {
+                    facts.publication_tuples.contains(&(
+                        publication_id.to_owned(),
+                        allocation_id,
+                        artifact_id,
+                    ))
+                })
+                .and_then(|_| recovery_resolution("COMPLETED".to_owned()))
+        }
+        _ => None,
+    })
+}
+
 fn resolved_recovery_subject(
     transaction: &Transaction<'_>,
     task_id: &str,
@@ -5164,23 +5694,7 @@ fn resolved_recovery_subject(
         return Ok(certainty.and_then(recovery_resolution));
     }
     if let Some(publication_id) = inventory_id.strip_prefix("publication:") {
-        let state = transaction
-            .query_row(
-                "SELECT state FROM artifact_publications WHERE task_id=?1 AND publication_id=?2",
-                params![task_id, publication_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        return Ok(match state.as_deref() {
-            Some("COMMITTED") => recovery_resolution("COMPLETED".to_owned()),
-            Some("ABORTED") => Some(RecoveryResolution {
-                certainty: "FAILED_NO_EFFECT".to_owned(),
-                safe_action: "CLEAN_STAGING",
-                reason_code: "RECOVERY_FAILED_NO_EFFECT",
-                event_status: "cancelled",
-            }),
-            _ => None,
-        });
+        return resolved_publication_recovery_subject(transaction, task_id, publication_id);
     }
     if let Some(grant_id) = inventory_id.strip_prefix("grant:") {
         let state = transaction
@@ -5217,10 +5731,8 @@ fn resolved_recovery_subject(
             .as_ref()
             .and_then(|record| authenticated_credential_use_resolution(task_id, record)));
     }
-    if inventory_id.starts_with("provider-invocation:") {
-        // Provider invocation rows lack an authenticated outcome-certainty
-        // field, so even terminal-looking runtime statuses cannot prove safety.
-        return Ok(None);
+    if let Some(invocation_id) = inventory_id.strip_prefix("provider-invocation:") {
+        return provider_invocation_resolution(transaction, task_id, invocation_id);
     }
     let Some(operation_id) = inventory_id.strip_prefix("operation:") else {
         return Ok(None);
@@ -5528,12 +6040,23 @@ fn guard_failure(
     } else {
         &active_steps
     };
-    let valid_program = active_program.is_some()
-        && transaction.query_row(
-            "SELECT COUNT(*) FROM semantic_program_revisions p JOIN validation_results v ON v.validation_result_id = p.validation_result_id WHERE p.task_id = ?1 AND p.program_revision = ?2 AND p.status = 'active' AND v.valid = 1 AND v.semantic_hash = p.semantic_hash AND v.registry_snapshot_id = p.registry_snapshot_id",
-            params![request.task_id, active_program],
-            |row| row.get::<_, i64>(0),
-        )? == 1;
+    let active_program_hash = active_program
+        .map(|program_revision| {
+            transaction
+                .query_row(
+                    "SELECT semantic_hash FROM semantic_program_revisions WHERE task_id=?1 AND program_revision=?2 AND status='active'",
+                    params![request.task_id, program_revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .transpose()?
+        .flatten();
+    let valid_program = if let Some(active_program_hash) = active_program_hash {
+        active_program_validation_valid(transaction, &request.task_id, &active_program_hash)?
+    } else {
+        false
+    };
     let ready_steps = count_active_steps(transaction, &request.task_id, &active_steps, "READY")?;
     let bound_ready_steps = count_bound_active_steps(
         transaction,
@@ -5636,6 +6159,12 @@ fn guard_failure(
         return Ok(Some("TASK_PROGRAM_NOT_RUNNABLE"));
     }
     let code = match request.to_state {
+        TaskState::Runnable
+            if request.expected_state == TaskState::Running
+                && !execution_is_contained(transaction, &request.task_id)? =>
+        {
+            Some("TASK_TRANSITION_GUARD_FAILED")
+        }
         TaskState::WaitingForInput
             if !waiting
                 .iter()
@@ -5675,7 +6204,9 @@ fn guard_failure(
             let published_outputs =
                 active_step_completion_facts(transaction, &request.task_id, &active_steps)?;
             let verified = match &published_outputs {
-                Some(outputs) => has_current_verification(transaction, &request.task_id, outputs)?,
+                Some(outputs) => {
+                    has_current_verification(transaction, &request.task_id, &outputs.artifact_ids)?
+                }
                 None => false,
             };
             if unknown_operations > 0 {
@@ -5723,7 +6254,11 @@ fn guard_failure(
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
         }
-        TaskState::Planning | TaskState::Paused | TaskState::Cancelled
+        TaskState::Planning
+        | TaskState::WaitingForInput
+        | TaskState::WaitingForAuth
+        | TaskState::Paused
+        | TaskState::Cancelled
             if !execution_is_contained(transaction, &request.task_id)? =>
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
