@@ -1029,6 +1029,16 @@ impl TaskManager {
         if allocation.binding_id.is_none() || allocation.attempt_id.is_none() {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        if allocation.writer_grant_admission.is_none() {
+            let committed_replay = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND state='COMMITTED')",
+                params![request.publication_id, request.allocation_id, request.task_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !committed_replay {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+        }
         self.publish_artifact_output(request)
     }
 
@@ -3497,14 +3507,26 @@ fn place_blob(
         let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
     }
-    drop(pending);
     sync_cap_directory(store, "blobs/pending")?;
+    pending_placement_step(store, &pending_ref)?;
     let reused = match store.hard_link(
         safe_internal_ref(&pending_ref)?,
         store,
         safe_internal_ref(&storage_ref)?,
     ) {
-        Ok(()) => false,
+        Ok(()) => {
+            let mut promoted = store.open(safe_internal_ref(&storage_ref)?)?;
+            let same_identity = same_open_file_identity(&pending, &promoted)?;
+            let (promoted_size, promoted_hash) = hash_reader(&mut promoted)?;
+            if !same_identity || promoted_size != size || promoted_hash != content_hash {
+                drop(promoted);
+                drop(pending);
+                let _ = store.remove_file(safe_internal_ref(&storage_ref)?);
+                let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+            }
+            false
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let (existing_size, existing_hash) = hash_internal_file(store, &storage_ref)?;
             if existing_size != size || existing_hash != content_hash {
@@ -3514,6 +3536,7 @@ fn place_blob(
         }
         Err(error) => return Err(error.into()),
     };
+    drop(pending);
     store.remove_file(safe_internal_ref(&pending_ref)?)?;
     sync_cap_directory(store, &parent_ref)?;
     sync_cap_directory(store, "blobs/pending")?;
@@ -3522,6 +3545,31 @@ fn place_blob(
         sync_cap_directory(store, "staging")?;
     }
     Ok((storage_ref, reused))
+}
+
+fn same_open_file_identity(left: &cap_std::fs::File, right: &cap_std::fs::File) -> Result<bool> {
+    let left = left.try_clone()?.into_std();
+    let right = right.try_clone()?.into_std();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(windows)]
+    {
+        let left = winx::winapi_util::file::information(&left)?;
+        let right = winx::winapi_util::file::information(&right)?;
+        Ok(left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index() == right.file_index())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Ok(true)
+    }
 }
 
 fn placement_token(identity: &str) -> String {
@@ -3754,7 +3802,13 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<()> {
             store,
             safe_internal_ref(&final_ref)?,
         ) {
-            Ok(()) => {}
+            Ok(()) => {
+                let (_, final_hash) = hash_internal_file(store, &final_ref)?;
+                if final_hash != expected {
+                    let _ = store.remove_file(safe_internal_ref(&final_ref)?);
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let (_, final_hash) = hash_internal_file(store, &final_ref)?;
                 if final_hash != expected {
@@ -3990,6 +4044,34 @@ fn durability_step(operation: &str) -> Result<()> {
     reason = "test fault injection shares the production call signature"
 )]
 fn durability_step(_operation: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+type PendingPlacementTestHook = Box<dyn FnOnce(&Dir, &str) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_PLACEMENT_TEST_HOOK: std::cell::RefCell<Option<PendingPlacementTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn pending_placement_step(store: &Dir, pending_ref: &str) -> Result<()> {
+    PENDING_PLACEMENT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(store, pending_ref)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test path replacement injection shares the production call signature"
+)]
+fn pending_placement_step(_store: &Dir, _pending_ref: &str) -> Result<()> {
     Ok(())
 }
 
@@ -4779,6 +4861,81 @@ mod tests {
     }
 
     #[test]
+    fn pending_path_replacement_cannot_substitute_verified_blob_bytes() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-pending-replacement";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        write_output(&mut manager, allocation_id, b"verified candidate");
+        let root = manager.artifact_store_root.clone();
+        PENDING_PLACEMENT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_store, pending_ref| {
+                let pending = root.join(safe_internal_ref(pending_ref)?);
+                let displaced = pending.with_extension("verified-displaced");
+                std::fs::rename(&pending, displaced)?;
+                std::fs::write(&pending, b"substituted bytes")?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.publish_artifact_output(&publication("pub-pending-replacement", allocation_id)),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifact_blobs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_artifacts WHERE role='output'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.created'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_publications WHERE state='COMMITTED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn corrupt_published_blob_fails_integrity_and_scoped_reads() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -5368,6 +5525,214 @@ mod tests {
                 "publication or response-loss replay consumed {scope} again"
             );
         }
+    }
+
+    #[test]
+    fn legacy_bound_inflight_allocations_without_writer_admission_fail_closed() {
+        for legacy_state in ["WRITING", "FINALIZING"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let fixture = format!("legacy-{}", legacy_state.to_ascii_lowercase());
+            let (allocation_id, _) = finish_bound_output(&mut manager, &fixture, "ONE_SHOT");
+            let publication_id = format!("pub-{fixture}");
+            let request = publication(&publication_id, &allocation_id);
+            // Migration 0006 cannot reconstruct the exact grant admitted by a
+            // pre-v6 in-flight writer, so upgraded legacy rows retain NULL here.
+            if legacy_state == "FINALIZING" {
+                manager
+                    .connection
+                    .execute(
+                        "INSERT INTO artifact_publications(publication_id,allocation_id,task_id,request_json,state,requested_at) VALUES (?1,?2,'T-artifact',?3,'PENDING','2026-09-19T22:00:00Z')",
+                        params![publication_id, allocation_id, canonical_json(&request).unwrap()],
+                    )
+                    .unwrap();
+            }
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifact_output_allocations
+                     SET state=?2,publication_id=CASE WHEN ?2='FINALIZING' THEN ?3 ELSE NULL END,
+                         writer_grant_id=NULL,writer_grant_one_shot_consumed=NULL
+                     WHERE allocation_id=?1",
+                    params![allocation_id, legacy_state, publication_id],
+                )
+                .unwrap();
+
+            assert!(matches!(
+                manager.publish_bound_artifact_output(&request),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+            assert_publication_not_committed(&manager, &allocation_id, &publication_id);
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT state FROM artifact_output_allocations WHERE allocation_id=?1",
+                        [&allocation_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                legacy_state
+            );
+            let publication_rows = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_publications WHERE publication_id=?1",
+                    [&publication_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(publication_rows, i64::from(legacy_state == "FINALIZING"));
+            if legacy_state == "FINALIZING" {
+                assert_eq!(
+                    manager
+                        .connection
+                        .query_row(
+                            "SELECT state FROM artifact_publications WHERE publication_id=?1",
+                            [&publication_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                    "PENDING"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_committed_bound_publication_without_writer_admission_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let (allocation_id, grant_id) =
+            finish_bound_output(&mut manager, "legacy-committed", "ONE_SHOT");
+        let request = publication("pub-legacy-committed", &allocation_id);
+        let committed = manager.publish_bound_artifact_output(&request).unwrap();
+        assert!(committed.published);
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations
+                 SET writer_grant_id=NULL,writer_grant_one_shot_consumed=NULL
+                 WHERE allocation_id=?1",
+                [&allocation_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.publish_bound_artifact_output(&request).unwrap(),
+            committed
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_allocated_bound_output_records_writer_admission_atomically() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let fixture = "legacy-allocated";
+        let allocation_id = format!("alloc-{fixture}");
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            fixture,
+            &[],
+            &[("artifact.write", "output-allocation", &allocation_id)],
+        );
+        let mut request = allocation(&allocation_id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        manager.allocate_bound_artifact_output(&request).unwrap();
+        // A pre-v6 ALLOCATED row has no prior writer admission to reconstruct;
+        // opening it after migration records the admission normally.
+        assert!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT writer_grant_id IS NULL AND writer_grant_one_shot_consumed IS NULL
+                     FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [&allocation_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+
+        let writer = manager.open_bound_artifact_output(&allocation_id).unwrap();
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT a.state,a.writer_grant_id,a.writer_grant_one_shot_consumed,g.uses_consumed,g.state
+                     FROM artifact_output_allocations a JOIN authority_grants g ON g.grant_id=a.writer_grant_id
+                     WHERE a.allocation_id=?1",
+                    [&allocation_id],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    )),
+                )
+                .unwrap(),
+            (
+                "WRITING".to_owned(),
+                format!("grant-{fixture}-0"),
+                true,
+                1,
+                "CONSUMED".to_owned(),
+            )
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn committed_bound_one_shot_replays_after_close_without_second_consumption() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let (allocation_id, grant_id) =
+            finish_bound_output(&mut manager, "reopen-committed", "ONE_SHOT");
+        let request = publication("pub-reopen-committed", &allocation_id);
+        let committed = manager.publish_bound_artifact_output(&request).unwrap();
+        assert!(committed.published);
+        manager
+            .connection
+            .execute_batch(&format!(
+                "UPDATE step_executions
+                 SET state='SUCCEEDED',outcome_certainty='COMPLETED',output_artifacts_json='[\"{}\"]',finished_at='2026-09-19T22:00:00Z'
+                 WHERE attempt_id='attempt-reopen-committed';
+                 UPDATE tasks SET state='COMPLETED',completed_at='2026-09-19T22:00:00Z'
+                 WHERE task_id='T-artifact';",
+                committed.artifact_id.as_deref().unwrap()
+            ))
+            .unwrap();
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened.publish_bound_artifact_output(&request).unwrap(),
+            committed
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
