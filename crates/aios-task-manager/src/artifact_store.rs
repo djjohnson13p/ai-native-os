@@ -479,6 +479,29 @@ pub struct ProviderArtifactSession {
 /// Implementations must complete every fallible close, commit, or finalization step in
 /// [`ArtifactExportWriter::finalize`]. Relying on `Drop` is unsafe because the Artifact Store
 /// records export success only after this method returns successfully.
+///
+/// ```
+/// use std::io::{self, Write};
+/// use aios_task_manager::ArtifactExportWriter;
+///
+/// struct Destination(Vec<u8>);
+///
+/// impl Write for Destination {
+///     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+///         self.0.write(bytes)
+///     }
+///
+///     fn flush(&mut self) -> io::Result<()> {
+///         self.0.flush()
+///     }
+/// }
+///
+/// impl ArtifactExportWriter for Destination {
+///     fn finalize(&mut self) -> io::Result<()> {
+///         self.flush()
+///     }
+/// }
+/// ```
 pub trait ArtifactExportWriter: Write {
     /// Completes every fallible commit/close step needed before success may be recorded.
     fn finalize(&mut self) -> std::io::Result<()>;
@@ -1356,14 +1379,7 @@ impl TaskManager {
             .min(IMPORT_LIMIT);
         let (size, content_hash) =
             stream_into_new_internal_file(reader, &self.artifact_store_dir, &staging_ref, maximum)?;
-        let placement = place_blob(
-            &self.artifact_store_dir,
-            &staging_ref,
-            &content_hash,
-            size,
-            false,
-            &token,
-        );
+        let placement = self.place_blob(&staging_ref, &content_hash, size, false, &token);
         let (storage_ref, reused) = match placement {
             Ok(placement) => placement,
             Err(error @ TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH")) => {
@@ -1777,8 +1793,7 @@ impl TaskManager {
             };
             return self.fail_pending_publication(request, code);
         }
-        let placement = place_blob(
-            &self.artifact_store_dir,
+        let placement = self.place_blob(
             staging_ref,
             &content_hash,
             size,
@@ -4957,105 +4972,109 @@ fn upsert_durable_blob(
     Ok(())
 }
 
-fn place_blob(
-    store: &Dir,
-    staging_ref: &str,
-    content_hash: &str,
-    size: u64,
-    preserve_staging: bool,
-    placement_identity: &str,
-) -> Result<(String, bool)> {
-    validate_hash(content_hash)?;
-    let digest = content_hash.strip_prefix("sha256:").unwrap_or_default();
-    let storage_ref = format!(
-        "blobs/sha256/{}/{}/{}",
-        &digest[0..2],
-        &digest[2..4],
-        digest
-    );
-    let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
-    create_durable_ancestors(store, &parent_ref)?;
-    let pending_ref = format!(
-        "blobs/pending/{}-{}",
-        digest,
-        placement_token(placement_identity)
-    );
-    let mut source = store.open(safe_internal_ref(staging_ref)?)?;
-    let mut pending = store.open_with(
-        safe_internal_ref(&pending_ref)?,
-        CapOpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true),
-    )?;
-    secure_cap_file_permissions(&pending)?;
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-    loop {
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
+impl TaskManager {
+    fn place_blob(
+        &mut self,
+        staging_ref: &str,
+        content_hash: &str,
+        size: u64,
+        preserve_staging: bool,
+        placement_identity: &str,
+    ) -> Result<(String, bool)> {
+        let store = self.artifact_store_dir.try_clone()?;
+        validate_hash(content_hash)?;
+        let digest = content_hash.strip_prefix("sha256:").unwrap_or_default();
+        let storage_ref = format!(
+            "blobs/sha256/{}/{}/{}",
+            &digest[0..2],
+            &digest[2..4],
+            digest
+        );
+        let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
+        create_durable_ancestors(&store, &parent_ref)?;
+        let pending_ref = format!(
+            "blobs/pending/{}-{}",
+            digest,
+            placement_token(placement_identity)
+        );
+        let mut source = store.open(safe_internal_ref(staging_ref)?)?;
+        let mut pending = store.open_with(
+            safe_internal_ref(&pending_ref)?,
+            CapOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true),
+        )?;
+        secure_cap_file_permissions(&pending)?;
+        let mut hasher = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(
+                    u64::try_from(count)
+                        .map_err(|_| TaskManagerError::InvalidRecord("Artifact size overflow"))?,
+                )
+                .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
+            pending.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
         }
-        copied = copied
-            .checked_add(
-                u64::try_from(count)
-                    .map_err(|_| TaskManagerError::InvalidRecord("Artifact size overflow"))?,
-            )
-            .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
-        pending.write_all(&buffer[..count])?;
-        hasher.update(&buffer[..count]);
-    }
-    pending.flush()?;
-    pending.sync_all()?;
-    if copied != size || tagged_digest(hasher) != content_hash {
+        pending.flush()?;
+        pending.sync_all()?;
+        if copied != size || tagged_digest(hasher) != content_hash {
+            drop(pending);
+            let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+        }
+        sync_cap_directory(&store, "blobs/pending")?;
+        pending_placement_step(&store, &pending_ref)?;
+        let reused = match store.hard_link(
+            safe_internal_ref(&pending_ref)?,
+            &store,
+            safe_internal_ref(&storage_ref)?,
+        ) {
+            Ok(()) => {
+                let mut promoted = store.open(safe_internal_ref(&storage_ref)?)?;
+                let same_identity = same_open_file_identity(&pending, &promoted)?;
+                let (promoted_size, promoted_hash) = hash_reader(&mut promoted)?;
+                if !same_identity || promoted_size != size || promoted_hash != content_hash {
+                    drop(promoted);
+                    drop(pending);
+                    let _ = store.remove_file(safe_internal_ref(&storage_ref)?);
+                    let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                }
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (existing_size, existing_hash) = hash_internal_file(&store, &storage_ref)?;
+                if existing_size != size || existing_hash != content_hash {
+                    drop(pending);
+                    self.mark_content_hash_failed(content_hash, "CORRUPT")?;
+                    quarantine_blob_collision(&store, &pending_ref, &storage_ref, digest)?;
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                }
+                true
+            }
+            Err(error) => return Err(error.into()),
+        };
         drop(pending);
-        let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
-        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-    }
-    sync_cap_directory(store, "blobs/pending")?;
-    pending_placement_step(store, &pending_ref)?;
-    let reused = match store.hard_link(
-        safe_internal_ref(&pending_ref)?,
-        store,
-        safe_internal_ref(&storage_ref)?,
-    ) {
-        Ok(()) => {
-            let mut promoted = store.open(safe_internal_ref(&storage_ref)?)?;
-            let same_identity = same_open_file_identity(&pending, &promoted)?;
-            let (promoted_size, promoted_hash) = hash_reader(&mut promoted)?;
-            if !same_identity || promoted_size != size || promoted_hash != content_hash {
-                drop(promoted);
-                drop(pending);
-                let _ = store.remove_file(safe_internal_ref(&storage_ref)?);
-                let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-            }
-            false
+        durability_step("sync-promoted-blob-parent")?;
+        sync_cap_directory(&store, &parent_ref)?;
+        durability_step("unlink-promoted-blob-pending")?;
+        store.remove_file(safe_internal_ref(&pending_ref)?)?;
+        durability_step("sync-promoted-blob-pending")?;
+        sync_cap_directory(&store, "blobs/pending")?;
+        if !preserve_staging {
+            store.remove_file(safe_internal_ref(staging_ref)?)?;
+            sync_cap_directory(&store, "staging")?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (existing_size, existing_hash) = hash_internal_file(store, &storage_ref)?;
-            if existing_size != size || existing_hash != content_hash {
-                drop(pending);
-                quarantine_blob_collision(store, &pending_ref, &storage_ref, digest)?;
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-            }
-            true
-        }
-        Err(error) => return Err(error.into()),
-    };
-    drop(pending);
-    durability_step("sync-promoted-blob-parent")?;
-    sync_cap_directory(store, &parent_ref)?;
-    durability_step("unlink-promoted-blob-pending")?;
-    store.remove_file(safe_internal_ref(&pending_ref)?)?;
-    durability_step("sync-promoted-blob-pending")?;
-    sync_cap_directory(store, "blobs/pending")?;
-    if !preserve_staging {
-        store.remove_file(safe_internal_ref(staging_ref)?)?;
-        sync_cap_directory(store, "staging")?;
+        Ok((storage_ref, reused))
     }
-    Ok((storage_ref, reused))
 }
 
 fn quarantine_blob_collision(
@@ -8513,15 +8532,9 @@ mod tests {
         let staging = manager.artifact_store_root.join(staging_ref);
         let (size, hash) =
             stream_into_new_file(&mut Cursor::new(b"orphan".as_slice()), &staging, 1_024).unwrap();
-        place_blob(
-            &manager.artifact_store_dir,
-            staging_ref,
-            &hash,
-            size,
-            false,
-            "manual-crash",
-        )
-        .unwrap();
+        manager
+            .place_blob(staging_ref, &hash, size, false, "manual-crash")
+            .unwrap();
         std::fs::write(
             manager.artifact_store_root.join("staging/raw-residue"),
             b"unknown",
@@ -8583,15 +8596,9 @@ mod tests {
         let staging_path =
             resolve_internal_ref(&manager.artifact_store_root, &staging_ref).unwrap();
         let (size, hash) = hash_file(&staging_path).unwrap();
-        place_blob(
-            &manager.artifact_store_dir,
-            &staging_ref,
-            &hash,
-            size,
-            true,
-            "pub-crash",
-        )
-        .unwrap();
+        manager
+            .place_blob(&staging_ref, &hash, size, true, "pub-crash")
+            .unwrap();
 
         let report = manager.reconcile_artifacts_startup().unwrap();
         assert!(
@@ -11187,6 +11194,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one collision fixture covers runtime and startup quarantine, shared metadata fanout, provenance, and an already-issued reader fence"
+    )]
     fn partial_final_blob_is_never_overwritten_and_pending_blob_is_reconciled() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -11264,17 +11275,20 @@ mod tests {
         let artifact = manager
             .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
             .unwrap();
-        std::fs::write(manager.artifact_store_root.join(&final_ref), b"corrupt").unwrap();
-        let pending_ref = format!("blobs/pending/{digest}-committed-recovery");
-        manager
-            .artifact_store_dir
-            .write(&pending_ref, bytes)
+        let shared_artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
             .unwrap();
-        let report = manager.reconcile_artifacts_startup().unwrap();
-        assert!(report.findings.iter().any(|finding| {
-            finding.kind == ArtifactReconciliationKind::BlobCorrupt
-                && finding.artifact_ids == [artifact.artifact_id.clone()]
-        }));
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut issued_reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        std::fs::write(manager.artifact_store_root.join(&final_ref), b"corrupt").unwrap();
+        assert!(matches!(
+            manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice())),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
         assert_eq!(
             manager
                 .get_artifact(&artifact.artifact_id)
@@ -11284,8 +11298,32 @@ mod tests {
                 .state,
             ArtifactIntegrityState::Failed
         );
+        assert_eq!(
+            manager
+                .get_artifact(&shared_artifact.artifact_id)
+                .unwrap()
+                .unwrap()
+                .integrity
+                .state,
+            ArtifactIntegrityState::Failed
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            issued_reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.integrity-failed' AND task_id='T-artifact' AND json_extract(event_json,'$.input_artifacts[0]') IN (?1,?2)",
+                    params![artifact.artifact_id, shared_artifact.artifact_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
         assert!(!manager.artifact_store_root.join(&final_ref).exists());
-        assert!(!manager.artifact_store_root.join(&pending_ref).exists());
         assert!(manager.reconcile_artifacts_startup().is_ok());
     }
 
