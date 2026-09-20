@@ -1724,6 +1724,7 @@ impl TaskManager {
                 "ARTIFACT_ALLOCATION_NOT_FOUND",
             ));
         };
+        ensure_task_is_not_recovering(&transaction, &allocation.task_id)?;
         let Some(staging_ref) = allocation.staging_ref.clone() else {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_ALLOCATION_NOT_FOUND",
@@ -2226,6 +2227,7 @@ impl TaskManager {
         scope: &ArtifactReadScope,
         artifact_id: &str,
     ) -> Result<PreparedArtifactReader> {
+        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         let now = self.clock.now();
         if scope.issuer_id != self.artifact_scope_issuer
             || !scope.artifact_ids.contains(artifact_id)
@@ -4745,6 +4747,7 @@ fn admit_prepared_artifact_reader(
     handle: &ArtifactHandle,
     admitted_at: &str,
 ) -> Result<Option<GrantAdmission>> {
+    ensure_task_is_not_recovering(connection, &scope.task_id)?;
     let integrity_current = connection.query_row(
         "SELECT a.integrity_state,b.durability_state
          FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
@@ -8764,7 +8767,7 @@ mod tests {
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
         assert!(matches!(
-            manager.scope_artifact_reads(&session, &[artifact.artifact_id]),
+            manager.scope_artifact_reads(&session, &[artifact.artifact_id.clone()]),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
@@ -8772,6 +8775,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one recovery-boundary fixture proves retained provider/owner readers, writer admission, import, allocation, and publication remain mutation-free"
+    )]
     fn recovering_task_denies_retained_provider_artifact_authority_without_export_unknown() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -8797,8 +8804,23 @@ mod tests {
         let scope = manager
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
-        let mut reader = manager
-            .open_artifact_reader(&scope, &artifact.artifact_id)
+        let owner_scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let integrity_before = manager
+            .connection
+            .query_row(
+                "SELECT integrity_state,integrity_verified_at,integrity_verifier
+                 FROM artifacts WHERE artifact_id=?1",
+                [&artifact.artifact_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
             .unwrap();
         let mut request = allocation(allocation_id);
         request.binding_id = Some(binding_id.clone());
@@ -8811,6 +8833,10 @@ mod tests {
             .unwrap();
         writer.write_all(b"recovery output").unwrap();
         writer.finish().unwrap();
+        let unopened_allocation = allocation("alloc-recovery-unopened");
+        manager
+            .allocate_artifact_output(&unopened_allocation)
+            .unwrap();
         manager
             .connection
             .execute(
@@ -8820,17 +8846,63 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            reader.read(&mut [0_u8; 1]),
-            Err(error) if error.to_string().contains("ARTIFACT_AUTHORITY_DENIED")
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
         assert!(matches!(
-            manager.scope_artifact_reads(&session, &[artifact.artifact_id]),
+            manager.open_artifact_reader(&owner_scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-recovery-provider-fence-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT integrity_state,integrity_verified_at,integrity_verifier
+                     FROM artifacts WHERE artifact_id=?1",
+                    [&artifact.artifact_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            integrity_before
+        );
+        assert!(matches!(
+            manager.scope_artifact_reads(&session, &[artifact.artifact_id.clone()]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
         assert!(matches!(
             manager.allocate_bound_artifact_output(&session, &request),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+        assert!(matches!(
+            manager.open_artifact_output(&unopened_allocation.allocation_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            manager
+                .get_artifact_output_allocation(&unopened_allocation.allocation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactAllocationState::Allocated
+        );
         assert!(matches!(
             manager.import_artifact(
                 &import_request(),
@@ -8850,6 +8922,63 @@ mod tests {
                 .unwrap()
                 .state,
             ArtifactAllocationState::Writing
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        READER_SETUP_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-recovery-provider-fence-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-recovery-provider-fence-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 
