@@ -367,3 +367,45 @@ fn corrupt_registry_uses_normative_bounded_rejection_output() {
     assert!(response["validation"]["semantic_hash"].is_null());
     assert!(response["effect_summary"].is_null());
 }
+
+#[test]
+fn duplicate_registry_key_text_is_redacted_from_cli_output() {
+    let secret = "Bearer sk-test-registry-duplicate-key";
+    let directory = temporary_directory("duplicate-key-registry");
+    for name in ["capability-contracts.json", "type-contracts.json"] {
+        std::fs::copy(fixture_root().join(name), directory.join(name)).unwrap();
+    }
+    let snapshot = std::fs::read_to_string(fixture_root().join("registry-snapshot.json")).unwrap();
+    let injected = snapshot.replacen('{', &format!("{{\"{secret}\":0,\"{secret}\":1,"), 1);
+    std::fs::write(directory.join("registry-snapshot.json"), injected).unwrap();
+
+    let output = cli()
+        .arg("validate")
+        .arg(fixture_root().join("demonstration-a.ir.json"))
+        .arg("--registry")
+        .arg(&directory)
+        .output()
+        .expect("run duplicate-key registry rejection");
+
+    for name in [
+        "capability-contracts.json",
+        "type-contracts.json",
+        "registry-snapshot.json",
+    ] {
+        let _ = std::fs::remove_file(directory.join(name));
+    }
+    let _ = std::fs::remove_dir(directory);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["validation"]["diagnostics"][0]["code"],
+        "REGISTRY_SCHEMA_INVALID"
+    );
+    assert_eq!(
+        response["validation"]["diagnostics"][0]["message"],
+        "duplicate JSON key"
+    );
+}

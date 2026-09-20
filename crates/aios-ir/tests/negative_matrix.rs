@@ -263,6 +263,37 @@ fn input_authority_selector_must_name_an_input_consumed_by_the_node() {
 }
 
 #[test]
+fn required_artifact_read_must_cover_each_direct_artifact_input() {
+    let mut program = base_copy();
+    program["nodes"][0]["authority_requests"][0]["resource"] = json!("task.output");
+
+    assert_code(
+        &validate(strict_registry(), &program),
+        ValidatorReasonCode::IrRequiredAuthorityMissing,
+    );
+}
+
+#[test]
+fn fallback_relation_rejects_multi_capability_cycles() {
+    let mut program = fallback_copy();
+    let mut reverse = program["nodes"][0].clone();
+    reverse["id"] = json!("copy_compat");
+    reverse["operation"]["capability"] = json!("artifact.copy.compat@1");
+    reverse["failure"] = json!({
+        "on_error":"fallback",
+        "fallback_capabilities":["artifact.copy@1"]
+    });
+    program["nodes"].as_array_mut().unwrap().push(reverse);
+
+    let report = validate(strict_registry(), &program);
+    assert_code(
+        &report,
+        ValidatorReasonCode::IrFailurePolicyRecursiveFallback,
+    );
+    assert!(report.output.validation.semantic_hash.is_none());
+}
+
+#[test]
 fn fallback_ports_are_checked_against_bindings_and_consumers() {
     let program = fallback_copy();
 

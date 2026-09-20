@@ -3,11 +3,13 @@
 use crate::version::{FullVersion, SemanticRef, validate_semantic_id};
 use crate::{SemanticRegistry, effect_for_authority_class};
 use aios_contracts::{
-    CapabilityManifest, EffectClass, EgressMode, Locality, NetworkDefault, ProviderCapability,
-    ProviderReasonCode, ProviderRuntimeKind, SCHEMA_VERSION_V0_1,
+    CapabilityManifest, EffectClass, EgressMode, IsolationProfile, Locality, NetworkDefault,
+    ProviderCapability, ProviderReasonCode, ProviderRuntimeKind, SCHEMA_VERSION_V0_1,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
+
+const V0_1_PROVIDER_ISOLATION_FLOOR: IsolationProfile = IsolationProfile::P2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderConformanceOptions {
@@ -140,6 +142,13 @@ fn validate_provider_capability(
         collector.push(
             ProviderReasonCode::ProviderDeclarationInvalid,
             "provider capability declaration violates required nonempty or uniqueness constraints",
+            Some(capability.clone()),
+        );
+    }
+    if provider.execution.minimum_isolation < V0_1_PROVIDER_ISOLATION_FLOOR {
+        collector.push(
+            ProviderReasonCode::ProviderIsolationIncompatible,
+            "provider minimum isolation is below the v0.1 P2 provider floor",
             Some(capability.clone()),
         );
     }
@@ -584,7 +593,7 @@ mod tests {
 
     fn network_only_deny_registry() -> SemanticRegistry {
         modified_report_registry(|contract| {
-            contract.allowed_effect_classes = vec![EffectClass::Network];
+            contract.allowed_effect_classes = vec![EffectClass::Pure, EffectClass::Network];
             contract.allowed_authority_classes = vec!["network.connect".to_owned()];
             contract.allowed_egress_modes = vec![EgressMode::Deny];
         })
@@ -646,6 +655,35 @@ mod tests {
                 assert!(bounded.diagnostics_truncated);
                 assert!(!bounded.bootstrap_contract_hash_bypass_used);
             }
+        }
+    }
+
+    #[test]
+    fn provider_isolation_respects_the_v0_1_floor() {
+        let registry =
+            SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+
+        for (profile, valid) in [
+            (IsolationProfile::P0, false),
+            (IsolationProfile::P1, false),
+            (IsolationProfile::P2, true),
+            (IsolationProfile::P3, true),
+            (IsolationProfile::P4, true),
+            (IsolationProfile::P5, true),
+        ] {
+            let mut manifest = provider_cases().remove(0).provider;
+            manifest.provides[0].execution.minimum_isolation = profile;
+            let report = validate_provider_manifest(
+                &registry,
+                &manifest,
+                ProviderConformanceOptions::default(),
+            );
+            assert_eq!(report.valid, valid, "{profile:?}: {:?}", report.diagnostics);
+            assert_eq!(
+                report.contains(ProviderReasonCode::ProviderIsolationIncompatible),
+                !valid,
+                "{profile:?}"
+            );
         }
     }
 

@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 
 const DUPLICATE_MARKER: &str = "AIOS_DUPLICATE_KEY:";
-const MAX_METADATA_SCANNER_DEPTH: usize = 128;
+pub(crate) const MAX_SUPPORTED_JSON_DEPTH: usize = 127;
 
 /// Failure returned by the strict JSON reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub enum StrictJsonError {
 
 /// Parses one JSON value while rejecting duplicate object keys.
 pub fn parse_strict_json(bytes: &[u8], max_depth: usize) -> Result<Value, StrictJsonError> {
+    let max_depth = max_depth.min(MAX_SUPPORTED_JSON_DEPTH);
     if exceeds_depth(bytes, max_depth) {
         return Err(StrictJsonError::DepthLimit);
     }
@@ -72,7 +73,7 @@ struct MetadataScanner<'a> {
 
 impl MetadataScanner<'_> {
     fn scan_value(&mut self, inside_metadata: bool, depth: usize) -> Result<(), ()> {
-        if depth > MAX_METADATA_SCANNER_DEPTH {
+        if depth > MAX_SUPPORTED_JSON_DEPTH {
             return Err(());
         }
         self.skip_whitespace();
@@ -364,7 +365,17 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_METADATA_SCANNER_DEPTH, StrictJsonError, parse_strict_json};
+    use super::{MAX_SUPPORTED_JSON_DEPTH, StrictJsonError, parse_strict_json};
+
+    fn nested_metadata_number(depth: usize) -> Vec<u8> {
+        assert!(depth >= 1);
+        format!(
+            "{{\"metadata\":{}1e9999{}}}",
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        )
+        .into_bytes()
+    }
 
     #[test]
     fn rejects_duplicate_keys() {
@@ -408,12 +419,30 @@ mod tests {
     }
 
     #[test]
-    fn configured_depth_cannot_make_metadata_scanning_overflow_the_stack() {
-        let nested = format!(
-            "{{\"metadata\":{}1e9999{}}}",
-            "[".repeat(MAX_METADATA_SCANNER_DEPTH + 64),
-            "]".repeat(MAX_METADATA_SCANNER_DEPTH + 64)
+    fn configured_depth_is_inclusive_below_the_supported_ceiling() {
+        let configured = 96;
+        assert!(parse_strict_json(&nested_metadata_number(configured), configured).is_ok());
+        assert_eq!(
+            parse_strict_json(&nested_metadata_number(configured + 1), configured),
+            Err(StrictJsonError::DepthLimit)
         );
-        assert!(parse_strict_json(nested.as_bytes(), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn configured_depth_above_the_supported_ceiling_is_deterministically_clamped() {
+        assert!(
+            parse_strict_json(
+                &nested_metadata_number(MAX_SUPPORTED_JSON_DEPTH),
+                usize::MAX
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            parse_strict_json(
+                &nested_metadata_number(MAX_SUPPORTED_JSON_DEPTH + 1),
+                usize::MAX
+            ),
+            Err(StrictJsonError::DepthLimit)
+        );
     }
 }

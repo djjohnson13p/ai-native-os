@@ -1,12 +1,15 @@
 //! Fail-closed identity and contract-consistency tests for Registry Snapshots.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aios_contracts::{
     CapabilityContract, EffectClass, RegistrySnapshot, TypeContract, ValidatorReasonCode,
 };
-use aios_registry::{RegistryBuildOptions, SemanticRegistry};
+use aios_registry::{RegistryBuildOptions, RegistryLoadOptions, SemanticRegistry};
 use serde::Deserialize;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
 struct VersionResolutionFixtures {
@@ -22,6 +25,16 @@ struct RegistryFixtureCase {
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/aios-ir")
+}
+
+fn temporary_registry(label: &str) -> PathBuf {
+    let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "aios-registry-{label}-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("create temporary registry");
+    path
 }
 
 fn read<T: serde::de::DeserializeOwned>(name: &str) -> T {
@@ -43,6 +56,37 @@ fn assert_registry_code(
     let error = result.expect_err("mutated registry must fail closed");
     assert_eq!(error.reason_code(), Some(code), "{error}");
     assert!(!error.is_operational());
+}
+
+#[test]
+fn duplicate_json_key_text_is_redacted_from_registry_error() {
+    let secret = "Bearer sk-test-registry-duplicate-key";
+    let directory = temporary_registry("duplicate-key-redaction");
+    for name in ["capability-contracts.json", "type-contracts.json"] {
+        std::fs::copy(fixture_root().join(name), directory.join(name)).unwrap();
+    }
+    let snapshot = std::fs::read_to_string(fixture_root().join("registry-snapshot.json")).unwrap();
+    let injected = snapshot.replacen('{', &format!("{{\"{secret}\":0,\"{secret}\":1,"), 1);
+    std::fs::write(directory.join("registry-snapshot.json"), injected).unwrap();
+
+    let error = SemanticRegistry::load_bundle(&directory, RegistryLoadOptions::default())
+        .expect_err("duplicate registry key must fail");
+
+    for name in [
+        "capability-contracts.json",
+        "type-contracts.json",
+        "registry-snapshot.json",
+    ] {
+        let _ = std::fs::remove_file(directory.join(name));
+    }
+    let _ = std::fs::remove_dir(directory);
+
+    assert_eq!(
+        error.reason_code(),
+        Some(ValidatorReasonCode::RegistrySchemaInvalid)
+    );
+    assert_eq!(error.message, "duplicate JSON key");
+    assert!(!error.to_string().contains(secret));
 }
 
 #[test]

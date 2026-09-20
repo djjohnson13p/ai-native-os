@@ -872,6 +872,16 @@ pub(crate) fn validate_capability_contract(contract: &CapabilityContract) -> Reg
     }
 
     let allowed_effects: BTreeSet<_> = contract.allowed_effect_classes.iter().copied().collect();
+    if contract.required_effect_classes.is_empty() && !allowed_effects.contains(&EffectClass::Pure)
+    {
+        return Err(RegistryError::validation(
+            ValidatorReasonCode::RegistryPureEffectContradiction,
+            format!(
+                "capability {} has no required effect but does not allow PURE",
+                contract.capability
+            ),
+        ));
+    }
     if contract
         .required_effect_classes
         .iter()
@@ -1603,6 +1613,46 @@ mod tests {
     }
 
     #[test]
+    fn optional_effect_envelopes_must_allow_pure() {
+        let (_, _, capabilities) = fixture_records();
+        let base = capabilities
+            .iter()
+            .find(|contract| contract.capability == "table.normalize")
+            .unwrap();
+
+        for allowed in [vec![EffectClass::LegacyOpaque], vec![EffectClass::Network]] {
+            let mut contract = base.clone();
+            contract.required_effect_classes.clear();
+            contract.allowed_effect_classes = allowed;
+            let error = validate_capability_contract(&contract)
+                .expect_err("an optional-effect envelope without PURE must fail");
+            assert_eq!(
+                error.reason_code(),
+                Some(ValidatorReasonCode::RegistryPureEffectContradiction)
+            );
+        }
+
+        for allowed in [
+            vec![EffectClass::Pure],
+            vec![EffectClass::Pure, EffectClass::Network],
+        ] {
+            let mut contract = base.clone();
+            contract.required_effect_classes.clear();
+            contract.allowed_effect_classes = allowed;
+            if contract
+                .allowed_effect_classes
+                .contains(&EffectClass::Network)
+            {
+                contract
+                    .allowed_authority_classes
+                    .push("network.connect".to_owned());
+            }
+            validate_capability_contract(&contract)
+                .expect("an optional-effect envelope allowing PURE must remain admissible");
+        }
+    }
+
+    #[test]
     fn bidirectional_port_names_cannot_represent_different_types() {
         let (_, _, capabilities) = fixture_records();
         let baseline = capabilities
@@ -1637,7 +1687,7 @@ mod tests {
 
         let mut deny_only = baseline.clone();
         deny_only.allowed_egress_modes = vec![aios_contracts::EgressMode::Deny];
-        deny_only.allowed_effect_classes = vec![EffectClass::Network];
+        deny_only.allowed_effect_classes = vec![EffectClass::Pure, EffectClass::Network];
         deny_only.allowed_authority_classes = vec!["network.connect".to_owned()];
         validate_capability_contract(&deny_only).unwrap();
 

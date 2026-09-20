@@ -577,6 +577,14 @@ fn validate_effects(
                     Some(&node.operation.capability),
                     Some(format!("/nodes/{node_index}/authority_requests")),
                 ));
+            } else if required == "artifact.read" {
+                validate_required_artifact_read_resources(
+                    program,
+                    node,
+                    contract,
+                    node_index,
+                    diagnostics,
+                );
             }
         }
 
@@ -646,6 +654,47 @@ fn validate_effects(
         all_effects.insert(node.id.clone(), effects);
     }
     all_effects
+}
+
+fn validate_required_artifact_read_resources(
+    program: &AiosIr,
+    node: &Node,
+    contract: &CapabilityContract,
+    node_index: usize,
+    diagnostics: &mut DiagnosticCollector,
+) {
+    for (port, value_ref) in &node.inputs {
+        let ValueRef::Input { name } = value_ref else {
+            continue;
+        };
+        let Some(port_contract) = contract.inputs.get(port) else {
+            continue;
+        };
+        let Some(program_input) = program.inputs.get(name) else {
+            continue;
+        };
+        if !port_contract.type_ref.starts_with("artifact.")
+            || !program_input.type_ref.starts_with("artifact.")
+        {
+            continue;
+        }
+
+        let expected_resource = format!("input:{name}");
+        if !node.authority_requests.iter().any(|request| {
+            request.action == "artifact.read" && request.resource == expected_resource
+        }) {
+            diagnostics.push(contextual(
+                ValidatorReasonCode::IrRequiredAuthorityMissing,
+                format!(
+                    "required artifact.read authority does not cover accessed resource '{expected_resource}'"
+                ),
+                Some(&node.id),
+                Some(port),
+                Some(&node.operation.capability),
+                Some(format!("/nodes/{node_index}/authority_requests")),
+            ));
+        }
+    }
 }
 
 fn require_placement_authority(
@@ -746,6 +795,7 @@ fn validate_fallbacks(
     node_effects: &BTreeMap<String, BTreeSet<EffectClass>>,
     diagnostics: &mut DiagnosticCollector,
 ) {
+    let fallback_relation = build_fallback_relation(program);
     for (node_index, node) in program.nodes.iter().enumerate() {
         let FailurePolicy::Fallback {
             fallback_capabilities,
@@ -778,6 +828,16 @@ fn validate_fallbacks(
                     Some(pointer),
                 ));
                 continue;
+            }
+            if fallback_path_exists(&fallback_relation, fallback_ref, &node.operation.capability) {
+                diagnostics.push(contextual(
+                    ValidatorReasonCode::IrFailurePolicyRecursiveFallback,
+                    "fallback relation contains a multi-capability cycle",
+                    Some(&node.id),
+                    None,
+                    Some(&node.operation.capability),
+                    Some(pointer.clone()),
+                ));
             }
             let Some(fallback) = registry.resolve_capability(fallback_ref).ok().flatten() else {
                 diagnostics.push(contextual(
@@ -884,6 +944,44 @@ fn validate_fallbacks(
             }
         }
     }
+}
+
+fn build_fallback_relation(program: &AiosIr) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut relation = BTreeMap::new();
+    for node in &program.nodes {
+        let FailurePolicy::Fallback {
+            fallback_capabilities,
+        } = &node.failure
+        else {
+            continue;
+        };
+        relation
+            .entry(node.operation.capability.as_str())
+            .or_insert_with(BTreeSet::new)
+            .extend(fallback_capabilities.iter().map(String::as_str));
+    }
+    relation
+}
+
+fn fallback_path_exists(
+    relation: &BTreeMap<&str, BTreeSet<&str>>,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut pending = VecDeque::from([start]);
+    let mut visited = BTreeSet::new();
+    while let Some(capability) = pending.pop_front() {
+        if capability == target {
+            return true;
+        }
+        if !visited.insert(capability) {
+            continue;
+        }
+        if let Some(fallbacks) = relation.get(capability) {
+            pending.extend(fallbacks.iter().copied());
+        }
+    }
+    false
 }
 
 fn fallback_ports_compatible(

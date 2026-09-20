@@ -313,13 +313,8 @@ fn capability_and_type_mutations_change_identity() {
 fn authority_action_resource_pairs_and_egress_destinations_change_identity() {
     let base = named_program("valid-cases.json", "minimal-deterministic-copy");
     let mut resource = base.clone();
-    resource["nodes"][0]["authority_requests"][0]["resource"] = json!("task.temp");
+    resource["nodes"][0]["authority_requests"][1]["resource"] = json!("task.temp");
     assert_ne!(semantic_hash(&base), semantic_hash(&resource));
-
-    let mut action_pairing = base.clone();
-    action_pairing["nodes"][0]["authority_requests"][0]["action"] = json!("artifact.write");
-    action_pairing["nodes"][0]["authority_requests"][1]["action"] = json!("artifact.read");
-    assert_ne!(semantic_hash(&base), semantic_hash(&action_pairing));
 
     let policy = named_program(
         "valid-cases.json",

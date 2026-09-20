@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::parse::MAX_SUPPORTED_JSON_DEPTH;
+
 pub(crate) const MAX_OUTPUT_DIAGNOSTICS: usize = 256;
 
 /// Validator resource ceilings. All ceilings are deterministic and inclusive.
@@ -9,7 +11,8 @@ pub(crate) const MAX_OUTPUT_DIAGNOSTICS: usize = 256;
 pub struct ValidationLimits {
     /// Maximum encoded document size.
     pub max_document_bytes: usize,
-    /// Maximum JSON object/array nesting depth.
+    /// Requested maximum JSON object/array nesting depth. Validator construction
+    /// clamps this to the implementation-supported inclusive maximum of 127.
     pub max_depth: usize,
     /// Maximum number of program nodes.
     pub max_nodes: usize,
@@ -43,6 +46,7 @@ impl Default for ValidationLimits {
 
 impl ValidationLimits {
     pub(crate) fn bounded_for_output(mut self) -> Self {
+        self.max_depth = self.max_depth.min(MAX_SUPPORTED_JSON_DEPTH);
         self.max_diagnostics = self.max_diagnostics.clamp(1, MAX_OUTPUT_DIAGNOSTICS);
         self
     }
@@ -153,7 +157,10 @@ fn contains_long_string(value: &Value, max_chars: usize) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{LimitViolation, MAX_OUTPUT_DIAGNOSTICS, ValidationLimits, inspect_value_limits};
+    use super::{
+        LimitViolation, MAX_OUTPUT_DIAGNOSTICS, MAX_SUPPORTED_JSON_DEPTH, ValidationLimits,
+        inspect_value_limits,
+    };
 
     #[test]
     fn diagnostic_limit_stays_inside_normative_output_schema() {
@@ -170,6 +177,18 @@ mod tests {
         assert_eq!(
             excessive.bounded_for_output().max_diagnostics,
             MAX_OUTPUT_DIAGNOSTICS
+        );
+    }
+
+    #[test]
+    fn json_depth_limit_stays_inside_the_supported_parser_ceiling() {
+        let excessive = ValidationLimits {
+            max_depth: usize::MAX,
+            ..ValidationLimits::default()
+        };
+        assert_eq!(
+            excessive.bounded_for_output().max_depth,
+            MAX_SUPPORTED_JSON_DEPTH
         );
     }
 

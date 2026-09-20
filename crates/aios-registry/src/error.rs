@@ -66,15 +66,35 @@ impl std::error::Error for RegistryError {}
 
 impl From<StrictJsonError> for RegistryError {
     fn from(error: StrictJsonError) -> Self {
+        if error.kind == StrictJsonErrorKind::DuplicateKey {
+            return RegistryError::schema("duplicate JSON key");
+        }
         let detail = match error.kind {
-            StrictJsonErrorKind::DuplicateKey => "duplicate JSON key",
             StrictJsonErrorKind::DocumentTooLarge => "document size limit exceeded",
             StrictJsonErrorKind::DepthExceeded => "JSON depth limit exceeded",
             StrictJsonErrorKind::InvalidJson => "invalid JSON",
             StrictJsonErrorKind::TypedDecode => "typed contract mismatch",
+            StrictJsonErrorKind::DuplicateKey => unreachable!("handled above"),
         };
         RegistryError::schema(format!("{detail}: {}", error.message))
     }
 }
 
 pub type RegistryResult<T> = Result<T, RegistryError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_key_registry_errors_redact_parser_detail() {
+        let secret = "Bearer sk-test-registry-duplicate-key";
+        let error = RegistryError::from(StrictJsonError {
+            kind: StrictJsonErrorKind::DuplicateKey,
+            message: format!("AIOS_DUPLICATE_JSON_KEY:{secret} at line 1 column 80"),
+        });
+
+        assert_eq!(error.message, "duplicate JSON key");
+        assert!(!error.to_string().contains(secret));
+    }
+}
