@@ -82,6 +82,7 @@ dependencies = [
  "fs2",
  "jsonschema",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

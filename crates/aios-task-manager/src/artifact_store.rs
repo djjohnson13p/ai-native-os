@@ -474,11 +474,27 @@ pub struct ProviderArtifactSession {
     authority: ExecutionAuthority,
 }
 
+/// A destination writer whose durable close/finalization can report failure.
+///
+/// Implementations must complete every fallible close, commit, or finalization step in
+/// [`ArtifactExportWriter::finalize`]. Relying on `Drop` is unsafe because the Artifact Store
+/// records export success only after this method returns successfully.
+pub trait ArtifactExportWriter: Write {
+    /// Completes every fallible commit/close step needed before success may be recorded.
+    fn finalize(&mut self) -> std::io::Result<()>;
+}
+
+impl ArtifactExportWriter for Vec<u8> {
+    fn finalize(&mut self) -> std::io::Result<()> {
+        self.flush()
+    }
+}
+
 /// An opaque, single-use export destination prepared by the trusted control plane.
 ///
 /// The destination class and exact egress admission are sealed into this handle, so callers of
 /// [`TaskManager::export_artifact`] cannot substitute an arbitrary writer or destination label.
-pub struct ArtifactExportDestination<W: Write> {
+pub struct ArtifactExportDestination<W: ArtifactExportWriter> {
     writer_factory: Option<Box<dyn FnOnce() -> std::io::Result<W>>>,
     writer: Option<W>,
     external_effect_possible: bool,
@@ -519,7 +535,7 @@ struct GrantAdmission {
     one_shot_consumed: bool,
 }
 
-impl<W: Write> ArtifactExportDestination<W> {
+impl<W: ArtifactExportWriter> ArtifactExportDestination<W> {
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }
@@ -870,7 +886,11 @@ fn validate_opened_store_root(root: &Path, root_file: &File) -> Result<()> {
             "opened Artifact store root is not a directory",
         ));
     }
-    validate_windows_store_security(root)
+    let information = winx::winapi_util::file::information(root_file)?;
+    validate_windows_store_security(
+        root,
+        Some((information.volume_serial_number(), information.file_index())),
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -968,42 +988,7 @@ fn secure_store_root(root: &Path, created: bool) -> Result<()> {
 
 #[cfg(unix)]
 fn manager_effective_uid() -> Result<u32> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    if let Some(uid) = UID.get() {
-        return Ok(*uid);
-    }
-    for program in [Path::new("/usr/bin/id"), Path::new("/bin/id")] {
-        let Ok(metadata) = std::fs::symlink_metadata(program) else {
-            continue;
-        };
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            continue;
-        }
-        let output = std::process::Command::new(program)
-            .arg("-u")
-            .env_clear()
-            .output()?;
-        if !output.status.success() {
-            continue;
-        }
-        let text = std::str::from_utf8(&output.stdout).map_err(|_| {
-            TaskManagerError::InvalidRecord("effective Unix user identity is not UTF-8")
-        })?;
-        let uid = text.trim().parse::<u32>().map_err(|_| {
-            TaskManagerError::InvalidRecord("effective Unix user identity is invalid")
-        })?;
-        let _ = UID.set(uid);
-        return Ok(uid);
-    }
-    Err(TaskManagerError::InvalidRecord(
-        "effective Unix user identity could not be resolved",
-    ))
+    Ok(rustix::process::geteuid().as_raw())
 }
 
 #[cfg(windows)]
@@ -1023,7 +1008,7 @@ fn secure_store_root(root: &Path, created: bool) -> Result<()> {
         run_windows_acl_command(&[root_text, "/setowner", &format!("*{sid}")])?;
         return Ok(());
     }
-    validate_windows_store_security(root)
+    validate_windows_store_security(root, None)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1089,15 +1074,120 @@ fn run_windows_acl_command(arguments: &[&str]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn validate_windows_store_security(root: &Path) -> Result<()> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the fixed same-handle Windows identity and ACL inspection script auditable as one security boundary"
+)]
+fn validate_windows_store_security(
+    root: &Path,
+    expected_identity: Option<(u64, u64)>,
+) -> Result<()> {
     const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
     const POWERSHELL_MODULES: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules";
-    const SCRIPT: &str = r"
+    const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class AiosOpenedDirectorySecurityResult {
+  public UInt32 VolumeSerialNumber { get; set; }
+  public UInt64 FileIndex { get; set; }
+  public byte[] Descriptor { get; set; }
+}
+
+public static class AiosOpenedDirectorySecurity {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FILETIME { public UInt32 Low; public UInt32 High; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct BY_HANDLE_FILE_INFORMATION {
+    public UInt32 FileAttributes;
+    public FILETIME CreationTime;
+    public FILETIME LastAccessTime;
+    public FILETIME LastWriteTime;
+    public UInt32 VolumeSerialNumber;
+    public UInt32 FileSizeHigh;
+    public UInt32 FileSizeLow;
+    public UInt32 NumberOfLinks;
+    public UInt32 FileIndexHigh;
+    public UInt32 FileIndexLow;
+  }
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern SafeFileHandle CreateFileW(
+    string name, UInt32 access, UInt32 share, IntPtr security,
+    UInt32 creation, UInt32 flags, IntPtr template);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool GetFileInformationByHandle(
+    SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION information);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern UInt32 GetSecurityInfo(
+    SafeFileHandle handle, UInt32 objectType, UInt32 securityInformation,
+    out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl,
+    out IntPtr securityDescriptor);
+
+  [DllImport("advapi32.dll")]
+  private static extern UInt32 GetSecurityDescriptorLength(IntPtr securityDescriptor);
+
+  [DllImport("kernel32.dll")]
+  private static extern IntPtr LocalFree(IntPtr memory);
+
+  public static AiosOpenedDirectorySecurityResult Inspect(string path) {
+    const UInt32 READ_CONTROL = 0x00020000;
+    const UInt32 FILE_READ_ATTRIBUTES = 0x00000080;
+    const UInt32 SHARE_ALL = 0x00000007;
+    const UInt32 OPEN_EXISTING = 3;
+    const UInt32 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    const UInt32 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    const UInt32 SE_FILE_OBJECT = 1;
+    const UInt32 OWNER_AND_DACL = 0x00000001 | 0x00000004;
+
+    using (SafeFileHandle handle = CreateFileW(
+      path, READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE_ALL, IntPtr.Zero,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      IntPtr.Zero)) {
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+      BY_HANDLE_FILE_INFORMATION information;
+      if (!GetFileInformationByHandle(handle, out information))
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      IntPtr owner, group, dacl, sacl, descriptor;
+      UInt32 status = GetSecurityInfo(
+        handle, SE_FILE_OBJECT, OWNER_AND_DACL,
+        out owner, out group, out dacl, out sacl, out descriptor);
+      if (status != 0) throw new Win32Exception((int)status);
+      try {
+        UInt32 length = GetSecurityDescriptorLength(descriptor);
+        byte[] bytes = new byte[length];
+        Marshal.Copy(descriptor, bytes, 0, checked((int)length));
+        return new AiosOpenedDirectorySecurityResult {
+          VolumeSerialNumber = information.VolumeSerialNumber,
+          FileIndex = ((UInt64)information.FileIndexHigh << 32) | information.FileIndexLow,
+          Descriptor = bytes
+        };
+      } finally {
+        LocalFree(descriptor);
+      }
+    }
+  }
+}
+'@
 $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $root = Get-Item -LiteralPath $env:AIOS_ARTIFACT_STORE_ROOT -Force
-$items = @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Force -Recurse)
-$entries = @($items | ForEach-Object {
+$opened = [AiosOpenedDirectorySecurity]::Inspect($root.FullName)
+$rootAcl = New-Object Security.AccessControl.DirectorySecurity
+$rootAcl.SetSecurityDescriptorBinaryForm($opened.Descriptor)
+$rootOwner = $rootAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+$rootRules = @($rootAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+  [PSCustomObject]@{ identity = $_.IdentityReference.Value; kind = $_.AccessControlType.ToString() }
+})
+$entries = @([PSCustomObject]@{
+  owner = $rootOwner; protected = $rootAcl.AreAccessRulesProtected; rules = $rootRules
+}) + @(Get-ChildItem -LiteralPath $root.FullName -Force -Recurse | ForEach-Object {
   $acl = Get-Acl -LiteralPath $_.FullName
   $owner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
   $rules = @($acl.Access | ForEach-Object {
@@ -1106,8 +1196,13 @@ $entries = @($items | ForEach-Object {
   })
   [PSCustomObject]@{ owner = $owner; protected = $acl.AreAccessRulesProtected; rules = $rules }
 })
-[PSCustomObject]@{ current = $current; entries = $entries } | ConvertTo-Json -Compress -Depth 5
-";
+[PSCustomObject]@{
+  current = $current
+  volume_serial_number = [UInt64]$opened.VolumeSerialNumber
+  file_index = [UInt64]$opened.FileIndex
+  entries = $entries
+} | ConvertTo-Json -Compress -Depth 5
+"#;
     validate_trusted_windows_executable(Path::new(POWERSHELL))?;
     let output = std::process::Command::new(POWERSHELL)
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
@@ -1133,6 +1228,25 @@ $entries = @($items | ForEach-Object {
         .ok_or(TaskManagerError::InvalidRecord(
             "Artifact store ACL inspection omitted current owner",
         ))?;
+    let inspected_identity = (
+        report
+            .get("volume_serial_number")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TaskManagerError::InvalidRecord(
+                "Artifact store ACL inspection omitted opened identity",
+            ))?,
+        report
+            .get("file_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TaskManagerError::InvalidRecord(
+                "Artifact store ACL inspection omitted opened identity",
+            ))?,
+    );
+    if expected_identity.is_some_and(|expected| expected != inspected_identity) {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact store root changed while security was inspected",
+        ));
+    }
     let entries = report
         .get("entries")
         .and_then(serde_json::Value::as_array)
@@ -1316,6 +1430,7 @@ impl TaskManager {
         session: &ProviderArtifactSession,
         request: &OutputAllocationRequest,
     ) -> Result<ArtifactOutputAllocation> {
+        validate_allocation_request(request, &self.clock.now())?;
         self.validate_provider_artifact_session(session)?;
         if request.task_id != session.task_id
             || request.binding_id.as_deref() != Some(session.authority.binding_id.as_str())
@@ -1960,6 +2075,7 @@ impl TaskManager {
             Err(error) => return Err(error.into()),
         };
         let length_before = file.metadata()?.len();
+        reader_hash_step()?;
         let verified = hash_reader(&mut file);
         let length_after = file.metadata()?.len();
         let expected_hash = handle.content_hash.tagged();
@@ -1985,7 +2101,12 @@ impl TaskManager {
                     database_identity,
                 })
             }
-            _ => {
+            Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.mark_content_hash_failed(&expected_hash, "MISSING")?;
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
+            }
+            Err(error) => Err(error),
+            Ok(_) => {
                 self.mark_content_hash_failed(&expected_hash, "CORRUPT")?;
                 Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
             }
@@ -2046,7 +2167,7 @@ impl TaskManager {
         writer_factory: F,
     ) -> Result<ArtifactExportDestination<W>>
     where
-        W: Write,
+        W: ArtifactExportWriter,
         F: FnOnce() -> std::io::Result<W> + 'static,
     {
         self.validate_provider_artifact_session(session)?;
@@ -2143,7 +2264,7 @@ impl TaskManager {
         writer_factory: F,
     ) -> Result<ArtifactExportDestination<W>>
     where
-        W: Write,
+        W: ArtifactExportWriter,
         F: FnOnce() -> std::io::Result<W> + 'static,
     {
         validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
@@ -2210,7 +2331,7 @@ impl TaskManager {
         clippy::too_many_lines,
         reason = "keeps egress admission, bounded copy, and its provenance receipt together"
     )]
-    pub fn export_artifact<W: Write>(
+    pub fn export_artifact<W: ArtifactExportWriter>(
         &mut self,
         scope: &ArtifactReadScope,
         artifact_id: &str,
@@ -2328,10 +2449,10 @@ impl TaskManager {
         destination.writer = if let Ok(writer) = writer_factory() {
             Some(writer)
         } else {
-            let _ = self.finish_failed_export_operation(
+            let _ = self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
-                destination.external_effect_possible,
+                &destination.task_id,
             );
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
@@ -2372,11 +2493,19 @@ impl TaskManager {
             Err(failure) => {
                 drop(reader);
                 let uncertain = failure.external_effect_possible;
-                let recorded = self.finish_failed_export_operation(
-                    &destination.operation_id,
-                    &destination.intent_json,
-                    uncertain,
-                );
+                let recorded = if uncertain {
+                    self.finish_unknown_export_operation(
+                        &destination.operation_id,
+                        &destination.intent_json,
+                        &destination.task_id,
+                    )
+                } else {
+                    self.finish_failed_export_operation(
+                        &destination.operation_id,
+                        &destination.intent_json,
+                        false,
+                    )
+                };
                 return if uncertain || recorded.is_err() {
                     Err(TaskManagerError::InvalidRecord(
                         "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
@@ -2387,6 +2516,32 @@ impl TaskManager {
             }
         };
         drop(reader);
+        let writer = destination
+            .writer
+            .as_mut()
+            .ok_or(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ))?;
+        if writer.finalize().is_err()
+            || validate_export_destination_fence(
+                &self.connection,
+                &self.clock,
+                &destination.task_id,
+                &destination.authority,
+                &destination.destination_class,
+                destination.grant_admission.as_ref(),
+            )
+            .is_err()
+        {
+            let _ = self.finish_unknown_export_operation(
+                &destination.operation_id,
+                &destination.intent_json,
+                &destination.task_id,
+            );
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+            ));
+        }
         let exported_at = self.clock.now();
         let (actor, binding_id, provider_id) = scope.authority.execution.as_ref().map_or_else(
             || {
@@ -2464,15 +2619,39 @@ impl TaskManager {
         if let Ok(exported) = completion {
             Ok(exported)
         } else {
-            let _ = self.finish_failed_export_operation(
+            let _ = self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
-                destination.external_effect_possible,
+                &destination.task_id,
             );
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ))
         }
+    }
+
+    fn finish_unknown_export_operation(
+        &mut self,
+        operation_id: &str,
+        intent_json: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        self.finish_failed_export_operation(operation_id, intent_json, true)?;
+        let state = self
+            .connection
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if state
+            .as_deref()
+            .is_some_and(|state| matches!(state, "RUNNING" | "VERIFYING" | "PAUSED"))
+        {
+            self.reconcile_live_execution(task_id)?;
+        }
+        Ok(())
     }
 
     fn finish_failed_export_operation(
@@ -2634,27 +2813,35 @@ impl TaskManager {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut removed_allocated_residue = false;
+        let mut removed_terminal_residue = false;
         for (_, staging_ref, state) in &staged {
-            if state == "ALLOCATED" {
+            if matches!(
+                state.as_str(),
+                "ALLOCATED" | "FAILED" | "ABORTED" | "PUBLISHED"
+            ) {
                 for residue in [staging_ref.clone(), seal_ref(staging_ref)] {
                     match self
                         .artifact_store_dir
                         .remove_file(safe_internal_ref(&residue)?)
                     {
-                        Ok(()) => removed_allocated_residue = true,
+                        Ok(()) => removed_terminal_residue = true,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
             }
         }
-        if removed_allocated_residue {
+        if removed_terminal_residue {
             sync_cap_directory(&self.artifact_store_dir, "staging")?;
         }
         let staged_by_ref = staged
             .into_iter()
-            .filter(|(_, _, state)| state != "ALLOCATED")
+            .filter(|(_, _, state)| {
+                !matches!(
+                    state.as_str(),
+                    "ALLOCATED" | "FAILED" | "ABORTED" | "PUBLISHED"
+                )
+            })
             .map(|(allocation_id, staging_ref, _)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
         for entry in self.artifact_store_dir.read_dir("staging")? {
@@ -3042,6 +3229,7 @@ impl TaskManager {
             && result.task_id == request.task_id
             && result.published
             && result.reason_code == "ARTIFACT_PUBLICATION_APPLIED"
+            && result.blob_reused.is_some()
             && row.0 == artifact_id("publication", &request.publication_id)
             && result.artifact_id.as_deref() == Some(row.0.as_str())
             && row.11 == ArtifactUri::new(&row.0).as_str()
@@ -4143,6 +4331,19 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
     if !owns_fence {
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
     }
+    let intact = reader.authority_connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM artifacts a
+             JOIN artifact_blobs b ON b.content_hash=a.content_hash
+             WHERE a.artifact_id=?1 AND a.integrity_state='verified'
+               AND b.durability_state='DURABLE'
+         )",
+        [&reader.artifact_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !intact {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
+    }
     let now = reader.clock.now();
     match &reader.authority.execution {
         Some(execution) => {
@@ -4835,6 +5036,8 @@ fn place_blob(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let (existing_size, existing_hash) = hash_internal_file(store, &storage_ref)?;
             if existing_size != size || existing_hash != content_hash {
+                drop(pending);
+                quarantine_blob_collision(store, &pending_ref, &storage_ref, digest)?;
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
             }
             true
@@ -4842,14 +5045,47 @@ fn place_blob(
         Err(error) => return Err(error.into()),
     };
     drop(pending);
-    store.remove_file(safe_internal_ref(&pending_ref)?)?;
+    durability_step("sync-promoted-blob-parent")?;
     sync_cap_directory(store, &parent_ref)?;
+    durability_step("unlink-promoted-blob-pending")?;
+    store.remove_file(safe_internal_ref(&pending_ref)?)?;
+    durability_step("sync-promoted-blob-pending")?;
     sync_cap_directory(store, "blobs/pending")?;
     if !preserve_staging {
         store.remove_file(safe_internal_ref(staging_ref)?)?;
         sync_cap_directory(store, "staging")?;
     }
     Ok((storage_ref, reused))
+}
+
+fn quarantine_blob_collision(
+    store: &Dir,
+    pending_ref: &str,
+    final_ref: &str,
+    digest: &str,
+) -> Result<()> {
+    let token = placement_token(pending_ref);
+    for (source, kind) in [(final_ref, "final"), (pending_ref, "pending")] {
+        let target = format!("quarantine/blob-collision-{kind}-{digest}-{token}");
+        match store.rename(
+            safe_internal_ref(source)?,
+            store,
+            safe_internal_ref(&target)?,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                store.remove_file(safe_internal_ref(source)?)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Some(parent) = Path::new(final_ref).parent().and_then(Path::to_str) {
+        sync_cap_directory(store, parent)?;
+    }
+    sync_cap_directory(store, "blobs/pending")?;
+    sync_cap_directory(store, "quarantine")?;
+    Ok(())
 }
 
 fn same_open_file_identity(left: &cap_std::fs::File, right: &cap_std::fs::File) -> Result<bool> {
@@ -5320,6 +5556,7 @@ fn authenticate_export_operation(
                 ))?;
             let stored_event: serde_json::Value = serde_json::from_str(&stored_event_json)?;
             if stored_event_hash != expected_event_hash
+                || !super::verify_provenance_through(connection, &intent.task_id, Some(sequence))?
                 || u64::try_from(sequence).map_or(true, |sequence| {
                     provenance_hash(
                         &intent.task_id,
@@ -5479,15 +5716,20 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<Vec<Option<String>>>
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let (_, final_hash) = hash_internal_file(store, &final_ref)?;
                 if final_hash != expected {
-                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                    quarantine_blob_collision(store, &pending_ref, &final_ref, digest)?;
+                    invalid.push(Some(expected));
+                    continue;
                 }
             }
             Err(error) => return Err(error.into()),
         }
-        store.remove_file(safe_internal_ref(&pending_ref)?)?;
+        durability_step("sync-recovered-blob-parent")?;
         sync_cap_directory(store, &parent_ref)?;
+        durability_step("unlink-recovered-blob-pending")?;
+        store.remove_file(safe_internal_ref(&pending_ref)?)?;
+        durability_step("sync-recovered-blob-pending")?;
+        sync_cap_directory(store, "blobs/pending")?;
     }
-    sync_cap_directory(store, "blobs/pending")?;
     Ok(invalid)
 }
 
@@ -5805,8 +6047,29 @@ type ReaderSetupTestHook = Box<dyn FnOnce() -> Result<()>>;
 
 #[cfg(test)]
 thread_local! {
+    static READER_HASH_TEST_HOOK: std::cell::RefCell<Option<ReaderSetupTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static READER_SETUP_TEST_HOOK: std::cell::RefCell<Option<ReaderSetupTestHook>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn reader_hash_step() -> Result<()> {
+    READER_HASH_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "reader hash failure injection shares the production call signature"
+)]
+fn reader_hash_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5956,7 +6219,9 @@ mod tests {
         }
     }
 
-    fn deferred<W: Write + 'static>(writer: W) -> impl FnOnce() -> std::io::Result<W> {
+    fn deferred<W: ArtifactExportWriter + 'static>(
+        writer: W,
+    ) -> impl FnOnce() -> std::io::Result<W> {
         move || Ok(writer)
     }
 
@@ -5982,6 +6247,12 @@ mod tests {
         }
     }
 
+    impl ArtifactExportWriter for PrefixThenErrorWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            self.flush()
+        }
+    }
+
     #[derive(Default)]
     struct FlushFailureWriter {
         bytes: Vec<u8>,
@@ -5995,6 +6266,12 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Err(std::io::Error::other("injected export flush failure"))
+        }
+    }
+
+    impl ArtifactExportWriter for FlushFailureWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            self.flush()
         }
     }
 
@@ -6019,6 +6296,36 @@ mod tests {
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             self.flushed = true;
             Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for AuthorityRevokingWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            self.flush()
+        }
+    }
+
+    #[derive(Default)]
+    struct FinalizeFailureWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FinalizeFailureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for FinalizeFailureWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "injected destination finalization failure",
+            ))
         }
     }
 
@@ -6835,6 +7142,59 @@ mod tests {
     }
 
     #[test]
+    fn completed_export_replay_authenticates_the_full_provenance_prefix() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"chain bound".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut first = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-chain-bound",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        manager
+            .export_artifact(&scope, &artifact.artifact_id, &mut first)
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provenance_events_no_update;
+                 UPDATE provenance_events SET event_hash='sha256:corrupt-prefix'
+                 WHERE task_id='T-artifact' AND sequence=1;",
+            )
+            .unwrap();
+        let mut replay = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-chain-bound",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut replay),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact export receipt is invalid"
+            ))
+        ));
+        assert!(replay.writer.is_none());
+    }
+
+    #[test]
     fn revoked_egress_after_destination_issuance_fails_before_copy() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -7487,6 +7847,84 @@ mod tests {
     }
 
     #[test]
+    fn finalize_failure_is_unknown_and_routes_live_task_to_recovery() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"finalize me".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "export-finalize-recovery",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut destination = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export-finalize-recovery",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-finalize-recovery'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .unwrap(),
+            "RECOVERING"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.exported'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn empty_export_successful_flush_then_failed_final_fence_is_unknown() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
@@ -8002,6 +8440,69 @@ mod tests {
         let mut writer = manager.open_artifact_output("alloc-residue").unwrap();
         writer.write_all(b"retry").unwrap();
         writer.finish().unwrap();
+
+        for state in ["FAILED", "ABORTED", "PUBLISHED"] {
+            let id = format!("alloc-residue-{state}");
+            let mut request = allocation(&id);
+            request.output_port = Some(format!("report-{state}"));
+            manager.allocate_artifact_output(&request).unwrap();
+            let staging_ref = manager
+                .connection
+                .query_row(
+                    "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [&id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            manager
+                .artifact_store_dir
+                .write(&staging_ref, b"terminal residue")
+                .unwrap();
+            manager
+                .artifact_store_dir
+                .write(seal_ref(&staging_ref), b"terminal seal")
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifact_output_allocations SET state=?2 WHERE allocation_id=?1",
+                    params![id, state],
+                )
+                .unwrap();
+            manager.reconcile_artifacts_startup().unwrap();
+            assert!(!manager.artifact_store_root.join(&staging_ref).exists());
+            assert!(
+                !manager
+                    .artifact_store_root
+                    .join(seal_ref(&staging_ref))
+                    .exists()
+            );
+        }
+
+        let mut live = allocation("alloc-live-residue");
+        live.output_port = Some("report-live".to_owned());
+        manager.allocate_artifact_output(&live).unwrap();
+        let live_ref = manager
+            .connection
+            .query_row(
+                "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id='alloc-live-residue'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        manager
+            .artifact_store_dir
+            .write(&live_ref, b"live")
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET state='WRITING' WHERE allocation_id='alloc-live-residue'",
+                [],
+            )
+            .unwrap();
+        manager.reconcile_artifacts_startup().unwrap();
+        assert!(manager.artifact_store_root.join(live_ref).exists());
     }
 
     #[test]
@@ -8899,6 +9400,59 @@ mod tests {
     }
 
     #[test]
+    fn issued_reader_rechecks_shared_integrity_and_transient_hash_errors_do_not_poison() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"shared reader".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+
+        READER_HASH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected transient read failure",
+                )))
+            }));
+        });
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert_eq!(
+            manager
+                .get_artifact(&artifact.artifact_id)
+                .unwrap()
+                .unwrap()
+                .integrity
+                .state,
+            ArtifactIntegrityState::Verified
+        );
+
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        manager
+            .mark_content_hash_failed(&artifact.content_hash.tagged(), "CORRUPT")
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            reader.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn finite_task_and_time_limited_grants_admit_exactly_one_reader() {
         for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
             let temp = TempDir::new().unwrap();
@@ -9722,6 +10276,36 @@ mod tests {
                 &publication("publication-unbound-public", &request.allocation_id)
             ),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn bound_allocation_validates_schema_before_idempotent_replay() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-schema-replay";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "allocation-schema-replay",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        manager
+            .allocate_bound_artifact_output(&session, &request)
+            .unwrap();
+
+        request.schema_version = "9.9".to_owned();
+        assert!(matches!(
+            manager.allocate_bound_artifact_output(&session, &request),
+            Err(TaskManagerError::InvalidRecord(
+                "invalid Artifact output allocation"
+            ))
         ));
     }
 
@@ -10568,6 +11152,40 @@ mod tests {
         std::fs::rename(displaced, root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn effective_uid_comes_from_the_process_identity_api() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = TempDir::new().unwrap();
+        assert_eq!(
+            manager_effective_uid().unwrap(),
+            temp.path().metadata().unwrap().uid()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_opened_store_acl_rejects_evidence_for_a_different_handle_identity() {
+        let temp = TempDir::new().unwrap();
+        let opened = temp.path().join("opened-root");
+        let decoy = temp.path().join("trusted-decoy");
+        std::fs::create_dir(&opened).unwrap();
+        std::fs::create_dir(&decoy).unwrap();
+        secure_store_root(&opened, true).unwrap();
+        secure_store_root(&decoy, true).unwrap();
+        let opened_file = Dir::open_ambient_dir(&opened, ambient_authority())
+            .unwrap()
+            .into_std_file();
+
+        assert!(matches!(
+            validate_opened_store_root(&decoy, &opened_file),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store root changed while security was inspected"
+            ))
+        ));
+    }
+
     #[test]
     fn partial_final_blob_is_never_overwritten_and_pending_blob_is_reconciled() {
         let temp = TempDir::new().unwrap();
@@ -10590,27 +11208,85 @@ mod tests {
             manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice())),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
         ));
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
         assert_eq!(
-            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
-            b"partial"
+            manager
+                .artifact_store_dir
+                .read_dir("quarantine")
+                .unwrap()
+                .count(),
+            2
         );
 
-        manager.artifact_store_dir.remove_file(&final_ref).unwrap();
         let pending_ref = format!("blobs/pending/{digest}-interrupted");
+        manager
+            .artifact_store_dir
+            .write(&final_ref, b"corrupt-final")
+            .unwrap();
         manager
             .artifact_store_dir
             .write(&pending_ref, bytes)
             .unwrap();
         let report = manager.reconcile_artifacts_startup().unwrap();
         assert!(report.findings.iter().any(|finding| {
-            finding.kind == ArtifactReconciliationKind::BlobOrphaned
+            finding.kind == ArtifactReconciliationKind::BlobCorrupt
                 && finding.content_hash.as_deref() == Some(hash.as_str())
         }));
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert!(!manager.artifact_store_root.join(pending_ref).exists());
+        assert!(manager.reconcile_artifacts_startup().is_ok());
+
+        let pending_ref = format!("blobs/pending/{digest}-retry");
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), None));
+        });
+        manager.reconcile_artifacts_startup().unwrap();
+        let operations =
+            DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        assert!(operations.windows(3).any(|window| {
+            window
+                == [
+                    "sync-recovered-blob-parent",
+                    "unlink-recovered-blob-pending",
+                    "sync-recovered-blob-pending",
+                ]
+        }));
         assert_eq!(
-            std::fs::read(manager.artifact_store_root.join(final_ref)).unwrap(),
+            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
             bytes
         );
         assert!(!manager.artifact_store_root.join(pending_ref).exists());
+
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
+            .unwrap();
+        std::fs::write(manager.artifact_store_root.join(&final_ref), b"corrupt").unwrap();
+        let pending_ref = format!("blobs/pending/{digest}-committed-recovery");
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+        let report = manager.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobCorrupt
+                && finding.artifact_ids == [artifact.artifact_id.clone()]
+        }));
+        assert_eq!(
+            manager
+                .get_artifact(&artifact.artifact_id)
+                .unwrap()
+                .unwrap()
+                .integrity
+                .state,
+            ArtifactIntegrityState::Failed
+        );
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert!(!manager.artifact_store_root.join(&pending_ref).exists());
+        assert!(manager.reconcile_artifacts_startup().is_ok());
     }
 
     #[test]
@@ -10788,6 +11464,26 @@ mod tests {
         let request = publication("pub-replay", "alloc-replay");
         let original = manager.publish_artifact_output(&request).unwrap();
         assert!(original.published);
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=json_set(result_json,'$.blob_reused',NULL) WHERE publication_id='pub-replay'",
+                [],
+            )
+            .unwrap();
+        let missing_reuse = manager.publish_artifact_output(&request).unwrap();
+        assert!(!missing_reuse.published);
+        assert_eq!(missing_reuse.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                params![
+                    request.publication_id,
+                    serde_json::to_string(&original).unwrap()
+                ],
+            )
+            .unwrap();
         manager
             .connection
             .execute(
