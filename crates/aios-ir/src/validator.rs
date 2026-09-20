@@ -100,10 +100,10 @@ impl Validator {
                 );
                 return self.invalid_report(None, None, collector, validated_at);
             }
-            Err(StrictJsonError::DuplicateKey(key)) => {
+            Err(StrictJsonError::DuplicateKey(_)) => {
                 collector.error(
                     ValidatorReasonCode::IrParseDuplicateKey,
-                    format!("JSON object contains duplicate key '{key}'"),
+                    "JSON object contains a duplicate key",
                 );
                 return self.invalid_report(None, None, collector, validated_at);
             }
@@ -311,7 +311,7 @@ fn domain_prechecks(value: &Value, collector: &mut DiagnosticCollector) {
         if version != "0.1" {
             collector.error(
                 ValidatorReasonCode::IrVersionUnsupported,
-                format!("IR version '{version}' is not supported; expected 0.1"),
+                "IR version is not supported; expected 0.1",
             );
             return;
         }
@@ -331,7 +331,6 @@ fn domain_prechecks(value: &Value, collector: &mut DiagnosticCollector) {
                     ValidatorReasonCode::IrFailurePolicyUnbounded,
                     "retry and replan failure policies require an explicit finite budget",
                 );
-                diagnostic.node_id = node.get("id").and_then(Value::as_str).map(str::to_owned);
                 diagnostic.json_pointer = Some(format!("/nodes/{index}/failure"));
                 collector.push(diagnostic);
             }
@@ -347,7 +346,6 @@ fn domain_prechecks(value: &Value, collector: &mut DiagnosticCollector) {
                     ValidatorReasonCode::IrEgressContradiction,
                     "deny egress cannot name destination classes",
                 );
-                diagnostic.node_id = node.get("id").and_then(Value::as_str).map(str::to_owned);
                 diagnostic.json_pointer = Some(format!("/nodes/{index}/egress"));
                 collector.push(diagnostic);
             }

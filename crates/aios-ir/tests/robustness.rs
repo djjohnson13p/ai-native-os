@@ -183,9 +183,10 @@ proptest! {
 
 #[test]
 fn duplicate_json_members_are_rejected_before_schema_validation() {
+    let secret = "Bearer sk-test-duplicate-key-secret";
     let bytes = br#"{
-        "ir_version":"0.1",
-        "ir_version":"0.1",
+        "Bearer sk-test-duplicate-key-secret":"0.1",
+        "Bearer sk-test-duplicate-key-secret":"0.1",
         "program_id":"duplicate",
         "kind":"task_graph",
         "inputs":{},"nodes":[],"outputs":{}
@@ -197,6 +198,11 @@ fn duplicate_json_members_are_rejected_before_schema_validation() {
         ValidatorReasonCode::IrParseDuplicateKey
     );
     assert!(report.output.validation.semantic_hash.is_none());
+    assert!(
+        !serde_json::to_string(&report.output)
+            .unwrap()
+            .contains(secret)
+    );
 }
 
 #[test]

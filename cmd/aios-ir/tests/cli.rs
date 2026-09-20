@@ -139,13 +139,18 @@ fn all_program_views_succeed_with_json_only_output() {
 
 #[test]
 fn deterministic_rejection_uses_exit_two_and_never_emits_identity() {
-    let program = temporary_program("rejected", br#"{"ir_version":"0.1","ir_version":"0.1"}"#);
+    let secret = "Bearer sk-test-duplicate-key-secret";
+    let program = temporary_program(
+        "rejected",
+        br#"{"Bearer sk-test-duplicate-key-secret":0,"Bearer sk-test-duplicate-key-secret":0}"#,
+    );
     for command in ["validate", "normalize", "hash", "effects"] {
         let output = run_program(command, &program);
         assert_eq!(output.status.code(), Some(2), "{command}");
         assert!(output.stderr.is_empty(), "{command}");
         let response: Value = serde_json::from_slice(&output.stdout).expect("JSON rejection");
         assert_eq!(response["validation"]["valid"], false, "{command}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
         assert!(
             response["validation"]["semantic_hash"].is_null(),
             "{command}"
@@ -219,6 +224,68 @@ fn schema_valid_semantic_rejection_preserves_identifiers() {
     assert_eq!(response["validation"]["ir_version"], "0.1");
     assert_eq!(response["validation"]["program_id"], expected_program_id);
     assert!(response["validation"]["semantic_hash"].is_null());
+    assert!(
+        response["validation"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["node_id"] == "import_table")
+    );
+}
+
+#[test]
+fn pre_schema_rejections_do_not_echo_unvalidated_identifiers() {
+    let secret = "Bearer sk-test-unvalidated-identifier";
+    let base: Value = serde_json::from_slice(
+        &std::fs::read(fixture_root().join("demonstration-a.ir.json")).unwrap(),
+    )
+    .unwrap();
+
+    let mut cases = Vec::new();
+    let mut unsupported_version = base.clone();
+    unsupported_version["ir_version"] = Value::String(secret.to_owned());
+    cases.push((
+        "secret-version",
+        unsupported_version,
+        "IR_VERSION_UNSUPPORTED",
+    ));
+
+    let mut unbounded_retry = base.clone();
+    unbounded_retry["nodes"][0]["id"] = Value::String(secret.to_owned());
+    unbounded_retry["nodes"][0]["failure"] = serde_json::json!({"on_error":"retry"});
+    cases.push((
+        "secret-node-retry",
+        unbounded_retry,
+        "IR_FAILURE_POLICY_UNBOUNDED",
+    ));
+
+    let mut contradictory_egress = base;
+    contradictory_egress["nodes"][0]["id"] = Value::String(secret.to_owned());
+    contradictory_egress["nodes"][0]["egress"] =
+        serde_json::json!({"mode":"deny","destination_classes":["public"]});
+    cases.push((
+        "secret-node-egress",
+        contradictory_egress,
+        "IR_EGRESS_CONTRADICTION",
+    ));
+
+    for (label, program, expected_code) in cases {
+        let path = temporary_program(label, &serde_json::to_vec(&program).unwrap());
+        let output = run_program("validate", &path);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["validation"]["diagnostics"][0]["code"],
+            expected_code
+        );
+        assert!(response["validation"]["ir_version"].is_null());
+        assert!(response["validation"]["program_id"].is_null());
+        assert!(response["validation"]["diagnostics"][0]["node_id"].is_null());
+    }
 }
 
 #[test]

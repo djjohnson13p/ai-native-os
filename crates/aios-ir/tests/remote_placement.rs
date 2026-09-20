@@ -1,4 +1,4 @@
-//! Regressions for effects and authority implied by remote-only placement.
+//! Regressions for effects and authority implied by non-local-only placement.
 
 use std::path::Path;
 
@@ -28,28 +28,36 @@ fn validate(program: &Value) -> aios_ir::ValidationReport {
 }
 
 #[test]
-fn remote_only_node_cannot_hide_network_and_egress_effects() {
-    let mut program = remote_program();
-    program["nodes"][0]["authority_requests"] = json!([]);
-    program["nodes"][0]["egress"] = json!({"mode": "deny"});
+fn non_local_only_node_cannot_hide_network_and_egress_effects() {
+    for locality in [
+        json!(["remote"]),
+        json!(["peer"]),
+        json!(["hybrid"]),
+        json!(["peer", "remote"]),
+    ] {
+        let mut program = remote_program();
+        program["nodes"][0]["constraints"]["locality"] = locality.clone();
+        program["nodes"][0]["authority_requests"] = json!([]);
+        program["nodes"][0]["egress"] = json!({"mode": "deny"});
 
-    let report = validate(&program);
-    assert!(!report.output.validation.valid);
-    let diagnostics = &report.output.validation.diagnostics;
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == ValidatorReasonCode::IrRequiredAuthorityMissing
-            && diagnostic.message.contains("network.connect")
-    }));
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == ValidatorReasonCode::IrRequiredAuthorityMissing
-            && diagnostic.message.contains("data.egress")
-    }));
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == ValidatorReasonCode::IrEgressContradiction)
-    );
-    assert!(report.output.effect_summary.is_none());
+        let report = validate(&program);
+        assert!(!report.output.validation.valid, "{locality}");
+        let diagnostics = &report.output.validation.diagnostics;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ValidatorReasonCode::IrRequiredAuthorityMissing
+                && diagnostic.message.contains("network.connect")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ValidatorReasonCode::IrRequiredAuthorityMissing
+                && diagnostic.message.contains("data.egress")
+        }));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == ValidatorReasonCode::IrEgressContradiction)
+        );
+        assert!(report.output.effect_summary.is_none());
+    }
 }
 
 #[test]

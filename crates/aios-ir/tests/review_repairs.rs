@@ -501,6 +501,14 @@ fn identifiers_are_emitted_only_after_structural_validation() {
         report.output.validation.program_id.as_deref(),
         semantic_rejection["program_id"].as_str()
     );
+    assert!(
+        report
+            .output
+            .validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.node_id.as_deref() == Some("copy"))
+    );
 
     let mut over_limit = program();
     over_limit["program_id"] = json!("secret-oversized-identifier");
@@ -512,6 +520,57 @@ fn identifiers_are_emitted_only_after_structural_validation() {
     assert!(diagnostic_codes(&report).contains(&ValidatorReasonCode::IrLimitStringLength));
     assert!(report.output.validation.ir_version.is_none());
     assert!(report.output.validation.program_id.is_none());
+}
+
+#[test]
+fn pre_schema_diagnostics_do_not_echo_unvalidated_identifiers() {
+    let validator = validator();
+    let secret = "Bearer sk-test-unvalidated-identifier";
+
+    let mut unsupported_version = program();
+    unsupported_version["ir_version"] = json!(secret);
+    let report = validator.validate_bytes(&serde_json::to_vec(&unsupported_version).unwrap());
+    assert_eq!(
+        diagnostic_codes(&report),
+        [ValidatorReasonCode::IrVersionUnsupported]
+    );
+    assert!(report.output.validation.ir_version.is_none());
+    assert!(report.output.validation.program_id.is_none());
+    assert!(
+        !serde_json::to_string(&report.output)
+            .unwrap()
+            .contains(secret)
+    );
+
+    for precheck in [
+        json!({"on_error":"retry"}),
+        json!({"mode":"deny","destination_classes":["public"]}),
+    ] {
+        let mut input = program();
+        input["nodes"][0]["id"] = json!(secret);
+        if precheck.get("on_error").is_some() {
+            input["nodes"][0]["failure"] = precheck;
+        } else {
+            input["nodes"][0]["egress"] = precheck;
+        }
+        let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
+        assert!(!report.output.validation.valid);
+        assert!(report.output.validation.ir_version.is_none());
+        assert!(report.output.validation.program_id.is_none());
+        assert!(
+            report
+                .output
+                .validation
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.node_id.is_none())
+        );
+        assert!(
+            !serde_json::to_string(&report.output)
+                .unwrap()
+                .contains(secret)
+        );
+    }
 }
 
 #[test]

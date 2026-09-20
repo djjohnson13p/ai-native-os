@@ -580,18 +580,18 @@ fn validate_effects(
             }
         }
 
-        // Selecting remote as the only permitted placement makes network use
-        // intrinsic to this node, even when the capability can also run locally.
-        // Bound inputs also cross that placement boundary and therefore require
-        // explicit data-egress authority and policy.
-        let remote_only = node.constraints.as_ref().is_some_and(|constraints| {
+        // If every allowed placement is non-local, network use is intrinsic to
+        // this node even when the capability can also run locally. Bound inputs
+        // cross that placement boundary and therefore require explicit
+        // data-egress authority and policy.
+        let non_local_only = node.constraints.as_ref().is_some_and(|constraints| {
             !constraints.locality.is_empty()
                 && constraints
                     .locality
                     .iter()
-                    .all(|locality| *locality == Locality::Remote)
+                    .all(|locality| *locality != Locality::Local)
         });
-        if remote_only {
+        if non_local_only {
             require_placement_authority(
                 node,
                 node_index,
@@ -658,7 +658,7 @@ fn require_placement_authority(
     if !requested_actions.contains(action) {
         diagnostics.push(contextual(
             ValidatorReasonCode::IrRequiredAuthorityMissing,
-            format!("remote-only placement requires authority class '{action}'"),
+            format!("non-local-only placement requires authority class '{action}'"),
             Some(&node.id),
             None,
             Some(&node.operation.capability),
