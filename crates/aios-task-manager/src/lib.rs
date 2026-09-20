@@ -775,6 +775,7 @@ impl TaskManager {
             artifact_store_cleanup,
         };
         manager.verify_all_provenance_chains()?;
+        manager.reconcile_export_operations_startup()?;
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
         Ok(manager)
