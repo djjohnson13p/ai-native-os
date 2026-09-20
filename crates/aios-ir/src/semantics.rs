@@ -582,6 +582,7 @@ fn validate_effects(
                     program,
                     node,
                     contract,
+                    &node.operation.capability,
                     node_index,
                     diagnostics,
                 );
@@ -660,6 +661,7 @@ fn validate_required_artifact_read_resources(
     program: &AiosIr,
     node: &Node,
     contract: &CapabilityContract,
+    reported_capability: &str,
     node_index: usize,
     diagnostics: &mut DiagnosticCollector,
 ) {
@@ -690,7 +692,7 @@ fn validate_required_artifact_read_resources(
                 ),
                 Some(&node.id),
                 Some(port),
-                Some(&node.operation.capability),
+                Some(reported_capability),
                 Some(format!("/nodes/{node_index}/authority_requests")),
             ));
         }
@@ -860,6 +862,7 @@ fn validate_fallbacks(
                     program,
                     node,
                     fallback,
+                    fallback_ref,
                     node_index,
                     diagnostics,
                 );

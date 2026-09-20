@@ -282,9 +282,18 @@ fn fallback_required_artifact_read_must_cover_each_direct_artifact_input() {
     let mut program = fallback_copy();
     program["nodes"][0]["authority_requests"][0]["resource"] = json!("task.output");
 
-    assert_code(
-        &validate(registry, &program),
-        ValidatorReasonCode::IrRequiredAuthorityMissing,
+    let report = validate(registry, &program);
+    assert_code(&report, ValidatorReasonCode::IrRequiredAuthorityMissing);
+    assert!(
+        report
+            .output
+            .validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == ValidatorReasonCode::IrRequiredAuthorityMissing
+                    && diagnostic.capability.as_deref() == Some("artifact.copy.compat@1")
+            })
     );
 }
 
