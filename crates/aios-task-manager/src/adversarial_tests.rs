@@ -469,7 +469,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -3944,6 +3944,7 @@ fn persisted_step_timestamp_and_migration_chain_are_strict() {
         "0003_task_manager_recovery_fencing_privacy",
         "0004_task_manager_review_hardening",
         "0005_artifact_store_root_binding",
+        "0006_artifact_writer_admission",
     ] {
         assert_eq!(
             manager
@@ -4884,6 +4885,51 @@ fn upgraded_recovery_basis_is_backfilled_and_trigger_enforced() {
         "UPDATE recovery_assessments SET basis_revision=0 WHERE assessment_id='assessment:basis'",
         [],
     ).is_err());
+}
+
+#[test]
+fn artifact_writer_admission_columns_are_added_by_the_ordered_migration() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("writer-admission-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE artifact_output_allocations DROP COLUMN writer_grant_one_shot_consumed;
+             ALTER TABLE artifact_output_allocations DROP COLUMN writer_grant_id;
+             DELETE FROM schema_migrations WHERE migration_id='0006_artifact_writer_admission';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_grant_id"
+        )
+        .unwrap()
+    );
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_grant_one_shot_consumed"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE migration_id='0006_artifact_writer_admission'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "artifact-writer-admission-v0.1"
+    );
 }
 
 #[test]

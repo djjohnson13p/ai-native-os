@@ -984,8 +984,19 @@ impl TaskManager {
             }
         };
         transaction.execute(
-            "UPDATE artifact_output_allocations SET state='WRITING',updated_at=?2 WHERE allocation_id=?1 AND state='ALLOCATED'",
-            params![allocation_id,now],
+            "UPDATE artifact_output_allocations
+             SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,updated_at=?4
+             WHERE allocation_id=?1 AND state='ALLOCATED'",
+            params![
+                allocation_id,
+                grant_admission
+                    .as_ref()
+                    .map(|admission| &admission.grant_id),
+                grant_admission
+                    .as_ref()
+                    .map(|admission| admission.one_shot_consumed),
+                now
+            ],
         )?;
         transaction.commit()?;
         Ok(ArtifactStagingWriter {
@@ -1118,6 +1129,15 @@ impl TaskManager {
                 self.clock.now(),
             ));
         }
+        if let Err(error) =
+            self.validate_pending_publication_authority(request, &request_json, &allocation)
+        {
+            let Some(code) = artifact_reason(&error) else {
+                return Err(error);
+            };
+            self.fail_pending_publication(request, code)?;
+            return Ok(publication_failure(request, code, self.clock.now()));
+        }
         let (storage_ref, blob_reused) = place_blob(
             &self.artifact_store_dir,
             staging_ref,
@@ -1159,7 +1179,8 @@ impl TaskManager {
                 self.clock.now(),
             ));
         }
-        if let Err(error) = validate_publication_execution_scope(&transaction, request, &allocation)
+        if let Err(error) =
+            validate_publication_authority(&transaction, request, &allocation, &resulted_at)
         {
             drop(transaction);
             let Some(code) = artifact_reason(&error) else {
@@ -1662,6 +1683,7 @@ impl TaskManager {
             TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
         )?;
         validate_publication_allocation(request, &allocation, &now)?;
+        validate_publication_authority(&transaction, request, &allocation, &now)?;
         let occupied = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE allocation_id=?1)",
             [&request.allocation_id],
@@ -1674,6 +1696,41 @@ impl TaskManager {
         }
         transaction.execute("INSERT INTO artifact_publications(publication_id,allocation_id,task_id,request_json,state,requested_at) VALUES (?1,?2,?3,?4,'PENDING',?5)",params![request.publication_id,request.allocation_id,request.task_id,request_json,now])?;
         transaction.execute("UPDATE artifact_output_allocations SET state='FINALIZING',publication_id=?2,updated_at=?3 WHERE allocation_id=?1 AND state=?4",params![request.allocation_id,request.publication_id,now,request.expected_allocation_state.as_str()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn validate_pending_publication_authority(
+        &mut self,
+        request: &ArtifactPublicationRequest,
+        request_json: &str,
+        expected_allocation: &AllocationRow,
+    ) -> Result<()> {
+        let now = self.clock.now();
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        let pending_exact = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND request_json=?4 AND state='PENDING')",
+            params![request.publication_id,request.allocation_id,request.task_id,request_json],
+            |row| row.get::<_,bool>(0),
+        )?;
+        if !pending_exact {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        let allocation = load_allocation_row(&transaction, &request.allocation_id)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+        )?;
+        if allocation != *expected_allocation {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        validate_publication_allocation(request, &allocation, &now)?;
+        validate_publication_authority(&transaction, request, &allocation, &now)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1996,6 +2053,7 @@ struct AllocationRow {
     sensitivity: String,
     retention: String,
     state: String,
+    writer_grant_admission: Option<GrantAdmission>,
     staging_ref: Option<String>,
     expires_at: String,
 }
@@ -2004,7 +2062,7 @@ fn load_allocation_row(
     connection: &Connection,
     allocation_id: &str,
 ) -> Result<Option<AllocationRow>> {
-    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,Option<String>>(11)?,row.get::<_,String>(12)?))).optional()?;
+    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,writer_grant_id,writer_grant_one_shot_consumed,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,Option<String>>(11)?,row.get::<_,Option<bool>>(12)?,row.get::<_,Option<String>>(13)?,row.get::<_,String>(14)?))).optional()?;
     row.map(|row| {
         Ok(AllocationRow {
             task_id: row.0,
@@ -2029,8 +2087,18 @@ fn load_allocation_row(
             sensitivity: row.8,
             retention: row.9,
             state: row.10,
-            staging_ref: row.11,
-            expires_at: row.12,
+            writer_grant_admission: match (row.11, row.12) {
+                (Some(grant_id), Some(one_shot_consumed)) => Some(GrantAdmission {
+                    grant_id,
+                    one_shot_consumed,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+            },
+            staging_ref: row.13,
+            expires_at: row.14,
         })
     })
     .transpose()
@@ -2132,6 +2200,9 @@ fn validate_writer_fence(
     if let Some(binding_id) = allocation.binding_id.as_deref() {
         let admission =
             grant_admission.ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if allocation.writer_grant_admission.as_ref() != Some(admission) {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
         let execution = load_execution_authority(connection, &allocation.task_id, binding_id, now)?;
         let valid = exact_operation_grant(
             connection,
@@ -2149,6 +2220,9 @@ fn validate_writer_fence(
         }
         Ok(())
     } else {
+        if allocation.writer_grant_admission.is_some() || grant_admission.is_some() {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
         validate_allocation_execution_scope(connection, allocation_id, &allocation, now)
     }
 }
@@ -2979,7 +3053,7 @@ fn task_accepts_artifact_import(state: &str) -> bool {
 }
 
 fn validate_publication_execution_scope(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Connection,
     request: &ArtifactPublicationRequest,
     allocation: &AllocationRow,
 ) -> Result<()> {
@@ -3039,6 +3113,45 @@ fn validate_publication_execution_scope(
         _ => return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
     }
     Ok(())
+}
+
+fn validate_publication_authority(
+    connection: &Connection,
+    request: &ArtifactPublicationRequest,
+    allocation: &AllocationRow,
+    now: &str,
+) -> Result<()> {
+    validate_publication_execution_scope(connection, request, allocation)?;
+    match (
+        allocation.binding_id.as_deref(),
+        allocation.attempt_id.as_deref(),
+        allocation.writer_grant_admission.as_ref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(binding_id), Some(attempt_id), Some(admission)) => {
+            let execution =
+                load_execution_authority(connection, &allocation.task_id, binding_id, now)?;
+            if execution.attempt_id != attempt_id
+                || execution.semantic_program_hash != allocation.semantic_program_hash
+                || execution.node_id != allocation.node_id
+                || exact_operation_grant(
+                    connection,
+                    &allocation.task_id,
+                    &execution,
+                    "artifact.write",
+                    "output-allocation",
+                    &request.allocation_id,
+                    now,
+                    Some(admission),
+                )?
+                .is_none()
+            {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            Ok(())
+        }
+        _ => Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
+    }
 }
 
 fn lineage_authorized(
@@ -3968,6 +4081,41 @@ mod tests {
         }
     }
 
+    struct BlobRevokingClock {
+        state: Arc<Mutex<BlobRevokingClockState>>,
+    }
+
+    struct BlobRevokingClockState {
+        armed: bool,
+        database: PathBuf,
+        blob: Option<PathBuf>,
+        grant_id: Option<String>,
+        revoked: bool,
+        error: Option<String>,
+    }
+
+    impl Clock for BlobRevokingClock {
+        fn now(&self) -> String {
+            let mut state = self.state.lock().unwrap();
+            if state.armed && state.blob.as_ref().is_some_and(|blob| blob.exists()) {
+                let result = (|| -> rusqlite::Result<()> {
+                    let connection = Connection::open(&state.database)?;
+                    connection.execute(
+                        "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z' WHERE grant_id=?1",
+                        [state.grant_id.as_deref().unwrap()],
+                    )?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => state.revoked = true,
+                    Err(error) => state.error = Some(error.to_string()),
+                }
+                state.armed = false;
+            }
+            "2026-09-19T22:00:00Z".to_owned()
+        }
+    }
+
     fn manager(temp: &TempDir) -> TaskManager {
         let mut manager = TaskManager::open_with_clock(
             temp.path().join("task-manager.sqlite"),
@@ -4153,6 +4301,95 @@ mod tests {
         let mut writer = manager.open_artifact_output(allocation_id).unwrap();
         writer.write_all(bytes).unwrap();
         assert_eq!(writer.finish().unwrap(), bytes.len() as u64);
+    }
+
+    fn finish_bound_output(
+        manager: &mut TaskManager,
+        fixture: &str,
+        scope: &str,
+    ) -> (String, String) {
+        let allocation_id = format!("alloc-{fixture}");
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            manager,
+            fixture,
+            &[],
+            &[("artifact.write", "output-allocation", &allocation_id)],
+        );
+        let grant_id = format!("grant-{fixture}-0");
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope=?1 WHERE grant_id=?2",
+                params![scope, grant_id],
+            )
+            .unwrap();
+        let mut request = allocation(&allocation_id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        manager.allocate_bound_artifact_output(&request).unwrap();
+        let mut writer = manager.open_bound_artifact_output(&allocation_id).unwrap();
+        writer.write_all(fixture.as_bytes()).unwrap();
+        writer.finish().unwrap();
+        (allocation_id, grant_id)
+    }
+
+    fn assert_publication_not_committed(
+        manager: &TaskManager,
+        allocation_id: &str,
+        publication_id: &str,
+    ) {
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_publications WHERE publication_id=?1 AND state='COMMITTED'",
+                    [publication_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_artifacts WHERE role='output'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.created'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_ne!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [allocation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "PUBLISHED"
+        );
     }
 
     fn write_manual_seal(manager: &TaskManager, allocation_id: &str, staging_ref: &str) {
@@ -5075,6 +5312,316 @@ mod tests {
     }
 
     #[test]
+    fn admitted_one_shot_and_exhausted_finite_writers_can_publish_and_replay() {
+        for (index, scope) in ["ONE_SHOT", "TASK", "TIME_LIMITED"].into_iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let fixture = format!("publish-admitted-{index}");
+            let (allocation_id, grant_id) = finish_bound_output(&mut manager, &fixture, scope);
+            let before = manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed,authority_grants.state,writer_grant_id,writer_grant_one_shot_consumed
+                     FROM authority_grants JOIN artifact_output_allocations ON writer_grant_id=grant_id
+                     WHERE allocation_id=?1",
+                    [&allocation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(before.0, 1);
+            assert_eq!(
+                before.1,
+                if scope == "ONE_SHOT" {
+                    "CONSUMED"
+                } else {
+                    "ACTIVE"
+                }
+            );
+            assert_eq!(before.2, grant_id);
+            assert_eq!(before.3, scope == "ONE_SHOT");
+
+            let publication_id = format!("pub-{fixture}");
+            let request = publication(&publication_id, &allocation_id);
+            let result = manager.publish_bound_artifact_output(&request).unwrap();
+            assert!(result.published, "{scope} admitted writer did not publish");
+            assert_eq!(
+                manager.publish_bound_artifact_output(&request).unwrap(),
+                result
+            );
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                        [&grant_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "publication or response-loss replay consumed {scope} again"
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_or_expired_writer_grant_after_finish_cannot_publish() {
+        for mutation in ["revoke", "expire"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let fixture = format!("post-finish-{mutation}");
+            let (allocation_id, grant_id) = finish_bound_output(&mut manager, &fixture, "ONE_SHOT");
+            match mutation {
+                "revoke" => {
+                    manager
+                        .connection
+                        .execute(
+                            "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z' WHERE grant_id=?1",
+                            [&grant_id],
+                        )
+                        .unwrap();
+                }
+                "expire" => {
+                    manager
+                        .connection
+                        .execute(
+                            "UPDATE authority_grants SET expires_at='2026-09-19T21:59:59Z' WHERE grant_id=?1",
+                            [&grant_id],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let publication_id = format!("pub-{fixture}");
+            let result = manager
+                .publish_bound_artifact_output(&publication(&publication_id, &allocation_id))
+                .unwrap();
+            assert!(!result.published);
+            assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+            assert_publication_not_committed(&manager, &allocation_id, &publication_id);
+        }
+    }
+
+    #[test]
+    fn invalidated_writer_approval_after_finish_cannot_publish() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let fixture = "post-finish-approval";
+        let allocation_id = format!("alloc-{fixture}");
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            fixture,
+            &[],
+            &[("artifact.write", "output-allocation", &allocation_id)],
+        );
+        let program_hash = allocation("unused").semantic_program_hash;
+        manager
+            .connection
+            .execute_batch(&format!(
+                "INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-{fixture}','request-{fixture}-0','T-artifact','{program_hash}','compose_report','artifact.write','APPROVED','{{}}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
+                 UPDATE policy_decisions SET approval_request_id='approval-{fixture}' WHERE decision_id='decision-{fixture}-0';
+                 UPDATE authority_grants SET approval_id='approval-{fixture}' WHERE grant_id='grant-{fixture}-0';
+                 INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at) VALUES ('approval-decision-{fixture}','approval-{fixture}','T-artifact','APPROVE','user','user:approver','ONE_SHOT','2026-09-20T00:00:00Z','{{}}','2026-09-19T00:00:00Z');"
+            ))
+            .unwrap();
+        let mut allocation_request = allocation(&allocation_id);
+        allocation_request.binding_id = Some(binding_id);
+        allocation_request.attempt_id = Some(attempt_id);
+        manager
+            .allocate_bound_artifact_output(&allocation_request)
+            .unwrap();
+        let mut writer = manager.open_bound_artifact_output(&allocation_id).unwrap();
+        writer.write_all(b"approval-bound").unwrap();
+        writer.finish().unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE approval_requests SET status='STALE' WHERE approval_id=?1",
+                [format!("approval-{fixture}")],
+            )
+            .unwrap();
+
+        let publication_id = format!("pub-{fixture}");
+        let result = manager
+            .publish_bound_artifact_output(&publication(&publication_id, &allocation_id))
+            .unwrap();
+        assert!(!result.published);
+        assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        assert_publication_not_committed(&manager, &allocation_id, &publication_id);
+    }
+
+    #[test]
+    fn writer_grant_admission_substitution_or_tamper_cannot_publish() {
+        for tamper in ["grant", "kind"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let fixture = format!("admission-tamper-{tamper}");
+            let allocation_id = format!("alloc-{fixture}");
+            let unrelated_id = format!("alloc-{fixture}-unrelated");
+            let (binding_id, attempt_id) = install_one_shot_binding(
+                &manager,
+                &fixture,
+                &[],
+                &[
+                    ("artifact.write", "output-allocation", &allocation_id),
+                    ("artifact.write", "output-allocation", &unrelated_id),
+                ],
+            );
+            if tamper == "kind" {
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE authority_grants SET scope='TASK' WHERE grant_id=?1",
+                        [format!("grant-{fixture}-0")],
+                    )
+                    .unwrap();
+            }
+            let mut request = allocation(&allocation_id);
+            request.binding_id = Some(binding_id);
+            request.attempt_id = Some(attempt_id);
+            manager.allocate_bound_artifact_output(&request).unwrap();
+            let mut writer = manager.open_bound_artifact_output(&allocation_id).unwrap();
+            writer.write_all(b"sealed admission").unwrap();
+            writer.finish().unwrap();
+            match tamper {
+                "grant" => {
+                    manager
+                        .connection
+                        .execute(
+                            "UPDATE artifact_output_allocations SET writer_grant_id=?2 WHERE allocation_id=?1",
+                            params![allocation_id, format!("grant-{fixture}-1")],
+                        )
+                        .unwrap();
+                }
+                "kind" => {
+                    manager
+                        .connection
+                        .execute(
+                            "UPDATE artifact_output_allocations SET writer_grant_one_shot_consumed=1 WHERE allocation_id=?1",
+                            [&allocation_id],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let publication_id = format!("pub-{fixture}");
+            let result = manager
+                .publish_bound_artifact_output(&publication(&publication_id, &allocation_id))
+                .unwrap();
+            assert!(!result.published);
+            assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+            assert_publication_not_committed(&manager, &allocation_id, &publication_id);
+        }
+    }
+
+    #[test]
+    fn cancelled_bound_task_after_writer_finish_cannot_publish() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let (allocation_id, _) =
+            finish_bound_output(&mut manager, "post-finish-cancel", "ONE_SHOT");
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let publication_id = "pub-post-finish-cancel";
+        let result = manager
+            .publish_bound_artifact_output(&publication(publication_id, &allocation_id))
+            .unwrap();
+        assert!(!result.published);
+        assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        assert_publication_not_committed(&manager, &allocation_id, publication_id);
+    }
+
+    #[test]
+    fn revocation_after_blob_placement_is_caught_by_metadata_commit_fence() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let state = Arc::new(Mutex::new(BlobRevokingClockState {
+            armed: false,
+            database: database.clone(),
+            blob: None,
+            grant_id: None,
+            revoked: false,
+            error: None,
+        }));
+        let mut manager = TaskManager::open_with_clock(
+            &database,
+            Box::new(BlobRevokingClock {
+                state: Arc::clone(&state),
+            }),
+        )
+        .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "exercise Artifact storage".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        let fixture = "placement-revocation";
+        let (allocation_id, grant_id) = finish_bound_output(&mut manager, fixture, "ONE_SHOT");
+        let mut hasher = Sha256::new();
+        hasher.update(fixture.as_bytes());
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let blob = manager.artifact_store_root.join(format!(
+            "blobs/sha256/{}/{}/{}",
+            &digest[..2],
+            &digest[2..4],
+            digest
+        ));
+        {
+            let mut state = state.lock().unwrap();
+            state.blob = Some(blob.clone());
+            state.grant_id = Some(grant_id.clone());
+            state.armed = true;
+        }
+
+        let publication_id = "pub-placement-revocation";
+        let result = manager
+            .publish_bound_artifact_output(&publication(publication_id, &allocation_id))
+            .unwrap();
+        assert!(!result.published);
+        assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        let state = state.lock().unwrap();
+        assert!(state.revoked, "test did not revoke after blob placement");
+        assert_eq!(state.error, None);
+        drop(state);
+        assert!(
+            blob.exists(),
+            "placement race did not reach durable blob placement"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM authority_grants WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "REVOKED"
+        );
+        assert_publication_not_committed(&manager, &allocation_id, publication_id);
+    }
+
+    #[test]
     fn malformed_exhausted_sibling_grants_fail_closed() {
         for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
             let temp = TempDir::new().unwrap();
@@ -5938,11 +6485,13 @@ mod tests {
         let mut request = allocation("alloc-stale");
         request.binding_id = Some("binding-old".to_owned());
         request.attempt_id = Some("attempt-old".to_owned());
-        manager.allocate_artifact_output(&request).unwrap();
+        manager.allocate_bound_artifact_output(&request).unwrap();
         let mut unopened = request.clone();
         unopened.allocation_id = "alloc-stale-unopened".to_owned();
         manager.allocate_artifact_output(&unopened).unwrap();
-        write_output(&mut manager, "alloc-stale", b"stale");
+        let mut writer = manager.open_bound_artifact_output("alloc-stale").unwrap();
+        writer.write_all(b"stale").unwrap();
+        writer.finish().unwrap();
         manager
             .connection
             .execute_batch(&format!(
@@ -5961,7 +6510,7 @@ mod tests {
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
         let result = manager
-            .publish_artifact_output(&publication("pub-stale", "alloc-stale"))
+            .publish_bound_artifact_output(&publication("pub-stale", "alloc-stale"))
             .unwrap();
         assert!(!result.published);
         assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
@@ -5973,6 +6522,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_publication_not_committed(&manager, "alloc-stale", "pub-stale");
     }
 
     #[test]
