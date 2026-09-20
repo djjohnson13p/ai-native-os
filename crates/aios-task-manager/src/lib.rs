@@ -447,6 +447,7 @@ pub struct TaskManager {
     lease_owner: String,
     lease_epoch: i64,
     artifact_store_root: PathBuf,
+    artifact_store_dir: cap_std::fs::Dir,
     _store_lock: Option<StoreLock>,
 }
 
@@ -479,6 +480,23 @@ struct StoreIdentity {
     inode: u64,
     #[cfg(windows)]
     creation_time: u64,
+}
+
+impl StoreIdentity {
+    fn persistent_key(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("unix:{}:{}", self.device, self.inode)
+        }
+        #[cfg(windows)]
+        {
+            format!("windows:{}", self.creation_time)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("path:{}", self.canonical_path.display())
+        }
+    }
 }
 
 fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
@@ -676,7 +694,7 @@ impl TaskManager {
         let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
-        let artifact_store_root =
+        let (artifact_store_root, artifact_store_dir) =
             artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
         let mut manager = Self {
             connection,
@@ -684,6 +702,7 @@ impl TaskManager {
             lease_owner,
             lease_epoch,
             artifact_store_root,
+            artifact_store_dir,
             _store_lock: store_lock,
         };
         manager.reconcile_artifacts_startup()?;
@@ -2793,7 +2812,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -2821,6 +2840,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0004_task_manager_review_hardening",
         "task-manager-review-hardening-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0005_artifact_store_root_binding",
+        "artifact-store-root-binding-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -2897,6 +2921,14 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                     "recovery_unknown_operations",
                 ],
             )?;
+        }
+        let has_v5 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0005_artifact_store_root_binding')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v5 {
+            require_migration_tables(connection, &["artifact_store_binding"])?;
         }
     }
     let has_steps = connection.query_row(
@@ -3085,6 +3117,10 @@ fn migrate_task_manager_schema(
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0004_task_manager_review_hardening', 'task-manager-review-hardening-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0005_artifact_store_root_binding', 'artifact-store-root-binding-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -3823,7 +3859,7 @@ fn load_recovery_subjects(
         subjects.push(RecoverySubject {
             kind: "artifact-publication",
             id: format!("publication:{id}"),
-            evidence_kind: "artifact-integrity",
+            evidence_kind: "blob-integrity",
             certainty: "FAILED_PARTIAL_EFFECT".to_owned(),
             safe_action: "FAIL_TASK",
             reason_code: "RECOVERY_ARTIFACT_INTEGRITY_FAILED",

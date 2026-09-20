@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS provider_conformance_evidence (
 -- Artifact content identity / output publication
 -- ---------------------------------------------------------------------------
 
+CREATE TABLE IF NOT EXISTS artifact_store_binding (
+    singleton_id           INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    database_identity      TEXT NOT NULL,
+    canonical_root         TEXT NOT NULL,
+    root_identity          TEXT NOT NULL,
+    bound_at               TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifact_blobs (
     content_hash           TEXT PRIMARY KEY,
     size_bytes             INTEGER NOT NULL CHECK (size_bytes >= 0),

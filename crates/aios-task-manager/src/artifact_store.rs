@@ -11,6 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,6 +27,7 @@ use super::{
 
 const IMPORT_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const SEALED_STAGING_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -391,10 +394,20 @@ impl Seek for ArtifactReader {
 }
 
 pub struct ArtifactStagingWriter {
-    file: Option<File>,
+    file: Option<cap_std::fs::File>,
+    store: Dir,
     allocation_id: String,
+    seal_ref: String,
     maximum: u64,
     written: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SealedStaging {
+    version: u8,
+    allocation_id: String,
+    size_bytes: u64,
+    content_hash: String,
 }
 
 impl ArtifactStagingWriter {
@@ -412,6 +425,29 @@ impl ArtifactStagingWriter {
         ))?;
         file.flush()?;
         file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        let (size_bytes, content_hash) = hash_reader(&mut file)?;
+        if size_bytes != self.written {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact staging writer byte count changed before sealing",
+            ));
+        }
+        drop(file);
+        let sealed = SealedStaging {
+            version: SEALED_STAGING_VERSION,
+            allocation_id: self.allocation_id.clone(),
+            size_bytes,
+            content_hash,
+        };
+        let bytes = serde_json::to_vec(&sealed)?;
+        let mut seal = self.store.open_with(
+            safe_internal_ref(&self.seal_ref)?,
+            CapOpenOptions::new().write(true).create_new(true),
+        )?;
+        seal.write_all(&bytes)?;
+        seal.flush()?;
+        seal.sync_all()?;
+        sync_cap_directory(&self.store, "staging")?;
         Ok(self.written)
     }
 }
@@ -473,8 +509,8 @@ pub struct ArtifactReconciliationReport {
 pub(super) fn initialize_root(
     store_lock: Option<&StoreLock>,
     connection: &Connection,
-) -> Result<PathBuf> {
-    let root = if let Some(lock) = store_lock {
+) -> Result<(PathBuf, Dir)> {
+    let (root, database_identity, stored_root_identity) = if let Some(lock) = store_lock {
         let file_name = lock
             .identity
             .canonical_path
@@ -483,17 +519,85 @@ pub(super) fn initialize_root(
             .ok_or(TaskManagerError::InvalidRecord(
                 "Task store path has no portable file name",
             ))?;
-        lock.identity
+        let proposed = lock
+            .identity
             .canonical_path
-            .with_file_name(format!("{file_name}.artifacts"))
+            .with_file_name(format!("{file_name}.artifacts"));
+        let identity = lock.identity.persistent_key();
+        let stored = connection
+            .query_row(
+                "SELECT database_identity,canonical_root,root_identity FROM artifact_store_binding WHERE singleton_id=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((stored_identity, stored_root, root_identity)) => {
+                if stored_identity != identity {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "Artifact store root binding does not match the locked database identity",
+                    ));
+                }
+                (PathBuf::from(stored_root), identity, Some(root_identity))
+            }
+            None => (proposed, identity, None),
+        }
     } else {
         let token = random_token(connection)?;
-        std::env::temp_dir().join(format!("aios-task-manager-{token}"))
+        (
+            std::env::temp_dir().join(format!("aios-task-manager-{token}")),
+            format!("memory:{token}"),
+            None,
+        )
     };
-    std::fs::create_dir_all(root.join("blobs").join("sha256"))?;
-    std::fs::create_dir_all(root.join("staging"))?;
-    std::fs::create_dir_all(root.join("quarantine"))?;
-    Ok(root.canonicalize()?)
+    std::fs::create_dir_all(&root)?;
+    reject_reparse_root(&root)?;
+    let canonical_root = root.canonicalize()?;
+    let directory = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
+    let root_file = directory.try_clone()?.into_std_file();
+    let root_identity = super::store_identity(&canonical_root, &root_file)?.persistent_key();
+    if stored_root_identity
+        .as_deref()
+        .is_some_and(|stored| stored != root_identity)
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact store root identity does not match its database binding",
+        ));
+    }
+    directory.create_dir_all("blobs/sha256")?;
+    directory.create_dir_all("staging")?;
+    directory.create_dir_all("quarantine")?;
+    directory.create_dir_all("blobs/pending")?;
+    let canonical_text = canonical_root
+        .to_str()
+        .ok_or(TaskManagerError::InvalidRecord(
+            "Artifact store root is not UTF-8",
+        ))?;
+    connection.execute(
+        "INSERT INTO artifact_store_binding(singleton_id,database_identity,canonical_root,root_identity,bound_at) VALUES (1,?1,?2,?3,?4) ON CONFLICT(singleton_id) DO NOTHING",
+        params![database_identity, canonical_text, root_identity, OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| TaskManagerError::InvalidRecord("Artifact store binding time could not be formatted"))?],
+    )?;
+    Ok((canonical_root, directory))
+}
+
+fn reject_reparse_root(root: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact store root must be a real directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact store root must not be a reparse point",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl TaskManager {
@@ -503,36 +607,44 @@ impl TaskManager {
         reader: &mut R,
     ) -> Result<ArtifactHandle> {
         validate_import_request(request)?;
-        let principal = self
+        let task = self
             .connection
             .query_row(
-                "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1",
+                "SELECT principal_kind,principal_id,state FROM tasks WHERE task_id=?1",
                 [&request.task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord(
                 "Artifact import Task does not exist",
             ))?;
-        if request.actor.kind == "user"
-            && (principal.0 != request.actor.kind || principal.1 != request.actor.id)
+        if task.0 != request.actor.kind
+            || task.1 != request.actor.id
+            || !task_accepts_artifact_import(&task.2)
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         let token = random_token(&self.connection)?;
         let staging_ref = format!("staging/import-{token}");
-        let staging_path = resolve_internal_ref(&self.artifact_store_root, &staging_ref)?;
         let maximum = request
             .max_size_bytes
             .unwrap_or(IMPORT_LIMIT)
             .min(IMPORT_LIMIT);
-        let (size, content_hash) = stream_into_new_file(reader, &staging_path, maximum)?;
+        let (size, content_hash) =
+            stream_into_new_internal_file(reader, &self.artifact_store_dir, &staging_ref, maximum)?;
         let (storage_ref, reused) = place_blob(
-            &self.artifact_store_root,
-            &staging_path,
+            &self.artifact_store_dir,
+            &staging_ref,
             &content_hash,
             size,
             false,
+            &token,
         )?;
         let created_at = self.clock.now();
         let artifact_id = artifact_id("import", &token);
@@ -544,6 +656,14 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        let import_still_authorized = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1 AND principal_kind=?2 AND principal_id=?3 AND state NOT IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK','ROLLING_BACK'))",
+            params![request.task_id,request.actor.kind,request.actor.id],
+            |row| row.get::<_,bool>(0),
+        )?;
+        if !import_still_authorized {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
         upsert_durable_blob(&transaction, &content_hash, size, &storage_ref, &created_at)?;
         transaction.execute(
             "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,format,size_bytes,content_hash,sensitivity,retention_class,expires_at,origin_kind,origin_task_id,integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'verified',?13,'artifact-store:sha256',?14,?13)",
@@ -657,8 +777,13 @@ impl TaskManager {
                 "ARTIFACT_ALLOCATION_EXPIRED",
             ));
         }
-        let path = resolve_internal_ref(&self.artifact_store_root, &staging_ref)?;
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let file = self.artifact_store_dir.open_with(
+            safe_internal_ref(&staging_ref)?,
+            CapOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true),
+        )?;
         transaction.execute(
             "UPDATE artifact_output_allocations SET state='WRITING',updated_at=?2 WHERE allocation_id=?1 AND state='ALLOCATED'",
             params![allocation_id,now],
@@ -666,8 +791,12 @@ impl TaskManager {
         transaction.commit()?;
         Ok(ArtifactStagingWriter {
             file: Some(file),
+            store: self.artifact_store_dir.try_clone()?,
             allocation_id: allocation_id.to_owned(),
-            maximum: maximum.map_or(IMPORT_LIMIT, |value| u64::try_from(value).unwrap_or(0)),
+            seal_ref: seal_ref(&staging_ref),
+            maximum: maximum
+                .map_or(IMPORT_LIMIT, |value| u64::try_from(value).unwrap_or(0))
+                .min(IMPORT_LIMIT),
             written: 0,
         })
     }
@@ -695,17 +824,11 @@ impl TaskManager {
                 return Ok(publication_conflict(request, self.clock.now()));
             }
             if state == "COMMITTED" {
-                let result: ArtifactPublicationResult = serde_json::from_str(
-                    result_json.as_deref().ok_or(TaskManagerError::InvalidRecord(
-                        "committed Artifact publication has no result",
-                    ))?,
-                )?;
-                if let Some(current_hash) = self.staged_content_hash(&request.allocation_id)? {
-                    if stored_hash.as_deref() != Some(current_hash.as_str()) {
-                        return Ok(publication_conflict(request, self.clock.now()));
-                    }
-                }
-                return Ok(result);
+                return self.authenticate_committed_publication(
+                    request,
+                    result_json.as_deref(),
+                    stored_hash.as_deref(),
+                );
             }
             if state != "PENDING" {
                 return Ok(publication_conflict(request, self.clock.now()));
@@ -717,6 +840,16 @@ impl TaskManager {
                     "ARTIFACT_AUTHORITY_DENIED",
                     self.clock.now(),
                 ));
+            }
+            let allocation = load_allocation_row(&self.connection, &request.allocation_id)?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_NOT_FOUND",
+                ))?;
+            if let Err(error) = self.sealed_staging(&allocation, request) {
+                if let Some(code) = artifact_reason(&error) {
+                    return Ok(publication_failure(request, code, self.clock.now()));
+                }
+                return Err(error);
             }
             if let Err(error) = self.begin_publication(request, &request_json) {
                 if let Some(code) = artifact_reason(&error) {
@@ -743,8 +876,16 @@ impl TaskManager {
                 .ok_or(TaskManagerError::InvalidRecord(
                     "Artifact allocation has no staging object",
                 ))?;
-        let staging_path = resolve_internal_ref(&self.artifact_store_root, staging_ref)?;
-        let (size, content_hash) = hash_file(&staging_path)?;
+        let sealed = self.sealed_staging(&allocation, request)?;
+        let (size, content_hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
+        if size != sealed.size_bytes || content_hash != sealed.content_hash {
+            self.fail_pending_publication(request, "ARTIFACT_HASH_MISMATCH")?;
+            return Ok(publication_failure(
+                request,
+                "ARTIFACT_HASH_MISMATCH",
+                self.clock.now(),
+            ));
+        }
         let effective_maximum = allocation
             .max_size_bytes
             .unwrap_or(IMPORT_LIMIT)
@@ -758,11 +899,12 @@ impl TaskManager {
             ));
         }
         let (storage_ref, blob_reused) = place_blob(
-            &self.artifact_store_root,
-            &staging_path,
+            &self.artifact_store_dir,
+            staging_ref,
             &content_hash,
             size,
             true,
+            &request.publication_id,
         )?;
         let resulted_at = self.clock.now();
         let artifact_id = artifact_id("publication", &request.publication_id);
@@ -782,6 +924,29 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
             ));
+        }
+        let current_allocation = load_allocation_row(&transaction, &request.allocation_id)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+        )?;
+        if current_allocation != allocation
+            || validate_publication_allocation(request, &current_allocation, &resulted_at).is_err()
+        {
+            drop(transaction);
+            self.fail_pending_publication(request, "ARTIFACT_AUTHORITY_DENIED")?;
+            return Ok(publication_failure(
+                request,
+                "ARTIFACT_AUTHORITY_DENIED",
+                self.clock.now(),
+            ));
+        }
+        if let Err(error) = validate_publication_execution_scope(&transaction, request, &allocation)
+        {
+            drop(transaction);
+            let Some(code) = artifact_reason(&error) else {
+                return Err(error);
+            };
+            self.fail_pending_publication(request, code)?;
+            return Ok(publication_failure(request, code, self.clock.now()));
         }
         for source in request
             .lineage
@@ -866,7 +1031,12 @@ impl TaskManager {
         transaction.commit()?;
         // Publication is already durable. Failure to remove residue is safe;
         // startup reconciliation will classify and clean it separately.
-        let _ = std::fs::remove_file(staging_path);
+        let _ = self
+            .artifact_store_dir
+            .remove_file(safe_internal_ref(staging_ref)?);
+        let _ = self
+            .artifact_store_dir
+            .remove_file(safe_internal_ref(&seal_ref(staging_ref))?);
         Ok(result)
     }
 
@@ -949,8 +1119,7 @@ impl TaskManager {
             [artifact_id],
             |row| row.get::<_,String>(0),
         )?;
-        let path = resolve_internal_ref(&self.artifact_store_root, &storage_ref)?;
-        let verified = hash_file(&path);
+        let verified = hash_internal_file(&self.artifact_store_dir, &storage_ref);
         let expected_hash = handle.content_hash.tagged();
         match verified {
             Ok((size, hash)) if size == handle.size_bytes && hash == expected_hash => {
@@ -971,7 +1140,10 @@ impl TaskManager {
             }
         }
         Ok(ArtifactReader {
-            file: File::open(path)?,
+            file: self
+                .artifact_store_dir
+                .open(safe_internal_ref(&storage_ref)?)?
+                .into_std(),
             handle: self
                 .get_artifact(artifact_id)?
                 .ok_or(TaskManagerError::InvalidRecord(
@@ -1024,8 +1196,7 @@ impl TaskManager {
             .map(|row| row.2.clone())
             .collect::<BTreeSet<_>>();
         for (content_hash, size, storage_ref, durability_state) in blobs {
-            let path = resolve_internal_ref(&self.artifact_store_root, &storage_ref)?;
-            let status = match hash_file(&path) {
+            let status = match hash_internal_file(&self.artifact_store_dir, &storage_ref) {
                 Err(TaskManagerError::Io(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
@@ -1058,12 +1229,12 @@ impl TaskManager {
                 });
             }
         }
-        for path in physical_blob_paths(&self.artifact_store_root)? {
-            let relative = internal_relative_ref(&self.artifact_store_root, &path)?;
+        reconcile_pending_blob_placements(&self.artifact_store_dir)?;
+        for relative in physical_blob_refs(&self.artifact_store_dir)? {
             if known_refs.contains(&relative) {
                 continue;
             }
-            let (size, hash) = hash_file(&path)?;
+            let (size, hash) = hash_internal_file(&self.artifact_store_dir, &relative)?;
             if known.contains(&hash) {
                 continue;
             }
@@ -1095,10 +1266,17 @@ impl TaskManager {
             .into_iter()
             .map(|(allocation_id, staging_ref)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
-        for entry in std::fs::read_dir(self.artifact_store_root.join("staging"))? {
+        for entry in self.artifact_store_dir.read_dir("staging")? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
-                let staging_ref = internal_relative_ref(&self.artifact_store_root, &entry.path())?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if name.ends_with(".sealed") {
+                    continue;
+                }
+                let staging_ref = format!("staging/{name}");
                 findings.push(ArtifactReconciliationFinding {
                     kind: ArtifactReconciliationKind::StagingOrphaned,
                     allocation_id: staged_by_ref.get(&staging_ref).cloned(),
@@ -1169,24 +1347,210 @@ impl TaskManager {
         Ok(())
     }
 
-    fn staged_content_hash(&self, allocation_id: &str) -> Result<Option<String>> {
-        let staging_ref = self
+    fn sealed_staging(
+        &self,
+        allocation: &AllocationRow,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<SealedStaging> {
+        let staging_ref =
+            allocation
+                .staging_ref
+                .as_deref()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                ))?;
+        let file = self
+            .artifact_store_dir
+            .open(safe_internal_ref(&seal_ref(staging_ref))?)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_STATE_CONFLICT")
+                } else {
+                    TaskManagerError::Io(error)
+                }
+            })?;
+        let mut bytes = Vec::new();
+        file.take(16 * 1024).read_to_end(&mut bytes)?;
+        let sealed: SealedStaging = serde_json::from_slice(&bytes)
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))?;
+        if sealed.version != SEALED_STAGING_VERSION || sealed.allocation_id != request.allocation_id
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+        }
+        if sealed.size_bytes
+            > allocation
+                .max_size_bytes
+                .unwrap_or(IMPORT_LIMIT)
+                .min(IMPORT_LIMIT)
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
+        }
+        validate_hash(&sealed.content_hash)?;
+        Ok(sealed)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "authenticates the complete committed publication receipt before replay"
+    )]
+    fn authenticate_committed_publication(
+        &mut self,
+        request: &ArtifactPublicationRequest,
+        result_json: Option<&str>,
+        stored_hash: Option<&str>,
+    ) -> Result<ArtifactPublicationResult> {
+        let failed_at = self.clock.now();
+        let failed =
+            || publication_failure(request, "ARTIFACT_INTEGRITY_FAILED", failed_at.clone());
+        let Some(result_json) = result_json else {
+            return Ok(failed());
+        };
+        let Ok(result) = serde_json::from_str::<ArtifactPublicationResult>(result_json) else {
+            return Ok(failed());
+        };
+        let row = self
             .connection
             .query_row(
-                "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id=?1",
-                [allocation_id],
-                |row| row.get::<_, Option<String>>(0),
+                "SELECT p.artifact_id,p.content_hash,p.committed_at,a.state,a.publication_id,a.published_artifact_id,a.task_id,a.semantic_program_hash,a.node_id,a.binding_id,a.attempt_id,r.uri,r.semantic_type,r.media_type,r.format,r.size_bytes,r.content_hash,r.origin_task_id,r.origin_program_hash,r.origin_node_id,r.origin_binding_id,r.integrity_state,b.size_bytes,b.storage_ref,b.durability_state,t.role,t.node_id,e.event_hash,e.task_id,e.event_type,e.semantic_program_hash,e.node_id,e.execution_binding_id,e.status,e.event_json FROM artifact_publications p JOIN artifact_output_allocations a ON a.allocation_id=p.allocation_id JOIN artifacts r ON r.artifact_id=p.artifact_id JOIN artifact_blobs b ON b.content_hash=p.content_hash JOIN task_artifacts t ON t.task_id=p.task_id AND t.artifact_id=p.artifact_id LEFT JOIN provenance_events e ON e.event_id=?2 WHERE p.publication_id=?1 AND p.allocation_id=?3 AND p.task_id=?4 AND p.state='COMMITTED'",
+                params![request.publication_id,result.provenance_event_id,request.allocation_id,request.task_id],
+                |row| Ok((
+                    row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,
+                    row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,
+                    row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?,
+                    row.get::<_,Option<String>>(9)?,row.get::<_,Option<String>>(10)?,row.get::<_,String>(11)?,
+                    row.get::<_,Option<String>>(12)?,row.get::<_,String>(13)?,row.get::<_,Option<String>>(14)?,
+                    row.get::<_,i64>(15)?,row.get::<_,String>(16)?,row.get::<_,Option<String>>(17)?,
+                    row.get::<_,Option<String>>(18)?,row.get::<_,Option<String>>(19)?,row.get::<_,Option<String>>(20)?,
+                    row.get::<_,String>(21)?,row.get::<_,i64>(22)?,row.get::<_,String>(23)?,
+                    row.get::<_,String>(24)?,row.get::<_,String>(25)?,row.get::<_,Option<String>>(26)?,
+                    row.get::<_,Option<String>>(27)?,row.get::<_,Option<String>>(28)?,row.get::<_,Option<String>>(29)?,
+                    row.get::<_,Option<String>>(30)?,row.get::<_,Option<String>>(31)?,row.get::<_,Option<String>>(32)?,
+                    row.get::<_,Option<String>>(33)?,row.get::<_,Option<String>>(34)?
+                )),
             )
-            .optional()?
-            .flatten();
-        let Some(staging_ref) = staging_ref else {
-            return Ok(None);
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(failed());
         };
-        let path = resolve_internal_ref(&self.artifact_store_root, &staging_ref)?;
-        if !path.is_file() {
-            return Ok(None);
+        let size = u64::try_from(row.15).unwrap_or(u64::MAX);
+        let blob_size = u64::try_from(row.22).unwrap_or(u64::MAX);
+        let event = row
+            .34
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+        let event_exact = event.as_ref().is_some_and(|event| {
+            event
+                .get("output_artifacts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|artifacts| {
+                    artifacts.len() == 1 && artifacts[0].as_str() == Some(row.0.as_str())
+                })
+                && event
+                    .pointer("/details/allocation_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request.allocation_id.as_str())
+                && event
+                    .pointer("/details/publication_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request.publication_id.as_str())
+                && event
+                    .pointer("/details/content_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(row.1.as_str())
+                && event
+                    .pointer("/details/size_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(size)
+        });
+        let lineage = {
+            let mut statement = self.connection.prepare(
+                "SELECT parent_artifact_id,relationship FROM artifact_lineage WHERE child_artifact_id=?1 ORDER BY parent_artifact_id,relationship",
+            )?;
+            statement
+                .query_map([&row.0], |lineage_row| {
+                    Ok((
+                        lineage_row.get::<_, String>(0)?,
+                        lineage_row.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        let expected_lineage = request
+            .lineage
+            .input_artifact_ids
+            .iter()
+            .map(|parent| (parent.clone(), "consumed-by".to_owned()))
+            .chain(
+                request
+                    .lineage
+                    .derived_from_artifact_ids
+                    .iter()
+                    .map(|parent| (parent.clone(), "transformed-to".to_owned())),
+            )
+            .collect::<BTreeSet<_>>();
+        let artifact_exact = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts r JOIN artifact_output_allocations a ON a.published_artifact_id=r.artifact_id WHERE r.artifact_id=?1 AND r.labels_json=?2 AND r.sensitivity=a.sensitivity AND r.retention_class=a.retention)",
+            params![row.0,serde_json::to_string(&request.labels)?],
+            |artifact_row| artifact_row.get::<_,bool>(0),
+        )?;
+        let exact = result.schema_version == SCHEMA_VERSION
+            && result.publication_id == request.publication_id
+            && result.allocation_id == request.allocation_id
+            && result.task_id == request.task_id
+            && result.published
+            && result.reason_code == "ARTIFACT_PUBLICATION_APPLIED"
+            && row.0 == artifact_id("publication", &request.publication_id)
+            && result.artifact_id.as_deref() == Some(row.0.as_str())
+            && row.11 == ArtifactUri::new(&row.0).as_str()
+            && result.artifact_uri.as_deref() == Some(row.11.as_str())
+            && result.semantic_type == row.12
+            && result.media_type.as_deref() == Some(row.13.as_str())
+            && result.size_bytes == Some(size)
+            && result.content_hash.as_deref() == Some(row.1.as_str())
+            && stored_hash == Some(row.1.as_str())
+            && row.2.as_deref() == Some(result.resulted_at.as_str())
+            && row.3 == "PUBLISHED"
+            && row.4.as_deref() == Some(request.publication_id.as_str())
+            && row.5.as_deref() == Some(row.0.as_str())
+            && row.6 == request.task_id
+            && row.12 == request.semantic_type
+            && row.13 == request.media_type
+            && row.14 == request.format
+            && row.16 == row.1
+            && row.17.as_deref() == Some(request.task_id.as_str())
+            && row.18.as_deref() == Some(row.7.as_str())
+            && row.19.as_deref() == Some(row.8.as_str())
+            && row.20 == row.9
+            && row.21 == "verified"
+            && blob_size == size
+            && row.24 == "DURABLE"
+            && row.25 == "output"
+            && row.26.as_deref() == Some(row.8.as_str())
+            && result.provenance_event_hash == row.27
+            && result.provenance_event_id.as_deref()
+                == Some(event_id("artifact-created", &row.0).as_str())
+            && row.28.as_deref() == Some(request.task_id.as_str())
+            && row.29.as_deref() == Some("artifact.created")
+            && row.30.as_deref() == Some(row.7.as_str())
+            && row.31.as_deref() == Some(row.8.as_str())
+            && row.32 == row.9
+            && row.33.as_deref() == Some("success")
+            && event_exact
+            && lineage == expected_lineage
+            && artifact_exact
+            && super::verify_provenance_through(&self.connection, &request.task_id, None)?;
+        if !exact {
+            return Ok(failed());
         }
-        hash_file(&path).map(|(_, hash)| Some(hash))
+        match hash_internal_file(&self.artifact_store_dir, &row.23) {
+            Ok((actual_size, actual_hash)) if actual_size == size && actual_hash == row.1 => {
+                Ok(result)
+            }
+            _ => {
+                self.mark_integrity_failed(&row.0, &request.task_id, &row.1)?;
+                Ok(failed())
+            }
+        }
     }
 
     fn artifact_ids_for_hash(&self, content_hash: &str) -> Result<Vec<String>> {
@@ -1264,12 +1628,13 @@ impl TaskManager {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct AllocationRow {
     task_id: String,
     semantic_program_hash: String,
     node_id: String,
     binding_id: Option<String>,
+    attempt_id: Option<String>,
     expected_semantic_type: Option<String>,
     allowed_media_types: Vec<String>,
     max_size_bytes: Option<u64>,
@@ -1284,32 +1649,33 @@ fn load_allocation_row(
     connection: &Connection,
     allocation_id: &str,
 ) -> Result<Option<AllocationRow>> {
-    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<i64>>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,Option<String>>(10)?,row.get::<_,String>(11)?))).optional()?;
+    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,Option<String>>(11)?,row.get::<_,String>(12)?))).optional()?;
     row.map(|row| {
         Ok(AllocationRow {
             task_id: row.0,
             semantic_program_hash: row.1,
             node_id: row.2,
             binding_id: row.3,
-            expected_semantic_type: row.4,
+            attempt_id: row.4,
+            expected_semantic_type: row.5,
             allowed_media_types: row
-                .5
+                .6
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?
                 .unwrap_or_default(),
             max_size_bytes: row
-                .6
+                .7
                 .map(|value| {
                     u64::try_from(value).map_err(|_| {
                         TaskManagerError::InvalidRecord("negative Artifact size limit")
                     })
                 })
                 .transpose()?,
-            sensitivity: row.7,
-            retention: row.8,
-            state: row.9,
-            staging_ref: row.10,
-            expires_at: row.11,
+            sensitivity: row.8,
+            retention: row.9,
+            state: row.10,
+            staging_ref: row.11,
+            expires_at: row.12,
         })
     })
     .transpose()
@@ -1346,6 +1712,76 @@ fn validate_publication_allocation(
         return Err(TaskManagerError::InvalidRecord(
             "ARTIFACT_SEMANTIC_TYPE_MISMATCH",
         ));
+    }
+    Ok(())
+}
+
+fn task_accepts_artifact_import(state: &str) -> bool {
+    !matches!(
+        state,
+        "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK" | "ROLLING_BACK"
+    )
+}
+
+fn validate_publication_execution_scope(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ArtifactPublicationRequest,
+    allocation: &AllocationRow,
+) -> Result<()> {
+    let task = transaction
+        .query_row(
+            "SELECT state,active_program_revision,active_step_ids_json FROM tasks WHERE task_id=?1",
+            [&request.task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+    if !task_accepts_artifact_import(&task.0) {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    match (
+        allocation.binding_id.as_deref(),
+        allocation.attempt_id.as_deref(),
+    ) {
+        (None, None) => {
+            if let Some(program_revision) = task.1 {
+                let current = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM semantic_program_revisions WHERE task_id=?1 AND program_revision=?2 AND semantic_hash=?3 AND status='active' AND superseded_at IS NULL)",
+                    params![request.task_id,program_revision,allocation.semantic_program_hash],
+                    |row| row.get::<_,bool>(0),
+                )?;
+                if !current {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+            }
+        }
+        (Some(binding_id), Some(attempt_id)) => {
+            if !matches!(task.0.as_str(), "RUNNING" | "VERIFYING" | "RECOVERING") {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            let active_steps: Vec<String> = serde_json::from_str(&task.2)?;
+            if !active_steps.iter().any(|step| step == &allocation.node_id) {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            let Some(program_revision) = task.1 else {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            };
+            let exact = transaction.query_row(
+                "SELECT COUNT(*) FROM step_executions s JOIN execution_bindings b ON b.binding_id=s.binding_id AND b.attempt_id=s.attempt_id AND b.task_id=s.task_id AND b.semantic_program_hash=s.semantic_program_hash AND b.registry_snapshot_id=s.registry_snapshot_id AND b.node_id=s.node_id JOIN semantic_program_revisions p ON p.task_id=s.task_id AND p.program_revision=?6 AND p.semantic_hash=s.semantic_program_hash AND p.registry_snapshot_id=s.registry_snapshot_id AND p.status='active' AND p.superseded_at IS NULL WHERE s.task_id=?1 AND s.semantic_program_hash=?2 AND s.node_id=?3 AND s.attempt_id=?4 AND s.binding_id=?5 AND s.state IN ('READY','STARTING','RUNNING','SUCCEEDED') AND s.attempt_number=(SELECT MAX(latest.attempt_number) FROM step_executions latest WHERE latest.task_id=s.task_id AND latest.semantic_program_hash=s.semantic_program_hash AND latest.registry_snapshot_id=s.registry_snapshot_id AND latest.node_id=s.node_id)",
+                params![request.task_id,allocation.semantic_program_hash,allocation.node_id,attempt_id,binding_id,program_revision],
+                |row| row.get::<_,i64>(0),
+            )?;
+            if exact != 1 {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+        }
+        _ => return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
     }
     Ok(())
 }
@@ -1643,11 +2079,12 @@ fn upsert_durable_blob(
 }
 
 fn place_blob(
-    root: &Path,
-    staging: &Path,
+    store: &Dir,
+    staging_ref: &str,
     content_hash: &str,
     size: u64,
     preserve_staging: bool,
+    placement_identity: &str,
 ) -> Result<(String, bool)> {
     validate_hash(content_hash)?;
     let digest = content_hash.strip_prefix("sha256:").unwrap_or_default();
@@ -1657,43 +2094,103 @@ fn place_blob(
         &digest[2..4],
         digest
     );
-    let destination = resolve_internal_ref(root, &storage_ref)?;
-    let parent = destination.parent().ok_or(TaskManagerError::InvalidRecord(
-        "Artifact blob has no parent",
-    ))?;
-    std::fs::create_dir_all(parent)?;
-    let reused = if destination.exists() {
-        let (existing_size, existing_hash) = hash_file(&destination)?;
-        if existing_size != size || existing_hash != content_hash {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-        }
-        if !preserve_staging {
-            std::fs::remove_file(staging)?;
-        }
-        true
-    } else {
-        if preserve_staging {
-            let mut source = File::open(staging)?;
-            let mut blob = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&destination)?;
-            std::io::copy(&mut source, &mut blob)?;
-            blob.flush()?;
-            blob.sync_all()?;
-        } else {
-            std::fs::rename(staging, &destination)?;
-        }
-        OpenOptions::new()
+    let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
+    store.create_dir_all(safe_internal_ref(&parent_ref)?)?;
+    let pending_ref = format!(
+        "blobs/pending/{}-{}",
+        digest,
+        placement_token(placement_identity)
+    );
+    let mut source = store.open(safe_internal_ref(staging_ref)?)?;
+    let mut pending = store.open_with(
+        safe_internal_ref(&pending_ref)?,
+        CapOpenOptions::new()
             .read(true)
             .write(true)
-            .open(&destination)?
-            .sync_all()?;
-        sync_directory(parent)?;
-        false
+            .create_new(true),
+    )?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(
+                u64::try_from(count)
+                    .map_err(|_| TaskManagerError::InvalidRecord("Artifact size overflow"))?,
+            )
+            .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
+        pending.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    pending.flush()?;
+    pending.sync_all()?;
+    if copied != size || tagged_digest(hasher) != content_hash {
+        drop(pending);
+        let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+    }
+    drop(pending);
+    sync_cap_directory(store, "blobs/pending")?;
+    let reused = match store.hard_link(
+        safe_internal_ref(&pending_ref)?,
+        store,
+        safe_internal_ref(&storage_ref)?,
+    ) {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (existing_size, existing_hash) = hash_internal_file(store, &storage_ref)?;
+            if existing_size != size || existing_hash != content_hash {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+            }
+            true
+        }
+        Err(error) => return Err(error.into()),
     };
+    store.remove_file(safe_internal_ref(&pending_ref)?)?;
+    sync_cap_directory(store, &parent_ref)?;
+    sync_cap_directory(store, "blobs/pending")?;
+    if !preserve_staging {
+        store.remove_file(safe_internal_ref(staging_ref)?)?;
+        sync_cap_directory(store, "staging")?;
+    }
     Ok((storage_ref, reused))
+}
+
+fn placement_token(identity: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = Sha256::new();
+    hasher.update(b"AIOS-ARTIFACT-BLOB-PLACEMENT\0v1\0");
+    hasher.update(identity.as_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    hasher.update(NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    tagged_digest(hasher)
+        .strip_prefix("sha256:")
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn stream_into_new_internal_file<R: Read>(
+    reader: &mut R,
+    store: &Dir,
+    reference: &str,
+    maximum: u64,
+) -> Result<(u64, String)> {
+    let relative = safe_internal_ref(reference)?;
+    let mut file = store.open_with(
+        &relative,
+        CapOpenOptions::new().write(true).create_new(true),
+    )?;
+    let result = stream_into_file(reader, &mut file, maximum);
+    if result.is_err() {
+        drop(file);
+        let _ = store.remove_file(&relative);
+    }
+    result
 }
 
 fn stream_into_new_file<R: Read>(
@@ -1702,6 +2199,19 @@ fn stream_into_new_file<R: Read>(
     maximum: u64,
 ) -> Result<(u64, String)> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = stream_into_file(reader, &mut file, maximum);
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn stream_into_file<R: Read, W: Write + SyncFile>(
+    reader: &mut R,
+    file: &mut W,
+    maximum: u64,
+) -> Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
@@ -1717,8 +2227,6 @@ fn stream_into_new_file<R: Read>(
             )
             .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
         if size > maximum {
-            drop(file);
-            let _ = std::fs::remove_file(path);
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
         file.write_all(&buffer[..count])?;
@@ -1729,8 +2237,33 @@ fn stream_into_new_file<R: Read>(
     Ok((size, tagged_digest(hasher)))
 }
 
+trait SyncFile {
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+
+impl SyncFile for File {
+    fn sync_all(&self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
+impl SyncFile for cap_std::fs::File {
+    fn sync_all(&self) -> std::io::Result<()> {
+        cap_std::fs::File::sync_all(self)
+    }
+}
+
 fn hash_file(path: &Path) -> Result<(u64, String)> {
     let mut file = File::open(path)?;
+    hash_reader(&mut file)
+}
+
+fn hash_internal_file(store: &Dir, reference: &str) -> Result<(u64, String)> {
+    let mut file = store.open(safe_internal_ref(reference)?)?;
+    hash_reader(&mut file)
+}
+
+fn hash_reader<R: Read>(file: &mut R) -> Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
@@ -1781,23 +2314,39 @@ fn copy_bounded<R: Read, W: Write>(reader: &mut R, writer: &mut W, maximum: u64)
     Ok(size)
 }
 
-fn physical_blob_paths(root: &Path) -> Result<Vec<PathBuf>> {
-    let base = root.join("blobs").join("sha256");
+fn physical_blob_refs(store: &Dir) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    for first in std::fs::read_dir(base)? {
+    for first in store.read_dir("blobs/sha256")? {
         let first = first?;
         if !first.file_type()?.is_dir() {
             continue;
         }
-        for second in std::fs::read_dir(first.path())? {
+        let Some(first_name) = first.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if first_name.len() != 2 {
+            continue;
+        }
+        for second in store.read_dir(format!("blobs/sha256/{first_name}"))? {
             let second = second?;
             if !second.file_type()?.is_dir() {
                 continue;
             }
-            for blob in std::fs::read_dir(second.path())? {
+            let Some(second_name) = second.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if second_name.len() != 2 {
+                continue;
+            }
+            for blob in store.read_dir(format!("blobs/sha256/{first_name}/{second_name}"))? {
                 let blob = blob?;
                 if blob.file_type()?.is_file() {
-                    paths.push(blob.path());
+                    let Some(blob_name) = blob.file_name().to_str().map(ToOwned::to_owned) else {
+                        continue;
+                    };
+                    paths.push(format!(
+                        "blobs/sha256/{first_name}/{second_name}/{blob_name}"
+                    ));
                 }
             }
         }
@@ -1806,30 +2355,63 @@ fn physical_blob_paths(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn internal_relative_ref(root: &Path, path: &Path) -> Result<String> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| TaskManagerError::InvalidRecord("Artifact path escaped store root"))?;
-    let parts = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => {
-                value
-                    .to_str()
-                    .map(ToOwned::to_owned)
-                    .ok_or(TaskManagerError::InvalidRecord(
-                        "Artifact path is not UTF-8",
-                    ))
+fn reconcile_pending_blob_placements(store: &Dir) -> Result<()> {
+    let pending = store
+        .read_dir("blobs/pending")?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for entry in pending {
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let Some(digest) = name.split('-').next() else {
+            continue;
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            continue;
+        }
+        let pending_ref = format!("blobs/pending/{name}");
+        let expected = format!("sha256:{digest}");
+        let (_, actual) = hash_internal_file(store, &pending_ref)?;
+        if actual != expected {
+            continue;
+        }
+        let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
+        let final_ref = format!("{parent_ref}/{digest}");
+        store.create_dir_all(safe_internal_ref(&parent_ref)?)?;
+        match store.hard_link(
+            safe_internal_ref(&pending_ref)?,
+            store,
+            safe_internal_ref(&final_ref)?,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (_, final_hash) = hash_internal_file(store, &final_ref)?;
+                if final_hash != expected {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                }
             }
-            _ => Err(TaskManagerError::InvalidRecord(
-                "Artifact path is not a safe relative reference",
-            )),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(parts.join("/"))
+            Err(error) => return Err(error.into()),
+        }
+        store.remove_file(safe_internal_ref(&pending_ref)?)?;
+        sync_cap_directory(store, &parent_ref)?;
+    }
+    sync_cap_directory(store, "blobs/pending")?;
+    Ok(())
 }
 
+#[cfg(test)]
 fn resolve_internal_ref(root: &Path, reference: &str) -> Result<PathBuf> {
+    Ok(root.join(safe_internal_ref(reference)?))
+}
+
+fn safe_internal_ref(reference: &str) -> Result<PathBuf> {
     if reference.is_empty() || reference.contains('\\') {
         return Err(TaskManagerError::InvalidRecord(
             "Artifact storage reference is invalid",
@@ -1845,7 +2427,11 @@ fn resolve_internal_ref(root: &Path, reference: &str) -> Result<PathBuf> {
             "Artifact storage reference escaped store root",
         ));
     }
-    Ok(root.join(relative))
+    Ok(relative.to_path_buf())
+}
+
+fn seal_ref(staging_ref: &str) -> String {
+    format!("{staging_ref}.sealed")
 }
 
 fn random_token(connection: &Connection) -> Result<String> {
@@ -1925,8 +2511,11 @@ fn all_unique(values: &[String]) -> bool {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+fn sync_cap_directory(store: &Dir, reference: &str) -> Result<()> {
+    store
+        .open(safe_internal_ref(reference)?)?
+        .into_std()
+        .sync_all()?;
     Ok(())
 }
 
@@ -1935,7 +2524,7 @@ fn sync_directory(path: &Path) -> Result<()> {
     clippy::unnecessary_wraps,
     reason = "keeps the platform-specific durability helper signature uniform"
 )]
-fn sync_directory(_path: &Path) -> Result<()> {
+fn sync_cap_directory(_store: &Dir, _reference: &str) -> Result<()> {
     Ok(())
 }
 
@@ -2037,6 +2626,22 @@ mod tests {
         let mut writer = manager.open_artifact_output(allocation_id).unwrap();
         writer.write_all(bytes).unwrap();
         assert_eq!(writer.finish().unwrap(), bytes.len() as u64);
+    }
+
+    fn write_manual_seal(manager: &TaskManager, allocation_id: &str, staging_ref: &str) {
+        let staging_path = resolve_internal_ref(&manager.artifact_store_root, staging_ref).unwrap();
+        let (size_bytes, content_hash) = hash_file(&staging_path).unwrap();
+        std::fs::write(
+            resolve_internal_ref(&manager.artifact_store_root, &seal_ref(staging_ref)).unwrap(),
+            serde_json::to_vec(&SealedStaging {
+                version: SEALED_STAGING_VERSION,
+                allocation_id: allocation_id.to_owned(),
+                size_bytes,
+                content_hash,
+            })
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     fn assert_matches_schema<T: Serialize>(schema_name: &str, value: &T) {
@@ -2256,6 +2861,7 @@ mod tests {
             b"oversized",
         )
         .unwrap();
+        write_manual_seal(&manager, "alloc-final-size", &staging_ref);
         manager
             .connection
             .execute(
@@ -2309,10 +2915,19 @@ mod tests {
     fn orphan_blob_and_staging_are_reported_but_never_promoted() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
-        let staging = manager.artifact_store_root.join("staging/manual-crash");
+        let staging_ref = "staging/manual-crash";
+        let staging = manager.artifact_store_root.join(staging_ref);
         let (size, hash) =
             stream_into_new_file(&mut Cursor::new(b"orphan".as_slice()), &staging, 1_024).unwrap();
-        place_blob(&manager.artifact_store_root, &staging, &hash, size, false).unwrap();
+        place_blob(
+            &manager.artifact_store_dir,
+            staging_ref,
+            &hash,
+            size,
+            false,
+            "manual-crash",
+        )
+        .unwrap();
         std::fs::write(
             manager.artifact_store_root.join("staging/raw-residue"),
             b"unknown",
@@ -2370,11 +2985,12 @@ mod tests {
             resolve_internal_ref(&manager.artifact_store_root, &staging_ref).unwrap();
         let (size, hash) = hash_file(&staging_path).unwrap();
         place_blob(
-            &manager.artifact_store_root,
-            &staging_path,
+            &manager.artifact_store_dir,
+            &staging_ref,
             &hash,
             size,
             true,
+            "pub-crash",
         )
         .unwrap();
 
@@ -2513,6 +3129,323 @@ mod tests {
         assert!(matches!(
             manager.scope_artifact_reads("T-other", None, &[artifact.artifact_id]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
+    fn live_writer_cannot_publish_and_can_continue_until_durable_finish() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-live"))
+            .unwrap();
+        let mut writer = manager.open_artifact_output("alloc-live").unwrap();
+        writer.write_all(b"partial").unwrap();
+        let early = manager
+            .publish_artifact_output(&publication("pub-live", "alloc-live"))
+            .unwrap();
+        assert!(!early.published);
+        assert_eq!(early.reason_code, "ARTIFACT_ALLOCATION_STATE_CONFLICT");
+        writer.write_all(b"-finished").unwrap();
+        assert_eq!(writer.finish().unwrap(), 16);
+        let published = manager
+            .publish_artifact_output(&publication("pub-live", "alloc-live"))
+            .unwrap();
+        assert!(published.published);
+        let scope = manager
+            .scope_artifact_reads(
+                "T-artifact",
+                None,
+                &[published.artifact_id.clone().unwrap()],
+            )
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, published.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"partial-finished");
+    }
+
+    #[test]
+    fn writer_limit_is_clamped_to_global_import_limit() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let mut request = allocation("alloc-global-limit");
+        request.max_size_bytes = Some(IMPORT_LIMIT + 1);
+        manager.allocate_artifact_output(&request).unwrap();
+        let writer = manager.open_artifact_output("alloc-global-limit").unwrap();
+        assert_eq!(writer.maximum, IMPORT_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_capability_rejects_staging_and_blob_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-link-escape"))
+            .unwrap();
+        symlink(
+            outside.path(),
+            manager.artifact_store_root.join("staging").join("escape"),
+        )
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET staging_ref='staging/escape/output' WHERE allocation_id='alloc-link-escape'",
+                [],
+            )
+            .unwrap();
+        assert!(manager.open_artifact_output("alloc-link-escape").is_err());
+        assert!(!outside.path().join("output").exists());
+
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"inside".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads("T-artifact", None, &[artifact.artifact_id.clone()])
+            .unwrap();
+        std::fs::write(outside.path().join("external-blob"), b"inside").unwrap();
+        symlink(
+            outside.path(),
+            manager.artifact_store_root.join("blobs").join("escape"),
+        )
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_blobs SET storage_ref='blobs/escape/external-blob' WHERE content_hash=?1",
+                [artifact.content_hash.tagged()],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_store_root_cannot_be_preplaced_as_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let database = temp.path().join("preplaced.sqlite");
+        symlink(
+            outside.path(),
+            temp.path().join("preplaced.sqlite.artifacts"),
+        )
+        .unwrap();
+        assert!(matches!(
+            TaskManager::open_with_clock(database, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store root must be a real directory"
+            ))
+        ));
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn partial_final_blob_is_never_overwritten_and_pending_blob_is_reconciled() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"complete-content";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        manager
+            .artifact_store_dir
+            .create_dir_all(format!("blobs/sha256/{}/{}", &digest[..2], &digest[2..4]))
+            .unwrap();
+        manager
+            .artifact_store_dir
+            .write(&final_ref, b"partial")
+            .unwrap();
+        assert!(matches!(
+            manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice())),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
+            b"partial"
+        );
+
+        manager.artifact_store_dir.remove_file(&final_ref).unwrap();
+        let pending_ref = format!("blobs/pending/{digest}-interrupted");
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+        let report = manager.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobOrphaned
+                && finding.content_hash.as_deref() == Some(hash.as_str())
+        }));
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(final_ref)).unwrap(),
+            bytes
+        );
+        assert!(!manager.artifact_store_root.join(pending_ref).exists());
+    }
+
+    #[test]
+    fn cancelled_task_cannot_import_or_publish() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-cancelled"))
+            .unwrap();
+        write_output(&mut manager, "alloc-cancelled", b"candidate");
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.import_artifact(&import_request(), &mut Cursor::new(b"input".as_slice())),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let result = manager
+            .publish_artifact_output(&publication("pub-cancelled", "alloc-cancelled"))
+            .unwrap();
+        assert!(!result.published);
+        assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+    }
+
+    #[test]
+    fn superseded_attempt_cannot_publish_after_a_new_latest_binding_exists() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let program_hash = allocation("unused").semantic_program_hash;
+        manager
+            .connection
+            .execute_batch(&format!(
+                "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES ('registry-artifact','{{}}','2026-09-19T00:00:00Z');
+                 INSERT INTO semantic_program_revisions(task_id,program_revision,program_id,ir_version,semantic_hash,registry_snapshot_id,status,program_json,created_at) VALUES ('T-artifact',1,'program-artifact','0.1','{program_hash}','registry-artifact','active','{{}}','2026-09-19T00:00:00Z');
+                 UPDATE tasks SET state='RUNNING',active_program_revision=1,active_step_ids_json='[\"compose_report\"]' WHERE task_id='T-artifact';
+                 INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at) VALUES ('binding-old','attempt-old','T-artifact','{program_hash}','registry-artifact','0.1','compose_report','document.compose','provider:test','1',1,'[]','[]','profile:test','{{}}','{{}}','2026-09-19T00:00:00Z');
+                 INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,created_at,updated_at) VALUES ('attempt-old','T-artifact','{program_hash}','registry-artifact','compose_report','binding-old',1,1,'RUNNING','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');"
+            ))
+            .unwrap();
+        let mut request = allocation("alloc-stale");
+        request.binding_id = Some("binding-old".to_owned());
+        request.attempt_id = Some("attempt-old".to_owned());
+        manager.allocate_artifact_output(&request).unwrap();
+        write_output(&mut manager, "alloc-stale", b"stale");
+        manager
+            .connection
+            .execute_batch(&format!(
+                "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at) VALUES ('binding-new','attempt-new','T-artifact','{program_hash}','registry-artifact','0.1','compose_report','document.compose','provider:test','1',2,'[]','[]','profile:test','{{}}','{{}}','2026-09-19T00:01:00Z');
+                 INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,created_at,updated_at) VALUES ('attempt-new','T-artifact','{program_hash}','registry-artifact','compose_report','binding-new',2,1,'RUNNING','2026-09-19T00:01:00Z','2026-09-19T00:01:00Z');"
+            ))
+            .unwrap();
+        let result = manager
+            .publish_artifact_output(&publication("pub-stale", "alloc-stale"))
+            .unwrap();
+        assert!(!result.published);
+        assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn committed_replay_authenticates_receipt_rows_and_blob_bytes() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-replay"))
+            .unwrap();
+        write_output(&mut manager, "alloc-replay", b"replay");
+        let request = publication("pub-replay", "alloc-replay");
+        let original = manager.publish_artifact_output(&request).unwrap();
+        assert!(original.published);
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=json_set(result_json,'$.size_bytes',999) WHERE publication_id='pub-replay'",
+                [],
+            )
+            .unwrap();
+        let replay = manager.publish_artifact_output(&request).unwrap();
+        assert!(!replay.published);
+        assert_eq!(replay.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                params![
+                    request.publication_id,
+                    serde_json::to_string(&original).unwrap()
+                ],
+            )
+            .unwrap();
+        let storage_ref = manager
+            .connection
+            .query_row(
+                "SELECT storage_ref FROM artifact_blobs WHERE content_hash=?1",
+                [original.content_hash.as_deref().unwrap()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        manager
+            .artifact_store_dir
+            .remove_file(&storage_ref)
+            .unwrap();
+        let missing = manager.publish_artifact_output(&request).unwrap();
+        assert!(!missing.published);
+        assert_eq!(missing.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+    }
+
+    #[test]
+    fn hardlink_database_alias_reuses_bound_artifact_root() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let alias = temp.path().join("database-alias.sqlite");
+        let manager = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let root = manager.artifact_store_root.clone();
+        drop(manager);
+        std::fs::hard_link(&database, &alias).unwrap();
+        let reopened = TaskManager::open_with_clock(&alias, Box::new(FixedClock)).unwrap();
+        assert_eq!(reopened.artifact_store_root, root);
+        let bound_root = reopened
+            .connection
+            .query_row(
+                "SELECT canonical_root FROM artifact_store_binding WHERE singleton_id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(bound_root), root);
+        let attacker_root = TempDir::new().unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE artifact_store_binding SET canonical_root=?1 WHERE singleton_id=1",
+                [attacker_root.path().to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(reopened);
+        assert!(matches!(
+            TaskManager::open_with_clock(&alias, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store root identity does not match its database binding"
+            ))
         ));
     }
 }

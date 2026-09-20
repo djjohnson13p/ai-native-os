@@ -469,7 +469,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -3943,6 +3943,7 @@ fn persisted_step_timestamp_and_migration_chain_are_strict() {
         "0002_task_manager_contract_reconciliation",
         "0003_task_manager_recovery_fencing_privacy",
         "0004_task_manager_review_hardening",
+        "0005_artifact_store_root_binding",
     ] {
         assert_eq!(
             manager

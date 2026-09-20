@@ -78,6 +78,7 @@ name = "aios-task-manager"
 version = "0.1.0"
 dependencies = [
  "aios-ir",
+ "cap-std",
  "fs2",
  "jsonschema",
  "rusqlite",

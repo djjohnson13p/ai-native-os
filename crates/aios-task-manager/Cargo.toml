@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 aios-ir.workspace = true
+cap-std.workspace = true
 fs2.workspace = true
 jsonschema.workspace = true
 rusqlite.workspace = true
