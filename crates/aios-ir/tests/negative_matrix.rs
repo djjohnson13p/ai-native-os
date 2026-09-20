@@ -274,6 +274,21 @@ fn required_artifact_read_must_cover_each_direct_artifact_input() {
 }
 
 #[test]
+fn fallback_required_artifact_read_must_cover_each_direct_artifact_input() {
+    let registry = modified_registry("artifact.copy", |contract| {
+        contract.required_effect_classes = vec![EffectClass::ArtifactWrite];
+        contract.required_authority_classes = vec!["artifact.write".to_owned()];
+    });
+    let mut program = fallback_copy();
+    program["nodes"][0]["authority_requests"][0]["resource"] = json!("task.output");
+
+    assert_code(
+        &validate(registry, &program),
+        ValidatorReasonCode::IrRequiredAuthorityMissing,
+    );
+}
+
+#[test]
 fn fallback_relation_rejects_multi_capability_cycles() {
     let mut program = fallback_copy();
     let mut reverse = program["nodes"][0].clone();

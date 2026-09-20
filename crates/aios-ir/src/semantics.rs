@@ -851,6 +851,20 @@ fn validate_fallbacks(
                 continue;
             };
 
+            if fallback
+                .required_authority_classes
+                .iter()
+                .any(|action| action == "artifact.read")
+            {
+                validate_required_artifact_read_resources(
+                    program,
+                    node,
+                    fallback,
+                    node_index,
+                    diagnostics,
+                );
+            }
+
             if !fallback_ports_compatible(program, node, primary, fallback) {
                 diagnostics.push(contextual(
                     ValidatorReasonCode::IrFallbackPortMismatch,
