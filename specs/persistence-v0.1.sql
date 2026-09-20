@@ -591,8 +591,8 @@ CREATE TABLE IF NOT EXISTS provider_invocations (
 CREATE TABLE IF NOT EXISTS operations (
     operation_id             TEXT PRIMARY KEY,
     task_id                  TEXT NOT NULL,
-    semantic_program_hash    TEXT NOT NULL,
-    node_id                  TEXT NOT NULL,
+    semantic_program_hash    TEXT,
+    node_id                  TEXT,
     binding_id               TEXT,
     attempt_id               TEXT,
     transaction_class        TEXT,

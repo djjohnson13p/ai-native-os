@@ -1238,6 +1238,10 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when durable state cannot be read or a recovery
     /// transition cannot be committed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps nonterminal recovery transitions and immutable terminal recovery reporting in one startup scan"
+    )]
     pub(crate) fn recover_startup(&mut self) -> Result<Vec<TransitionResult>> {
         self.verify_nonterminal_heads()?;
         let candidates = {
@@ -1317,6 +1321,37 @@ impl TaskManager {
                 ));
             }
             results.push(result);
+        }
+        // Terminal state is immutable, but new consequential evidence may be
+        // discovered during startup Artifact/export reconciliation. Persist a
+        // deterministic recovery inventory for reporting and subject-level
+        // reconciliation without fabricating a terminal -> RECOVERING edge.
+        let terminal_tasks = {
+            let mut statement = self.connection.prepare(
+                "SELECT task_id,revision FROM tasks
+                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK')
+                 ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (task_id, revision) in terminal_tasks {
+            let revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let inventory = unresolved_execution_ids(&self.connection, &task_id)?;
+            if inventory.is_empty() {
+                continue;
+            }
+            let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
+            self.persist_recovery_inventory(
+                &recovery_ref,
+                &task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+            )?;
         }
         Ok(results)
     }
@@ -2901,7 +2936,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -2939,6 +2974,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0006_artifact_writer_admission",
         "artifact-writer-admission-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0007_artifact_owner_export_context",
+        "artifact-owner-export-context-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3041,6 +3081,19 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 "artifact writer admission migration is incomplete",
             ));
         }
+        let has_v7 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v7
+            && (table_column_not_null(connection, "operations", "semantic_program_hash")?
+                || table_column_not_null(connection, "operations", "node_id")?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact owner export context migration is incomplete",
+            ));
+        }
     }
     let has_steps = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'step_executions')",
@@ -3110,6 +3163,11 @@ fn migrate_task_manager_schema(
         connection,
         "0006_artifact_writer_admission",
         "artifact-writer-admission-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0007_artifact_owner_export_context",
+        "artifact-owner-export-context-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -3222,6 +3280,49 @@ fn migrate_task_manager_schema(
                 "ALTER TABLE artifact_output_allocations ADD COLUMN writer_grant_one_shot_consumed INTEGER CHECK (writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1));",
             )?;
         }
+        let has_owner_export_context = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_owner_export_context
+            && (table_column_not_null(connection, "operations", "semantic_program_hash")?
+                || table_column_not_null(connection, "operations", "node_id")?)
+        {
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS ix_operations_task_state;
+                 ALTER TABLE operations RENAME TO operations_legacy;
+                 CREATE TABLE operations (
+                     operation_id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     semantic_program_hash TEXT,
+                     node_id TEXT,
+                     binding_id TEXT,
+                     attempt_id TEXT,
+                     transaction_class TEXT,
+                     effect_class TEXT NOT NULL,
+                     idempotency_key TEXT,
+                     state TEXT NOT NULL CHECK (state IN (
+                         'PREPARED','STARTED','SUCCEEDED','FAILED','UNKNOWN','CANCELLED'
+                     )),
+                     outcome_certainty TEXT CHECK (outcome_certainty IS NULL OR outcome_certainty IN (
+                         'NOT_STARTED','STARTED_NO_EFFECT','COMPLETED',
+                         'FAILED_NO_EFFECT','FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'
+                     )),
+                     external_receipt TEXT,
+                     details_json TEXT,
+                     prepared_at TEXT NOT NULL,
+                     started_at TEXT,
+                     finished_at TEXT,
+                     FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+                     FOREIGN KEY (binding_id) REFERENCES execution_bindings(binding_id),
+                     FOREIGN KEY (attempt_id) REFERENCES step_executions(attempt_id)
+                 );
+                 INSERT INTO operations SELECT * FROM operations_legacy;
+                 DROP TABLE operations_legacy;
+                 CREATE INDEX ix_operations_task_state ON operations(task_id,state);",
+            )?;
+        }
         let duplicate_publications = connection.query_row(
             "SELECT COUNT(*) FROM (SELECT allocation_id FROM artifact_publications GROUP BY allocation_id HAVING COUNT(*) > 1)",
             [],
@@ -3260,6 +3361,10 @@ fn migrate_task_manager_schema(
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0006_artifact_writer_admission', 'artifact-writer-admission-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0007_artifact_owner_export_context', 'artifact-owner-export-context-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -3594,6 +3699,22 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
         }
     }
     Ok(false)
+}
+
+fn table_column_not_null(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+    })?;
+    for stored in columns {
+        let (name, not_null) = stored?;
+        if name == column {
+            return Ok(not_null);
+        }
+    }
+    Err(TaskManagerError::InvalidRecord(
+        "required persistence column is missing",
+    ))
 }
 
 fn require_migration_tables(connection: &Connection, tables: &[&str]) -> Result<()> {

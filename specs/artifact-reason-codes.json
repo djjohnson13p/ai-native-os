@@ -18,6 +18,9 @@
     {"code": "ARTIFACT_INTEGRITY_FAILED", "severity": "error", "meaning": "published Artifact metadata exists but referenced immutable content is missing/corrupt"},
     {"code": "ARTIFACT_STAGING_ORPHANED", "severity": "warning", "meaning": "unpublished staging bytes remain after interrupted/expired allocation and require cleanup/quarantine"},
     {"code": "ARTIFACT_BLOB_ORPHANED", "severity": "warning", "meaning": "immutable blob exists without a retained published Artifact reference"},
-    {"code": "ARTIFACT_EXPORT_FAILED", "severity": "error", "meaning": "authorized export to user/external destination failed"}
+    {"code": "ARTIFACT_EXPORT_FAILED", "severity": "error", "meaning": "authorized export to user/external destination failed"},
+    {"code": "ARTIFACT_EXPORT_FAILED_NO_EFFECT", "severity": "error", "meaning": "authorized export failed before any external destination effect was possible and may be retried safely"},
+    {"code": "ARTIFACT_EXPORT_OUTCOME_UNKNOWN", "severity": "error", "meaning": "authorized export may have affected the external destination and requires deterministic reconciliation"},
+    {"code": "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT", "severity": "error", "meaning": "export operation ID was previously used for a non-equivalent export intent"}
   ]
 }
