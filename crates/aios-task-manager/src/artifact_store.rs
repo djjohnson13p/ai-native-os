@@ -554,29 +554,29 @@ struct ArtifactExportIntent {
 
 /// Exact durable export identity presented to a trusted external-outcome verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ArtifactExportReconciliationSubject {
-    pub(crate) operation_id: String,
-    pub(crate) task_id: String,
-    pub(crate) artifact_id: String,
-    pub(crate) content_hash: String,
-    pub(crate) destination_class: String,
-    pub(crate) max_size_bytes: u64,
-    pub(crate) principal_kind: String,
-    pub(crate) principal_id: String,
-    pub(crate) semantic_program_hash: Option<String>,
-    pub(crate) node_id: Option<String>,
-    pub(crate) binding_id: Option<String>,
-    pub(crate) attempt_id: Option<String>,
-    pub(crate) grant_id: Option<String>,
+pub struct ArtifactExportReconciliationSubject {
+    pub operation_id: String,
+    pub task_id: String,
+    pub artifact_id: String,
+    pub content_hash: String,
+    pub destination_class: String,
+    pub max_size_bytes: u64,
+    pub principal_kind: String,
+    pub principal_id: String,
+    pub semantic_program_hash: Option<String>,
+    pub node_id: Option<String>,
+    pub binding_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub grant_id: Option<String>,
 }
 
 /// Authenticated durable observation returned only by a trusted reconciliation adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VerifiedArtifactExportNoEffect {
-    pub(crate) subject: ArtifactExportReconciliationSubject,
-    pub(crate) evidence_ref: String,
-    pub(crate) proof_hash: String,
-    pub(crate) observed_at: String,
+pub struct VerifiedArtifactExportNoEffect {
+    pub subject: ArtifactExportReconciliationSubject,
+    pub evidence_ref: String,
+    pub proof_hash: String,
+    pub observed_at: String,
 }
 
 /// Trusted adapter boundary for independently checking external destination state.
@@ -584,7 +584,7 @@ pub(crate) struct VerifiedArtifactExportNoEffect {
 /// The adapter receives the Task Manager's stored immutable subject and must retrieve and verify
 /// durable evidence independently. Callers cannot supply a serializable evidence assertion to the
 /// Task Manager reconciliation method.
-pub(crate) trait ArtifactExportOutcomeVerifier {
+pub trait ArtifactExportOutcomeVerifier {
     fn verifier_id(&self) -> &str;
 
     fn verify_no_effect(
@@ -1455,6 +1455,7 @@ impl TaskManager {
         if session.issuer_id != self.artifact_scope_issuer {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        ensure_task_is_not_recovering(&self.connection, &session.task_id)?;
         ensure_no_unknown_artifact_export(&self.connection, &session.task_id)?;
         Ok(())
     }
@@ -1557,7 +1558,7 @@ impl TaskManager {
         session: &ProviderArtifactSession,
         request: &OutputAllocationRequest,
     ) -> Result<ArtifactOutputAllocation> {
-        validate_allocation_request(request, &self.clock.now())?;
+        validate_allocation_request_shape(request)?;
         self.validate_provider_artifact_session(session)?;
         if request.task_id != session.task_id
             || request.binding_id.as_deref() != Some(session.authority.binding_id.as_str())
@@ -1586,6 +1587,7 @@ impl TaskManager {
                 ))
             };
         }
+        validate_allocation_request_expiry(request, &self.clock.now())?;
         self.allocate_artifact_output(request)
     }
 
@@ -1593,7 +1595,9 @@ impl TaskManager {
         &mut self,
         request: &OutputAllocationRequest,
     ) -> Result<ArtifactOutputAllocation> {
-        validate_allocation_request(request, &self.clock.now())?;
+        validate_allocation_request_shape(request)?;
+        validate_allocation_request_expiry(request, &self.clock.now())?;
+        ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
         ensure_no_unknown_artifact_export(&self.connection, &request.task_id)?;
         let created_at = self.clock.now();
         let staging_ref = format!("staging/output-{}", random_token(&self.connection)?);
@@ -2889,7 +2893,7 @@ impl TaskManager {
         clippy::too_many_lines,
         reason = "keeps export evidence authentication, idempotent provenance, and certainty transition atomic"
     )]
-    pub(crate) fn reconcile_unknown_artifact_export_no_effect(
+    pub fn reconcile_unknown_artifact_export_no_effect(
         &mut self,
         operation_id: &str,
         verifier: &dyn ArtifactExportOutcomeVerifier,
@@ -2898,7 +2902,7 @@ impl TaskManager {
         let row = self
             .connection
             .query_row(
-                "SELECT task_id,state,outcome_certainty,details_json FROM operations
+                "SELECT task_id,state,outcome_certainty,details_json,started_at,finished_at FROM operations
                  WHERE operation_id=?1 AND transaction_class='irreversible_external'
                    AND effect_class='DATA_EGRESS'",
                 [operation_id],
@@ -2908,6 +2912,8 @@ impl TaskManager {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
@@ -2939,7 +2945,19 @@ impl TaskManager {
             "invalid Artifact export reconciliation evidence reference",
         )?;
         validate_hash(&observation.proof_hash)?;
-        parse_time(&observation.observed_at)?;
+        let observed_at = parse_time(&observation.observed_at)?;
+        let effect_boundary =
+            row.5
+                .as_deref()
+                .or(row.4.as_deref())
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact export operation lacks an effect boundary timestamp",
+                ))?;
+        if observed_at < parse_time(effect_boundary)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation evidence predates the effect boundary",
+            ));
+        }
         let subject_json = canonical_json(&subject)?;
         let mut subject_hasher = Sha256::new();
         subject_hasher.update(b"AIOS-ARTIFACT-EXPORT-RECONCILIATION-SUBJECT\0v1\0");
@@ -3018,9 +3036,14 @@ impl TaskManager {
                 "SELECT task_id,event_id,event_json FROM provenance_events
                  WHERE event_type='execution.completed' AND (
                    json_extract(event_json,'$.details.export_reconciliation.proof_hash')=?1 OR
-                   json_extract(event_json,'$.details.export_reconciliation.evidence_ref')=?2
+                   (json_extract(event_json,'$.details.export_reconciliation.verifier_id')=?2 AND
+                    json_extract(event_json,'$.details.export_reconciliation.evidence_ref')=?3)
                  ) ORDER BY task_id,event_id LIMIT 1",
-                params![observation.proof_hash, observation.evidence_ref],
+                params![
+                    observation.proof_hash,
+                    verifier.verifier_id(),
+                    observation.evidence_ref
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -3090,8 +3113,14 @@ impl TaskManager {
                 "Artifact export reconciliation operation is not unknown",
             ));
         }
+        super::reconcile_recovery_subject_in_transaction(
+            &transaction,
+            &recovery_ref,
+            &inventory_id,
+            &event_timestamp,
+        )?;
         transaction.commit()?;
-        self.reconcile_recovery_subject(&recovery_ref, &inventory_id)
+        Ok(())
     }
 
     pub(crate) fn reconcile_export_operations_startup(&mut self) -> Result<()> {
@@ -3252,6 +3281,7 @@ impl TaskManager {
             })
             .map(|(allocation_id, staging_ref, _)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let mut removed_import_residue = false;
         for entry in self.artifact_store_dir.read_dir("staging")? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
@@ -3263,6 +3293,11 @@ impl TaskManager {
                     continue;
                 }
                 let staging_ref = format!("staging/{name}");
+                if name.starts_with("import-") && !staged_by_ref.contains_key(&staging_ref) {
+                    self.artifact_store_dir
+                        .remove_file(safe_internal_ref(&staging_ref)?)?;
+                    removed_import_residue = true;
+                }
                 findings.push(ArtifactReconciliationFinding {
                     kind: ArtifactReconciliationKind::StagingOrphaned,
                     allocation_id: staged_by_ref.get(&staging_ref).cloned(),
@@ -3270,6 +3305,9 @@ impl TaskManager {
                     artifact_ids: Vec::new(),
                 });
             }
+        }
+        if removed_import_residue {
+            sync_cap_directory(&self.artifact_store_dir, "staging")?;
         }
         Ok(ArtifactReconciliationReport {
             reconciled_at,
@@ -3926,6 +3964,7 @@ fn validate_writer_fence(
     let allocation = load_allocation_row(connection, allocation_id)?.ok_or(
         TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
     )?;
+    ensure_task_is_not_recovering(connection, &allocation.task_id)?;
     ensure_no_unknown_artifact_export(connection, &allocation.task_id)?;
     if allocation.state != "WRITING" || parse_time(&allocation.expires_at)? <= parse_time(now)? {
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
@@ -4746,6 +4785,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
     if !owns_fence {
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
     }
+    ensure_task_is_not_recovering(&reader.authority_connection, &reader.task_id)?;
     ensure_no_unknown_artifact_export(&reader.authority_connection, &reader.task_id)?;
     let intact = reader.authority_connection.query_row(
         "SELECT EXISTS(
@@ -5069,7 +5109,7 @@ fn validate_import_request(request: &ImportArtifactRequest) -> Result<()> {
     Ok(())
 }
 
-fn validate_allocation_request(request: &OutputAllocationRequest, now: &str) -> Result<()> {
+fn validate_allocation_request_shape(request: &OutputAllocationRequest) -> Result<()> {
     if request.schema_version != SCHEMA_VERSION
         || request.allowed_media_types.len() > 32
         || !all_unique(&request.allowed_media_types)
@@ -5090,7 +5130,6 @@ fn validate_allocation_request(request: &OutputAllocationRequest, now: &str) -> 
             .as_ref()
             .is_some_and(|value| value.is_empty() || value.chars().count() > 256)
         || request.binding_id.is_some() != request.attempt_id.is_some()
-        || parse_time(&request.expires_at)? <= parse_time(now)?
     {
         return Err(TaskManagerError::InvalidRecord(
             "invalid Artifact output allocation",
@@ -5105,6 +5144,15 @@ fn validate_allocation_request(request: &OutputAllocationRequest, now: &str) -> 
     validate_id(&request.node_id, 128, "invalid Artifact allocation node")?;
     validate_hash(&request.semantic_program_hash)?;
     validate_optional_semantic_type(request.expected_semantic_type.as_deref())?;
+    Ok(())
+}
+
+fn validate_allocation_request_expiry(request: &OutputAllocationRequest, now: &str) -> Result<()> {
+    if parse_time(&request.expires_at)? <= parse_time(now)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "invalid Artifact output allocation",
+        ));
+    }
     Ok(())
 }
 
@@ -5562,7 +5610,11 @@ fn stream_into_new_internal_file<R: Read>(
     let result = stream_into_file(reader, &mut file, maximum);
     if result.is_err() {
         drop(file);
-        let _ = store.remove_file(&relative);
+        match store.remove_file(&relative) {
+            Ok(()) => sync_cap_directory(store, "staging")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     result
 }
@@ -5814,6 +5866,7 @@ fn validate_export_destination_fence(
     destination_class: &str,
     grant_admission: Option<&GrantAdmission>,
 ) -> Result<()> {
+    ensure_task_is_not_recovering(connection, task_id)?;
     let now = clock.now();
     match (&authority.execution, grant_admission) {
         (Some(execution), Some(admission)) => {
@@ -5861,7 +5914,7 @@ fn unresolved_export_effect_exists(
                    AND json_extract(details_json,'$.content_hash')=?3
                    AND json_extract(details_json,'$.destination_class')=?4
                    AND (
-                       state IN ('PREPARED','STARTED','SUCCEEDED','UNKNOWN')
+                       state IN ('PREPARED','STARTED','UNKNOWN')
                        OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')
                    )
              )",
@@ -5895,6 +5948,19 @@ fn ensure_no_unknown_artifact_export(connection: &Connection, task_id: &str) -> 
         Err(TaskManagerError::InvalidRecord(
             "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
         ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_task_is_not_recovering(connection: &Connection, task_id: &str) -> Result<()> {
+    let recovering = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1 AND state='RECOVERING')",
+        [task_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if recovering {
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
     } else {
         Ok(())
     }
@@ -6259,6 +6325,9 @@ fn validate_hash(value: &str) -> Result<()> {
 
 fn validate_optional_semantic_type(value: Option<&str>) -> Result<()> {
     let valid = value.is_none_or(|value| {
+        if value.is_empty() {
+            return true;
+        }
         let Some((name, version)) = value.split_once('@') else {
             return false;
         };
@@ -6861,6 +6930,7 @@ mod tests {
         verifier_id: &'static str,
         evidence_ref: String,
         proof_hash: String,
+        observed_at: String,
         subject_mutation: TestExportSubjectMutation,
     }
 
@@ -6908,7 +6978,7 @@ mod tests {
                 subject: verified_subject,
                 evidence_ref: self.evidence_ref.clone(),
                 proof_hash: self.proof_hash.clone(),
-                observed_at: "2026-09-19T22:00:00Z".to_owned(),
+                observed_at: self.observed_at.clone(),
             })
         }
     }
@@ -6921,6 +6991,7 @@ mod tests {
             verifier_id: "adapter:test-destination-status",
             evidence_ref: evidence_ref.to_owned(),
             proof_hash: format!("sha256:{}", proof_digit.to_string().repeat(64)),
+            observed_at: "2026-09-19T22:00:00Z".to_owned(),
             subject_mutation: TestExportSubjectMutation::None,
         }
     }
@@ -7476,13 +7547,13 @@ mod tests {
                 .unwrap(),
             8
         );
-        assert!(matches!(
-            manager.export_artifact(&scope, &first.artifact_id, &mut export_two),
-            Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
-            ))
-        ));
-        assert!(export_two.writer.is_none());
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &first.artifact_id, &mut export_two)
+                .unwrap(),
+            8
+        );
+        assert!(export_two.writer.is_some());
         assert_eq!(
             manager
                 .get_artifact(&first.artifact_id)
@@ -7728,13 +7799,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            manager.export_artifact(&scope, &artifact.artifact_id, &mut fresh_operation),
-            Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
-            ))
-        ));
-        assert_eq!(fresh_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut fresh_operation)
+                .unwrap(),
+            13
+        );
+        assert_eq!(fresh_opens.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -8523,6 +8594,47 @@ mod tests {
 
         let verifier = export_no_effect_verifier("evidence:destination-unchanged", 'a');
         manager
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_export_recovery_assessment
+                 BEFORE UPDATE ON recovery_assessments
+                 WHEN OLD.subject_kind<>'task'
+                 BEGIN SELECT RAISE(ABORT,'injected assessment failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            manager
+                .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier,)
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-finalize-recovery'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events
+                     WHERE json_extract(event_json,'$.details.export_reconciliation.proof_hash')=?1",
+                    [&verifier.proof_hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER fail_export_recovery_assessment;")
+            .unwrap();
+        manager
             .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier)
             .unwrap();
         // A response-loss retry authenticates and reuses the immutable resolution event.
@@ -8623,6 +8735,60 @@ mod tests {
     }
 
     #[test]
+    fn recovering_task_denies_retained_provider_artifact_authority_without_export_unknown() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"recovery fence".as_slice()),
+            )
+            .unwrap();
+        let allocation_id = "alloc-recovery-provider-fence";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "recovery-provider-fence",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("artifact.write", "output-allocation", allocation_id),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reader.read(&mut [0_u8; 1]),
+            Err(error) if error.to_string().contains("ARTIFACT_AUTHORITY_DENIED")
+        ));
+        assert!(matches!(
+            manager.scope_artifact_reads(&session, &[artifact.artifact_id]),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        assert!(matches!(
+            manager.allocate_bound_artifact_output(&session, &request),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+    }
+
+    #[test]
     fn authenticated_unknown_export_resolution_releases_recovery_when_all_subjects_are_safe() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -8663,6 +8829,7 @@ mod tests {
             verifier_id: "adapter:test-destination-status",
             evidence_ref: "evidence:forged".to_owned(),
             proof_hash: "sha256:not-a-proof".to_owned(),
+            observed_at: "2026-09-19T22:00:00Z".to_owned(),
             subject_mutation: TestExportSubjectMutation::None,
         };
         assert!(
@@ -8702,6 +8869,14 @@ mod tests {
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
+        let mut stale = export_no_effect_verifier("evidence:stale-preflight", 'e');
+        stale.observed_at = "2026-09-19T21:59:59Z".to_owned();
+        assert!(matches!(
+            manager.reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &stale,),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation evidence predates the effect boundary"
+            ))
+        ));
         assert!(matches!(
             manager.scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()]),
             Err(TaskManagerError::InvalidRecord(
@@ -8854,7 +9029,8 @@ mod tests {
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
-        let second_proof = export_no_effect_verifier("evidence:terminal-second", 'e');
+        let mut second_proof = export_no_effect_verifier("evidence:terminal-first", 'e');
+        second_proof.verifier_id = "adapter:independent-destination-status";
         manager
             .reconcile_unknown_artifact_export_no_effect("export-terminal-second", &second_proof)
             .unwrap();
@@ -9278,6 +9454,17 @@ mod tests {
         let mut valid = import_request();
         valid.semantic_type = Some("artifact.report_v2@0".to_owned());
         validate_import_request(&valid).unwrap();
+        valid.semantic_type = Some(String::new());
+        validate_import_request(&valid).unwrap();
+        let mut empty_allocation = allocation("alloc-empty-semantic-type");
+        empty_allocation.expected_semantic_type = Some(String::new());
+        validate_allocation_request_shape(&empty_allocation).unwrap();
+        let mut empty_publication = publication(
+            "publication-empty-semantic-type",
+            "alloc-empty-semantic-type",
+        );
+        empty_publication.semantic_type = Some(String::new());
+        validate_publication_request(&empty_publication).unwrap();
 
         let mut oversized_format = import_request();
         oversized_format.format = Some("x".repeat(161));
@@ -9508,6 +9695,10 @@ mod tests {
             b"unknown",
         )
         .unwrap();
+        let abandoned_import = manager
+            .artifact_store_root
+            .join("staging/import-response-loss");
+        std::fs::write(&abandoned_import, b"uncommitted import").unwrap();
         manager
             .allocate_artifact_output(&allocation("alloc-staged"))
             .unwrap();
@@ -9519,6 +9710,13 @@ mod tests {
             finding.kind == ArtifactReconciliationKind::BlobOrphaned
                 && finding.content_hash.as_deref() == Some(hash.as_str())
         }));
+        assert!(!abandoned_import.exists());
+        assert!(
+            manager
+                .artifact_store_root
+                .join("staging/raw-residue")
+                .exists()
+        );
         assert!(report.findings.iter().any(|finding| {
             finding.kind == ArtifactReconciliationKind::StagingOrphaned
                 && finding.allocation_id.as_deref() == Some("alloc-staged")
@@ -11274,6 +11472,22 @@ mod tests {
         manager
             .allocate_bound_artifact_output(&session, &request)
             .unwrap();
+
+        request.expires_at = "2026-09-19T21:59:59Z".to_owned();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET expires_at=?2 WHERE allocation_id=?1",
+                params![request.allocation_id, request.expires_at],
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .allocate_bound_artifact_output(&session, &request)
+                .unwrap()
+                .allocation_id,
+            allocation_id
+        );
 
         request.schema_version = "9.9".to_owned();
         assert!(matches!(

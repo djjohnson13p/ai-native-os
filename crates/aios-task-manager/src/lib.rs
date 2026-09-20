@@ -16,12 +16,14 @@ mod artifact_store;
 
 pub use artifact_store::{
     ArtifactAllocationState, ArtifactExpectedState, ArtifactExportDestination,
-    ArtifactExportWriter, ArtifactHandle, ArtifactIntegrity, ArtifactIntegrityState,
-    ArtifactLineage, ArtifactOrigin, ArtifactOriginKind, ArtifactOutputAllocation,
-    ArtifactPublicationRequest, ArtifactPublicationResult, ArtifactReadScope, ArtifactReader,
-    ArtifactReconciliationFinding, ArtifactReconciliationKind, ArtifactReconciliationReport,
-    ArtifactRetention, ArtifactStagingWriter, ArtifactUri, ContentHash, ImportArtifactRequest,
+    ArtifactExportOutcomeVerifier, ArtifactExportReconciliationSubject, ArtifactExportWriter,
+    ArtifactHandle, ArtifactIntegrity, ArtifactIntegrityState, ArtifactLineage, ArtifactOrigin,
+    ArtifactOriginKind, ArtifactOutputAllocation, ArtifactPublicationRequest,
+    ArtifactPublicationResult, ArtifactReadScope, ArtifactReader, ArtifactReconciliationFinding,
+    ArtifactReconciliationKind, ArtifactReconciliationReport, ArtifactRetention,
+    ArtifactStagingWriter, ArtifactUri, ContentHash, ImportArtifactRequest,
     OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
+    VerifiedArtifactExportNoEffect,
 };
 
 use std::fmt;
@@ -1531,123 +1533,11 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let (task_id, epoch_id) = transaction
-            .query_row(
-                "SELECT task_id, recovery_epoch_id FROM recovery_assessments WHERE assessment_id=?1 AND subject_kind='task'",
-                [recovery_ref],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .ok_or(TaskManagerError::InvalidRecord(
-                "recovery reference does not exist",
-            ))?;
-        let inventoried = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
-            params![recovery_ref, inventory_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        let resolution = resolved_recovery_subject(&transaction, &task_id, inventory_id)?;
-        let Some(resolution) = resolution.filter(|_| inventoried) else {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery subject lacks a safe durable outcome",
-            ));
-        };
-        let rows = {
-            let mut statement = transaction.prepare(
-                "SELECT assessment_id, subject_kind, subject_id, basis_revision, created_at FROM recovery_assessments WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'",
-            )?;
-            let rows = statement.query_map(params![task_id, epoch_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let Some((assessment_id, subject_kind, subject_id, basis_revision, created_at)) =
-            rows.into_iter().find(|(_, kind, id, _, _)| {
-                recovery_subject_inventory_id(kind, id).as_deref() == Some(inventory_id)
-            })
-        else {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery subject assessment is missing",
-            ));
-        };
-        let event_id = recovery_resolution_event_id(recovery_ref, inventory_id);
-        let existing_event = transaction
-            .query_row(
-                "SELECT event_json, timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
-                params![task_id, event_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let event_timestamp = existing_event
-            .as_ref()
-            .map_or(observed_at.as_str(), |(_, timestamp)| timestamp.as_str())
-            .to_owned();
-        let event = json!({
-            "schema_version": SCHEMA_VERSION,
-            "event_id": event_id,
-            "task_id": task_id,
-            "event_type": "execution.completed",
-            "timestamp": event_timestamp,
-            "actor": {"kind":"system-service","id":"service:recovery"},
-            "status": resolution.event_status,
-            "details": {
-                "recovery_ref":recovery_ref,
-                "inventory_id":inventory_id,
-                "certainty":resolution.certainty,
-                "safe_action":resolution.safe_action,
-                "reason_code":resolution.reason_code
-            }
-        });
-        let resolution_event_id = if let Some((stored, _)) = existing_event {
-            let stored: Value = serde_json::from_str(&stored)?;
-            if stored != event || !verify_provenance_through(&transaction, &task_id, None)? {
-                return Err(TaskManagerError::InvalidRecord(
-                    "recovery resolution event identity conflicts with durable provenance",
-                ));
-            }
-            event_id
-        } else {
-            append_event(&transaction, &task_id, &event)?.event_id
-        };
-        if let Some(operation_id) = inventory_id.strip_prefix("operation:") {
-            let terminal_state = match resolution.certainty.as_str() {
-                "NOT_STARTED" => Some("CANCELLED"),
-                "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
-                "COMPLETED" => Some("SUCCEEDED"),
-                _ => None,
-            };
-            if let Some(terminal_state) = terminal_state {
-                transaction.execute(
-                    "UPDATE operations SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5) WHERE task_id=?1 AND operation_id=?2",
-                    params![task_id, operation_id, terminal_state, resolution.certainty, event_timestamp],
-                )?;
-            }
-        }
-        let new_binding_required = resolution.safe_action == "CREATE_NEW_ATTEMPT";
-        let assessment = canonical_json(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "assessment_id": assessment_id,
-            "recovery_epoch_id": epoch_id,
-            "task_id": task_id,
-            "subject": {"kind":subject_kind,"id":subject_id},
-            "certainty":resolution.certainty,
-            "evidence":[{"kind":"provenance","ref":resolution_event_id,"observation":"trusted durable recovery observation"}],
-            "safe_action":resolution.safe_action,
-            "new_binding_required":new_binding_required,
-            "external_reconciliation_required":false,
-            "reason_codes":[resolution.reason_code],
-            "created_at":created_at
-        }))?;
-        let reason_codes_json = serde_json::to_string(&[resolution.reason_code])?;
-        transaction.execute(
-            "UPDATE recovery_assessments SET certainty=?2, safe_action=?3, reason_codes_json=?4, assessment_json=?5 WHERE assessment_id=?1 AND basis_revision=?6",
-            params![assessment_id, resolution.certainty, resolution.safe_action, reason_codes_json, assessment, basis_revision],
+        reconcile_recovery_subject_in_transaction(
+            &transaction,
+            recovery_ref,
+            inventory_id,
+            &observed_at,
         )?;
         transaction.commit()?;
         Ok(())
@@ -2431,6 +2321,137 @@ struct ProvenanceRow {
     previous_event_hash: Option<String>,
     event_hash: String,
     event_json: String,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the authenticated resolution event, operation certainty, and subject assessment in one transaction"
+)]
+pub(crate) fn reconcile_recovery_subject_in_transaction(
+    transaction: &Transaction<'_>,
+    recovery_ref: &str,
+    inventory_id: &str,
+    observed_at: &str,
+) -> Result<()> {
+    let (task_id, epoch_id) = transaction
+        .query_row(
+            "SELECT task_id, recovery_epoch_id FROM recovery_assessments WHERE assessment_id=?1 AND subject_kind='task'",
+            [recovery_ref],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord(
+            "recovery reference does not exist",
+        ))?;
+    let inventoried = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
+        params![recovery_ref, inventory_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let resolution = resolved_recovery_subject(transaction, &task_id, inventory_id)?;
+    let Some(resolution) = resolution.filter(|_| inventoried) else {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery subject lacks a safe durable outcome",
+        ));
+    };
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT assessment_id, subject_kind, subject_id, basis_revision, created_at FROM recovery_assessments WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'",
+        )?;
+        let rows = statement.query_map(params![task_id, epoch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let Some((assessment_id, subject_kind, subject_id, basis_revision, created_at)) =
+        rows.into_iter().find(|(_, kind, id, _, _)| {
+            recovery_subject_inventory_id(kind, id).as_deref() == Some(inventory_id)
+        })
+    else {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery subject assessment is missing",
+        ));
+    };
+    let event_id = recovery_resolution_event_id(recovery_ref, inventory_id);
+    let existing_event = transaction
+        .query_row(
+            "SELECT event_json, timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
+            params![task_id, event_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let event_timestamp = existing_event
+        .as_ref()
+        .map_or(observed_at, |(_, timestamp)| timestamp.as_str())
+        .to_owned();
+    let event = json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": event_id,
+        "task_id": task_id,
+        "event_type": "execution.completed",
+        "timestamp": event_timestamp,
+        "actor": {"kind":"system-service","id":"service:recovery"},
+        "status": resolution.event_status,
+        "details": {
+            "recovery_ref":recovery_ref,
+            "inventory_id":inventory_id,
+            "certainty":resolution.certainty,
+            "safe_action":resolution.safe_action,
+            "reason_code":resolution.reason_code
+        }
+    });
+    let resolution_event_id = if let Some((stored, _)) = existing_event {
+        let stored: Value = serde_json::from_str(&stored)?;
+        if stored != event || !verify_provenance_through(transaction, &task_id, None)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "recovery resolution event identity conflicts with durable provenance",
+            ));
+        }
+        event_id
+    } else {
+        append_event(transaction, &task_id, &event)?.event_id
+    };
+    if let Some(operation_id) = inventory_id.strip_prefix("operation:") {
+        let terminal_state = match resolution.certainty.as_str() {
+            "NOT_STARTED" => Some("CANCELLED"),
+            "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
+            "COMPLETED" => Some("SUCCEEDED"),
+            _ => None,
+        };
+        if let Some(terminal_state) = terminal_state {
+            transaction.execute(
+                "UPDATE operations SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5) WHERE task_id=?1 AND operation_id=?2",
+                params![task_id, operation_id, terminal_state, resolution.certainty, event_timestamp],
+            )?;
+        }
+    }
+    let new_binding_required = resolution.safe_action == "CREATE_NEW_ATTEMPT";
+    let assessment = canonical_json(&json!({
+        "schema_version": SCHEMA_VERSION,
+        "assessment_id": assessment_id,
+        "recovery_epoch_id": epoch_id,
+        "task_id": task_id,
+        "subject": {"kind":subject_kind,"id":subject_id},
+        "certainty":resolution.certainty,
+        "evidence":[{"kind":"provenance","ref":resolution_event_id,"observation":"trusted durable recovery observation"}],
+        "safe_action":resolution.safe_action,
+        "new_binding_required":new_binding_required,
+        "external_reconciliation_required":false,
+        "reason_codes":[resolution.reason_code],
+        "created_at":created_at
+    }))?;
+    let reason_codes_json = serde_json::to_string(&[resolution.reason_code])?;
+    transaction.execute(
+        "UPDATE recovery_assessments SET certainty=?2, safe_action=?3, reason_codes_json=?4, assessment_json=?5 WHERE assessment_id=?1 AND basis_revision=?6",
+        params![assessment_id, resolution.certainty, resolution.safe_action, reason_codes_json, assessment, basis_revision],
+    )?;
+    Ok(())
 }
 
 fn verify_provenance_through(
