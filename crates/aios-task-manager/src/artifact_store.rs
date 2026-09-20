@@ -244,11 +244,24 @@ pub struct ArtifactHandle {
     pub created_at: String,
 }
 
+/// Parameters for a trusted control-plane Artifact import.
+///
+/// This DTO does not authenticate its caller. The import entry point is crate-private so
+/// authentication and user-selected source mediation must happen before this request reaches the
+/// Artifact Store.
+///
+/// ```compile_fail
+/// use std::io::Cursor;
+/// use aios_task_manager::{ImportArtifactRequest, TaskManager};
+///
+/// fn forge(manager: &mut TaskManager, request: &ImportArtifactRequest) {
+///     let _ = manager.import_artifact(request, &mut Cursor::new(b"forged"));
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportArtifactRequest {
     pub schema_version: String,
     pub task_id: String,
-    pub actor: Actor,
     pub origin_kind: ArtifactOriginKind,
     pub semantic_type: Option<String>,
     pub media_type: String,
@@ -355,10 +368,10 @@ pub struct ArtifactPublicationResult {
 /// caller cannot obtain owner authority by presenting a plain serialized [`Actor`].
 ///
 /// ```compile_fail
-/// use aios_task_manager::{Actor, TaskManager};
+/// use aios_task_manager::TaskManager;
 ///
-/// fn forge(manager: &TaskManager, actor: &Actor) {
-///     let _ = manager.scope_owned_artifact_reads("T-1", actor, &[]);
+/// fn forge(manager: &TaskManager) {
+///     let _ = manager.scope_owned_artifact_reads("T-1", &[]);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,33 +719,26 @@ fn reject_reparse_root(root: &Path) -> Result<()> {
 }
 
 impl TaskManager {
-    pub fn import_artifact<R: Read>(
+    /// Imports bytes after the trusted in-crate control plane has authenticated the caller and
+    /// mediated the selected source.
+    pub(crate) fn import_artifact<R: Read>(
         &mut self,
         request: &ImportArtifactRequest,
         reader: &mut R,
     ) -> Result<ArtifactHandle> {
         validate_import_request(request)?;
-        let task = self
+        let task_state = self
             .connection
             .query_row(
-                "SELECT principal_kind,principal_id,state FROM tasks WHERE task_id=?1",
+                "SELECT state FROM tasks WHERE task_id=?1",
                 [&request.task_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                |row| row.get::<_, String>(0),
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord(
                 "Artifact import Task does not exist",
             ))?;
-        if task.0 != request.actor.kind
-            || task.1 != request.actor.id
-            || !task_accepts_artifact_import(&task.2)
-        {
+        if !task_accepts_artifact_import(&task_state) {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         let token = random_token(&self.connection)?;
@@ -761,14 +767,19 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let import_still_authorized = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1 AND principal_kind=?2 AND principal_id=?3 AND state NOT IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK','ROLLING_BACK'))",
-            params![request.task_id,request.actor.kind,request.actor.id],
-            |row| row.get::<_,bool>(0),
-        )?;
-        if !import_still_authorized {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-        }
+        let import_actor = transaction
+            .query_row(
+                "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1 AND state NOT IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK','ROLLING_BACK')",
+                [&request.task_id],
+                |row| {
+                    Ok(Actor {
+                        kind: row.get(0)?,
+                        id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
         upsert_durable_blob(&transaction, &content_hash, size, &storage_ref, &created_at)?;
         transaction.execute(
             "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,format,size_bytes,content_hash,sensitivity,retention_class,expires_at,origin_kind,origin_task_id,integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'verified',?13,'artifact-store:sha256',?14,?13)",
@@ -784,7 +795,7 @@ impl TaskManager {
             "task_id": request.task_id,
             "event_type": "artifact.imported",
             "timestamp": created_at,
-            "actor": request.actor,
+            "actor": import_actor,
             "input_artifacts": [],
             "output_artifacts": [artifact_id],
             "status": "success",
@@ -2394,6 +2405,7 @@ fn binding_runtime_authority_valid(
 struct ExactOperationGrant {
     grant_id: String,
     scope: String,
+    max_uses: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -2528,7 +2540,8 @@ fn exact_operation_grant(
                     && row.max_uses == Some(1)
                     && row.uses_consumed == 1
             }
-            _ => {
+            Some(_) => row.state == "ACTIVE",
+            None => {
                 row.state == "ACTIVE"
                     && row
                         .max_uses
@@ -2577,6 +2590,7 @@ fn exact_operation_grant(
         matching.push(ExactOperationGrant {
             grant_id,
             scope: row.scope,
+            max_uses: row.max_uses,
         });
     }
     if matching.len() == 1 {
@@ -2664,9 +2678,14 @@ fn admit_operation_grant(
     .filter(|grant| grant.grant_id == expected_grant_id)
     .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
     let one_shot_consumed = grant.scope == "ONE_SHOT";
-    if one_shot_consumed {
+    if grant.max_uses.is_some() {
         let changed = connection.execute(
-            "UPDATE authority_grants SET uses_consumed=1,state='CONSUMED' WHERE grant_id=?1 AND state='ACTIVE' AND scope='ONE_SHOT' AND max_uses=1 AND uses_consumed=0",
+            "UPDATE authority_grants
+             SET uses_consumed=uses_consumed+1,
+                 state=CASE WHEN scope='ONE_SHOT' THEN 'CONSUMED' ELSE state END
+             WHERE grant_id=?1 AND state='ACTIVE' AND max_uses IS NOT NULL
+               AND uses_consumed < max_uses
+               AND (scope <> 'ONE_SHOT' OR (max_uses=1 AND uses_consumed=0))",
             [expected_grant_id],
         )?;
         if changed != 1 {
@@ -2921,10 +2940,6 @@ fn validate_import_request(request: &ImportArtifactRequest) -> Result<()> {
         || request.max_size_bytes == Some(0)
         || !all_unique(&request.labels)
         || request.labels.len() > 64
-        || !matches!(
-            request.actor.kind.as_str(),
-            "user" | "system-service" | "legacy-app"
-        )
     {
         return Err(TaskManagerError::InvalidRecord(
             "invalid Artifact import request",
@@ -3778,7 +3793,7 @@ fn sync_windows_directory(store: &Dir, reference: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read as _, Write as _};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use tempfile::TempDir;
 
@@ -3850,10 +3865,6 @@ mod tests {
         ImportArtifactRequest {
             schema_version: "0.1".to_owned(),
             task_id: "T-artifact".to_owned(),
-            actor: Actor {
-                kind: "user".to_owned(),
-                id: "user:test".to_owned(),
-            },
             origin_kind: ArtifactOriginKind::User,
             semantic_type: Some("artifact.table@1".to_owned()),
             media_type: "text/csv".to_owned(),
@@ -3863,13 +3874,6 @@ mod tests {
             expires_at: None,
             labels: vec!["fixture".to_owned()],
             max_size_bytes: Some(1_024),
-        }
-    }
-
-    fn owner_actor() -> Actor {
-        Actor {
-            kind: "user".to_owned(),
-            id: "user:test".to_owned(),
         }
     }
 
@@ -4610,11 +4614,9 @@ mod tests {
     }
 
     #[test]
-    fn forged_plain_actor_cannot_request_owner_scope_through_the_public_read_api() {
+    fn public_read_scope_cannot_request_owner_authority_without_a_binding() {
         let temp = TempDir::new().unwrap();
         let manager = manager(&temp);
-        let forged = owner_actor();
-        assert_eq!(forged.id, "user:test");
         assert!(matches!(
             manager.scope_artifact_reads("T-artifact", None, &["artifact:forged".to_owned()]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
@@ -4737,6 +4739,141 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(states, ["CONSUMED", "CONSUMED"]);
+    }
+
+    #[test]
+    fn finite_task_and_time_limited_grants_admit_exactly_one_reader() {
+        for (index, scope_name) in ["TASK", "TIME_LIMITED"].into_iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let artifact = manager
+                .import_artifact(&import_request(), &mut Cursor::new(scope_name.as_bytes()))
+                .unwrap();
+            let fixture = format!("bounded-{index}");
+            let (binding_id, _) = install_one_shot_binding(
+                &manager,
+                &fixture,
+                &[artifact.artifact_id.clone()],
+                &[("artifact.read", "artifact", &artifact.artifact_id)],
+            );
+            let grant_id = format!("grant-{fixture}-0");
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET scope=?1 WHERE grant_id=?2",
+                    params![scope_name, grant_id],
+                )
+                .unwrap();
+            let read_scope = manager
+                .scope_artifact_reads(
+                    "T-artifact",
+                    Some(&binding_id),
+                    &[artifact.artifact_id.clone()],
+                )
+                .unwrap();
+
+            let mut first = manager
+                .open_artifact_reader(&read_scope, &artifact.artifact_id)
+                .unwrap();
+            assert!(matches!(
+                manager.open_artifact_reader(&read_scope, &artifact.artifact_id),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+            let (uses_consumed, state) = manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed,state FROM authority_grants WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(uses_consumed, 1, "wrong use count for {scope_name}");
+            assert_eq!(state, "ACTIVE", "wrong state for {scope_name}");
+
+            let mut bytes = Vec::new();
+            first.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, scope_name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn concurrent_bounded_grant_admission_is_atomic() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"atomic".as_slice()))
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "atomic-bounded",
+            &[artifact.artifact_id.clone()],
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let grant_id = "grant-atomic-bounded-0";
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK' WHERE grant_id=?1",
+                [grant_id],
+            )
+            .unwrap();
+        let execution = capture_execution_authority(
+            &manager.connection,
+            "T-artifact",
+            &binding_id,
+            "2026-09-19T22:00:00Z",
+        )
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let database_path = temp.path().join("task-manager.sqlite");
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let database_path = database_path.clone();
+            let execution = execution.clone();
+            let artifact_id = artifact.artifact_id.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut connection = Connection::open(database_path).unwrap();
+                connection
+                    .busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                barrier.wait();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                let admitted = admit_operation_grant(
+                    &transaction,
+                    "T-artifact",
+                    &execution,
+                    "artifact.read",
+                    "artifact",
+                    &artifact_id,
+                    "2026-09-19T22:00:00Z",
+                    grant_id,
+                )
+                .is_ok();
+                if admitted {
+                    transaction.commit().unwrap();
+                }
+                admitted
+            }));
+        }
+        let admissions = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(admissions, 1);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                    [grant_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
