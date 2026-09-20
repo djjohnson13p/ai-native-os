@@ -12,6 +12,17 @@
     )
 )]
 
+mod artifact_store;
+
+pub use artifact_store::{
+    ArtifactAllocationState, ArtifactExpectedState, ArtifactHandle, ArtifactIntegrity,
+    ArtifactIntegrityState, ArtifactLineage, ArtifactOrigin, ArtifactOriginKind,
+    ArtifactOutputAllocation, ArtifactPublicationRequest, ArtifactPublicationResult,
+    ArtifactReadScope, ArtifactReader, ArtifactReconciliationFinding, ArtifactReconciliationKind,
+    ArtifactReconciliationReport, ArtifactRetention, ArtifactStagingWriter, ArtifactUri,
+    ContentHash, ImportArtifactRequest, OutputAllocationRequest, RetentionClass, Sensitivity,
+};
+
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -44,7 +55,7 @@ impl fmt::Display for TaskManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => write!(formatter, "task storage failure: {error}"),
-            Self::Io(error) => write!(formatter, "task store ownership failure: {error}"),
+            Self::Io(error) => write!(formatter, "task store I/O failure: {error}"),
             Self::Serialization(error) => write!(formatter, "task serialization failure: {error}"),
             Self::Canonicalization(error) => {
                 write!(formatter, "provenance canonicalization failure: {error}")
@@ -435,6 +446,7 @@ pub struct TaskManager {
     clock: Box<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
+    artifact_store_root: PathBuf,
     _store_lock: Option<StoreLock>,
 }
 
@@ -664,13 +676,17 @@ impl TaskManager {
         let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
+        let artifact_store_root =
+            artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
         let mut manager = Self {
             connection,
             clock,
             lease_owner,
             lease_epoch,
+            artifact_store_root,
             _store_lock: store_lock,
         };
+        manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
         Ok(manager)
     }
@@ -3589,7 +3605,11 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
               WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))
              UNION ALL
              SELECT 'publication:' || publication_id FROM artifact_publications
-              WHERE task_id = ?1 AND state = 'PENDING'
+              WHERE task_id = ?1 AND (state = 'PENDING' OR (state = 'COMMITTED' AND EXISTS (
+                  SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash = a.content_hash
+                  WHERE a.artifact_id = artifact_publications.artifact_id
+                    AND (a.integrity_state = 'failed' OR b.durability_state IN ('MISSING', 'CORRUPT'))
+              )))
              UNION ALL
              SELECT 'grant:' || grant_id FROM authority_grants
               WHERE task_id = ?1 AND state = 'ACTIVE'
@@ -3794,6 +3814,22 @@ fn load_recovery_subjects(
                 observation: observation.to_owned(),
             });
         }
+    }
+    for id in query_strings(
+        transaction,
+        "SELECT publication_id FROM artifact_publications WHERE task_id = ?1 AND state = 'COMMITTED' AND EXISTS (SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash=a.content_hash WHERE a.artifact_id=artifact_publications.artifact_id AND (a.integrity_state='failed' OR b.durability_state IN ('MISSING','CORRUPT'))) ORDER BY publication_id",
+        task_id,
+    )? {
+        subjects.push(RecoverySubject {
+            kind: "artifact-publication",
+            id: format!("publication:{id}"),
+            evidence_kind: "artifact-integrity",
+            certainty: "FAILED_PARTIAL_EFFECT".to_owned(),
+            safe_action: "FAIL_TASK",
+            reason_code: "RECOVERY_ARTIFACT_INTEGRITY_FAILED",
+            observation: "committed Artifact publication references missing or corrupt bytes"
+                .to_owned(),
+        });
     }
     subjects.sort_by(|left, right| (left.kind, &left.id).cmp(&(right.kind, &right.id)));
     Ok(subjects)
