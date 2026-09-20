@@ -26,6 +26,7 @@ pub use artifact_store::{
     VerifiedArtifactExportNoEffect,
 };
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -455,6 +456,8 @@ pub struct TaskManager {
     artifact_store_dir: cap_std::fs::Dir,
     store_lock: Option<StoreLock>,
     artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
+    artifact_export_verifiers:
+        BTreeMap<String, Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
 }
 
 pub trait Clock: Send + Sync {
@@ -632,7 +635,12 @@ fn verify_locked_store_identity(connection: &Connection, lock: &StoreLock) -> Re
     Ok(())
 }
 
-fn open_locked_store<F>(path: &Path, clock: Box<dyn Clock>, after_lock: F) -> Result<TaskManager>
+fn open_locked_store<F>(
+    path: &Path,
+    clock: Box<dyn Clock>,
+    export_verifiers: Vec<Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
+    after_lock: F,
+) -> Result<TaskManager>
 where
     F: FnOnce(&Path),
 {
@@ -645,6 +653,7 @@ where
         clock,
         Some(lock),
         DatabaseLocator::File(path.to_path_buf()),
+        export_verifiers,
     )
 }
 
@@ -702,7 +711,7 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        open_locked_store(path, Box::new(SystemClock), |_| {})
+        open_locked_store(path, Box::new(SystemClock), Vec::new(), |_| {})
     }
 
     /// Opens an isolated in-memory store with the production clock.
@@ -719,7 +728,36 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open_with_clock(path: impl AsRef<Path>, clock: Box<dyn Clock>) -> Result<Self> {
         let path = path.as_ref();
-        open_locked_store(path, clock, |_| {})
+        open_locked_store(path, clock, Vec::new(), |_| {})
+    }
+
+    /// Opens a store with an immutable set of trusted destination-status adapters.
+    ///
+    /// The adapters are fixed for the manager lifetime. Provider-facing methods cannot add,
+    /// replace, or select them when resolving an unknown export.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot open, an adapter identity is invalid, or two
+    /// adapters claim the same destination class.
+    pub fn open_with_export_verifiers(
+        path: impl AsRef<Path>,
+        verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        open_locked_store(path, Box::new(SystemClock), verifiers, |_| {})
+    }
+
+    /// Opens a store with an injected trusted clock and immutable export verifiers.
+    ///
+    /// # Errors
+    /// Returns an error when the store or verifier registry is invalid.
+    pub fn open_with_clock_and_export_verifiers(
+        path: impl AsRef<Path>,
+        clock: Box<dyn Clock>,
+        verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        open_locked_store(path, clock, verifiers, |_| {})
     }
 
     /// Opens an in-memory store with an injected trusted clock.
@@ -736,7 +774,7 @@ impl TaskManager {
         let sequence = NEXT_MEMORY_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let uri = format!("file:aios-task-manager-{sequence}?mode=memory&cache=shared");
         let locator = DatabaseLocator::SharedMemory(uri.clone());
-        Self::initialize(locator.open()?, clock, None, locator)
+        Self::initialize(locator.open()?, clock, None, locator, Vec::new())
     }
 
     fn initialize(
@@ -744,6 +782,7 @@ impl TaskManager {
         clock: Box<dyn Clock>,
         store_lock: Option<StoreLock>,
         database_locator: DatabaseLocator,
+        export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_migration_state(&connection)?;
@@ -764,6 +803,27 @@ impl TaskManager {
             artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
         let artifact_scope_issuer =
             connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
+        let mut artifact_export_verifiers = BTreeMap::new();
+        for verifier in export_verifiers {
+            artifact_store::validate_id(
+                verifier.verifier_id(),
+                256,
+                "invalid Artifact export reconciliation verifier",
+            )?;
+            artifact_store::validate_id(
+                verifier.destination_class(),
+                256,
+                "invalid Artifact export reconciliation destination class",
+            )?;
+            if artifact_export_verifiers
+                .insert(verifier.destination_class().to_owned(), verifier)
+                .is_some()
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "duplicate Artifact export reconciliation destination adapter",
+                ));
+            }
+        }
         let mut manager = Self {
             connection,
             clock,
@@ -775,6 +835,7 @@ impl TaskManager {
             artifact_store_dir,
             store_lock,
             artifact_store_cleanup,
+            artifact_export_verifiers,
         };
         manager.verify_all_provenance_chains()?;
         manager.reconcile_export_operations_startup()?;

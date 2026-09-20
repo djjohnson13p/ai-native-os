@@ -587,6 +587,8 @@ pub struct VerifiedArtifactExportNoEffect {
 pub trait ArtifactExportOutcomeVerifier {
     fn verifier_id(&self) -> &str;
 
+    fn destination_class(&self) -> &str;
+
     fn verify_no_effect(
         &self,
         subject: &ArtifactExportReconciliationSubject,
@@ -1468,6 +1470,7 @@ impl TaskManager {
         reader: &mut R,
     ) -> Result<ArtifactHandle> {
         validate_import_request(request)?;
+        ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
         let task_state = self
             .connection
             .query_row(
@@ -1864,6 +1867,7 @@ impl TaskManager {
         request: &ArtifactPublicationRequest,
     ) -> Result<ArtifactPublicationResult> {
         validate_publication_request(request)?;
+        ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
         let request_json = canonical_json(request)?;
         if let Some((stored_request, state, result_json, stored_hash)) = self
             .connection
@@ -2191,6 +2195,7 @@ impl TaskManager {
         artifact_ids: &[String],
     ) -> Result<ArtifactReadScope> {
         validate_id(task_id, 256, "invalid Artifact read Task")?;
+        ensure_task_is_not_recovering(&self.connection, task_id)?;
         ensure_no_unknown_artifact_export(&self.connection, task_id)?;
         if artifact_ids.is_empty() || artifact_ids.len() > 256 || !all_unique(artifact_ids) {
             return Err(TaskManagerError::InvalidRecord(
@@ -2458,6 +2463,7 @@ impl TaskManager {
             256,
             "invalid Artifact export destination class",
         )?;
+        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         let now = self.clock.now();
         if scope.issuer_id != self.artifact_scope_issuer
             || scope.authority.execution.is_some()
@@ -2530,6 +2536,7 @@ impl TaskManager {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         if let Some(replay) = authenticate_export_operation(
             &self.connection,
             &destination.operation_id,
@@ -2889,6 +2896,26 @@ impl TaskManager {
     }
 
     /// Records trusted external evidence that an unknown export had no external effect.
+    ///
+    /// The verifier is selected from the immutable registry installed when this manager opened;
+    /// reconciliation callers cannot supply a one-off assertion.
+    ///
+    /// ```compile_fail
+    /// use aios_task_manager::{ArtifactExportOutcomeVerifier, TaskManager};
+    /// fn forge(
+    ///     manager: &mut TaskManager,
+    ///     verifier: &dyn ArtifactExportOutcomeVerifier,
+    /// ) {
+    ///     let _ = manager.reconcile_unknown_artifact_export_no_effect("operation", verifier);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use aios_task_manager::TaskManager;
+    /// fn replace_registry(manager: &mut TaskManager) {
+    ///     manager.artifact_export_verifiers.clear();
+    /// }
+    /// ```
     #[allow(
         clippy::too_many_lines,
         reason = "keeps export evidence authentication, idempotent provenance, and certainty transition atomic"
@@ -2896,7 +2923,6 @@ impl TaskManager {
     pub fn reconcile_unknown_artifact_export_no_effect(
         &mut self,
         operation_id: &str,
-        verifier: &dyn ArtifactExportOutcomeVerifier,
     ) -> Result<()> {
         validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
         let row = self
@@ -2927,6 +2953,13 @@ impl TaskManager {
                 "stored Artifact export operation is invalid",
             ));
         }
+        let verifier = Arc::clone(
+            self.artifact_export_verifiers
+                .get(&intent.destination_class)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "no trusted Artifact export reconciliation adapter is registered",
+                ))?,
+        );
         let subject = ArtifactExportReconciliationSubject::from_intent(operation_id, &intent);
         let observation = verifier.verify_no_effect(&subject)?;
         if observation.subject != subject {
@@ -6297,7 +6330,7 @@ fn event_id(kind: &str, identity: &str) -> String {
     format!("event:{kind}:v1:{}", tagged_digest(hasher))
 }
 
-fn validate_id(value: &str, maximum: usize, message: &'static str) -> Result<()> {
+pub(crate) fn validate_id(value: &str, maximum: usize, message: &'static str) -> Result<()> {
     if value.is_empty() || value.chars().count() > maximum || value.chars().any(char::is_control) {
         Err(TaskManagerError::InvalidRecord(message))
     } else {
@@ -6928,21 +6961,10 @@ mod tests {
 
     struct TestExportOutcomeVerifier {
         verifier_id: &'static str,
+        destination_class: &'static str,
         evidence_ref: String,
         proof_hash: String,
         observed_at: String,
-        subject_mutation: TestExportSubjectMutation,
-    }
-
-    #[derive(Clone, Copy)]
-    enum TestExportSubjectMutation {
-        None,
-        Task,
-        Artifact,
-        Destination,
-        Principal,
-        Binding,
-        Attempt,
     }
 
     impl ArtifactExportOutcomeVerifier for TestExportOutcomeVerifier {
@@ -6950,32 +6972,16 @@ mod tests {
             self.verifier_id
         }
 
+        fn destination_class(&self) -> &str {
+            self.destination_class
+        }
+
         fn verify_no_effect(
             &self,
             subject: &ArtifactExportReconciliationSubject,
         ) -> Result<VerifiedArtifactExportNoEffect> {
-            let mut verified_subject = subject.clone();
-            match self.subject_mutation {
-                TestExportSubjectMutation::None => {}
-                TestExportSubjectMutation::Task => verified_subject.task_id.push_str(":forged"),
-                TestExportSubjectMutation::Artifact => {
-                    verified_subject.artifact_id.push_str(":forged");
-                }
-                TestExportSubjectMutation::Destination => {
-                    verified_subject.destination_class.push_str(":forged");
-                }
-                TestExportSubjectMutation::Principal => {
-                    verified_subject.principal_id.push_str(":forged");
-                }
-                TestExportSubjectMutation::Binding => {
-                    verified_subject.binding_id = Some("binding:forged".to_owned());
-                }
-                TestExportSubjectMutation::Attempt => {
-                    verified_subject.attempt_id = Some("attempt:forged".to_owned());
-                }
-            }
             Ok(VerifiedArtifactExportNoEffect {
-                subject: verified_subject,
+                subject: subject.clone(),
                 evidence_ref: self.evidence_ref.clone(),
                 proof_hash: self.proof_hash.clone(),
                 observed_at: self.observed_at.clone(),
@@ -6984,15 +6990,16 @@ mod tests {
     }
 
     fn export_no_effect_verifier(
+        destination_class: &'static str,
         evidence_ref: &str,
         proof_digit: char,
     ) -> TestExportOutcomeVerifier {
         TestExportOutcomeVerifier {
             verifier_id: "adapter:test-destination-status",
+            destination_class,
             evidence_ref: evidence_ref.to_owned(),
             proof_hash: format!("sha256:{}", proof_digit.to_string().repeat(64)),
             observed_at: "2026-09-19T22:00:00Z".to_owned(),
-            subject_mutation: TestExportSubjectMutation::None,
         }
     }
 
@@ -7066,6 +7073,32 @@ mod tests {
         let mut manager = TaskManager::open_with_clock(
             temp.path().join("task-manager.sqlite"),
             Box::new(FixedClock),
+        )
+        .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "exercise Artifact storage".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        manager
+    }
+
+    fn manager_with_export_verifiers(
+        temp: &TempDir,
+        verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
+    ) -> TaskManager {
+        let mut manager = TaskManager::open_with_clock_and_export_verifiers(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+            verifiers,
         )
         .unwrap();
         manager
@@ -8518,7 +8551,12 @@ mod tests {
     )]
     fn finalize_failure_is_unknown_and_routes_live_task_to_recovery() {
         let temp = TempDir::new().unwrap();
-        let mut manager = manager(&temp);
+        let verifier = Arc::new(export_no_effect_verifier(
+            "user-selected-file",
+            "evidence:destination-unchanged",
+            'a',
+        ));
+        let mut manager = manager_with_export_verifiers(&temp, vec![verifier.clone()]);
         let artifact = manager
             .import_artifact(
                 &import_request(),
@@ -8592,7 +8630,6 @@ mod tests {
             0
         );
 
-        let verifier = export_no_effect_verifier("evidence:destination-unchanged", 'a');
         manager
             .connection
             .execute_batch(
@@ -8604,7 +8641,7 @@ mod tests {
             .unwrap();
         assert!(
             manager
-                .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier,)
+                .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery")
                 .is_err()
         );
         assert_eq!(
@@ -8635,11 +8672,11 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_export_recovery_assessment;")
             .unwrap();
         manager
-            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier)
+            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery")
             .unwrap();
         // A response-loss retry authenticates and reuses the immutable resolution event.
         manager
-            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery", &verifier)
+            .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery")
             .unwrap();
         assert_eq!(
             manager
@@ -8763,6 +8800,17 @@ mod tests {
         let mut reader = manager
             .open_artifact_reader(&scope, &artifact.artifact_id)
             .unwrap();
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id.clone());
+        manager
+            .allocate_bound_artifact_output(&session, &request)
+            .unwrap();
+        let mut writer = manager
+            .open_bound_artifact_output(&session, allocation_id)
+            .unwrap();
+        writer.write_all(b"recovery output").unwrap();
+        writer.finish().unwrap();
         manager
             .connection
             .execute(
@@ -8779,19 +8827,39 @@ mod tests {
             manager.scope_artifact_reads(&session, &[artifact.artifact_id]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
-        let mut request = allocation(allocation_id);
-        request.binding_id = Some(binding_id);
-        request.attempt_id = Some(attempt_id);
         assert!(matches!(
             manager.allocate_bound_artifact_output(&session, &request),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+        assert!(matches!(
+            manager.import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"forbidden recovery import".as_slice()),
+            ),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let publication = publication("pub-recovery-provider-fence", allocation_id);
+        assert!(matches!(
+            manager.publish_artifact_output(&publication),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            manager
+                .get_artifact_output_allocation(allocation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactAllocationState::Writing
+        );
     }
 
     #[test]
-    fn authenticated_unknown_export_resolution_releases_recovery_when_all_subjects_are_safe() {
+    fn registered_export_verifier_must_cover_the_effect_boundary() {
         let temp = TempDir::new().unwrap();
-        let mut manager = manager(&temp);
+        let mut stale =
+            export_no_effect_verifier("user-selected-file", "evidence:stale-preflight", 'e');
+        stale.observed_at = "2026-09-19T21:59:59Z".to_owned();
+        let mut manager = manager_with_export_verifiers(&temp, vec![Arc::new(stale)]);
         let artifact = manager
             .import_artifact(
                 &import_request(),
@@ -8825,38 +8893,6 @@ mod tests {
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
-        let forged = TestExportOutcomeVerifier {
-            verifier_id: "adapter:test-destination-status",
-            evidence_ref: "evidence:forged".to_owned(),
-            proof_hash: "sha256:not-a-proof".to_owned(),
-            observed_at: "2026-09-19T22:00:00Z".to_owned(),
-            subject_mutation: TestExportSubjectMutation::None,
-        };
-        assert!(
-            manager
-                .reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &forged)
-                .is_err()
-        );
-        for mutation in [
-            TestExportSubjectMutation::Task,
-            TestExportSubjectMutation::Artifact,
-            TestExportSubjectMutation::Destination,
-            TestExportSubjectMutation::Principal,
-            TestExportSubjectMutation::Binding,
-            TestExportSubjectMutation::Attempt,
-        ] {
-            let mut mismatched = export_no_effect_verifier("evidence:mismatched", 'b');
-            mismatched.subject_mutation = mutation;
-            assert!(matches!(
-                manager.reconcile_unknown_artifact_export_no_effect(
-                    "export-owner-resolution",
-                    &mismatched,
-                ),
-                Err(TaskManagerError::InvalidRecord(
-                    "Artifact export reconciliation proof does not match its immutable subject"
-                ))
-            ));
-        }
         assert_eq!(
             manager
                 .connection
@@ -8869,27 +8905,53 @@ mod tests {
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
-        let mut stale = export_no_effect_verifier("evidence:stale-preflight", 'e');
-        stale.observed_at = "2026-09-19T21:59:59Z".to_owned();
         assert!(matches!(
-            manager.reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &stale,),
+            manager.scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()]),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert!(matches!(
+            manager.reconcile_unknown_artifact_export_no_effect("export-owner-resolution"),
             Err(TaskManagerError::InvalidRecord(
                 "Artifact export reconciliation evidence predates the effect boundary"
             ))
         ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-owner-resolution'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn export_verifier_registry_is_fixed_and_rejects_ambiguous_destination_owners() {
+        let temp = TempDir::new().unwrap();
+        let first = Arc::new(export_no_effect_verifier(
+            "user-selected-file",
+            "evidence:first",
+            '1',
+        ));
+        let second = Arc::new(export_no_effect_verifier(
+            "user-selected-file",
+            "evidence:second",
+            '2',
+        ));
         assert!(matches!(
-            manager.scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()]),
+            TaskManager::open_with_clock_and_export_verifiers(
+                temp.path().join("task-manager.sqlite"),
+                Box::new(FixedClock),
+                vec![first, second],
+            ),
             Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                "duplicate Artifact export reconciliation destination adapter"
             ))
         ));
-        let verifier = export_no_effect_verifier("evidence:owner-destination-unchanged", 'c');
-        manager
-            .reconcile_unknown_artifact_export_no_effect("export-owner-resolution", &verifier)
-            .unwrap();
-        let transaction = manager.connection.unchecked_transaction().unwrap();
-        assert!(crate::recovery_allows_exit(&transaction, "T-artifact").unwrap());
-        transaction.rollback().unwrap();
     }
 
     #[test]
@@ -8899,7 +8961,16 @@ mod tests {
     )]
     fn terminal_owner_export_reconciliation_preserves_state_and_rejects_proof_replay() {
         let temp = TempDir::new().unwrap();
-        let mut manager = manager(&temp);
+        let first_proof = Arc::new(export_no_effect_verifier(
+            "terminal-file-one",
+            "evidence:terminal-first",
+            'd',
+        ));
+        let mut second_proof =
+            export_no_effect_verifier("terminal-file-two", "evidence:terminal-first", 'e');
+        second_proof.verifier_id = "adapter:independent-destination-status";
+        let mut manager =
+            manager_with_export_verifiers(&temp, vec![first_proof.clone(), Arc::new(second_proof)]);
         let artifact = manager
             .import_artifact(
                 &import_request(),
@@ -8963,12 +9034,11 @@ mod tests {
             ))
         ));
 
-        let first_proof = export_no_effect_verifier("evidence:terminal-first", 'd');
         manager
-            .reconcile_unknown_artifact_export_no_effect("export-terminal-first", &first_proof)
+            .reconcile_unknown_artifact_export_no_effect("export-terminal-first")
             .unwrap();
         manager
-            .reconcile_unknown_artifact_export_no_effect("export-terminal-first", &first_proof)
+            .reconcile_unknown_artifact_export_no_effect("export-terminal-first")
             .unwrap();
         let second_scope = manager
             .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
@@ -9009,13 +9079,12 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            manager.reconcile_unknown_artifact_export_no_effect(
-                "export-terminal-second",
-                &first_proof,
-            ),
-            Err(TaskManagerError::InvalidRecord(
-                "Artifact export reconciliation proof was replayed for another subject"
-            ))
+            manager.reconcile_unknown_artifact_export_no_effect("export-terminal-second"),
+            Ok(()),
+        ));
+        assert!(matches!(
+            manager.reconcile_unknown_artifact_export_no_effect("export-terminal-second"),
+            Ok(()),
         ));
         assert_eq!(
             manager
@@ -9027,13 +9096,8 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "UNKNOWN:OUTCOME_UNKNOWN"
+            "FAILED:FAILED_NO_EFFECT"
         );
-        let mut second_proof = export_no_effect_verifier("evidence:terminal-first", 'e');
-        second_proof.verifier_id = "adapter:independent-destination-status";
-        manager
-            .reconcile_unknown_artifact_export_no_effect("export-terminal-second", &second_proof)
-            .unwrap();
         assert!(
             manager
                 .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id])
