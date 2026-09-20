@@ -349,6 +349,18 @@ pub struct ArtifactPublicationResult {
     pub resulted_at: String,
 }
 
+/// A store-issued, non-forgeable scope for a bounded set of Artifact reads.
+///
+/// Owner inspection scopes are issued only inside the trusted Task Manager crate. A
+/// caller cannot obtain owner authority by presenting a plain serialized [`Actor`].
+///
+/// ```compile_fail
+/// use aios_task_manager::{Actor, TaskManager};
+///
+/// fn forge(manager: &TaskManager, actor: &Actor) {
+///     let _ = manager.scope_owned_artifact_reads("T-1", actor, &[]);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactReadScope {
     scope_id: String,
@@ -1238,11 +1250,14 @@ impl TaskManager {
         })
     }
 
-    /// Creates an owner inspection scope from a trusted authenticated control-plane actor.
-    pub fn scope_owned_artifact_reads(
+    /// Creates an owner inspection scope for the trusted in-crate control plane.
+    ///
+    /// Authentication must be completed before this boundary. Keeping this entry point
+    /// crate-private prevents an untrusted caller from asserting ownership by constructing
+    /// an [`Actor`] with values copied from a Task record.
+    pub(crate) fn scope_owned_artifact_reads(
         &self,
         task_id: &str,
-        authenticated_actor: &Actor,
         artifact_ids: &[String],
     ) -> Result<ArtifactReadScope> {
         validate_id(task_id, 256, "invalid Artifact read Task")?;
@@ -1252,11 +1267,6 @@ impl TaskManager {
             ));
         }
         let authority = capture_read_authority(&self.connection, task_id, None, &self.clock.now())?;
-        if authority.task_principal_kind != authenticated_actor.kind
-            || authority.task_principal_id != authenticated_actor.id
-        {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-        }
         for artifact_id in artifact_ids {
             if !artifact_read_authorized(&self.connection, task_id, &authority, artifact_id)? {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
@@ -2121,9 +2131,6 @@ fn capture_read_authority(
     now: &str,
 ) -> Result<ReadAuthority> {
     let task = current_task_scope(connection, task_id)?;
-    if !task_accepts_artifact_import(&task.2) {
-        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-    }
     let execution = binding_id
         .map(|binding_id| capture_execution_authority(connection, task_id, binding_id, now))
         .transpose()?;
@@ -2238,7 +2245,7 @@ fn binding_runtime_authority_valid(
                         g.delegable,g.max_delegation_depth,d.decision_id,d.action,
                         d.resolved_resource_kind,d.resolved_resource_id,d.approval_request_id,
                         r.request_id,r.capability,r.action,r.resolved_resource_kind,
-                        r.resolved_resource_id,r.semantic_selector
+                        r.resolved_resource_id,r.semantic_selector,g.state,g.max_uses,g.uses_consumed
                  FROM authority_grants g
                  JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
                     AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
@@ -2249,10 +2256,9 @@ fn binding_runtime_authority_valid(
                     AND r.attempt_id=g.attempt_id
                  LEFT JOIN approval_requests a ON a.approval_id=g.approval_id
                     AND a.authority_request_id=r.request_id AND a.task_id=g.task_id
-                 WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
-                    AND g.node_id=?4 AND g.execution_binding_id=?5 AND g.attempt_id=?6
-                    AND g.principal_kind='provider' AND g.principal_id=?7
-                    AND g.state='ACTIVE' AND (g.max_uses IS NULL OR g.uses_consumed<g.max_uses)",
+                  WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
+                     AND g.node_id=?4 AND g.execution_binding_id=?5 AND g.attempt_id=?6
+                     AND g.principal_kind='provider' AND g.principal_id=?7",
                 params![
                     grant_id,
                     task_id,
@@ -2289,6 +2295,9 @@ fn binding_runtime_authority_valid(
                         row.get::<_, String>(22)?,
                         row.get::<_, String>(23)?,
                         row.get::<_, Option<String>>(24)?,
+                        row.get::<_, String>(25)?,
+                        row.get::<_, Option<i64>>(26)?,
+                        row.get::<_, i64>(27)?,
                     ))
                 },
             )
@@ -2296,7 +2305,15 @@ fn binding_runtime_authority_valid(
         let Some(grant) = grant else {
             return Ok(false);
         };
-        if parse_time(&grant.0)? <= checked_at
+        let consumed_one_shot = grant.25 == "CONSUMED"
+            && grant.11 == "ONE_SHOT"
+            && grant.26 == Some(1)
+            && grant.27 == 1;
+        let binding_lifecycle_valid = (grant.25 == "ACTIVE"
+            && grant.26.is_none_or(|maximum| grant.27 < maximum)
+            && parse_time(&grant.0)? > checked_at)
+            || consumed_one_shot;
+        if !binding_lifecycle_valid
             || grant.4 != "ALLOW"
             || grant.5 != "provider"
             || grant.6 != execution.principal_id
@@ -2336,10 +2353,14 @@ fn binding_runtime_authority_valid(
         }
         match (grant.1.as_deref(), grant.2.as_deref()) {
             (None, None) => {}
-            (Some(_), Some("APPROVED")) => {
-                if grant.3.as_deref().is_some_and(|expires| {
-                    parse_time(expires).map_or(true, |expires| expires <= checked_at)
-                }) {
+            (Some(_), Some(status))
+                if status == "APPROVED" || consumed_one_shot && status == "EXPIRED" =>
+            {
+                if !consumed_one_shot
+                    && grant.3.as_deref().is_some_and(|expires| {
+                        parse_time(expires).map_or(true, |expires| expires <= checked_at)
+                    })
+                {
                     return Ok(false);
                 }
                 let approved_until = {
@@ -2352,9 +2373,10 @@ fn binding_runtime_authority_valid(
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
                 if approved_until.len() != 1
-                    || approved_until[0].as_deref().is_some_and(|approved_until| {
-                        parse_time(approved_until).map_or(true, |expires| expires <= checked_at)
-                    })
+                    || !consumed_one_shot
+                        && approved_until[0].as_deref().is_some_and(|approved_until| {
+                            parse_time(approved_until).map_or(true, |expires| expires <= checked_at)
+                        })
                 {
                     return Ok(false);
                 }
@@ -3871,6 +3893,114 @@ mod tests {
         }
     }
 
+    fn install_one_shot_binding(
+        manager: &TaskManager,
+        fixture: &str,
+        input_artifact_ids: &[String],
+        operations: &[(&str, &str, &str)],
+    ) -> (String, String) {
+        let program_hash = allocation("unused").semantic_program_hash;
+        let registry_id = format!("registry-{fixture}");
+        let policy_id = format!("policy-{fixture}");
+        let binding_id = format!("binding-{fixture}");
+        let attempt_id = format!("attempt-{fixture}");
+        let request_ids = (0..operations.len())
+            .map(|index| format!("request-{fixture}-{index}"))
+            .collect::<Vec<_>>();
+        let decision_ids = (0..operations.len())
+            .map(|index| format!("decision-{fixture}-{index}"))
+            .collect::<Vec<_>>();
+        let grant_ids = (0..operations.len())
+            .map(|index| format!("grant-{fixture}-{index}"))
+            .collect::<Vec<_>>();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES (?1,'{}','2026-09-19T00:00:00Z')",
+                [&registry_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO semantic_program_revisions(task_id,program_revision,program_id,ir_version,semantic_hash,registry_snapshot_id,status,program_json,created_at) VALUES ('T-artifact',1,?1,'0.1',?2,?3,'active','{\"nodes\":[{\"id\":\"compose_report\"}]}','2026-09-19T00:00:00Z')",
+                params![format!("program-{fixture}"), program_hash, registry_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING',active_program_revision=1,active_step_ids_json='[\"compose_report\"]' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at) VALUES (?1,?2,'T-artifact',?3,?4,'0.1','compose_report','document.compose','provider:sequential','1',1,?5,?6,'profile:test','{}','{}','2026-09-19T00:00:00Z')",
+                params![
+                    binding_id,
+                    attempt_id,
+                    program_hash,
+                    registry_id,
+                    serde_json::to_string(&decision_ids).unwrap(),
+                    serde_json::to_string(&grant_ids).unwrap()
+                ],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES (?1,'T-artifact',?2,?3,'compose_report',?4,1,1,'RUNNING',?5,'[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z')",
+                params![
+                    attempt_id,
+                    program_hash,
+                    registry_id,
+                    binding_id,
+                    serde_json::to_string(input_artifact_ids).unwrap()
+                ],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at) VALUES (?1,'task','T-artifact','cedar','sha256:policy','test','1','{}','2026-09-19T00:00:00Z')",
+                [&policy_id],
+            )
+            .unwrap();
+
+        for (index, (action, resource_kind, resource_id)) in operations.iter().enumerate() {
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at) VALUES (?1,'T-artifact',?2,?3,'compose_report','document.compose','provider','provider:sequential',?4,?5,?6,?7,?8,'fixture','{}','2026-09-19T00:00:00Z')",
+                    params![request_ids[index], program_hash, registry_id, binding_id, attempt_id, action, resource_kind, resource_id],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,reason_codes_json,decision_json,decided_at) VALUES (?1,?2,'T-artifact',?3,'compose_report','provider','provider:sequential',?4,?5,?6,'ALLOW',?7,'[]','{}','2026-09-19T00:00:00Z')",
+                    params![decision_ids[index], request_ids[index], program_hash, action, resource_kind, resource_id, policy_id],
+                )
+                .unwrap();
+            let grants = json!([{
+                "action": action,
+                "resource_kind": resource_kind,
+                "resource_id": resource_id,
+                "semantic_selector": "fixture"
+            }]);
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES (?1,'T-artifact',?2,'compose_report','document.compose','provider','provider:sequential',?3,?4,?5,?6,?7,'ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z')",
+                    params![grant_ids[index], program_hash, binding_id, attempt_id, decision_ids[index], policy_id, grants.to_string()],
+                )
+                .unwrap();
+        }
+        (binding_id, attempt_id)
+    }
+
     fn publication(id: &str, allocation_id: &str) -> ArtifactPublicationRequest {
         ArtifactPublicationRequest {
             schema_version: "0.1".to_owned(),
@@ -3949,7 +4079,7 @@ mod tests {
             .unwrap();
         assert_eq!(blob_count, 1);
         let scope = manager
-            .scope_owned_artifact_reads("T-artifact", &owner_actor(), &[first.artifact_id.clone()])
+            .scope_owned_artifact_reads("T-artifact", &[first.artifact_id.clone()])
             .unwrap();
         let mut reader = manager
             .open_artifact_reader(&scope, &first.artifact_id)
@@ -4320,7 +4450,7 @@ mod tests {
             ArtifactIntegrityState::Failed
         );
         let scope = manager
-            .scope_owned_artifact_reads("T-artifact", &owner_actor(), &[artifact_id.clone()])
+            .scope_owned_artifact_reads("T-artifact", &[artifact_id.clone()])
             .unwrap();
         assert!(matches!(
             manager.open_artifact_reader(&scope, &artifact_id),
@@ -4395,7 +4525,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            manager.scope_owned_artifact_reads("T-other", &owner_actor(), &[artifact.artifact_id]),
+            manager.scope_owned_artifact_reads("T-other", &[artifact.artifact_id]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
     }
@@ -4409,11 +4539,7 @@ mod tests {
             .import_artifact(&import_request(), &mut Cursor::new(b"first".as_slice()))
             .unwrap();
         let foreign_scope = first
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
 
         let mut second = manager(&second_temp);
@@ -4447,11 +4573,7 @@ mod tests {
             .execute_batch("PRAGMA foreign_keys=ON")
             .unwrap();
         let local_scope = second
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
         assert!(
             second
@@ -4465,18 +4587,14 @@ mod tests {
     }
 
     #[test]
-    fn cached_read_scope_fails_after_task_or_principal_invalidation() {
+    fn cached_owner_read_scope_fails_after_principal_invalidation() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
         let artifact = manager
             .import_artifact(&import_request(), &mut Cursor::new(b"private".as_slice()))
             .unwrap();
         let principal_scope = manager
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
         manager
             .connection
@@ -4489,31 +4607,191 @@ mod tests {
             manager.open_artifact_reader(&principal_scope, &artifact.artifact_id),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET principal_id='user:test' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
-        let lifecycle_scope = manager
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
-            .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+    }
+
+    #[test]
+    fn forged_plain_actor_cannot_request_owner_scope_through_the_public_read_api() {
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let forged = owner_actor();
+        assert_eq!(forged.id, "user:test");
         assert!(matches!(
-            manager.open_artifact_reader(&lifecycle_scope, &artifact.artifact_id),
+            manager.scope_artifact_reads("T-artifact", None, &["artifact:forged".to_owned()]),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+    }
+
+    #[test]
+    fn owner_can_read_and_export_retained_artifacts_after_terminal_states() {
+        for state in ["COMPLETED", "FAILED", "CANCELLED", "ROLLED_BACK"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let bytes = format!("retained after {state}").into_bytes();
+            let artifact = manager
+                .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE tasks SET state=?1 WHERE task_id='T-artifact'",
+                    [state],
+                )
+                .unwrap();
+
+            let scope = manager
+                .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+                .unwrap();
+            let mut reader = manager
+                .open_artifact_reader(&scope, &artifact.artifact_id)
+                .unwrap();
+            let mut read = Vec::new();
+            reader.read_to_end(&mut read).unwrap();
+            assert_eq!(read, bytes, "owner read failed in {state}");
+
+            let mut exported = Vec::new();
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut exported, 1_024)
+                .unwrap();
+            assert_eq!(exported, bytes, "owner export failed in {state}");
+
+            assert!(matches!(
+                manager.import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"late import".as_slice())
+                ),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+            let mut late_allocation = allocation(&format!("alloc-after-{state}"));
+            late_allocation.expires_at = "2026-09-20T00:00:00Z".to_owned();
+            assert!(matches!(
+                manager.allocate_artifact_output(&late_allocation),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+        }
+    }
+
+    #[test]
+    fn sequential_one_shot_reads_ignore_an_expired_consumed_sibling_grant() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let first = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"first".as_slice()))
+            .unwrap();
+        let second = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"second".as_slice()))
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "two-reads",
+            &[first.artifact_id.clone(), second.artifact_id.clone()],
+            &[
+                ("artifact.read", "artifact", &first.artifact_id),
+                ("artifact.read", "artifact", &second.artifact_id),
+            ],
+        );
+        let scope = manager
+            .scope_artifact_reads(
+                "T-artifact",
+                Some(&binding_id),
+                &[first.artifact_id.clone(), second.artifact_id.clone()],
+            )
+            .unwrap();
+        let mut first_reader = manager
+            .open_artifact_reader(&scope, &first.artifact_id)
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET expires_at='2026-09-19T21:00:00Z' WHERE grant_id='grant-two-reads-0'",
+                [],
+            )
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            first_reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let mut second_reader = manager
+            .open_artifact_reader(&scope, &second.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        second_reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"second");
+        assert!(matches!(
+            manager.scope_artifact_reads(
+                "T-artifact",
+                Some(&binding_id),
+                &[first.artifact_id.clone()]
+            ),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let states = manager
+            .connection
+            .prepare(
+                "SELECT state FROM authority_grants WHERE grant_id LIKE 'grant-two-reads-%' ORDER BY grant_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(states, ["CONSUMED", "CONSUMED"]);
+    }
+
+    #[test]
+    fn one_shot_read_then_write_admits_the_exact_remaining_grant() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let input = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"input".as_slice()))
+            .unwrap();
+        let allocation_id = "alloc-read-then-write";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "read-write",
+            &[input.artifact_id.clone()],
+            &[
+                ("artifact.read", "artifact", &input.artifact_id),
+                ("artifact.write", "output-allocation", allocation_id),
+            ],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        manager.allocate_artifact_output(&request).unwrap();
+        let scope = manager
+            .scope_artifact_reads(
+                "T-artifact",
+                Some(&binding_id),
+                &[input.artifact_id.clone()],
+            )
+            .unwrap();
+        let _reader = manager
+            .open_artifact_reader(&scope, &input.artifact_id)
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET expires_at='2026-09-19T21:00:00Z' WHERE grant_id='grant-read-write-0'",
+                [],
+            )
+            .unwrap();
+
+        let mut writer = manager.open_artifact_output(allocation_id).unwrap();
+        writer.write_all(b"output").unwrap();
+        writer.finish().unwrap();
+        let states = manager
+            .connection
+            .prepare(
+                "SELECT state FROM authority_grants WHERE grant_id LIKE 'grant-read-write-%' ORDER BY grant_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(states, ["CONSUMED", "CONSUMED"]);
     }
 
     #[test]
@@ -4751,11 +5029,7 @@ mod tests {
             .import_artifact(&import_request(), &mut Cursor::new(original.as_slice()))
             .unwrap();
         let scope = manager
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
         let storage_ref = manager
             .connection
@@ -4955,11 +5229,7 @@ mod tests {
             .unwrap();
         assert!(published.published);
         let scope = manager
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[published.artifact_id.clone().unwrap()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[published.artifact_id.clone().unwrap()])
             .unwrap();
         let mut reader = manager
             .open_artifact_reader(&scope, published.artifact_id.as_deref().unwrap())
@@ -5010,11 +5280,7 @@ mod tests {
             .import_artifact(&import_request(), &mut Cursor::new(b"inside".as_slice()))
             .unwrap();
         let scope = manager
-            .scope_owned_artifact_reads(
-                "T-artifact",
-                &owner_actor(),
-                &[artifact.artifact_id.clone()],
-            )
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
         std::fs::write(outside.path().join("external-blob"), b"inside").unwrap();
         symlink(
