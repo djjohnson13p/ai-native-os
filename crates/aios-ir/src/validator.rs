@@ -113,15 +113,6 @@ impl Validator {
             }
         };
 
-        let ir_version = value
-            .get("ir_version")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let program_id = value
-            .get("program_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-
         for violation in inspect_value_limits(&value, self.limits) {
             let (code, message) = match violation {
                 LimitViolation::NodeCount => (
@@ -148,21 +139,29 @@ impl Validator {
             collector.error(code, message);
         }
         if collector.has_errors() {
-            return self.invalid_report(ir_version, program_id, collector, validated_at);
+            return self.invalid_report(None, None, collector, validated_at);
         }
 
         domain_prechecks(&value, &mut collector);
         if collector.has_errors() {
-            return self.invalid_report(ir_version, program_id, collector, validated_at);
+            return self.invalid_report(None, None, collector, validated_at);
         }
 
         if let Err(message) = validate_schema(&value, &mut collector) {
             collector.error(ValidatorReasonCode::IrSchemaType, message);
         }
         if collector.has_errors() {
-            return self.invalid_report(ir_version, program_id, collector, validated_at);
+            return self.invalid_report(None, None, collector, validated_at);
         }
 
+        let ir_version = value
+            .get("ir_version")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let program_id = value
+            .get("program_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let program: AiosIr = match serde_json::from_value(value) {
             Ok(program) => program,
             Err(error) => {
@@ -188,14 +187,24 @@ impl Validator {
             Ok(normalized) => normalized,
             Err(error) => {
                 collector.error(ValidatorReasonCode::IrCanonicalizationFailed, error);
-                return self.invalid_report(ir_version, program_id, collector, validated_at);
+                return self.invalid_report(
+                    Some(program.ir_version.clone()),
+                    Some(program.program_id.clone()),
+                    collector,
+                    validated_at,
+                );
             }
         };
         let hash = match semantic_hash(&normalized) {
             Ok(hash) => hash,
             Err(error) => {
                 collector.error(ValidatorReasonCode::IrCanonicalizationFailed, error);
-                return self.invalid_report(ir_version, program_id, collector, validated_at);
+                return self.invalid_report(
+                    Some(program.ir_version.clone()),
+                    Some(program.program_id.clone()),
+                    collector,
+                    validated_at,
+                );
             }
         };
 

@@ -285,11 +285,11 @@ fn validate_provider_capability(
         .iter()
         .any(|locality| *locality != Locality::Local);
     let remote_runtime = runtime_kind == ProviderRuntimeKind::Remote;
-    let local_only_capability = provider.execution.locality == [Locality::Local];
-    if remote_runtime && local_only_capability {
+    let includes_local_capability = provider.execution.locality.contains(&Locality::Local);
+    if remote_runtime && includes_local_capability {
         collector.push(
             ProviderReasonCode::ProviderDeclarationInvalid,
-            "remote provider runtime contradicts a local-only capability declaration",
+            "remote provider runtime contradicts a capability declaration containing local locality",
             Some(capability.clone()),
         );
     }
@@ -308,12 +308,11 @@ fn validate_provider_capability(
     let declares_data_egress_authority = authority_actions
         .iter()
         .any(|action| action == "data.egress");
-    let remote_required_input =
-        remote_execution && contract.inputs.values().any(|input| input.required);
-    if remote_required_input && !declares_data_egress_effect {
+    let remote_bindable_input = remote_execution && !contract.inputs.is_empty();
+    if remote_bindable_input && !declares_data_egress_effect {
         collector.push(
             ProviderReasonCode::ProviderRequiredEffectMissing,
-            "remote execution with required inputs requires the DATA_EGRESS effect declaration",
+            "remote execution with bindable inputs requires the DATA_EGRESS effect declaration",
             Some(capability.clone()),
         );
     }
@@ -322,7 +321,7 @@ fn validate_provider_capability(
         .iter()
         .copied()
         .chain(requires_network_envelope.then_some(EffectClass::Network))
-        .chain(remote_required_input.then_some(EffectClass::DataEgress))
+        .chain(remote_bindable_input.then_some(EffectClass::DataEgress))
         .filter(|effect| !matches!(effect, EffectClass::Pure | EffectClass::LegacyOpaque))
         .any(|effect| {
             !authority_actions
@@ -337,7 +336,7 @@ fn validate_provider_capability(
         );
     }
     let provider_egress =
-        if remote_required_input || declares_data_egress_effect || declares_data_egress_authority {
+        if remote_bindable_input || declares_data_egress_effect || declares_data_egress_authority {
             EgressMode::Policy
         } else {
             EgressMode::Deny
@@ -736,19 +735,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_rejects_local_only_capability_and_requires_network() {
+    fn remote_runtime_rejects_any_capability_locality_containing_local() {
         let registry =
             SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
-        let mut manifest = provider_cases().remove(0).provider;
-        manifest.runtime.kind = ProviderRuntimeKind::Remote;
+        for locality in [
+            vec![Locality::Local],
+            vec![Locality::Local, Locality::Remote],
+        ] {
+            let mut manifest = provider_cases().remove(0).provider;
+            manifest.runtime.kind = ProviderRuntimeKind::Remote;
+            manifest.provides[0].execution.locality = locality.clone();
 
-        let report =
-            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
-        assert!(!report.valid);
-        assert!(report.contains(ProviderReasonCode::ProviderDeclarationInvalid));
-        assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
-        assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
-        assert!(report.contains(ProviderReasonCode::ProviderEgressNotAllowed));
+            let report = validate_provider_manifest(
+                &registry,
+                &manifest,
+                ProviderConformanceOptions::default(),
+            );
+            assert!(!report.valid, "{locality:?} must contradict remote runtime");
+            assert!(report.contains(ProviderReasonCode::ProviderDeclarationInvalid));
+            assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
+            assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+            assert!(report.contains(ProviderReasonCode::ProviderEgressNotAllowed));
+        }
     }
 
     #[test]
@@ -777,6 +785,39 @@ mod tests {
         assert!(
             repaired.valid,
             "complete remote egress envelope must conform: {:?}",
+            repaired.diagnostics
+        );
+    }
+
+    #[test]
+    fn remote_optional_only_inputs_require_data_egress_policy() {
+        let registry = modified_report_registry(|contract| {
+            for input in contract.inputs.values_mut() {
+                input.required = false;
+            }
+        });
+        let mut manifest = network_summarizer(&registry);
+        manifest.provides[0].execution.locality = vec![Locality::Remote];
+
+        let report =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(!report.valid);
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredEffectMissing));
+        assert!(report.contains(ProviderReasonCode::ProviderRequiredAuthorityMissing));
+
+        let provider = &mut manifest.provides[0];
+        provider.effect_classes.push(EffectClass::DataEgress);
+        provider
+            .authority
+            .as_mut()
+            .unwrap()
+            .actions
+            .push("data.egress".to_owned());
+        let repaired =
+            validate_provider_manifest(&registry, &manifest, ProviderConformanceOptions::default());
+        assert!(
+            repaired.valid,
+            "complete remote egress envelope must conform for optional inputs: {:?}",
             repaired.diagnostics
         );
     }

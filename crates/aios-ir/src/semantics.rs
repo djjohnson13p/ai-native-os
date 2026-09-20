@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aios_contracts::{
     AiosIr, CachePolicy, CapabilityContract, CapabilityRole, Diagnostic, EffectClass,
-    EffectSummary, EgressMode, ExecutionClass, FailurePolicy, GeneratedBy, Node, NodeEffectSummary,
-    OperationKind, ValidatorReasonCode, ValueRef,
+    EffectSummary, EgressMode, ExecutionClass, FailurePolicy, GeneratedBy, Locality, Node,
+    NodeEffectSummary, OperationKind, ValidatorReasonCode, ValueRef,
 };
 use aios_registry::{SemanticRegistry, effect_for_authority_class};
 
@@ -580,6 +580,39 @@ fn validate_effects(
             }
         }
 
+        // Selecting remote as the only permitted placement makes network use
+        // intrinsic to this node, even when the capability can also run locally.
+        // Bound inputs also cross that placement boundary and therefore require
+        // explicit data-egress authority and policy.
+        let remote_only = node.constraints.as_ref().is_some_and(|constraints| {
+            !constraints.locality.is_empty()
+                && constraints
+                    .locality
+                    .iter()
+                    .all(|locality| *locality == Locality::Remote)
+        });
+        if remote_only {
+            require_placement_authority(
+                node,
+                node_index,
+                "network.connect",
+                &requested_actions,
+                diagnostics,
+            );
+            effects.insert(EffectClass::Network);
+
+            if !node.inputs.is_empty() {
+                require_placement_authority(
+                    node,
+                    node_index,
+                    "data.egress",
+                    &requested_actions,
+                    diagnostics,
+                );
+                effects.insert(EffectClass::DataEgress);
+            }
+        }
+
         if effects.is_empty() {
             effects.insert(EffectClass::Pure);
         }
@@ -613,6 +646,25 @@ fn validate_effects(
         all_effects.insert(node.id.clone(), effects);
     }
     all_effects
+}
+
+fn require_placement_authority(
+    node: &Node,
+    node_index: usize,
+    action: &str,
+    requested_actions: &BTreeSet<&str>,
+    diagnostics: &mut DiagnosticCollector,
+) {
+    if !requested_actions.contains(action) {
+        diagnostics.push(contextual(
+            ValidatorReasonCode::IrRequiredAuthorityMissing,
+            format!("remote-only placement requires authority class '{action}'"),
+            Some(&node.id),
+            None,
+            Some(&node.operation.capability),
+            Some(format!("/nodes/{node_index}/authority_requests")),
+        ));
+    }
 }
 
 fn validate_egress(

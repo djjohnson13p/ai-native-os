@@ -422,6 +422,7 @@ fn execution_class_and_egress_mode_change_validated_identity() {
     let mut deny = policy.clone();
     deny["nodes"][0]["authority_requests"] = json!([]);
     deny["nodes"][0]["egress"] = json!({"mode":"deny"});
+    deny["nodes"][0]["constraints"]["locality"] = json!(["local"]);
     assert_ne!(semantic_hash(&policy), semantic_hash(&deny));
 }
 

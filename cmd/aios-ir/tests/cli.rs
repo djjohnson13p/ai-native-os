@@ -187,16 +187,38 @@ fn schema_rejections_do_not_echo_invalid_instance_values() {
             response["validation"]["diagnostics"][0]["code"],
             "IR_SCHEMA_PATTERN"
         );
+        assert!(response["validation"]["ir_version"].is_null());
+        assert!(response["validation"]["program_id"].is_null());
         assert!(response["validation"]["semantic_hash"].is_null());
         assert!(
             !serde_json::to_string(&response["validation"]["diagnostics"])
                 .unwrap()
                 .contains(secret)
         );
-        if label == "secret-authority-resource" {
-            assert!(!String::from_utf8(output.stdout).unwrap().contains(secret));
-        }
+        assert!(!String::from_utf8(output.stdout).unwrap().contains(secret));
     }
+}
+
+#[test]
+fn schema_valid_semantic_rejection_preserves_identifiers() {
+    let mut program: Value = serde_json::from_slice(
+        &std::fs::read(fixture_root().join("demonstration-a.ir.json")).unwrap(),
+    )
+    .unwrap();
+    let expected_program_id = program["program_id"].clone();
+    program["nodes"][0]["inputs"]["source"]["name"] = Value::String("missing".to_owned());
+    let path = temporary_program(
+        "semantic-identifier",
+        &serde_json::to_vec(&program).unwrap(),
+    );
+    let output = run_program("validate", &path);
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(2));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["validation"]["ir_version"], "0.1");
+    assert_eq!(response["validation"]["program_id"], expected_program_id);
+    assert!(response["validation"]["semantic_hash"].is_null());
 }
 
 #[test]

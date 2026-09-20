@@ -467,6 +467,8 @@ fn schema_diagnostics_never_echo_invalid_instance_values() {
         let report = validator.validate_bytes(&serde_json::to_vec(&input).unwrap());
 
         assert_eq!(diagnostic_codes(&report), [expected]);
+        assert!(report.output.validation.ir_version.is_none());
+        assert!(report.output.validation.program_id.is_none());
         assert!(report.output.validation.semantic_hash.is_none());
         let rendered = serde_json::to_string(&report.output.validation.diagnostics).unwrap();
         assert!(!rendered.contains(secret), "secret leaked for {pointer}");
@@ -479,6 +481,37 @@ fn schema_diagnostics_never_echo_invalid_instance_values() {
                 .all(|diagnostic| !diagnostic.message.contains(secret))
         );
     }
+}
+
+#[test]
+fn identifiers_are_emitted_only_after_structural_validation() {
+    let valid = validator().validate_bytes(&serde_json::to_vec(&program()).unwrap());
+    assert_eq!(valid.output.validation.ir_version.as_deref(), Some("0.1"));
+    assert_eq!(
+        valid.output.validation.program_id.as_deref(),
+        program()["program_id"].as_str()
+    );
+
+    let mut semantic_rejection = program();
+    semantic_rejection["nodes"][0]["inputs"]["source"]["name"] = json!("missing");
+    let report = validator().validate_bytes(&serde_json::to_vec(&semantic_rejection).unwrap());
+    assert!(!report.output.validation.valid);
+    assert_eq!(report.output.validation.ir_version.as_deref(), Some("0.1"));
+    assert_eq!(
+        report.output.validation.program_id.as_deref(),
+        semantic_rejection["program_id"].as_str()
+    );
+
+    let mut over_limit = program();
+    over_limit["program_id"] = json!("secret-oversized-identifier");
+    let report = validator_with_limits(ValidationLimits {
+        max_string_chars: 24,
+        ..ValidationLimits::default()
+    })
+    .validate_bytes(&serde_json::to_vec(&over_limit).unwrap());
+    assert!(diagnostic_codes(&report).contains(&ValidatorReasonCode::IrLimitStringLength));
+    assert!(report.output.validation.ir_version.is_none());
+    assert!(report.output.validation.program_id.is_none());
 }
 
 #[test]
