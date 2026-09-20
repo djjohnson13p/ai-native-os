@@ -2145,6 +2145,11 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         let intent: ArtifactExportIntent = serde_json::from_str(&destination.intent_json)?;
+        if unresolved_export_effect_exists(&self.connection, &intent)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+            ));
+        }
         let mut reader = self.open_artifact_reader(scope, artifact_id)?;
         if reader.handle.size_bytes > intent.max_size_bytes
             || reader.handle.content_hash.tagged() != intent.content_hash
@@ -2156,14 +2161,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
-        let unresolved_duplicate = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations
-             WHERE task_id=?1 AND effect_class='DATA_EGRESS' AND details_json=?2
-               AND (state IN ('PREPARED','STARTED','UNKNOWN')
-                    OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')))",
-            params![intent.task_id, destination.intent_json],
-            |row| row.get::<_, bool>(0),
-        )?;
+        let unresolved_duplicate = unresolved_export_effect_exists(&transaction, &intent)?;
         if unresolved_duplicate {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
@@ -4892,6 +4890,38 @@ fn validate_export_destination_fence(
     Ok(())
 }
 
+fn unresolved_export_effect_exists(
+    connection: &Connection,
+    intent: &ArtifactExportIntent,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM operations
+                 WHERE task_id=?1
+                   AND transaction_class='irreversible_external'
+                   AND effect_class='DATA_EGRESS'
+                   AND json_extract(details_json,'$.version')=1
+                   AND json_extract(details_json,'$.task_id')=?1
+                   AND json_extract(details_json,'$.artifact_id')=?2
+                   AND json_extract(details_json,'$.content_hash')=?3
+                   AND json_extract(details_json,'$.destination_class')=?4
+                   AND (
+                       state IN ('PREPARED','STARTED','UNKNOWN')
+                       OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')
+                   )
+             )",
+            params![
+                &intent.task_id,
+                &intent.artifact_id,
+                &intent.content_hash,
+                &intent.destination_class,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "replay authenticates the complete operation intent, receipt, and provenance row"
@@ -6325,6 +6355,96 @@ mod tests {
     }
 
     #[test]
+    fn completed_export_replays_to_fresh_destination_and_rejects_changed_intent() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"exported once".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut original = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-fresh-replay",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut original)
+                .unwrap(),
+            13
+        );
+        assert_eq!(original.writer, b"exported once");
+
+        let mut fresh_replay = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-fresh-replay",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut fresh_replay)
+                .unwrap(),
+            13
+        );
+        assert!(fresh_replay.writer.is_empty());
+
+        let mut changed_intent = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-fresh-replay",
+                &artifact.artifact_id,
+                "user-selected-file",
+                2_048,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut changed_intent),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT"
+            ))
+        ));
+        assert!(changed_intent.writer.is_empty());
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.exported'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id='export-fresh-replay'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn revoked_egress_after_destination_issuance_fails_before_copy() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -6386,6 +6506,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers stable-effect fencing across changed owner and provider admissions"
+    )]
     fn partial_and_flush_export_failures_are_durable_unknown_outcomes() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -6429,7 +6553,7 @@ mod tests {
                 "export-partial-write-duplicate",
                 &artifact.artifact_id,
                 "user-selected-file",
-                1_024,
+                2_048,
                 Vec::new(),
             )
             .unwrap();
@@ -6440,6 +6564,74 @@ mod tests {
             ))
         ));
         assert!(duplicate.writer.is_empty());
+
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "export-replacement-admission",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let replacement_scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut replacement_admission = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &replacement_scope,
+                "export-partial-write-replacement-admission",
+                &artifact.artifact_id,
+                "user-selected-file",
+                4_096,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(
+                &replacement_scope,
+                &artifact.artifact_id,
+                &mut replacement_admission,
+            ),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert!(replacement_admission.writer.is_empty());
+        for grant_id in [
+            "grant-export-replacement-admission-0",
+            "grant-export-replacement-admission-1",
+        ] {
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT uses_consumed FROM authority_grants WHERE grant_id=?1",
+                        [grant_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id IN (
+                         'export-partial-write-duplicate',
+                         'export-partial-write-replacement-admission'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
 
         let mut flush = manager
             .issue_owned_artifact_export_destination(
