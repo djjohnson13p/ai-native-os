@@ -85,6 +85,9 @@
           "waiting_on": null,
           "failure": null,
           "recovery": null
+        },
+        "details": {
+          "reason_message_ref": null
         }
       }
     },
@@ -146,6 +149,46 @@
             "unknown_operations_ref": "recovery:fixture",
             "last_known_daemon_instance": "daemon:fixture"
           }
+        },
+        "details": {
+          "reason_message_ref": {
+            "kind": "task-field-commitment",
+            "version": "v1",
+            "algorithm": "sha256-keyed-prefix",
+            "field": "reason_message",
+            "commitment": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      }
+    },
+    {
+      "name": "task-transition-rejects-raw-reason-message",
+      "expected_valid": false,
+      "value": {
+        "schema_version": "0.1",
+        "event_id": "event:transition:raw-reason-message",
+        "task_id": "T-schema-fixture",
+        "event_type": "task.transitioned",
+        "timestamp": "2026-09-19T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "service:task-manager"},
+        "task_transition": {
+          "transition_id": "tr-raw-reason-message",
+          "previous_state": "CREATED",
+          "new_state": "PLANNING",
+          "previous_revision": 1,
+          "new_revision": 2,
+          "reason_code": "PLANNING_REQUESTED"
+        },
+        "committed_mutation": {
+          "active_plan": null,
+          "active_step_ids": null,
+          "waiting_on": null,
+          "failure": null,
+          "recovery": null
+        },
+        "details": {
+          "reason_message": "synthetic private transition explanation",
+          "reason_message_ref": null
         }
       }
     },

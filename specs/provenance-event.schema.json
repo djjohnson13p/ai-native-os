@@ -237,7 +237,18 @@
         "properties": {"event_type": {"const": "task.transitioned"}},
         "required": ["event_type"]
       },
-      "then": {"required": ["task_transition", "committed_mutation"]},
+      "then": {
+        "required": ["task_transition", "committed_mutation", "details"],
+        "properties": {
+          "details": {
+            "required": ["reason_message_ref"],
+            "properties": {
+              "reason_message": false,
+              "reason_message_ref": {"$ref": "#/$defs/reasonMessageRef"}
+            }
+          }
+        }
+      },
       "else": {"properties": {"task_transition": false, "committed_mutation": false}}
     }
   ],
@@ -248,6 +259,23 @@
         "CREATED", "PLANNING", "WAITING_FOR_INPUT", "WAITING_FOR_AUTH",
         "RUNNABLE", "RUNNING", "VERIFYING", "PAUSED", "RECOVERING",
         "ROLLING_BACK", "COMPLETED", "FAILED", "CANCELLED", "ROLLED_BACK"
+      ]
+    },
+    "reasonMessageRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "version", "algorithm", "field", "commitment"],
+          "properties": {
+            "kind": {"const": "task-field-commitment"},
+            "version": {"const": "v1"},
+            "algorithm": {"const": "sha256-keyed-prefix"},
+            "field": {"const": "reason_message"},
+            "commitment": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        }
       ]
     }
   }
