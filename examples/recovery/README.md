@@ -7,3 +7,7 @@ They model deterministic evidence and safe next actions. No model judgment is re
 Core rule:
 
 > Uncertainty is preserved as uncertainty until deterministic evidence resolves it; irreversible/opaque effects are never blindly retried merely because a response was lost.
+
+`per-subject-cases.json` adds adversarial multi-subject cases. It requires each
+subject to use evidence bound to its own identity and prevents a completed
+sibling from supplying optimistic certainty for an unknown effect.

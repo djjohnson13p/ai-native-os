@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_id            TEXT,
     original_intent         TEXT NOT NULL,
     normalized_intent_json  TEXT,
+    intent_commitment_nonce BLOB NOT NULL DEFAULT (randomblob(32)),
+    active_plan_revision    INTEGER,
     active_program_revision INTEGER,
+    active_step_ids_json     TEXT NOT NULL DEFAULT '[]',
+    waiting_on_json          TEXT NOT NULL DEFAULT '[]',
     constraints_json        TEXT,
     failure_json            TEXT,
     recovery_json           TEXT,
@@ -71,8 +75,14 @@ CREATE TABLE IF NOT EXISTS task_transitions (
     result_json             TEXT,
     provenance_event_id     TEXT,
     requested_at            TEXT NOT NULL,
-    committed_at            TEXT,
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+    committed_at            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_manager_lease (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    owner_id     TEXT NOT NULL,
+    fence_epoch  INTEGER NOT NULL CHECK (fence_epoch >= 1),
+    acquired_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plan_revisions (
@@ -394,6 +404,7 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
     decided_by_kind          TEXT NOT NULL,
     decided_by_id            TEXT NOT NULL,
     scope                    TEXT NOT NULL,
+    approved_until           TEXT,
     decision_json            TEXT NOT NULL,
     decided_at               TEXT NOT NULL,
     FOREIGN KEY (approval_id) REFERENCES approval_requests(approval_id),
@@ -520,7 +531,7 @@ CREATE TABLE IF NOT EXISTS step_executions (
     provider_id              TEXT,
     provider_version         TEXT,
     invocation_id            TEXT,
-    attempt_number           INTEGER NOT NULL CHECK (attempt_number >= 1),
+    attempt_number           INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 100),
     revision                 INTEGER NOT NULL CHECK (revision >= 1),
     state                    TEXT NOT NULL CHECK (state IN (
         'PENDING', 'BLOCKED', 'READY', 'STARTING', 'RUNNING',
@@ -646,6 +657,7 @@ CREATE TABLE IF NOT EXISTS recovery_assessments (
     assessment_id            TEXT PRIMARY KEY,
     recovery_epoch_id        TEXT NOT NULL,
     task_id                  TEXT NOT NULL,
+    basis_revision           INTEGER NOT NULL CHECK (basis_revision >= 1),
     subject_kind             TEXT NOT NULL,
     subject_id               TEXT NOT NULL,
     certainty                TEXT NOT NULL CHECK (certainty IN (
@@ -658,6 +670,15 @@ CREATE TABLE IF NOT EXISTS recovery_assessments (
     created_at               TEXT NOT NULL,
     FOREIGN KEY (recovery_epoch_id) REFERENCES recovery_epochs(recovery_epoch_id),
     FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS recovery_unknown_operations (
+    assessment_id            TEXT NOT NULL,
+    ordinal                  INTEGER NOT NULL CHECK (ordinal >= 0),
+    operation_id             TEXT NOT NULL,
+    PRIMARY KEY (assessment_id, ordinal),
+    UNIQUE (assessment_id, operation_id),
+    FOREIGN KEY (assessment_id) REFERENCES recovery_assessments(assessment_id) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------------
@@ -744,6 +765,14 @@ ON execution_bindings(task_id, semantic_program_hash, node_id, attempt);
 CREATE INDEX IF NOT EXISTS ix_step_executions_task_state
 ON step_executions(task_id, state);
 
+CREATE UNIQUE INDEX IF NOT EXISTS ux_step_executions_attempt_tuple
+ON step_executions(
+    task_id,
+    semantic_program_hash,
+    node_id,
+    attempt_number
+);
+
 CREATE INDEX IF NOT EXISTS ix_provider_invocations_task_status
 ON provider_invocations(task_id, status);
 
@@ -770,6 +799,20 @@ CREATE TRIGGER IF NOT EXISTS execution_bindings_no_delete
 BEFORE DELETE ON execution_bindings
 BEGIN
     SELECT RAISE(ABORT, 'execution_bindings are retained for audit/recovery');
+END;
+
+CREATE TRIGGER IF NOT EXISTS step_executions_attempt_number_insert_guard
+BEFORE INSERT ON step_executions
+WHEN NEW.attempt_number NOT BETWEEN 1 AND 100
+BEGIN
+    SELECT RAISE(ABORT, 'step attempt_number must be between 1 and 100');
+END;
+
+CREATE TRIGGER IF NOT EXISTS step_executions_attempt_number_update_guard
+BEFORE UPDATE OF attempt_number ON step_executions
+WHEN NEW.attempt_number NOT BETWEEN 1 AND 100
+BEGIN
+    SELECT RAISE(ABORT, 'step attempt_number must be between 1 and 100');
 END;
 
 CREATE TRIGGER IF NOT EXISTS provenance_events_no_update
@@ -808,3 +851,6 @@ COMMIT;
 --    them against the corresponding schema before persistence/use.
 -- 5. Filesystem/blob durability is coordinated with DB metadata through the
 --    publication/recovery protocol; SQLite ACID does not make blob writes atomic.
+-- 6. task_transitions intentionally has no tasks foreign key: rejected requests
+--    for absent task IDs are retained for global transition-ID idempotency.
+--    COMMITTED transition/task identity is enforced by the Task Manager transaction.

@@ -14,6 +14,7 @@
       "type": "string",
       "enum": [
         "task.created",
+        "task.transitioned",
         "task.paused",
         "task.resumed",
         "task.cancelled",
@@ -71,6 +72,97 @@
           "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]
         },
         "id": {"type": "string", "minLength": 1}
+      }
+    },
+    "task_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transition_id",
+        "previous_state",
+        "new_state",
+        "previous_revision",
+        "new_revision",
+        "reason_code"
+      ],
+      "properties": {
+        "transition_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "previous_state": {"$ref": "#/$defs/taskState"},
+        "new_state": {"$ref": "#/$defs/taskState"},
+        "previous_revision": {"type": "integer", "minimum": 1},
+        "new_revision": {"type": "integer", "minimum": 2},
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"}
+      }
+    },
+    "committed_mutation": {
+      "description": "Canonical privacy-safe projection of the Task mutation committed at this revision. Free-form waiting messages and failure summaries are intentionally excluded.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_plan", "active_step_ids", "waiting_on", "failure", "recovery"],
+      "properties": {
+        "active_plan": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["plan_id", "revision"],
+          "properties": {
+            "plan_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "revision": {"type": "integer", "minimum": 1}
+          }
+        },
+        "active_step_ids": {
+          "type": ["array", "null"],
+          "maxItems": 512,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128},
+          "uniqueItems": true
+        },
+        "waiting_on": {
+          "type": ["array", "null"],
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id"],
+            "properties": {
+              "kind": {"type": "string", "enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+          }
+        },
+        "failure": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["code", "retryable", "safe_to_replan", "unknown_side_effects", "rollback_available"],
+          "properties": {
+            "code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
+            "step_id": {"type": ["string", "null"], "maxLength": 128},
+            "provider_id": {"type": ["string", "null"], "maxLength": 256},
+            "execution_binding_id": {"type": ["string", "null"], "maxLength": 256},
+            "retryable": {"type": "boolean"},
+            "safe_to_replan": {"type": "boolean"},
+            "unknown_side_effects": {"type": "boolean"},
+            "rollback_available": {"type": "boolean"},
+            "provenance_event_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 64,
+              "items": {"type": "string", "maxLength": 256}
+            }
+          }
+        },
+        "recovery": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "unknown_operation_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 128,
+              "items": {"type": "string", "maxLength": 256}
+            },
+            "unknown_operations_ref": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+            "last_known_daemon_instance": {"type": ["string", "null"], "maxLength": 256}
+          }
+        }
       }
     },
     "semantic_program_hash": {
@@ -138,5 +230,53 @@
     },
     "previous_event_hash": {"type": ["string", "null"]},
     "event_hash": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"event_type": {"const": "task.transitioned"}},
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["task_transition", "committed_mutation", "details"],
+        "properties": {
+          "details": {
+            "required": ["reason_message_ref"],
+            "properties": {
+              "reason_message": false,
+              "reason_message_ref": {"$ref": "#/$defs/reasonMessageRef"}
+            }
+          }
+        }
+      },
+      "else": {"properties": {"task_transition": false, "committed_mutation": false}}
+    }
+  ],
+  "$defs": {
+    "taskState": {
+      "type": "string",
+      "enum": [
+        "CREATED", "PLANNING", "WAITING_FOR_INPUT", "WAITING_FOR_AUTH",
+        "RUNNABLE", "RUNNING", "VERIFYING", "PAUSED", "RECOVERING",
+        "ROLLING_BACK", "COMPLETED", "FAILED", "CANCELLED", "ROLLED_BACK"
+      ]
+    },
+    "reasonMessageRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "version", "algorithm", "field", "commitment"],
+          "properties": {
+            "kind": {"const": "task-field-commitment"},
+            "version": {"const": "v1"},
+            "algorithm": {"const": "sha256-keyed-prefix"},
+            "field": {"const": "reason_message"},
+            "commitment": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        }
+      ]
+    }
   }
 }

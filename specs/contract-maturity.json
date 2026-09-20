@@ -1,7 +1,7 @@
 {
   "schema_version": "0.1",
   "generated_for": "stage-0-pre-implementation",
-  "updated_at": "2026-09-15T17:30:00-07:00",
+  "updated_at": "2026-09-20T00:00:00-07:00",
   "entries": [
     {
       "id": "aios-ir-validator-v0.1",
@@ -23,7 +23,7 @@
       "controlling_adrs": ["ADR-0007", "ADR-0035", "ADR-0036", "ADR-0042"],
       "fixture_paths": ["examples/task-manager/"],
       "blocking_questions": [],
-      "notes": "Implement after validator; Task transitions must commit with material provenance."
+      "notes": "Task transitions commit with material provenance. Writable startup requires kernel-held exclusive store ownership plus a durable monotonic fencing epoch; RECOVERING is entered only through the private trusted coordinator."
     },
     {
       "id": "artifact-store-v0.1",
@@ -45,7 +45,7 @@
       "controlling_adrs": ["ADR-0035", "ADR-0042"],
       "fixture_paths": ["examples/provenance/"],
       "blocking_questions": [],
-      "notes": "Tamper-evident local journal, not tamper-proof against a privileged full-store rewrite."
+      "notes": "Tamper-evident local journal, not tamper-proof against a privileged full-store rewrite. Task creation provenance/export contains only the versioned private-nonce-bound intent commitment; raw intent and nonce remain private."
     },
     {
       "id": "semantic-provider-registry-v0.1",
@@ -100,7 +100,7 @@
       "controlling_adrs": ["ADR-0035", "ADR-0036", "ADR-0037", "ADR-0040", "ADR-0042"],
       "fixture_paths": ["examples/recovery/"],
       "blocking_questions": [],
-      "notes": "System preserves OUTCOME_UNKNOWN rather than universal exactly-once claims."
+      "notes": "System derives certainty independently for each recovery subject and preserves OUTCOME_UNKNOWN rather than optimistic Task-level inference or universal exactly-once claims."
     },
     {
       "id": "resource-personal-compute-fabric",

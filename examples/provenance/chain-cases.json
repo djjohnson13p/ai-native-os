@@ -16,7 +16,20 @@
           "timestamp": "2026-09-15T22:00:00Z",
           "actor": {"kind": "user", "id": "user:fixture"},
           "status": "success",
-          "details": {"fixture": true}
+          "details": {
+            "revision": 1,
+            "creation": {
+              "original_intent_ref": {
+                "kind": "task-field-commitment",
+                "version": "v1",
+                "algorithm": "sha256-keyed-prefix",
+                "field": "original_intent",
+                "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "normalized_intent_ref": null
+            },
+            "fixture": true
+          }
         }
       },
       {
@@ -129,6 +142,30 @@
       "mutation": "apply allowed Task transition using current expected revision and append matching provenance record in one transaction",
       "expected_valid": true,
       "expected_behavior": "Task revision increments once and stream sequence/head advances once"
+    },
+    {
+      "name": "creation-export-contains-commitment-only",
+      "mutation": "export the base stream while the private Task row contains a synthetic original intent and 32-byte nonce",
+      "expected_valid": true,
+      "expected_behavior": "export contains the versioned original_intent_ref commitment and contains neither raw intent nor nonce"
+    },
+    {
+      "name": "same-intent-different-task-nonces",
+      "mutation": "create two Tasks with identical synthetic intent using independent 32-byte CSPRNG nonces",
+      "expected_valid": true,
+      "expected_behavior": "the two v1 commitment values differ"
+    },
+    {
+      "name": "legacy-raw-intent-export-is-redacted-projection",
+      "mutation": "export a locally verified legacy stream whose immutable creation event contains raw synthetic intent",
+      "expected_valid": true,
+      "expected_behavior": "privacy-safe export contains only a v1 commitment, labels the manifest legacy-redacted, and does not claim that projected event bytes are the original hash preimage"
+    },
+    {
+      "name": "creation-commitment-mismatch-quarantines-task",
+      "mutation": "change the private Task intent without changing its private nonce or committed v1 reference",
+      "expected_valid": false,
+      "expected_behavior": "Task is inspect-only/quarantined and cannot be scheduled or recovery-mutated"
     }
   ],
   "reason_codes_expected": [

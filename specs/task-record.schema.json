@@ -139,7 +139,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
-        "code": {"type": "string"},
+        "code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
         "summary": {"type": "string"},
         "step_id": {"type": ["string", "null"]},
         "provider_id": {"type": ["string", "null"]},
@@ -165,7 +165,8 @@
           "type": "array",
           "items": {"type": "string"},
           "uniqueItems": true
-        }
+        },
+        "unknown_operations_ref": {"type": ["string", "null"]}
       }
     },
     "created_at": {"type": "string", "format": "date-time"},
