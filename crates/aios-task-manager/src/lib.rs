@@ -278,8 +278,10 @@ pub struct TaskRecord {
     pub active_step_ids: Vec<String>,
     pub active_execution_binding_ids: Vec<String>,
     pub waiting_on: Vec<WaitingOn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub constraints: Option<Value>,
     pub failure: Option<FailureRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<Value>,
     pub created_at: String,
     pub updated_at: String,
@@ -527,7 +529,7 @@ impl TaskManager {
         )?;
         let event = json!({
             "schema_version": SCHEMA_VERSION,
-            "event_id": format!("event:create:{}", request.task_id),
+            "event_id": task_created_event_id(&request.task_id),
             "task_id": request.task_id,
             "event_type": "task.created",
             "timestamp": created_at,
@@ -871,7 +873,7 @@ impl TaskManager {
                 "SELECT operation_id FROM operations WHERE task_id = ?1 AND outcome_certainty = 'OUTCOME_UNKNOWN' ORDER BY operation_id",
                 &task_id,
             )?;
-            let recovery_ref = recovery_operations_ref(&task_id, revision, &unknown_operation_ids);
+            let recovery_ref = recovery_operations_ref(&task_id, revision, &unknown_operation_ids)?;
             let assessed_at = self.clock.now();
             self.persist_recovery_inventory(
                 &recovery_ref,
@@ -1193,7 +1195,7 @@ impl TaskManager {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let event_id = format!("event:transition:{}", request.transition_id);
+        let event_id = transition_event_id(&request.transition_id);
         let event = json!({
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
@@ -1244,7 +1246,7 @@ impl TaskManager {
         if let Some(plan) = &request.mutation.active_plan {
             let changed = transaction.execute(
                 "UPDATE tasks SET active_plan_revision = ?2 WHERE task_id = ?1 AND EXISTS (SELECT 1 FROM plan_revisions WHERE task_id = ?1 AND plan_revision = ?2 AND plan_id = ?3)",
-                params![request.task_id, i64::try_from(plan.revision).unwrap_or(i64::MAX), plan.plan_id],
+                params![request.task_id, i64::try_from(plan.revision).map_err(|_| TaskManagerError::InvalidRecord("active plan revision exceeds SQLite range"))?, plan.plan_id],
             )?;
             if changed != 1 {
                 return Err(TaskManagerError::InvalidRecord(
@@ -1296,66 +1298,7 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when event JSON cannot be read or canonicalized.
     pub fn verify_provenance(&self, task_id: &str) -> Result<bool> {
-        let mut statement = self.connection.prepare("SELECT event_id, stream_id, sequence, timestamp, event_type, semantic_program_hash, ir_version, registry_snapshot_id, node_id, execution_binding_id, provider_id, status, previous_event_hash, event_hash, event_json FROM provenance_events WHERE task_id = ?1 ORDER BY sequence")?;
-        let rows = statement.query_map([task_id], |row| {
-            Ok(ProvenanceRow {
-                event_id: row.get(0)?,
-                stream_id: row.get(1)?,
-                sequence: row.get(2)?,
-                timestamp: row.get(3)?,
-                event_type: row.get(4)?,
-                semantic_program_hash: row.get(5)?,
-                ir_version: row.get(6)?,
-                registry_snapshot_id: row.get(7)?,
-                node_id: row.get(8)?,
-                execution_binding_id: row.get(9)?,
-                provider_id: row.get(10)?,
-                status: row.get(11)?,
-                previous_event_hash: row.get(12)?,
-                event_hash: row.get(13)?,
-                event_json: row.get(14)?,
-            })
-        })?;
-        let mut expected_sequence = 1_i64;
-        let mut previous: Option<String> = None;
-        for row in rows {
-            let row = row?;
-            if row.sequence != expected_sequence || row.previous_event_hash != previous {
-                return Ok(false);
-            }
-            let event: Value = serde_json::from_str(&row.event_json)?;
-            if !valid_transition_shape(&event)
-                || row.event_id != event_string(&event, "event_id").unwrap_or_default()
-                || row.stream_id != format!("task:{task_id}")
-                || event_string(&event, "task_id") != Some(task_id)
-                || row.timestamp != event_string(&event, "timestamp").unwrap_or_default()
-                || row.event_type != event_string(&event, "event_type").unwrap_or_default()
-                || row.semantic_program_hash.as_deref()
-                    != event_string(&event, "semantic_program_hash")
-                || row.ir_version.as_deref() != event_string(&event, "ir_version")
-                || row.registry_snapshot_id.as_deref()
-                    != event_string(&event, "registry_snapshot_id")
-                || row.node_id.as_deref() != event_string(&event, "step_id")
-                || row.execution_binding_id.as_deref()
-                    != event_string(&event, "execution_binding_id")
-                || row.provider_id.as_deref() != event_string(&event, "provider_id")
-                || row.status.as_deref() != event_string(&event, "status")
-            {
-                return Ok(false);
-            }
-            let computed = provenance_hash(
-                task_id,
-                u64::try_from(row.sequence).unwrap_or(0),
-                row.previous_event_hash.as_deref(),
-                &event,
-            )?;
-            if computed != row.event_hash {
-                return Ok(false);
-            }
-            previous = Some(row.event_hash);
-            expected_sequence += 1;
-        }
-        Ok(expected_sequence > 1)
+        verify_provenance_through(&self.connection, task_id, None)
     }
 
     #[cfg(test)]
@@ -1388,6 +1331,74 @@ struct ProvenanceRow {
     previous_event_hash: Option<String>,
     event_hash: String,
     event_json: String,
+}
+
+fn verify_provenance_through(
+    connection: &Connection,
+    task_id: &str,
+    through_sequence: Option<i64>,
+) -> Result<bool> {
+    let mut statement = connection.prepare("SELECT event_id, stream_id, sequence, timestamp, event_type, semantic_program_hash, ir_version, registry_snapshot_id, node_id, execution_binding_id, provider_id, status, previous_event_hash, event_hash, event_json FROM provenance_events WHERE task_id = ?1 AND (?2 IS NULL OR sequence <= ?2) ORDER BY sequence")?;
+    let rows = statement.query_map(params![task_id, through_sequence], |row| {
+        Ok(ProvenanceRow {
+            event_id: row.get(0)?,
+            stream_id: row.get(1)?,
+            sequence: row.get(2)?,
+            timestamp: row.get(3)?,
+            event_type: row.get(4)?,
+            semantic_program_hash: row.get(5)?,
+            ir_version: row.get(6)?,
+            registry_snapshot_id: row.get(7)?,
+            node_id: row.get(8)?,
+            execution_binding_id: row.get(9)?,
+            provider_id: row.get(10)?,
+            status: row.get(11)?,
+            previous_event_hash: row.get(12)?,
+            event_hash: row.get(13)?,
+            event_json: row.get(14)?,
+        })
+    })?;
+    let mut expected_sequence = 1_i64;
+    let mut previous: Option<String> = None;
+    for row in rows {
+        let row = row?;
+        if row.sequence != expected_sequence || row.previous_event_hash != previous {
+            return Ok(false);
+        }
+        let event: Value = serde_json::from_str(&row.event_json)?;
+        if (expected_sequence == 1 && row.event_type != "task.created")
+            || !valid_transition_shape(&event)
+            || row.event_id != event_string(&event, "event_id").unwrap_or_default()
+            || row.stream_id != format!("task:{task_id}")
+            || event_string(&event, "task_id") != Some(task_id)
+            || row.timestamp != event_string(&event, "timestamp").unwrap_or_default()
+            || row.event_type != event_string(&event, "event_type").unwrap_or_default()
+            || row.semantic_program_hash.as_deref() != event_string(&event, "semantic_program_hash")
+            || row.ir_version.as_deref() != event_string(&event, "ir_version")
+            || row.registry_snapshot_id.as_deref() != event_string(&event, "registry_snapshot_id")
+            || row.node_id.as_deref() != event_string(&event, "step_id")
+            || row.execution_binding_id.as_deref() != event_string(&event, "execution_binding_id")
+            || row.provider_id.as_deref() != event_string(&event, "provider_id")
+            || row.status.as_deref() != event_string(&event, "status")
+        {
+            return Ok(false);
+        }
+        let computed = provenance_hash(
+            task_id,
+            u64::try_from(row.sequence).unwrap_or(0),
+            row.previous_event_hash.as_deref(),
+            &event,
+        )?;
+        if computed != row.event_hash {
+            return Ok(false);
+        }
+        previous = Some(row.event_hash);
+        expected_sequence += 1;
+    }
+    Ok(match through_sequence {
+        Some(sequence) => expected_sequence == sequence.saturating_add(1),
+        None => expected_sequence > 1,
+    })
 }
 
 fn event_string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
@@ -1513,7 +1524,10 @@ fn validate_transition_request(request: &TransitionRequest, internal_recovery: b
         .len()
         == request.reason.related_ids.len();
     let valid_plan = request.mutation.active_plan.as_ref().is_none_or(|plan| {
-        !plan.plan_id.is_empty() && plan.plan_id.len() <= 256 && plan.revision > 0
+        !plan.plan_id.is_empty()
+            && plan.plan_id.len() <= 256
+            && plan.revision > 0
+            && i64::try_from(plan.revision).is_ok()
     });
     let valid_steps = request
         .mutation
@@ -1637,13 +1651,20 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn recovery_operations_ref(task_id: &str, revision: u64, operation_ids: &[String]) -> String {
+fn recovery_operations_ref(
+    task_id: &str,
+    revision: u64,
+    operation_ids: &[String],
+) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"AIOS-RECOVERY-OPERATIONS\0v0.1\0");
     hasher.update(task_id.as_bytes());
     hasher.update(revision.to_be_bytes());
     for operation_id in operation_ids {
-        hasher.update(operation_id.len().to_be_bytes());
+        let length = u64::try_from(operation_id.len()).map_err(|_| {
+            TaskManagerError::InvalidRecord("recovery operation ID length exceeds hash framing")
+        })?;
+        hasher.update(length.to_be_bytes());
         hasher.update(operation_id.as_bytes());
     }
     let digest = hasher.finalize();
@@ -1651,7 +1672,7 @@ fn recovery_operations_ref(task_id: &str, revision: u64, operation_ids: &[String
     for byte in digest {
         write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    format!("recovery-operations:sha256:{hex}")
+    Ok(format!("recovery-operations:sha256:{hex}"))
 }
 
 fn startup_recovery_transition_id(task_id: &str, revision: u64) -> String {
@@ -1665,6 +1686,34 @@ fn startup_recovery_transition_id(task_id: &str, revision: u64) -> String {
         write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     format!("__aios_internal:startup-recovery:sha256:{hex}")
+}
+
+fn hashed_event_id(prefix: &str, domain: &[u8], identity: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!("{prefix}{hex}")
+}
+
+fn transition_event_id(transition_id: &str) -> String {
+    hashed_event_id(
+        "event:transition:v1:sha256:",
+        b"AIOS-TASK-TRANSITION-EVENT-ID\0v1\0",
+        transition_id,
+    )
+}
+
+fn task_created_event_id(task_id: &str) -> String {
+    hashed_event_id(
+        "event:task-created:v1:sha256:",
+        b"AIOS-TASK-CREATED-EVENT-ID\0v1\0",
+        task_id,
+    )
 }
 
 fn migrate_task_manager_schema(connection: &Connection) -> Result<()> {
@@ -1722,11 +1771,25 @@ fn migrate_task_manager_schema(connection: &Connection) -> Result<()> {
              PRAGMA foreign_keys = ON;",
         )?;
     }
+    let duplicate_publications = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT allocation_id FROM artifact_publications GROUP BY allocation_id HAVING COUNT(*) > 1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if duplicate_publications != 0 {
+        return Err(TaskManagerError::InvalidRecord(
+            "duplicate artifact publications require operator quarantine",
+        ));
+    }
+    reconcile_pending_transitions(connection)?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_artifact_publications_allocation ON artifact_publications(allocation_id)",
+        [],
+    )?;
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0002_task_manager_contract_reconciliation', 'task-manager-v0.1', '2026-09-19T00:00:00Z')",
         [],
     )?;
-    reconcile_pending_transitions(connection)?;
     Ok(())
 }
 
@@ -1753,7 +1816,7 @@ fn verify_migration_checksum(
 fn reconcile_pending_transitions(connection: &Connection) -> Result<()> {
     let pending = {
         let mut statement = connection.prepare(
-            "SELECT transition_id, task_id, requested_at FROM task_transitions WHERE outcome = 'PENDING' OR result_json IS NULL ORDER BY transition_id",
+            "SELECT transition_id, task_id, requested_at FROM task_transitions WHERE outcome = 'PENDING' ORDER BY transition_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1806,6 +1869,156 @@ fn reconcile_pending_transitions(connection: &Connection) -> Result<()> {
             params![transition_id, result.reason_code, result.observed_revision.and_then(|value| i64::try_from(value).ok()), result.observed_state.map(TaskState::as_str), serde_json::to_string(&result)?],
         )?;
     }
+    let committed = {
+        let mut statement = connection.prepare(
+            "SELECT transition_id, task_id, result_revision, result_state, provenance_event_id FROM task_transitions WHERE outcome = 'COMMITTED' AND result_json IS NULL ORDER BY transition_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (transition_id, task_id, result_revision, result_state, event_id) in committed {
+        reconstruct_committed_transition(
+            connection,
+            &transition_id,
+            &task_id,
+            result_revision,
+            result_state.as_deref(),
+            event_id.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "legacy committed receipt reconstruction keeps every provenance consistency check together"
+)]
+fn reconstruct_committed_transition(
+    connection: &Connection,
+    transition_id: &str,
+    task_id: &str,
+    stored_revision: Option<i64>,
+    stored_state: Option<&str>,
+    event_id: Option<&str>,
+) -> Result<()> {
+    let event_id = event_id.ok_or(TaskManagerError::InvalidRecord(
+        "committed transition without result has no provenance identity",
+    ))?;
+    let event_row = connection
+        .query_row(
+            "SELECT sequence, previous_event_hash, event_hash, event_json, timestamp, task_id, event_type FROM provenance_events WHERE event_id = ?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord(
+            "committed transition result cannot be reconstructed from provenance",
+        ))?;
+    let event: Value = serde_json::from_str(&event_row.3)?;
+    let previous_revision = event
+        .pointer("/task_transition/previous_revision")
+        .and_then(Value::as_u64);
+    let new_revision = event
+        .pointer("/task_transition/new_revision")
+        .and_then(Value::as_u64);
+    let previous_state = event
+        .pointer("/task_transition/previous_state")
+        .and_then(Value::as_str)
+        .map(TaskState::parse)
+        .transpose()?;
+    let new_state = event
+        .pointer("/task_transition/new_state")
+        .and_then(Value::as_str)
+        .map(TaskState::parse)
+        .transpose()?;
+    let row_revision = stored_revision.and_then(|value| u64::try_from(value).ok());
+    let computed_hash = provenance_hash(
+        task_id,
+        u64::try_from(event_row.0)
+            .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance sequence"))?,
+        event_row.1.as_deref(),
+        &event,
+    )?;
+    if !valid_transition_shape(&event)
+        || event_row.2 != computed_hash
+        || event_row.5 != task_id
+        || event_row.6 != "task.transitioned"
+        || event_string(&event, "event_id") != Some(event_id)
+        || event_string(&event, "task_id") != Some(task_id)
+        || event_string(&event, "timestamp") != Some(event_row.4.as_str())
+        || event
+            .pointer("/task_transition/transition_id")
+            .and_then(Value::as_str)
+            != Some(transition_id)
+        || new_revision != row_revision
+        || new_state.map(TaskState::as_str) != stored_state
+        || previous_revision.and_then(|value| value.checked_add(1)) != new_revision
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "committed transition result conflicts with durable provenance",
+        ));
+    }
+    if !verify_provenance_through(connection, task_id, Some(event_row.0))? {
+        return Err(TaskManagerError::InvalidRecord(
+            "committed transition provenance stream is incomplete",
+        ));
+    }
+    let task_revision = connection
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id = ?1",
+            [task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord(
+            "committed transition task is missing",
+        ))?;
+    let task_revision = u64::try_from(task_revision)
+        .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+    if task_revision < new_revision.unwrap_or(u64::MAX) {
+        return Err(TaskManagerError::InvalidRecord(
+            "committed transition is ahead of its Task",
+        ));
+    }
+    let result = TransitionResult {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        transition_id: transition_id.to_owned(),
+        task_id: task_id.to_owned(),
+        applied: true,
+        reason_code: "TASK_TRANSITION_APPLIED".to_owned(),
+        message: None,
+        previous_state,
+        current_state: new_state,
+        previous_revision,
+        current_revision: new_revision,
+        observed_state: new_state,
+        observed_revision: new_revision,
+        provenance_event_id: Some(event_id.to_owned()),
+        provenance_event_hash: Some(event_row.2),
+        resulted_at: event_row.4,
+    };
+    connection.execute(
+        "UPDATE task_transitions SET result_json = ?2 WHERE transition_id = ?1 AND outcome = 'COMMITTED' AND result_json IS NULL",
+        params![transition_id, serde_json::to_string(&result)?],
+    )?;
     Ok(())
 }
 
@@ -1861,7 +2074,7 @@ fn current_active_binding_ids(
     for node_id in active_steps {
         let binding = connection
             .query_row(
-                "SELECT b.binding_id FROM execution_bindings b JOIN step_executions s ON s.binding_id = b.binding_id AND s.attempt_id = b.attempt_id AND s.task_id = b.task_id AND s.semantic_program_hash = b.semantic_program_hash AND s.node_id = b.node_id JOIN semantic_program_revisions p ON p.task_id = b.task_id AND p.semantic_hash = b.semantic_program_hash WHERE b.task_id = ?1 AND p.program_revision = ?2 AND b.node_id = ?3 AND s.state IN ('READY', 'STARTING', 'RUNNING') AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
+                "SELECT b.binding_id FROM execution_bindings b JOIN step_executions s ON s.binding_id = b.binding_id AND s.attempt_id = b.attempt_id AND s.task_id = b.task_id AND s.semantic_program_hash = b.semantic_program_hash AND s.registry_snapshot_id = b.registry_snapshot_id AND s.node_id = b.node_id JOIN semantic_program_revisions p ON p.task_id = b.task_id AND p.semantic_hash = b.semantic_program_hash AND p.registry_snapshot_id = b.registry_snapshot_id WHERE b.task_id = ?1 AND p.program_revision = ?2 AND b.node_id = ?3 AND s.state IN ('READY', 'STARTING', 'RUNNING') AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, program_revision, node_id],
                 |row| row.get::<_, String>(0),
             )
@@ -1994,13 +2207,30 @@ fn count_active_steps(
 ) -> Result<i64> {
     let mut count = 0_i64;
     for node_id in active_steps {
-        count += transaction.query_row(
-            "SELECT COUNT(*) FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = ?3",
+        let (latest_count, matching_state) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN s.state = ?3 THEN 1 ELSE 0 END), 0) FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id)",
             params![task_id, node_id, state],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
+        if latest_count == 1 && matching_state == 1 {
+            count += 1;
+        }
     }
     Ok(count)
+}
+
+fn latest_active_attempt_count(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    node_id: &str,
+) -> Result<i64> {
+    transaction
+        .query_row(
+            "SELECT COUNT(*) FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id)",
+            params![task_id, node_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
 }
 
 fn count_bound_active_steps(
@@ -2012,9 +2242,12 @@ fn count_bound_active_steps(
 ) -> Result<i64> {
     let mut count = 0_i64;
     for node_id in active_steps {
+        if latest_active_attempt_count(transaction, task_id, node_id)? != 1 {
+            continue;
+        }
         let candidate = transaction
             .query_row(
-                "SELECT s.state, b.binding_id, s.attempt_id, s.semantic_program_hash, b.grant_refs_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
+                "SELECT s.state, b.binding_id, s.attempt_id, s.semantic_program_hash, b.grant_refs_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, node_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
             )
@@ -2050,9 +2283,12 @@ fn admit_active_steps(
         return Ok(false);
     }
     for node_id in active_steps {
+        if latest_active_attempt_count(transaction, task_id, node_id)? != 1 {
+            return Ok(false);
+        }
         let candidate = transaction
             .query_row(
-                "SELECT s.attempt_id, b.binding_id, s.semantic_program_hash, b.grant_refs_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'READY' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
+                "SELECT s.attempt_id, b.binding_id, s.semantic_program_hash, b.grant_refs_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'READY' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, node_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             )
@@ -2137,7 +2373,7 @@ fn active_step_completion_facts(
     for node_id in active_steps {
         let attempt = transaction
             .query_row(
-                "SELECT s.attempt_id, s.binding_id, s.semantic_program_hash, s.state, s.outcome_certainty, s.output_artifacts_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
+                "SELECT s.attempt_id, s.binding_id, s.semantic_program_hash, s.state, s.outcome_certainty, s.output_artifacts_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, node_id],
                 |row| {
                     Ok((
@@ -2189,7 +2425,7 @@ fn active_candidate_output_count(
     for node_id in active_steps {
         let output_json = transaction
             .query_row(
-                "SELECT s.output_artifacts_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'SUCCEEDED' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
+                "SELECT s.output_artifacts_json FROM step_executions s JOIN tasks t ON t.task_id = s.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.semantic_hash = s.semantic_program_hash AND p.registry_snapshot_id = s.registry_snapshot_id JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.state = 'SUCCEEDED' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
                 params![task_id, node_id],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -2223,8 +2459,8 @@ fn has_current_verification(
     for node_id in active_steps {
         let output_json = transaction
             .query_row(
-                "SELECT s.output_artifacts_json FROM step_executions s JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.semantic_program_hash = ?3 AND s.state = 'SUCCEEDED' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash) LIMIT 1",
-                params![task_id, node_id, semantic_hash],
+                "SELECT s.output_artifacts_json FROM step_executions s JOIN execution_bindings b ON b.binding_id = s.binding_id AND b.attempt_id = s.attempt_id AND b.task_id = s.task_id AND b.semantic_program_hash = s.semantic_program_hash AND b.registry_snapshot_id = s.registry_snapshot_id AND b.node_id = s.node_id WHERE s.task_id = ?1 AND s.node_id = ?2 AND s.semantic_program_hash = ?3 AND s.registry_snapshot_id = ?4 AND s.state = 'SUCCEEDED' AND s.attempt_number = (SELECT MAX(s2.attempt_number) FROM step_executions s2 WHERE s2.task_id = s.task_id AND s2.node_id = s.node_id AND s2.semantic_program_hash = s.semantic_program_hash AND s2.registry_snapshot_id = s.registry_snapshot_id) LIMIT 1",
+                params![task_id, node_id, semantic_hash, registry_snapshot_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
@@ -2295,6 +2531,36 @@ fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Resul
     Ok(live_attempts == 0 && live_grants == 0 && live_effects == 0)
 }
 
+fn plan_program_coherent(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    active_program: Option<i64>,
+    proposed_plan: Option<&ActivePlan>,
+) -> Result<bool> {
+    let Some(program_revision) = active_program else {
+        return Ok(false);
+    };
+    if let Some(plan) = proposed_plan {
+        let plan_revision = i64::try_from(plan.revision).map_err(|_| {
+            TaskManagerError::InvalidRecord("active plan revision exceeds SQLite range")
+        })?;
+        return transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_program_revisions p JOIN plan_revisions r ON r.task_id = p.task_id AND r.plan_revision = p.created_from_plan_revision WHERE p.task_id = ?1 AND p.program_revision = ?2 AND r.plan_revision = ?3 AND r.plan_id = ?4)",
+                params![task_id, program_revision, plan_revision, plan.plan_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into);
+    }
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision JOIN plan_revisions r ON r.task_id = t.task_id AND r.plan_revision = t.active_plan_revision AND p.created_from_plan_revision = r.plan_revision WHERE t.task_id = ?1 AND p.program_revision = ?2)",
+            params![task_id, program_revision],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the deterministic target-state guard matrix in one auditable function"
@@ -2359,7 +2625,7 @@ fn guard_failure(
     if request.mutation.active_step_ids.is_some()
         && matches!(
             request.to_state,
-            TaskState::Running | TaskState::Verifying | TaskState::Completed
+            TaskState::Runnable | TaskState::Running | TaskState::Verifying | TaskState::Completed
         )
     {
         return Ok(Some("TASK_TRANSITION_GUARD_FAILED"));
@@ -2367,27 +2633,28 @@ fn guard_failure(
     if request.to_state == TaskState::Recovering && !internal_recovery {
         return Ok(Some("TASK_TRANSITION_GUARD_FAILED"));
     }
-    if let Some(plan) = &request.mutation.active_plan
-        && matches!(
-            request.to_state,
-            TaskState::Runnable | TaskState::Running | TaskState::Verifying | TaskState::Completed
-        )
-    {
-        let coherent = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plan_revisions r JOIN tasks t ON t.task_id = r.task_id JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision WHERE r.task_id = ?1 AND r.plan_id = ?2 AND r.plan_revision = ?3 AND p.created_from_plan_revision = r.plan_revision)",
-            params![request.task_id, plan.plan_id, i64::try_from(plan.revision).unwrap_or(i64::MAX)],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !coherent {
-            return Ok(Some("TASK_PROGRAM_NOT_RUNNABLE"));
-        }
-    }
+    let execution_target = matches!(
+        request.to_state,
+        TaskState::Runnable | TaskState::Running | TaskState::Verifying | TaskState::Completed
+    );
     if matches!(
         request.to_state,
         TaskState::Runnable | TaskState::Running | TaskState::Verifying
     ) && unknown_operations > 0
     {
         return Ok(Some("TASK_UNKNOWN_EXTERNAL_OUTCOME"));
+    }
+    let changed_plan_for_active_program =
+        request.mutation.active_plan.is_some() && active_program.is_some();
+    if (changed_plan_for_active_program || execution_target)
+        && !plan_program_coherent(
+            transaction,
+            &request.task_id,
+            active_program,
+            request.mutation.active_plan.as_ref(),
+        )?
+    {
+        return Ok(Some("TASK_PROGRAM_NOT_RUNNABLE"));
     }
     let code = match request.to_state {
         TaskState::WaitingForInput
@@ -2402,7 +2669,8 @@ fn guard_failure(
         }
         TaskState::Runnable
             if !valid_program
-                || ready_steps == 0
+                || active_steps.is_empty()
+                || usize::try_from(ready_steps).ok() != Some(active_steps.len())
                 || !waiting.is_empty()
                 || pending_approvals > 0
                 || durable_nonapproval_blocker =>
@@ -2448,9 +2716,6 @@ fn guard_failure(
         // Stage-1 services. Until those durable facts exist, rollback state
         // changes fail closed rather than trusting request-supplied flags.
         TaskState::RollingBack | TaskState::RolledBack => Some("TASK_TRANSITION_GUARD_FAILED"),
-        TaskState::Cancelled if !execution_is_contained(transaction, &request.task_id)? => {
-            Some("TASK_TRANSITION_GUARD_FAILED")
-        }
         TaskState::Failed
             if unknown_operations > 0
                 && !request
@@ -2460,6 +2725,11 @@ fn guard_failure(
                     .is_some_and(|failure| failure.unknown_side_effects) =>
         {
             Some("TASK_UNKNOWN_EXTERNAL_OUTCOME")
+        }
+        TaskState::Cancelled | TaskState::Failed
+            if !execution_is_contained(transaction, &request.task_id)? =>
+        {
+            Some("TASK_TRANSITION_GUARD_FAILED")
         }
         _ => None,
     };

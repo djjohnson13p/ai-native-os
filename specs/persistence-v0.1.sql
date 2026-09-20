@@ -278,9 +278,6 @@ CREATE TABLE IF NOT EXISTS artifact_publications (
     FOREIGN KEY (content_hash) REFERENCES artifact_blobs(content_hash)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_artifact_publications_allocation
-ON artifact_publications(allocation_id);
-
 CREATE TABLE IF NOT EXISTS task_artifacts (
     task_id             TEXT NOT NULL,
     artifact_id         TEXT NOT NULL,

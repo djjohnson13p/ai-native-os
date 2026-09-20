@@ -434,7 +434,7 @@ fn spoofed_rollback_metadata_and_rejected_admission_are_durable_and_idempotent()
         TaskState::Running,
     );
     let first = manager.transition(&denied).unwrap();
-    assert_eq!(first.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    assert_eq!(first.reason_code, "TASK_PROGRAM_NOT_RUNNABLE");
     assert_eq!(manager.transition(&denied).unwrap(), first);
 
     manager
@@ -713,6 +713,12 @@ fn seed_completion_fixture_with_identity(
             "INSERT INTO registry_snapshots (
                  snapshot_id, manifest_json, created_at
              ) VALUES ('snapshot-completion', '{}', '2026-09-19T00:00:00Z');
+             INSERT INTO plan_revisions (
+                 task_id, plan_revision, plan_id, plan_json, created_at
+             ) VALUES (
+                 'T-completion', 1, 'plan-1', '{}',
+                 '2026-09-19T00:00:00Z'
+             );
              INSERT INTO validation_results (
                  validation_result_id, task_id, valid, semantic_hash,
                  registry_snapshot_id, validator_id, validator_version,
@@ -726,11 +732,11 @@ fn seed_completion_fixture_with_identity(
              INSERT INTO semantic_program_revisions (
                  task_id, program_revision, program_id, ir_version,
                  semantic_hash, registry_snapshot_id, validation_result_id,
-                 status, program_json, created_at
+                 created_from_plan_revision, status, program_json, created_at
              ) VALUES (
                  'T-completion', 1, 'program-completion', '0.1',
                  'sha256:1111111111111111111111111111111111111111111111111111111111111111',
-                 'snapshot-completion', 'validation-completion', 'active', '{}',
+                 'snapshot-completion', 'validation-completion', 1, 'active', '{}',
                  '2026-09-19T00:00:00Z'
              );
              INSERT INTO execution_bindings (
@@ -797,6 +803,7 @@ fn seed_completion_fixture_with_identity(
              UPDATE tasks SET
                  revision = 2,
                  state = 'VERIFYING',
+                 active_plan_revision = 1,
                  active_program_revision = 1,
                  active_step_ids_json = '[\"node-completion\"]',
                  waiting_on_json = '[]'
@@ -1132,6 +1139,9 @@ fn task_record_returns_active_program_envelope_and_only_live_current_bindings() 
         )
         .unwrap();
     let task = manager.get_task("T-completion").unwrap().unwrap();
+    let serialized = serde_json::to_value(&task).unwrap();
+    assert!(serialized.get("constraints").is_none());
+    assert!(serialized.get("recovery").is_none());
     let active_program = task.active_program.unwrap();
     assert_eq!(active_program["program_id"], "program-completion");
     assert_eq!(active_program["semantic_hash"], HASH);
@@ -1260,9 +1270,7 @@ fn completion_requires_completed_certainty_no_proposed_blocker_and_coherent_plan
     let mut plan = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut plan, HASH, &["artifact-output"], "COMMITTED");
     plan.connection.execute_batch(
-        "INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 1, 'plan-1', '{}', '2026-09-19T00:00:00Z');
-         INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 2, 'plan-2', '{}', '2026-09-19T00:00:00Z');
-         UPDATE semantic_program_revisions SET created_from_plan_revision = 1 WHERE task_id = 'T-completion' AND program_revision = 1;",
+        "INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 2, 'plan-2', '{}', '2026-09-19T00:00:00Z');",
     ).unwrap();
     let mut incoherent = completion_request("tr-plan-mismatch");
     incoherent.mutation.active_plan = Some(ActivePlan {
@@ -1318,7 +1326,30 @@ fn cancellation_and_failure_preserve_live_or_unknown_effects() {
     let mut override_recorded = denied;
     override_recorded.transition_id = "tr-unknown-failed-override".to_owned();
     override_recorded.mutation.failure = Some(failure_record(true));
-    assert!(failure.transition(&override_recorded).unwrap().applied);
+    assert_eq!(
+        failure.transition(&override_recorded).unwrap().reason_code,
+        "TASK_TRANSITION_GUARD_FAILED"
+    );
+
+    let mut live_attempt = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    live_attempt.create_task(&create("T-live-failure")).unwrap();
+    live_attempt.connection.execute(
+        "INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-live-failure', 'T-live-failure', ?1, 'node-1', 1, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z')",
+        [HASH],
+    ).unwrap();
+    assert_eq!(
+        live_attempt
+            .transition(&request(
+                "tr-live-failed",
+                "T-live-failure",
+                1,
+                TaskState::Created,
+                TaskState::Failed,
+            ))
+            .unwrap()
+            .reason_code,
+        "TASK_TRANSITION_GUARD_FAILED"
+    );
 }
 
 #[test]
@@ -1504,6 +1535,372 @@ fn migration_quarantines_pending_receipts_and_rejects_checksum_mismatch() {
         .unwrap();
     assert_eq!(outcome, "REJECTED");
     assert!(result.is_some());
+}
+
+#[test]
+fn migration_reconstructs_only_provenance_backed_committed_receipts() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("committed-null.sqlite3");
+    let transition = request(
+        "tr-reconstruct",
+        "T-reconstruct",
+        1,
+        TaskState::Created,
+        TaskState::Planning,
+    );
+    let expected = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-reconstruct")).unwrap();
+        manager.transition(&transition).unwrap()
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE task_transitions SET result_json = NULL WHERE transition_id = 'tr-reconstruct'",
+            [],
+        )
+        .unwrap();
+    let mut reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert_eq!(reopened.transition(&transition).unwrap(), expected);
+
+    drop(reopened);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE task_transitions SET result_json = NULL, provenance_event_id = 'event:missing' WHERE transition_id = 'tr-reconstruct'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let (outcome, result): (String, Option<String>) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT outcome, result_json FROM task_transitions WHERE transition_id = 'tr-reconstruct'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "COMMITTED");
+    assert!(result.is_none());
+}
+
+#[test]
+fn committed_null_terminal_receipt_rejects_an_orphan_transition_event() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("terminal-orphan.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-terminal-orphan")).unwrap();
+        assert!(
+            manager
+                .transition(&request(
+                    "tr-terminal-orphan",
+                    "T-terminal-orphan",
+                    1,
+                    TaskState::Created,
+                    TaskState::Failed,
+                ))
+                .unwrap()
+                .applied
+        );
+    }
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(
+        "DROP TRIGGER provenance_events_no_delete;
+         DELETE FROM provenance_events WHERE task_id = 'T-terminal-orphan' AND sequence = 1;
+         UPDATE task_transitions SET result_json = NULL WHERE transition_id = 'tr-terminal-orphan';",
+    ).unwrap();
+    drop(connection);
+
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let result = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT result_json FROM task_transitions WHERE transition_id = 'tr-terminal-orphan'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn duplicate_legacy_publications_block_index_migration_without_data_loss() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("duplicate-publications.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(MIGRATION).unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at) VALUES ('publication-1', 'allocation-duplicate', 'T-missing', 'artifact-1', '{}', 'PENDING', '2026-09-19T00:00:00Z');
+         INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at) VALUES ('publication-2', 'allocation-duplicate', 'T-missing', 'artifact-2', '{}', 'PENDING', '2026-09-19T00:00:00Z');",
+    ).unwrap();
+    drop(connection);
+
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_publications WHERE allocation_id = 'allocation-duplicate'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_artifact_publications_allocation'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = '0002_task_manager_contract_reconciliation'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn identity_coherence_bounds_and_bounded_event_ids_fail_closed() {
+    assert_ne!(
+        recovery_operations_ref("T-framing", 1, &["operation-ab".to_owned(), "c".to_owned()],)
+            .unwrap(),
+        recovery_operations_ref("T-framing", 1, &["operation-a".to_owned(), "bc".to_owned()],)
+            .unwrap()
+    );
+
+    let mut snapshot = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut snapshot, HASH, &["artifact-output"], "COMMITTED");
+    snapshot.connection.execute_batch(
+        "INSERT INTO registry_snapshots (snapshot_id, manifest_json, created_at) VALUES ('snapshot-stale', '{}', '2026-09-19T00:00:00Z');
+         UPDATE tasks SET state = 'RECOVERING' WHERE task_id = 'T-completion';
+         UPDATE step_executions SET state = 'READY', registry_snapshot_id = 'snapshot-stale' WHERE attempt_id = 'attempt-completion';",
+    ).unwrap();
+    assert_eq!(
+        snapshot
+            .transition(&request(
+                "tr-stale-snapshot-admission",
+                "T-completion",
+                2,
+                TaskState::Recovering,
+                TaskState::Running,
+            ))
+            .unwrap()
+            .reason_code,
+        "TASK_TRANSITION_GUARD_FAILED"
+    );
+
+    let mut coherence = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut coherence, HASH, &["artifact-output"], "COMMITTED");
+    coherence.connection.execute_batch(
+        "INSERT INTO plan_revisions (task_id, plan_revision, plan_id, plan_json, created_at) VALUES ('T-completion', 2, 'plan-2', '{}', '2026-09-19T00:00:00Z');
+         UPDATE tasks SET state = 'PLANNING' WHERE task_id = 'T-completion';",
+    ).unwrap();
+    let mut change_plan = request(
+        "tr-plan2-paused",
+        "T-completion",
+        2,
+        TaskState::Planning,
+        TaskState::Paused,
+    );
+    change_plan.mutation.active_plan = Some(ActivePlan {
+        plan_id: "plan-2".to_owned(),
+        revision: 2,
+    });
+    assert_eq!(
+        coherence.transition(&change_plan).unwrap().reason_code,
+        "TASK_PROGRAM_NOT_RUNNABLE"
+    );
+
+    let mut mutate_steps = request(
+        "tr-proposed-runnable-steps",
+        "T-completion",
+        2,
+        TaskState::Planning,
+        TaskState::Runnable,
+    );
+    mutate_steps.mutation.active_step_ids = Some(vec!["node-completion".to_owned()]);
+    assert_eq!(
+        coherence.transition(&mutate_steps).unwrap().reason_code,
+        "TASK_TRANSITION_GUARD_FAILED"
+    );
+
+    let mut overflow = request(
+        "tr-plan-overflow",
+        "T-completion",
+        2,
+        TaskState::Planning,
+        TaskState::Paused,
+    );
+    overflow.mutation.active_plan = Some(ActivePlan {
+        plan_id: "plan-overflow".to_owned(),
+        revision: u64::MAX,
+    });
+    assert!(coherence.transition(&overflow).is_err());
+}
+
+#[test]
+fn event_id_namespaces_are_bounded_and_disjoint_for_maximum_contract_ids() {
+    let mut event_ids = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    event_ids.create_task(&create("T-long-transition")).unwrap();
+    let long_id = "x".repeat(256);
+    let transition = request(
+        &long_id,
+        "T-long-transition",
+        1,
+        TaskState::Created,
+        TaskState::Planning,
+    );
+    let result = event_ids.transition(&transition).unwrap();
+    let event_id = result.provenance_event_id.unwrap();
+    assert!(event_id.len() <= 256);
+    assert!(event_id.starts_with("event:transition:v1:sha256:"));
+
+    let legacy_long_event_id = hashed_event_id(
+        "event:transition:sha256:",
+        b"AIOS-TASK-TRANSITION-EVENT-ID\0v0.1\0",
+        &long_id,
+    );
+    let colliding_short_id = legacy_long_event_id
+        .strip_prefix("event:transition:")
+        .unwrap();
+    assert_eq!(
+        legacy_long_event_id,
+        format!("event:transition:{colliding_short_id}")
+    );
+    assert_ne!(
+        transition_event_id(&long_id),
+        transition_event_id(colliding_short_id)
+    );
+
+    let maximum_task_id = "T".repeat(256);
+    let task = event_ids.create_task(&create(&maximum_task_id)).unwrap();
+    let task_schema: Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../specs/task-record.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        jsonschema::validator_for(&task_schema)
+            .unwrap()
+            .is_valid(&serde_json::to_value(&task).unwrap())
+    );
+    let creation_event_id = task
+        .state_reason
+        .as_ref()
+        .and_then(|reason| reason.get("provenance_event_id"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(creation_event_id.len() <= 256);
+    assert!(creation_event_id.starts_with("event:task-created:v1:sha256:"));
+    assert!(event_ids.verify_provenance(&maximum_task_id).unwrap());
+}
+
+#[test]
+fn runnable_readiness_uses_each_active_nodes_latest_attempt_once() {
+    let mut stale = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut stale, HASH, &["artifact-output"], "COMMITTED");
+    stale.connection.execute_batch(
+        "UPDATE tasks SET state = 'PLANNING' WHERE task_id = 'T-completion';
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-old', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-failed-new', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 3, 1, 'FAILED', 'FAILED_NO_EFFECT', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+    ).unwrap();
+    assert_eq!(
+        stale
+            .transition(&request(
+                "tr-runnable-stale-ready",
+                "T-completion",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ))
+            .unwrap()
+            .reason_code,
+        "TASK_PROGRAM_NOT_RUNNABLE"
+    );
+
+    let mut compensated = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut compensated, HASH, &["artifact-output"], "COMMITTED");
+    compensated.connection.execute_batch(
+        "UPDATE tasks SET state = 'PLANNING', active_step_ids_json = '[\"node-completion\",\"node-missing\"]' WHERE task_id = 'T-completion';
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-2', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-3', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 3, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+    ).unwrap();
+    assert_eq!(
+        compensated
+            .transition(&request(
+                "tr-runnable-no-compensation",
+                "T-completion",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ))
+            .unwrap()
+            .reason_code,
+        "TASK_PROGRAM_NOT_RUNNABLE"
+    );
+}
+
+#[test]
+fn running_and_admission_reject_duplicate_latest_exact_bound_attempts() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager.connection.execute_batch(
+        "UPDATE tasks SET state = 'RECOVERING' WHERE task_id = 'T-completion';
+         UPDATE step_executions SET state = 'READY', outcome_certainty = 'NOT_STARTED' WHERE attempt_id = 'attempt-completion';
+         INSERT INTO execution_bindings (binding_id, attempt_id, task_id, semantic_program_hash, registry_snapshot_id, ir_version, node_id, capability, provider_id, provider_version, attempt, policy_decision_refs_json, grant_refs_json, execution_profile_ref, placement_json, binding_json, created_at) VALUES ('binding-duplicate-latest', 'attempt-duplicate-latest', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', '0.1', 'node-completion', 'test.complete', 'provider:test', '0.1.0', 2, '[]', '[]', 'profile:test', '{}', '{}', '2026-09-19T00:00:00Z');
+         INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, binding_id, provider_id, provider_version, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-duplicate-latest', 'T-completion', 'sha256:1111111111111111111111111111111111111111111111111111111111111111', 'snapshot-completion', 'node-completion', 'binding-duplicate-latest', 'provider:test', '0.1.0', 1, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
+    ).unwrap();
+
+    let transaction = manager
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(
+        !admit_active_steps(
+            &transaction,
+            "T-completion",
+            &["node-completion".to_owned()],
+            "2026-09-19T00:00:00Z",
+        )
+        .unwrap()
+    );
+    transaction.rollback().unwrap();
+
+    let result = manager
+        .transition(&request(
+            "tr-duplicate-latest-running",
+            "T-completion",
+            2,
+            TaskState::Recovering,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    let ready_count = manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM step_executions WHERE task_id = 'T-completion' AND node_id = 'node-completion' AND state = 'READY'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(ready_count, 2);
 }
 
 #[test]
