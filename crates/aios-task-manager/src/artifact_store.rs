@@ -1699,21 +1699,12 @@ impl TaskManager {
                     "ARTIFACT_ALLOCATION_STATE_CONFLICT",
                 ))?;
         let seal_reference = seal_ref(staging_ref);
-        let seal_bytes = match self
-            .artifact_store_dir
-            .open(safe_internal_ref(&seal_reference)?)
-        {
-            Ok(seal) => {
-                let mut bytes = Vec::new();
-                seal.take(16 * 1024).read_to_end(&mut bytes)?;
-                Some(bytes)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let sealed = seal_bytes
-            .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<SealedStaging>(bytes).ok());
+        // Read the fsynced pending evidence first. Once present, it is part of
+        // the authenticated finish protocol and must not be replaced from
+        // subsequently changed staging bytes.
+        let pending_reference = format!("{seal_reference}.pending");
+        let pending = read_staging_seal_evidence(&self.artifact_store_dir, &pending_reference)?;
+        let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
         let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
         writer_finish_step()?;
         validate_writer_fence(
@@ -1724,32 +1715,16 @@ impl TaskManager {
             self.lease_epoch,
             allocation.writer_grant_admission.as_ref(),
         )?;
-        if let Some(sealed) = sealed {
-            if sealed.version != SEALED_STAGING_VERSION
-                || sealed.allocation_id != allocation_id
-                || sealed.size_bytes != size
-                || sealed.content_hash != hash
-            {
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-            }
-        } else {
-            if seal_bytes.is_some() {
-                self.artifact_store_dir
-                    .remove_file(safe_internal_ref(&seal_reference)?)?;
-                sync_cap_directory(&self.artifact_store_dir, "staging")?;
-            }
-            let sealed = SealedStaging {
-                version: SEALED_STAGING_VERSION,
-                allocation_id: allocation_id.to_owned(),
-                size_bytes: size,
-                content_hash: hash,
-            };
-            write_staging_seal_atomically(
-                &self.artifact_store_dir,
-                &seal_reference,
-                &serde_json::to_vec(&sealed)?,
-            )?;
-        }
+        resolve_staging_seal_evidence(
+            &self.artifact_store_dir,
+            allocation_id,
+            &seal_reference,
+            &pending,
+            &final_seal,
+            size,
+            &hash,
+            true,
+        )?;
         Ok(size)
     }
 
@@ -6603,13 +6578,130 @@ fn seal_ref(staging_ref: &str) -> String {
     format!("{staging_ref}.sealed")
 }
 
+#[derive(Debug)]
+enum StagingSealEvidence {
+    Absent,
+    Truncated,
+    Complete(SealedStaging),
+}
+
+fn read_staging_seal_evidence(store: &Dir, reference: &str) -> Result<StagingSealEvidence> {
+    let file = match store.open(safe_internal_ref(reference)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StagingSealEvidence::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+    }
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) if error.is_eof() => return Ok(StagingSealEvidence::Truncated),
+        Err(_) => return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH")),
+    };
+    let sealed = serde_json::from_value::<SealedStaging>(value)
+        .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))?;
+    Ok(StagingSealEvidence::Complete(sealed))
+}
+
+fn validate_staging_seal(
+    sealed: &SealedStaging,
+    allocation_id: &str,
+    size_bytes: u64,
+    content_hash: &str,
+) -> Result<()> {
+    if sealed.version != SEALED_STAGING_VERSION
+        || sealed.allocation_id != allocation_id
+        || sealed.size_bytes != size_bytes
+        || sealed.content_hash != content_hash
+    {
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the resolver authenticates both durable seal names against one exact staging fact"
+)]
+fn resolve_staging_seal_evidence(
+    store: &Dir,
+    allocation_id: &str,
+    seal_reference: &str,
+    pending: &StagingSealEvidence,
+    final_seal: &StagingSealEvidence,
+    size_bytes: u64,
+    content_hash: &str,
+    reconstruct_when_absent: bool,
+) -> Result<()> {
+    let pending_reference = format!("{seal_reference}.pending");
+    if let StagingSealEvidence::Complete(sealed) = pending {
+        validate_staging_seal(sealed, allocation_id, size_bytes, content_hash)?;
+    }
+    if let StagingSealEvidence::Complete(sealed) = final_seal {
+        validate_staging_seal(sealed, allocation_id, size_bytes, content_hash)?;
+    }
+
+    if matches!(pending, StagingSealEvidence::Complete(_)) {
+        match final_seal {
+            StagingSealEvidence::Complete(_) => {
+                store.remove_file(safe_internal_ref(&pending_reference)?)?;
+                return sync_cap_directory(store, "staging");
+            }
+            StagingSealEvidence::Truncated => {
+                store.remove_file(safe_internal_ref(seal_reference)?)?;
+                sync_cap_directory(store, "staging")?;
+            }
+            StagingSealEvidence::Absent => {}
+        }
+        store.rename(
+            safe_internal_ref(&pending_reference)?,
+            store,
+            safe_internal_ref(seal_reference)?,
+        )?;
+        return sync_cap_directory(store, "staging");
+    }
+
+    if matches!(final_seal, StagingSealEvidence::Complete(_)) {
+        if matches!(pending, StagingSealEvidence::Truncated) {
+            store.remove_file(safe_internal_ref(&pending_reference)?)?;
+            sync_cap_directory(store, "staging")?;
+        }
+        return Ok(());
+    }
+
+    let has_incomplete_evidence = matches!(pending, StagingSealEvidence::Truncated)
+        || matches!(final_seal, StagingSealEvidence::Truncated);
+    if !has_incomplete_evidence && !reconstruct_when_absent {
+        return Ok(());
+    }
+    for (reference, evidence) in [
+        (pending_reference.as_str(), pending),
+        (seal_reference, final_seal),
+    ] {
+        if matches!(evidence, StagingSealEvidence::Truncated) {
+            store.remove_file(safe_internal_ref(reference)?)?;
+        }
+    }
+    if has_incomplete_evidence {
+        sync_cap_directory(store, "staging")?;
+    }
+    let sealed = SealedStaging {
+        version: SEALED_STAGING_VERSION,
+        allocation_id: allocation_id.to_owned(),
+        size_bytes,
+        content_hash: content_hash.to_owned(),
+    };
+    write_staging_seal_atomically(store, seal_reference, &serde_json::to_vec(&sealed)?)
+}
+
 fn write_staging_seal_atomically(store: &Dir, seal_reference: &str, bytes: &[u8]) -> Result<()> {
     let temporary = format!("{seal_reference}.pending");
-    match store.remove_file(safe_internal_ref(&temporary)?) {
-        Ok(()) => sync_cap_directory(store, "staging")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
     let mut seal = store.open_with(
         safe_internal_ref(&temporary)?,
         CapOpenOptions::new().write(true).create_new(true),
@@ -6635,55 +6727,24 @@ fn reconcile_interrupted_staging_seal(
 ) -> Result<()> {
     let seal_reference = seal_ref(staging_ref);
     let pending_reference = format!("{seal_reference}.pending");
-    let read_optional = |reference: &str| -> Result<Option<Vec<u8>>> {
-        match store.open(safe_internal_ref(reference)?) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(16 * 1024).read_to_end(&mut bytes)?;
-                Ok(Some(bytes))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    };
-    let seal_bytes = read_optional(&seal_reference)?;
-    let pending_bytes = read_optional(&pending_reference)?;
-    if seal_bytes.is_none() && pending_bytes.is_none() {
+    let pending = read_staging_seal_evidence(store, &pending_reference)?;
+    let final_seal = read_staging_seal_evidence(store, &seal_reference)?;
+    if matches!(&pending, StagingSealEvidence::Absent)
+        && matches!(&final_seal, StagingSealEvidence::Absent)
+    {
         return Ok(());
     }
     let (size_bytes, content_hash) = hash_internal_file(store, staging_ref)?;
-    if let Some(sealed) = seal_bytes
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<SealedStaging>(bytes).ok())
-    {
-        if sealed.version != SEALED_STAGING_VERSION
-            || sealed.allocation_id != allocation_id
-            || sealed.size_bytes != size_bytes
-            || sealed.content_hash != content_hash
-        {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-        }
-        if pending_bytes.is_some() {
-            store.remove_file(safe_internal_ref(&pending_reference)?)?;
-            sync_cap_directory(store, "staging")?;
-        }
-        return Ok(());
-    }
-    for reference in [&seal_reference, &pending_reference] {
-        match store.remove_file(safe_internal_ref(reference)?) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    sync_cap_directory(store, "staging")?;
-    let sealed = SealedStaging {
-        version: SEALED_STAGING_VERSION,
-        allocation_id: allocation_id.to_owned(),
+    resolve_staging_seal_evidence(
+        store,
+        allocation_id,
+        &seal_reference,
+        &pending,
+        &final_seal,
         size_bytes,
-        content_hash,
-    };
-    write_staging_seal_atomically(store, &seal_reference, &serde_json::to_vec(&sealed)?)
+        &content_hash,
+        false,
+    )
 }
 
 fn random_token(connection: &Connection) -> Result<String> {
@@ -13301,6 +13362,19 @@ mod tests {
                 .state,
             ArtifactAllocationState::Writing
         );
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let seal_reference = seal_ref(&staging_ref);
+        assert!(!manager.artifact_store_root.join(&seal_reference).exists());
+        assert!(
+            manager
+                .artifact_store_root
+                .join(format!("{seal_reference}.pending"))
+                .exists()
+        );
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -13309,6 +13383,13 @@ mod tests {
                 .retry_bound_artifact_output_finish(&session, allocation_id)
                 .unwrap(),
             15
+        );
+        assert!(manager.artifact_store_root.join(&seal_reference).exists());
+        assert!(
+            !manager
+                .artifact_store_root
+                .join(format!("{seal_reference}.pending"))
+                .exists()
         );
         // Response-loss retries authenticate the same seal and do not consume another grant use.
         assert_eq!(
@@ -13328,6 +13409,61 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn complete_pending_seal_rejects_changed_staging_and_survives_retry_and_reopen() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-pending-authoritative";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "pending-authoritative",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, allocation_id);
+        writer.write_all(b"original staging").unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some("sync-staging-seal".to_owned())));
+        });
+        assert!(matches!(writer.finish(), Err(TaskManagerError::Io(_))));
+        DURABILITY_TEST_CONTROL.with(|control| {
+            control.borrow_mut().take();
+        });
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let pending_path = manager
+            .artifact_store_root
+            .join(format!("{}.pending", seal_ref(&staging_ref)));
+        let pending_before = std::fs::read(&pending_path).unwrap();
+        std::fs::write(
+            manager.artifact_store_root.join(&staging_ref),
+            b"changed staging!",
+        )
+        .unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        assert!(matches!(
+            manager.retry_bound_artifact_output_finish(&session, allocation_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
+        assert_eq!(std::fs::read(&pending_path).unwrap(), pending_before);
+        drop(manager);
+        assert!(matches!(
+            TaskManager::open_with_clock(&database, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+        ));
+        assert_eq!(std::fs::read(pending_path).unwrap(), pending_before);
     }
 
     #[test]
@@ -13382,6 +13518,158 @@ mod tests {
                 .unwrap();
             assert_eq!(sealed.size_bytes, 25);
         }
+    }
+
+    #[test]
+    fn startup_rejects_complete_schema_invalid_seals_without_rewriting_them() {
+        for (suffix, seal_bytes) in [
+            (
+                "unknown-field",
+                br#"{"version":1,"allocation_id":"alloc-schema-unknown-field","size_bytes":25,"content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unexpected":true}"#.as_slice(),
+            ),
+            (
+                "wrong-type",
+                br#"{"version":1,"allocation_id":"alloc-schema-wrong-type","size_bytes":"25","content_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            ),
+            ("malformed-syntax", br#"{"version":1,}"#),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let database = temp.path().join("task-manager.sqlite");
+            let mut manager = manager(&temp);
+            let allocation_id = format!("alloc-schema-{suffix}");
+            manager
+                .allocate_artifact_output(&allocation(&allocation_id))
+                .unwrap();
+            let mut writer = manager.open_artifact_output(&allocation_id).unwrap();
+            writer.write_all(b"recoverable staging bytes").unwrap();
+            drop(writer);
+            let staging_ref = load_allocation_row(&manager.connection, &allocation_id)
+                .unwrap()
+                .unwrap()
+                .staging_ref
+                .unwrap();
+            let seal_path = manager.artifact_store_root.join(seal_ref(&staging_ref));
+            std::fs::write(&seal_path, seal_bytes).unwrap();
+            secure_cap_file_permissions(
+                &manager
+                    .artifact_store_dir
+                    .open(seal_ref(&staging_ref))
+                    .unwrap(),
+            )
+            .unwrap();
+            drop(manager);
+
+            assert!(matches!(
+                TaskManager::open_with_clock(&database, Box::new(FixedClock)),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+            ));
+            assert_eq!(std::fs::read(seal_path).unwrap(), seal_bytes);
+        }
+    }
+
+    #[test]
+    fn startup_reconstructs_only_eof_truncated_final_or_pending_seals() {
+        for target in ["final", "pending"] {
+            let temp = TempDir::new().unwrap();
+            let database = temp.path().join("task-manager.sqlite");
+            let mut manager = manager(&temp);
+            let allocation_id = format!("alloc-eof-{target}");
+            manager
+                .allocate_artifact_output(&allocation(&allocation_id))
+                .unwrap();
+            let mut writer = manager.open_artifact_output(&allocation_id).unwrap();
+            writer.write_all(b"recoverable staging bytes").unwrap();
+            drop(writer);
+            let staging_ref = load_allocation_row(&manager.connection, &allocation_id)
+                .unwrap()
+                .unwrap()
+                .staging_ref
+                .unwrap();
+            let seal_reference = seal_ref(&staging_ref);
+            let evidence_reference = if target == "final" {
+                seal_reference.clone()
+            } else {
+                format!("{seal_reference}.pending")
+            };
+            manager
+                .artifact_store_dir
+                .write(&evidence_reference, b"{\"version\":")
+                .unwrap();
+            secure_cap_file_permissions(
+                &manager
+                    .artifact_store_dir
+                    .open(&evidence_reference)
+                    .unwrap(),
+            )
+            .unwrap();
+            drop(manager);
+
+            let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+            let sealed =
+                read_staging_seal_evidence(&reopened.artifact_store_dir, &seal_reference).unwrap();
+            assert!(matches!(sealed, StagingSealEvidence::Complete(_)));
+            assert!(
+                !reopened
+                    .artifact_store_root
+                    .join(format!("{seal_reference}.pending"))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn complete_pending_seal_wins_over_eof_truncated_final() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-pending-wins";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        let mut writer = manager.open_artifact_output(allocation_id).unwrap();
+        writer.write_all(b"pending wins bytes").unwrap();
+        drop(writer);
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let (size_bytes, content_hash) =
+            hash_internal_file(&manager.artifact_store_dir, &staging_ref).unwrap();
+        let seal_reference = seal_ref(&staging_ref);
+        manager
+            .artifact_store_dir
+            .write(&seal_reference, b"{\"version\":")
+            .unwrap();
+        let pending_reference = format!("{seal_reference}.pending");
+        let pending = serde_json::to_vec(&SealedStaging {
+            version: SEALED_STAGING_VERSION,
+            allocation_id: allocation_id.to_owned(),
+            size_bytes,
+            content_hash,
+        })
+        .unwrap();
+        manager
+            .artifact_store_dir
+            .write(&pending_reference, &pending)
+            .unwrap();
+        for reference in [&seal_reference, &pending_reference] {
+            secure_cap_file_permissions(&manager.artifact_store_dir.open(reference).unwrap())
+                .unwrap();
+        }
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            std::fs::read(reopened.artifact_store_root.join(&seal_reference)).unwrap(),
+            pending
+        );
+        assert!(
+            !reopened
+                .artifact_store_root
+                .join(pending_reference)
+                .exists()
+        );
     }
 
     #[test]
