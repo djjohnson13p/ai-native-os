@@ -2014,22 +2014,15 @@ impl TaskManager {
             let appended = append_event(&transaction, &request.task_id, &event)?;
             if let Some(import_id) = request.import_id.as_deref() {
                 let operation_id = keyed_import_operation_id(&request.task_id, import_id);
-                let details = canonical_json(&json!({
-                    "version": 1,
-                    "kind": "keyed-artifact-import",
-                    "task_id": request.task_id,
-                    "import_id": import_id,
-                    "artifact_id": artifact_id,
-                    "request_digest": request_digest,
-                }))?;
-                let receipt = canonical_json(&json!({
-                    "version": 1,
-                    "kind": "keyed-artifact-import-committed",
-                    "operation_id": operation_id,
-                    "blob_reused": reused,
-                    "provenance_event_id": appended.event_id,
-                    "provenance_event_hash": appended.event_hash,
-                }))?;
+                let (details, receipt) = keyed_import_receipt_payloads(
+                    &request.task_id,
+                    import_id,
+                    &artifact_id,
+                    &request_digest,
+                    reused,
+                    &appended.event_id,
+                    &appended.event_hash,
+                )?;
                 transaction.execute(
                     "INSERT INTO operations(
                         operation_id,task_id,transaction_class,effect_class,idempotency_key,
@@ -4714,6 +4707,272 @@ impl TaskManager {
         for task_id in task_ids {
             self.ensure_unknown_export_recovery_inventory(&task_id)?;
         }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-time compatibility migration authenticates complete legacy import events, metadata, blobs, and receipts in one transaction"
+    )]
+    pub(crate) fn migrate_legacy_keyed_import_receipts(&mut self) -> Result<()> {
+        let already_applied = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations
+             WHERE migration_id='0010_keyed_import_causal_receipts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if already_applied {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        let events = {
+            let mut statement = transaction.prepare(
+                "SELECT event_id,task_id,timestamp,event_type,status,event_hash,event_json
+                 FROM provenance_events
+                 WHERE event_type='artifact.imported'
+                   AND json_type(event_json,'$.details.import_id')='text'
+                 ORDER BY task_id,sequence",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for row in events {
+            if !super::verify_provenance_through(&transaction, &row.1, None)? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ));
+            }
+            let event: serde_json::Value = serde_json::from_str(&row.6)?;
+            let details = event
+                .get("details")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let import_id = details
+                .get("import_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let request_digest = details
+                .get("request_digest")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let content_hash = details
+                .get("content_hash")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let size = details
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let blob_reused = details
+                .get("blob_reused")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            validate_id(
+                import_id,
+                256,
+                "legacy keyed Artifact import provenance is invalid",
+            )?;
+            validate_hash(request_digest)?;
+            validate_hash(content_hash)?;
+            parse_time(&row.2)?;
+            let artifact_id = artifact_id("import-key", &format!("{}\0{import_id}", row.1));
+            let actor = transaction
+                .query_row(
+                    "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1",
+                    [&row.1],
+                    |record| {
+                        Ok(Actor {
+                            kind: record.get(0)?,
+                            id: record.get(1)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ))?;
+            let expected_event = json!({
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id("artifact-imported", &artifact_id),
+                "task_id": row.1,
+                "event_type": "artifact.imported",
+                "timestamp": row.2,
+                "actor": actor,
+                "input_artifacts": [],
+                "output_artifacts": [artifact_id],
+                "status": "success",
+                "details": {
+                    "content_hash": content_hash,
+                    "size_bytes": size,
+                    "blob_reused": blob_reused,
+                    "import_id": import_id,
+                    "request_digest": request_digest,
+                }
+            });
+            if event != expected_event
+                || row.0 != event_id("artifact-imported", &artifact_id)
+                || row.3 != "artifact.imported"
+                || row.4 != "success"
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import provenance is invalid",
+                ));
+            }
+            let event_count = transaction.query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1
+                   AND event_type='artifact.imported'
+                   AND json_extract(event_json,'$.details.import_id')=?2",
+                params![row.1, import_id],
+                |record| record.get::<_, i64>(0),
+            )?;
+            let artifact = transaction
+                .query_row(
+                    "SELECT a.content_hash,a.size_bytes,a.created_at,a.origin_task_id,
+                            a.integrity_state,b.storage_ref,b.durability_state,
+                            (SELECT COUNT(*) FROM task_artifacts ta
+                             WHERE ta.task_id=?2 AND ta.artifact_id=a.artifact_id
+                               AND ta.role='input' AND ta.node_id IS NULL)
+                     FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+                     WHERE a.artifact_id=?1",
+                    params![artifact_id, row.1],
+                    |record| {
+                        Ok((
+                            record.get::<_, String>(0)?,
+                            record.get::<_, i64>(1)?,
+                            record.get::<_, String>(2)?,
+                            record.get::<_, Option<String>>(3)?,
+                            record.get::<_, String>(4)?,
+                            record.get::<_, String>(5)?,
+                            record.get::<_, String>(6)?,
+                            record.get::<_, i64>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import metadata is invalid",
+                ))?;
+            if event_count != 1
+                || artifact.0 != content_hash
+                || artifact.1 != to_i64(size)?
+                || artifact.2 != row.2
+                || artifact.3.as_deref() != Some(row.1.as_str())
+                || artifact.4 != "verified"
+                || artifact.6 != "DURABLE"
+                || artifact.7 != 1
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import metadata is invalid",
+                ));
+            }
+            let (physical_size, physical_hash) =
+                hash_internal_file(&self.artifact_store_dir, &artifact.5)?;
+            if physical_size != size || physical_hash != content_hash {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import blob is invalid",
+                ));
+            }
+            let operation_id = keyed_import_operation_id(&row.1, import_id);
+            let (expected_details, expected_receipt) = keyed_import_receipt_payloads(
+                &row.1,
+                import_id,
+                &artifact_id,
+                request_digest,
+                blob_reused,
+                &row.0,
+                &row.5,
+            )?;
+            let existing = transaction
+                .query_row(
+                    "SELECT task_id,transaction_class,effect_class,idempotency_key,state,
+                            outcome_certainty,external_receipt,details_json,
+                            prepared_at,started_at,finished_at
+                     FROM operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |record| {
+                        Ok((
+                            record.get::<_, String>(0)?,
+                            record.get::<_, Option<String>>(1)?,
+                            record.get::<_, String>(2)?,
+                            record.get::<_, Option<String>>(3)?,
+                            record.get::<_, String>(4)?,
+                            record.get::<_, Option<String>>(5)?,
+                            record.get::<_, Option<String>>(6)?,
+                            record.get::<_, Option<String>>(7)?,
+                            record.get::<_, String>(8)?,
+                            record.get::<_, Option<String>>(9)?,
+                            record.get::<_, Option<String>>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                let exact = existing.0 == row.1
+                    && existing.1.as_deref() == Some("reversible_local")
+                    && existing.2 == "ARTIFACT_IMPORT"
+                    && existing.3.as_deref() == Some(operation_id.as_str())
+                    && existing.4 == "SUCCEEDED"
+                    && existing.5.as_deref() == Some("COMPLETED")
+                    && existing.6.as_deref() == Some(expected_receipt.as_str())
+                    && existing.7.as_deref() == Some(expected_details.as_str())
+                    && existing.8 == row.2
+                    && existing.9.as_deref() == Some(row.2.as_str())
+                    && existing.10.as_deref() == Some(row.2.as_str());
+                if !exact {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "stored Artifact import receipt is invalid",
+                    ));
+                }
+            } else {
+                transaction.execute(
+                    "INSERT INTO operations(
+                        operation_id,task_id,transaction_class,effect_class,idempotency_key,
+                        state,outcome_certainty,external_receipt,details_json,
+                        prepared_at,started_at,finished_at
+                     ) VALUES (?1,?2,'reversible_local','ARTIFACT_IMPORT',?1,
+                               'SUCCEEDED','COMPLETED',?3,?4,?5,?5,?5)",
+                    params![
+                        operation_id,
+                        row.1,
+                        expected_receipt,
+                        expected_details,
+                        row.2
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at)
+             VALUES ('0010_keyed_import_causal_receipts',
+                     'keyed-import-causal-receipts-v0.1',?1)",
+            [self.clock.now()],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -8320,6 +8579,35 @@ fn keyed_import_operation_id(task_id: &str, import_id: &str) -> String {
         "artifact-import-receipt",
         &format!("{task_id}\0{import_id}"),
     )
+}
+
+fn keyed_import_receipt_payloads(
+    task_id: &str,
+    import_id: &str,
+    artifact_id: &str,
+    request_digest: &str,
+    blob_reused: bool,
+    provenance_event_id: &str,
+    provenance_event_hash: &str,
+) -> Result<(String, String)> {
+    let operation_id = keyed_import_operation_id(task_id, import_id);
+    let details = canonical_json(&json!({
+        "version": 1,
+        "kind": "keyed-artifact-import",
+        "task_id": task_id,
+        "import_id": import_id,
+        "artifact_id": artifact_id,
+        "request_digest": request_digest,
+    }))?;
+    let receipt = canonical_json(&json!({
+        "version": 1,
+        "kind": "keyed-artifact-import-committed",
+        "operation_id": operation_id,
+        "blob_reused": blob_reused,
+        "provenance_event_id": provenance_event_id,
+        "provenance_event_hash": provenance_event_hash,
+    }))?;
+    Ok((details, receipt))
 }
 
 #[allow(
@@ -19438,6 +19726,126 @@ mod tests {
                 "stored Artifact import receipt is invalid"
             ))
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one upgrade fixture covers legacy atomic backfill plus modern receipt tamper and deletion rejection"
+    )]
+    fn legacy_keyed_import_is_atomically_backfilled_but_modern_receipt_is_mandatory() {
+        struct PanicReader;
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an authenticated keyed import replay must not read its source")
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let mut request = import_request();
+        request.import_id = Some("import:pre-causal-receipt-layout".to_owned());
+        let artifact = manager
+            .import_artifact(&request, &mut Cursor::new(b"legacy keyed bytes".as_slice()))
+            .unwrap();
+        let operation_id =
+            keyed_import_operation_id(&request.task_id, request.import_id.as_deref().unwrap());
+        manager
+            .connection
+            .execute(
+                "DELETE FROM operations WHERE operation_id=?1",
+                [&operation_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM schema_migrations
+                 WHERE migration_id='0010_keyed_import_causal_receipts'",
+                [],
+            )
+            .unwrap();
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id=?1
+                       AND effect_class='ARTIFACT_IMPORT' AND state='SUCCEEDED'
+                       AND outcome_certainty='COMPLETED'",
+                    [&operation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .import_artifact(&request, &mut PanicReader)
+                .unwrap()
+                .artifact_id,
+            artifact.artifact_id
+        );
+
+        let original_receipt = reopened
+            .connection
+            .query_row(
+                "SELECT external_receipt FROM operations WHERE operation_id=?1",
+                [&operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE operations
+                 SET external_receipt=json_set(external_receipt,'$.blob_reused',
+                                               NOT json_extract(external_receipt,'$.blob_reused'))
+                 WHERE operation_id=?1",
+                [&operation_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.import_artifact(&request, &mut PanicReader),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact import receipt is invalid"
+            ))
+        ));
+        reopened
+            .connection
+            .execute(
+                "UPDATE operations SET external_receipt=?2 WHERE operation_id=?1",
+                params![operation_id, original_receipt],
+            )
+            .unwrap();
+        reopened
+            .connection
+            .execute(
+                "DELETE FROM operations WHERE operation_id=?1",
+                [&operation_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.import_artifact(&request, &mut PanicReader),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact import receipt is invalid"
+            ))
+        ));
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations
+                     WHERE migration_id='0010_keyed_import_causal_receipts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

@@ -856,6 +856,7 @@ impl TaskManager {
             delivered_reader_admissions: BTreeSet::new(),
         };
         manager.verify_all_provenance_chains()?;
+        manager.migrate_legacy_keyed_import_receipts()?;
         manager.reconcile_export_operations_startup()?;
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
@@ -3126,7 +3127,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3179,6 +3180,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0009_artifact_writer_session_fencing",
         "artifact-writer-session-fencing-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0010_keyed_import_causal_receipts",
+        "keyed-import-causal-receipts-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3406,6 +3412,11 @@ fn migrate_task_manager_schema(
         connection,
         "0009_artifact_writer_session_fencing",
         "artifact-writer-session-fencing-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0010_keyed_import_causal_receipts",
+        "keyed-import-causal-receipts-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
