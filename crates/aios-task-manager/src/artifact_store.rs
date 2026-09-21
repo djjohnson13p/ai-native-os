@@ -7236,6 +7236,11 @@ fn replayable_reader_admission_for_grant(
     checked_at: &str,
     delivered_in_process: &BTreeSet<String>,
 ) -> Result<Option<ReplayableReaderAdmission>> {
+    if !super::verify_provenance_through(connection, task_id, None)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Task provenance is invalid",
+        ));
+    }
     let candidates = {
         let mut statement = connection.prepare(
             "WITH candidate_ids(operation_id) AS (
@@ -7257,6 +7262,8 @@ fn replayable_reader_admission_for_grant(
                  WHERE event_type='execution.started'
                    AND event_id LIKE 'event:artifact-reader-admitted:v1:sha256:%'
                    AND (
+                       json_extract(event_json,'$.authority_token_id')=?6
+                       OR
                        (task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
                         AND execution_binding_id=?4)
                        OR
@@ -7266,9 +7273,9 @@ fn replayable_reader_admission_for_grant(
                         AND json_extract(event_json,'$.execution_binding_id')=?4)
                    )
              )
-             SELECT o.operation_id,o.details_json,o.external_receipt
-             FROM operations o JOIN candidate_ids c ON c.operation_id=o.operation_id
-             ORDER BY o.prepared_at,o.operation_id",
+             SELECT c.operation_id,o.details_json,o.external_receipt
+             FROM candidate_ids c LEFT JOIN operations o ON o.operation_id=c.operation_id
+             ORDER BY o.prepared_at,c.operation_id",
         )?;
         let rows = statement.query_map(
             params![
@@ -7277,6 +7284,7 @@ fn replayable_reader_admission_for_grant(
                 execution.node_id,
                 execution.binding_id,
                 execution.attempt_id,
+                grant_id,
             ],
             |row| {
                 Ok((
@@ -20938,6 +20946,24 @@ mod tests {
             .connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
+        let exact_provenance = manager
+            .connection
+            .query_row(
+                "SELECT event_id,node_id,event_json FROM provenance_events
+                 WHERE event_id=(
+                     SELECT json_extract(external_receipt,'$.admission_event_id')
+                     FROM operations WHERE operation_id=?1
+                 )",
+                [&second_operation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
         manager
             .connection
             .execute(
@@ -20948,10 +20974,24 @@ mod tests {
                 [&second_operation],
             )
             .unwrap();
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER provenance_events_no_update;")
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE provenance_events
+                 SET node_id='forged-node',
+                     event_json=json_set(event_json,'$.step_id','forged-node')
+                 WHERE event_id=?1",
+                [&exact_provenance.0],
+            )
+            .unwrap();
         assert!(matches!(
             manager.open_artifact_reader(&scope, &artifact.artifact_id),
             Err(TaskManagerError::InvalidRecord(
-                "stored Artifact reader admission is invalid"
+                "stored Task provenance is invalid"
             ))
         ));
         assert_eq!(
@@ -20979,6 +21019,23 @@ mod tests {
             .execute(
                 "UPDATE operations SET node_id=?2,details_json=?3 WHERE operation_id=?1",
                 params![second_operation, exact_context.2, exact_details],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE provenance_events SET node_id=?2,event_json=?3 WHERE event_id=?1",
+                params![exact_provenance.0, exact_provenance.1, exact_provenance.2],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER provenance_events_no_update
+                 BEFORE UPDATE ON provenance_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'provenance_events are append-only');
+                 END;",
             )
             .unwrap();
         let mut third = manager
@@ -21014,6 +21071,97 @@ mod tests {
                 )
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn deleted_pending_reader_operation_is_not_replaced_or_reconsumed() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"deleted pending admission".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "deleted-pending-reader",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=2
+                 WHERE grant_id='grant-deleted-pending-reader-0'",
+                [],
+            )
+            .unwrap();
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let operation_id = reader
+            .reader_admission
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM operations WHERE operation_id=?1",
+                [&operation_id],
+            )
+            .unwrap();
+        let operation_count = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            operation_count
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-deleted-pending-reader-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE effect_class='ARTIFACT_READ'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
     }
 
