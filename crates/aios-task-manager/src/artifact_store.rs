@@ -7238,10 +7238,37 @@ fn replayable_reader_admission_for_grant(
 ) -> Result<Option<ReplayableReaderAdmission>> {
     let candidates = {
         let mut statement = connection.prepare(
-            "SELECT operation_id,details_json,external_receipt FROM operations
-             WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
-               AND binding_id=?4 AND attempt_id=?5 AND effect_class='ARTIFACT_READ'
-             ORDER BY prepared_at,operation_id",
+            "WITH candidate_ids(operation_id) AS (
+                 SELECT operation_id FROM operations
+                 WHERE effect_class='ARTIFACT_READ' AND task_id=?1
+                   AND semantic_program_hash=?2 AND node_id=?3
+                   AND binding_id=?4 AND attempt_id=?5
+                 UNION
+                 SELECT operation_id FROM operations
+                 WHERE effect_class='ARTIFACT_READ'
+                   AND json_extract(details_json,'$.task_id')=?1
+                   AND json_extract(details_json,'$.semantic_program_hash')=?2
+                   AND json_extract(details_json,'$.node_id')=?3
+                   AND json_extract(details_json,'$.binding_id')=?4
+                   AND json_extract(details_json,'$.attempt_id')=?5
+                 UNION
+                 SELECT json_extract(event_json,'$.details.operation_id')
+                 FROM provenance_events
+                 WHERE event_type='execution.started'
+                   AND event_id LIKE 'event:artifact-reader-admitted:v1:sha256:%'
+                   AND (
+                       (task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
+                        AND execution_binding_id=?4)
+                       OR
+                       (json_extract(event_json,'$.task_id')=?1
+                        AND json_extract(event_json,'$.semantic_program_hash')=?2
+                        AND json_extract(event_json,'$.step_id')=?3
+                        AND json_extract(event_json,'$.execution_binding_id')=?4)
+                   )
+             )
+             SELECT o.operation_id,o.details_json,o.external_receipt
+             FROM operations o JOIN candidate_ids c ON c.operation_id=o.operation_id
+             ORDER BY o.prepared_at,o.operation_id",
         )?;
         let rows = statement.query_map(
             params![
@@ -20758,6 +20785,12 @@ mod tests {
             .unwrap()
             .operation_id
             .clone();
+        let operation_count = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
         let exact_details = manager
             .connection
             .query_row(
@@ -20800,13 +20833,10 @@ mod tests {
             assert_eq!(
                 manager
                     .connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM operations WHERE effect_class='ARTIFACT_READ'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
+                    .query_row("SELECT COUNT(*) FROM operations", [], |row| row
+                        .get::<_, i64>(0),)
                     .unwrap(),
-                2
+                operation_count
             );
             manager
                 .connection
@@ -20816,6 +20846,141 @@ mod tests {
                 )
                 .unwrap();
         }
+        let exact_context = manager
+            .connection
+            .query_row(
+                "SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id
+                 FROM operations WHERE operation_id=?1",
+                [&second_operation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        manager
+            .connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        for (tamper, restore, exact) in [
+            (
+                "UPDATE operations SET task_id='T-forged' WHERE operation_id=?1",
+                "UPDATE operations SET task_id=?2 WHERE operation_id=?1",
+                exact_context.0.as_str(),
+            ),
+            (
+                "UPDATE operations SET semantic_program_hash='sha256:forged' WHERE operation_id=?1",
+                "UPDATE operations SET semantic_program_hash=?2 WHERE operation_id=?1",
+                exact_context.1.as_str(),
+            ),
+            (
+                "UPDATE operations SET node_id='forged-node' WHERE operation_id=?1",
+                "UPDATE operations SET node_id=?2 WHERE operation_id=?1",
+                exact_context.2.as_str(),
+            ),
+            (
+                "UPDATE operations SET binding_id='binding-forged' WHERE operation_id=?1",
+                "UPDATE operations SET binding_id=?2 WHERE operation_id=?1",
+                exact_context.3.as_str(),
+            ),
+            (
+                "UPDATE operations SET attempt_id='attempt-forged' WHERE operation_id=?1",
+                "UPDATE operations SET attempt_id=?2 WHERE operation_id=?1",
+                exact_context.4.as_str(),
+            ),
+            (
+                "UPDATE operations SET effect_class='DATA_EGRESS' WHERE operation_id=?1",
+                "UPDATE operations SET effect_class=?2 WHERE operation_id=?1",
+                "ARTIFACT_READ",
+            ),
+        ] {
+            manager
+                .connection
+                .execute(tamper, [&second_operation])
+                .unwrap();
+            assert!(matches!(
+                manager.open_artifact_reader(&scope, &artifact.artifact_id),
+                Err(TaskManagerError::InvalidRecord(
+                    "stored Artifact reader admission is invalid"
+                ))
+            ));
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT uses_consumed FROM authority_grants
+                         WHERE grant_id='grant-three-pending-readers-0'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM operations", [], |row| row
+                        .get::<_, i64>(0),)
+                    .unwrap(),
+                operation_count
+            );
+            manager
+                .connection
+                .execute(restore, params![second_operation, exact])
+                .unwrap();
+        }
+        manager
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE operations
+                 SET node_id='forged-node',
+                     details_json=json_set(details_json,'$.node_id','forged-node')
+                 WHERE operation_id=?1",
+                [&second_operation],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-three-pending-readers-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            operation_count
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET node_id=?2,details_json=?3 WHERE operation_id=?1",
+                params![second_operation, exact_context.2, exact_details],
+            )
+            .unwrap();
         let mut third = manager
             .open_artifact_reader(&scope, &artifact.artifact_id)
             .unwrap();
