@@ -1790,6 +1790,41 @@ impl TaskManager {
                 "recovery reference does not authenticate its basis and inventory",
             ));
         }
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        Self::persist_recovery_inventory_in_transaction(
+            &transaction,
+            recovery_ref,
+            task_id,
+            basis_revision,
+            operation_ids,
+            created_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the recovery assessment and exact subject inventory in its caller's atomic transaction"
+    )]
+    fn persist_recovery_inventory_in_transaction(
+        transaction: &Transaction<'_>,
+        recovery_ref: &str,
+        task_id: &str,
+        basis_revision: u64,
+        operation_ids: &[String],
+        created_at: &str,
+    ) -> Result<()> {
+        if recovery_operations_ref(task_id, basis_revision, operation_ids)? != recovery_ref {
+            return Err(TaskManagerError::InvalidRecord(
+                "recovery reference does not authenticate its basis and inventory",
+            ));
+        }
         let epoch_id = format!("epoch:{recovery_ref}");
         // An empty inventory is absence of evidence, not affirmative proof that
         // execution never started. The aggregate therefore remains conservative;
@@ -1803,19 +1838,13 @@ impl TaskManager {
         ];
         let external_reconciliation_required = true;
         let reason_codes_json = serde_json::to_string(&reason_codes)?;
-        let lease_owner = self.lease_owner.clone();
-        let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
         transaction.execute(
             "INSERT OR IGNORE INTO recovery_epochs (recovery_epoch_id, started_at) VALUES (?1, ?2)",
             params![epoch_id, created_at],
         )?;
-        for subject in load_recovery_subjects(&transaction, task_id)? {
+        for subject in load_recovery_subjects(transaction, task_id)? {
             persist_recovery_subject_assessment(
-                &transaction,
+                transaction,
                 recovery_ref,
                 &epoch_id,
                 task_id,
@@ -1910,7 +1939,7 @@ impl TaskManager {
             ));
         }
         let stored_operations = query_strings(
-            &transaction,
+            transaction,
             "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
             recovery_ref,
         )?;
@@ -1919,7 +1948,6 @@ impl TaskManager {
                 "recovery reference resolves to a different operation inventory",
             ));
         }
-        transaction.commit()?;
         Ok(())
     }
 
