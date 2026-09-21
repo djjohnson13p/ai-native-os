@@ -3151,7 +3151,31 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
             .transition(&completion_request("tr-corrupt-blob"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+    );
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET state='PAUSED' WHERE task_id='T-completion'",
+            [],
+        )
+        .unwrap();
+    let paused = manager.get_task("T-completion").unwrap().unwrap();
+    let blocked = manager
+        .transition(&request(
+            "tr-corrupt-publication-live",
+            "T-completion",
+            paused.revision,
+            TaskState::Paused,
+            TaskState::Runnable,
+        ))
+        .unwrap();
+    assert!(!blocked.applied);
+    assert_eq!(blocked.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
+    let still_paused = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(
+        (still_paused.state, still_paused.revision),
+        (TaskState::Paused, paused.revision)
     );
 
     manager.connection.execute_batch(
@@ -4108,18 +4132,21 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
 
 #[test]
 fn completion_requires_present_durable_hash_matching_verified_blob() {
-    for (name, mutation) in [
+    for (name, mutation, expected_reason) in [
         (
             "blob-missing",
             "UPDATE artifact_blobs SET durability_state='MISSING' WHERE content_hash='sha256:artifact-output'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "integrity-failed",
             "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id='artifact-output'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "hash-mismatch",
             "UPDATE artifact_publications SET content_hash='sha256:mismatch' WHERE publication_id='publication-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -4136,7 +4163,7 @@ fn completion_requires_present_durable_hash_matching_verified_blob() {
                 .transition(&completion_request(&format!("tr-blob-{name}")))
                 .unwrap()
                 .reason_code,
-            "TASK_COMPLETION_GATE_FAILED",
+            expected_reason,
             "{name}"
         );
     }

@@ -4248,7 +4248,13 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('PREPARED', 'STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL)))",
+               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
+               (SELECT COUNT(*) FROM artifact_publications p
+                 WHERE p.task_id = ?1 AND p.state = 'COMMITTED' AND EXISTS (
+                     SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash = a.content_hash
+                     WHERE a.artifact_id = p.artifact_id
+                       AND (a.integrity_state = 'failed' OR b.durability_state IN ('MISSING', 'CORRUPT'))
+                 ))",
             [task_id],
             |row| row.get::<_, i64>(0),
         )?;
