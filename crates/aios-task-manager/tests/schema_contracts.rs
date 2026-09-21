@@ -145,6 +145,11 @@ fn artifact_contracts_enforce_exact_type_lineage_and_value_bounds() {
     let mut allocation = first["allocation"].clone();
     allocation["published_artifact_id"] = Value::String("a".repeat(513));
     assert!(!allocation_validator.is_valid(&allocation));
+    allocation = first["allocation"].clone();
+    allocation["expected_semantic_type"] = Value::String(format!("{}@0", "a".repeat(254)));
+    assert!(allocation_validator.is_valid(&allocation));
+    allocation["expected_semantic_type"] = Value::String(format!("{}@0", "a".repeat(255)));
+    assert!(!allocation_validator.is_valid(&allocation));
 
     let request_validator = load_validator("artifact-publication-request.schema.json");
     let mut request = first["request"].clone();

@@ -4031,6 +4031,23 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
     manager
         .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
         .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE step_executions SET outcome_certainty='COMPLETED'
+             WHERE task_id='T-completion' AND attempt_id='attempt-completion'",
+            [],
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_none(),
+            "a mutable attempt certainty cannot resolve without authenticated provider evidence"
+        );
+    }
     let result = canonical_json(&serde_json::json!({
         "schema_version":SCHEMA_VERSION,
         "result_id":"provider-result-terminal",
@@ -4054,6 +4071,15 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
             rusqlite::params![result, TEST_TIME],
         )
         .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_some(),
+            "the exact authenticated provider result resolves its attempt"
+        );
+    }
     for (field, forged) in [
         ("id", "provider:forged"),
         ("package_or_build_hash", "sha256:forged-build"),
@@ -7112,9 +7138,32 @@ fn reconciled_aborted_revoked_and_denied_subjects_keep_failure_dispositions() {
     manager
         .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
         .unwrap();
+    let publication_request: crate::artifact_store::ArtifactPublicationRequest = manager
+        .connection
+        .query_row(
+            "SELECT request_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    manager
+        .connection
+        .execute_batch(
+            "UPDATE artifact_output_allocations
+             SET state='WRITING',published_artifact_id=NULL
+             WHERE allocation_id='allocation-completion';
+             UPDATE artifact_publications
+             SET artifact_id=NULL,content_hash=NULL
+             WHERE publication_id='publication-completion';",
+        )
+        .unwrap();
+    manager
+        .abort_pending_publication(&publication_request)
+        .unwrap();
     manager.connection.execute_batch(
-        "UPDATE artifact_publications SET state='ABORTED' WHERE publication_id='publication-completion';
-         UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T00:00:00Z' WHERE grant_id='grant-recovery';",
+        "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T00:00:00Z' WHERE grant_id='grant-recovery';",
     ).unwrap();
     let denied_result = canonical_json(&serde_json::json!({
         "schema_version":SCHEMA_VERSION,

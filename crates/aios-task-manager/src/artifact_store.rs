@@ -2425,6 +2425,7 @@ impl TaskManager {
             Ok(placement) => placement,
             Err(error @ TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH")) => {
                 self.mark_content_hash_failed(&content_hash, "CORRUPT")?;
+                self.handoff_content_hash_damage(&content_hash)?;
                 return Err(error);
             }
             Err(error) => return Err(error),
@@ -2559,7 +2560,7 @@ impl TaskManager {
         };
         let content_hash = artifact.content_hash.as_ref().map(ContentHash::tagged);
         let created_at = artifact.created_at.as_deref();
-        let metadata_exact = artifact.artifact_id == artifact_id
+        let metadata_identity_exact = artifact.artifact_id == artifact_id
             && artifact.uri.as_str() == ArtifactUri::new(&artifact_id).as_str()
             && artifact.semantic_type == request.semantic_type
             && artifact.media_type == request.media_type
@@ -2575,19 +2576,23 @@ impl TaskManager {
             && artifact.origin.step_id.is_none()
             && artifact.origin.execution_binding_id.is_none()
             && artifact.origin.provider_id.is_none()
-            && artifact.labels == request.labels
-            && artifact.integrity.as_ref().is_some_and(|integrity| {
-                integrity.state == Some(ArtifactIntegrityState::Verified)
-                    && integrity.verifier.as_deref() == Some("artifact-store:sha256")
-                    && match (integrity.verified_at.as_deref(), created_at) {
-                        (Some(verified_at), Some(created_at)) => parse_time(verified_at)
-                            .and_then(|verified| {
-                                parse_time(created_at).map(|created| verified >= created)
-                            })
-                            .unwrap_or(false),
-                        _ => false,
-                    }
-            });
+            && artifact.labels == request.labels;
+        let verified_time_exact = artifact.integrity.as_ref().is_some_and(|integrity| {
+            match (integrity.verified_at.as_deref(), created_at) {
+                (Some(verified_at), Some(created_at)) => parse_time(verified_at)
+                    .and_then(|verified| parse_time(created_at).map(|created| verified >= created))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        });
+        let verified_integrity_exact = artifact.integrity.as_ref().is_some_and(|integrity| {
+            integrity.state == Some(ArtifactIntegrityState::Verified)
+                && integrity.verifier.as_deref() == Some("artifact-store:sha256")
+        }) && verified_time_exact;
+        let failed_integrity_exact = artifact.integrity.as_ref().is_some_and(|integrity| {
+            integrity.state == Some(ArtifactIntegrityState::Failed)
+                && integrity.verifier.as_deref() == Some("artifact-store:startup")
+        }) && verified_time_exact;
         let attachment_exact = self.connection.query_row(
             "SELECT COUNT(*)=1 FROM task_artifacts
              WHERE task_id=?1 AND artifact_id=?2 AND role='input' AND node_id IS NULL",
@@ -2610,7 +2615,10 @@ impl TaskManager {
                 },
             )
             .optional()?;
-        let blob_exact = blob.as_ref().is_some_and(|blob| blob.2 == "DURABLE");
+        let blob_durable = blob.as_ref().is_some_and(|blob| blob.2 == "DURABLE");
+        let blob_failed = blob
+            .as_ref()
+            .is_some_and(|blob| matches!(blob.2.as_str(), "MISSING" | "CORRUPT"));
         let import_actor = self
             .connection
             .query_row(
@@ -2661,12 +2669,11 @@ impl TaskManager {
                         == Some(expected)
                 })
             });
-        let exact = metadata_exact
+        let receipt_exact = metadata_identity_exact
             && event_exact
             && attachment_exact
-            && blob_exact
             && super::verify_provenance_through(&self.connection, &request.task_id, None)?;
-        if !exact {
+        if !receipt_exact {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
             ));
@@ -2674,6 +2681,15 @@ impl TaskManager {
         let expected_hash = content_hash.ok_or(TaskManagerError::InvalidRecord(
             "stored Artifact import receipt is invalid",
         ))?;
+        if failed_integrity_exact && blob_failed {
+            self.handoff_content_hash_damage(&expected_hash)?;
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
+        }
+        if !verified_integrity_exact || !blob_durable {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
+            ));
+        }
         let (expected_size, storage_ref, _, _) = blob.ok_or(TaskManagerError::InvalidRecord(
             "stored Artifact import receipt is invalid",
         ))?;
@@ -2683,11 +2699,13 @@ impl TaskManager {
                     && actual_hash == expected_hash => {}
             Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.mark_content_hash_failed(&expected_hash, "MISSING")?;
+                self.handoff_content_hash_damage(&expected_hash)?;
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
             }
             Err(error) => return Err(error),
             Ok(_) => {
                 self.mark_content_hash_failed(&expected_hash, "CORRUPT")?;
+                self.handoff_content_hash_damage(&expected_hash)?;
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
             }
         }
@@ -3246,13 +3264,17 @@ impl TaskManager {
                 );
             }
             if state == "FAILED" {
-                return authenticate_failed_publication(
+                let result = authenticate_failed_publication(
                     &self.connection,
                     request,
                     &state,
                     result_json.as_deref(),
                     committed_at.as_deref(),
-                );
+                )?;
+                if result.reason_code == "ARTIFACT_HASH_MISMATCH" {
+                    self.retry_failed_publication_damage_handoff(request)?;
+                }
+                return Ok(result);
             }
             if state != "PENDING" {
                 return Ok(publication_conflict(request, self.clock.now()));
@@ -3347,7 +3369,9 @@ impl TaskManager {
             Ok(placement) => placement,
             Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH")) => {
                 self.mark_content_hash_failed(&content_hash, "CORRUPT")?;
-                return self.fail_pending_publication(request, "ARTIFACT_HASH_MISMATCH");
+                let failure = self.fail_pending_publication(request, "ARTIFACT_HASH_MISMATCH")?;
+                self.handoff_content_hash_damage(&content_hash)?;
+                return Ok(failure);
             }
             Err(error) => return Err(error),
         };
@@ -6734,6 +6758,39 @@ impl TaskManager {
         Ok(())
     }
 
+    fn retry_failed_publication_damage_handoff(
+        &mut self,
+        request: &ArtifactPublicationRequest,
+    ) -> Result<()> {
+        let Some(allocation) = load_allocation_row(&self.connection, &request.allocation_id)?
+        else {
+            return Ok(());
+        };
+        let Some(staging_ref) = allocation.staging_ref.as_deref() else {
+            return Ok(());
+        };
+        let Ok((_, content_hash)) = hash_internal_file(&self.artifact_store_dir, staging_ref)
+        else {
+            return Ok(());
+        };
+        let damage_exact = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifact_blobs b
+                 WHERE b.content_hash=?1 AND b.durability_state='CORRUPT'
+                   AND EXISTS(
+                       SELECT 1 FROM artifacts a
+                       WHERE a.content_hash=b.content_hash AND a.integrity_state='failed'
+                   )
+             )",
+            [&content_hash],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if damage_exact {
+            self.handoff_content_hash_damage(&content_hash)?;
+        }
+        Ok(())
+    }
+
     fn mark_blob_failed(
         &mut self,
         content_hash: &str,
@@ -9622,6 +9679,81 @@ pub(crate) fn failed_expired_publication_receipt_authenticates(
     }
 }
 
+pub(crate) fn aborted_publication_receipt_authenticates(
+    connection: &Connection,
+    task_id: &str,
+    publication_id: &str,
+) -> Result<bool> {
+    let row = connection
+        .query_row(
+            "SELECT p.allocation_id,p.request_json,p.state,p.result_json,p.committed_at,
+                    a.state,a.publication_id,p.artifact_id,p.content_hash,a.published_artifact_id
+             FROM artifact_publications p
+             LEFT JOIN artifact_output_allocations a
+               ON a.allocation_id=p.allocation_id AND a.task_id=p.task_id
+             WHERE p.task_id=?1 AND p.publication_id=?2",
+            params![task_id, publication_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        allocation_id,
+        request_json,
+        state,
+        result_json,
+        committed_at,
+        allocation_state,
+        allocation_publication_id,
+        artifact_id,
+        content_hash,
+        published_artifact_id,
+    )) = row
+    else {
+        return Ok(false);
+    };
+    let Ok(request) = serde_json::from_str::<ArtifactPublicationRequest>(&request_json) else {
+        return Ok(false);
+    };
+    if state != "ABORTED"
+        || allocation_state.as_deref() != Some("ABORTED")
+        || allocation_publication_id.as_deref() != Some(publication_id)
+        || artifact_id.is_some()
+        || content_hash.is_some()
+        || published_artifact_id.is_some()
+        || request.task_id != task_id
+        || request.publication_id != publication_id
+        || request.allocation_id != allocation_id
+        || validate_publication_request(&request).is_err()
+        || canonical_json(&request)? != request_json
+    {
+        return Ok(false);
+    }
+    match authenticate_failed_publication(
+        connection,
+        &request,
+        &state,
+        result_json.as_deref(),
+        committed_at.as_deref(),
+    ) {
+        Ok(result) => Ok(result.reason_code == "ARTIFACT_ALLOCATION_STATE_CONFLICT"),
+        Err(TaskManagerError::InvalidRecord(_) | TaskManagerError::Serialization(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn artifact_reason(error: &TaskManagerError) -> Option<&'static str> {
     match error {
         TaskManagerError::InvalidRecord(code) if code.starts_with("ARTIFACT_") => Some(code),
@@ -9758,6 +9890,34 @@ fn upsert_durable_blob(
     Ok(())
 }
 
+fn copy_blob_to_pending(
+    source: &mut impl Read,
+    pending: &mut cap_std::fs::File,
+) -> Result<(u64, String)> {
+    secure_cap_file_permissions(pending)?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(
+                u64::try_from(count)
+                    .map_err(|_| TaskManagerError::InvalidRecord("Artifact size overflow"))?,
+            )
+            .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
+        pending.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        pending_blob_copy_step()?;
+    }
+    pending.flush()?;
+    pending.sync_all()?;
+    Ok((copied, tagged_digest(hasher)))
+}
+
 impl TaskManager {
     fn remove_uncommitted_blob_if_unreferenced(
         &self,
@@ -9830,29 +9990,18 @@ impl TaskManager {
                 .write(true)
                 .create_new(true),
         )?;
-        secure_cap_file_permissions(&pending)?;
-        let mut hasher = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-        loop {
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
+        let copy_result = copy_blob_to_pending(&mut source, &mut pending);
+        let (copied, copied_hash) = match copy_result {
+            Ok(result) => result,
+            Err(error) => {
+                drop(pending);
+                self.remove_uncommitted_blob(&pending_ref)?;
+                return Err(error);
             }
-            copied = copied
-                .checked_add(
-                    u64::try_from(count)
-                        .map_err(|_| TaskManagerError::InvalidRecord("Artifact size overflow"))?,
-                )
-                .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
-            pending.write_all(&buffer[..count])?;
-            hasher.update(&buffer[..count]);
-        }
-        pending.flush()?;
-        pending.sync_all()?;
-        if copied != size || tagged_digest(hasher) != content_hash {
+        };
+        if copied != size || copied_hash != content_hash {
             drop(pending);
-            let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+            self.remove_uncommitted_blob(&pending_ref)?;
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
         }
         sync_cap_directory(&store, "blobs/pending")?;
@@ -12247,6 +12396,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static CONTENT_HASH_HANDOFF_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static PENDING_BLOB_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn pending_blob_copy_step() -> Result<()> {
+    PENDING_BLOB_COPY_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "pending blob copy fault injection shares the production call signature"
+)]
+fn pending_blob_copy_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -18206,6 +18376,10 @@ mod tests {
         let mut empty_allocation = allocation("alloc-empty-semantic-type");
         empty_allocation.expected_semantic_type = Some(String::new());
         validate_allocation_request_shape(&empty_allocation).unwrap();
+        empty_allocation.expected_semantic_type = Some(format!("{}@0", "a".repeat(254)));
+        validate_allocation_request_shape(&empty_allocation).unwrap();
+        empty_allocation.expected_semantic_type = Some(format!("{}@0", "a".repeat(255)));
+        assert!(validate_allocation_request_shape(&empty_allocation).is_err());
         let mut empty_publication = publication(
             "publication-empty-semantic-type",
             "alloc-empty-semantic-type",
@@ -18606,6 +18780,40 @@ mod tests {
     }
 
     #[test]
+    fn blob_copy_failure_removes_the_durable_pending_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-copy-failure"))
+            .unwrap();
+        write_output(&mut manager, "alloc-copy-failure", b"candidate");
+        let allocation = load_allocation_row(&manager.connection, "alloc-copy-failure")
+            .unwrap()
+            .unwrap();
+        let staging_ref = allocation.staging_ref.unwrap();
+        let staging_path = manager.artifact_store_root.join(&staging_ref);
+        let (size, hash) = hash_file(&staging_path).unwrap();
+        PENDING_BLOB_COPY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected pending blob copy failure",
+                )))
+            }));
+        });
+
+        assert!(matches!(
+            manager.place_blob(&staging_ref, &hash, size, true, "copy-failure"),
+            Err(TaskManagerError::Io(_))
+        ));
+        assert_eq!(
+            std::fs::read_dir(manager.artifact_store_root.join("blobs/pending"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "covers explicit abort, changed-request conflict, and terminal-Task startup abort"
@@ -18614,6 +18822,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
         let mut manager = manager(&temp);
+        let forged_materialization = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"forged materialization target".as_slice()),
+            )
+            .unwrap();
         manager
             .allocate_artifact_output(&allocation("alloc-pending-abort"))
             .unwrap();
@@ -18644,6 +18858,156 @@ mod tests {
                 .unwrap(),
             "ABORTED:ABORTED"
         );
+        assert!(
+            aborted_publication_receipt_authenticates(
+                &manager.connection,
+                "T-artifact",
+                "pub-pending-abort"
+            )
+            .unwrap()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET state='ALLOCATED'
+                 WHERE allocation_id='alloc-pending-abort'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !aborted_publication_receipt_authenticates(
+                &manager.connection,
+                "T-artifact",
+                "pub-pending-abort"
+            )
+            .unwrap()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET state='ABORTED'
+                 WHERE allocation_id='alloc-pending-abort'",
+                [],
+            )
+            .unwrap();
+        let original_result = manager
+            .connection
+            .query_row(
+                "SELECT result_json FROM artifact_publications
+                 WHERE publication_id='pub-pending-abort'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let mut forged_result: serde_json::Value = serde_json::from_str(&original_result).unwrap();
+        forged_result["task_id"] = serde_json::Value::String("T-forged".to_owned());
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?1
+                 WHERE publication_id='pub-pending-abort'",
+                [canonical_json(&forged_result).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            !aborted_publication_receipt_authenticates(
+                &manager.connection,
+                "T-artifact",
+                "pub-pending-abort"
+            )
+            .unwrap()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?1
+                 WHERE publication_id='pub-pending-abort'",
+                [&original_result],
+            )
+            .unwrap();
+        let forged_content_hash = forged_materialization
+            .stored_content_hash()
+            .unwrap()
+            .tagged();
+        for (forge, restore, value) in [
+            (
+                "UPDATE artifact_publications SET artifact_id=?1
+                 WHERE publication_id='pub-pending-abort'",
+                "UPDATE artifact_publications SET artifact_id=NULL
+                 WHERE publication_id='pub-pending-abort'",
+                forged_materialization.artifact_id.as_str(),
+            ),
+            (
+                "UPDATE artifact_publications SET content_hash=?1
+                 WHERE publication_id='pub-pending-abort'",
+                "UPDATE artifact_publications SET content_hash=NULL
+                 WHERE publication_id='pub-pending-abort'",
+                forged_content_hash.as_str(),
+            ),
+            (
+                "UPDATE artifact_output_allocations SET published_artifact_id=?1
+                 WHERE allocation_id='alloc-pending-abort'",
+                "UPDATE artifact_output_allocations SET published_artifact_id=NULL
+                 WHERE allocation_id='alloc-pending-abort'",
+                forged_materialization.artifact_id.as_str(),
+            ),
+        ] {
+            manager.connection.execute(forge, [value]).unwrap();
+            assert!(
+                !aborted_publication_receipt_authenticates(
+                    &manager.connection,
+                    "T-artifact",
+                    "pub-pending-abort"
+                )
+                .unwrap()
+            );
+            manager.connection.execute(restore, []).unwrap();
+        }
+        let event_id = event_id("artifact-publication-failed", "pub-pending-abort");
+        let original_event = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_id=?1",
+                [&event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER provenance_events_no_update;")
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE provenance_events SET event_json='{}' WHERE event_id=?1",
+                [&event_id],
+            )
+            .unwrap();
+        assert!(
+            !aborted_publication_receipt_authenticates(
+                &manager.connection,
+                "T-artifact",
+                "pub-pending-abort"
+            )
+            .unwrap()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE provenance_events SET event_json=?1 WHERE event_id=?2",
+                rusqlite::params![original_event, event_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER provenance_events_no_update
+                 BEFORE UPDATE ON provenance_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'provenance_events are append-only');
+                 END;",
+            )
+            .unwrap();
         assert!(
             !crate::unresolved_execution_ids(&manager.connection, "T-artifact")
                 .unwrap()
@@ -19180,15 +19544,50 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers shared blob collision, every owner handoff, and integrity evidence"
+    )]
     fn mismatched_deduplicated_blob_marks_every_reference_failed() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-shared".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "shared collision owner".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
         let bytes = b"shared trusted bytes";
         let first = manager
             .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
             .unwrap();
+        let mut shared_request = import_request();
+        shared_request.task_id = "T-shared".to_owned();
         let second = manager
-            .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
+            .import_artifact(&shared_request, &mut Cursor::new(bytes.as_slice()))
+            .unwrap();
+        let allocation_id = "alloc-collision-T-shared";
+        let mut output = allocation(allocation_id);
+        output.task_id = "T-shared".to_owned();
+        manager.allocate_artifact_output(&output).unwrap();
+        let mut pending = publication("pub-collision-T-shared", allocation_id);
+        pending.task_id = "T-shared".to_owned();
+        manager
+            .reserve_publication(&pending, &canonical_json(&pending).unwrap())
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-shared'",
+                [],
+            )
             .unwrap();
         let storage_ref: String = manager
             .connection
@@ -19204,10 +19603,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice())),
-            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
-        ));
+        let collision =
+            manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()));
+        assert!(
+            matches!(
+                collision,
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
+            ),
+            "{collision:?}"
+        );
         assert_eq!(
             manager
                 .connection
@@ -19246,6 +19650,108 @@ mod tests {
                 )
                 .unwrap(),
             2
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-shared'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RECOVERING"
+        );
+    }
+
+    #[test]
+    fn publication_collision_records_failure_before_shared_damage_handoff() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"publication collision bytes";
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
+            .unwrap();
+        manager
+            .allocate_artifact_output(&allocation("alloc-collision-publish"))
+            .unwrap();
+        write_output(&mut manager, "alloc-collision-publish", bytes);
+        manager
+            .allocate_artifact_output(&allocation("alloc-collision-other"))
+            .unwrap();
+        let other = publication("pub-collision-other", "alloc-collision-other");
+        manager
+            .reserve_publication(&other, &canonical_json(&other).unwrap())
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let storage_ref = manager
+            .connection
+            .query_row(
+                "SELECT storage_ref FROM artifact_blobs WHERE content_hash=?1",
+                [artifact.stored_content_hash().unwrap().tagged()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        std::fs::write(
+            resolve_internal_ref(&manager.artifact_store_root, &storage_ref).unwrap(),
+            b"substituted",
+        )
+        .unwrap();
+
+        let collision_request = publication("pub-collision-publish", "alloc-collision-publish");
+        CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected publication damage handoff failure",
+                )))
+            }));
+        });
+        assert!(matches!(
+            manager.publish_artifact_output(&collision_request),
+            Err(TaskManagerError::Io(_))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RUNNING"
+        );
+        let collision = manager.publish_artifact_output(&collision_request).unwrap();
+        assert!(!collision.published);
+        assert_eq!(collision.reason_code, "ARTIFACT_HASH_MISMATCH");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM artifact_publications
+                     WHERE publication_id='pub-collision-publish'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "FAILED"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RECOVERING"
         );
     }
 
@@ -24372,6 +24878,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers physical damage, failed handoff retry, shared owners, and an unrelated control"
+    )]
     fn keyed_import_replay_verifies_physical_blob_and_marks_shared_failure() {
         struct PanicReader;
         impl Read for PanicReader {
@@ -24385,10 +24895,69 @@ mod tests {
         {
             let temp = TempDir::new().unwrap();
             let mut manager = manager(&temp);
+            for task_id in ["T-shared", "T-unrelated"] {
+                manager
+                    .create_task(&CreateTask {
+                        task_id: task_id.to_owned(),
+                        principal: Actor {
+                            kind: "user".to_owned(),
+                            id: "user:test".to_owned(),
+                        },
+                        workspace_id: None,
+                        original_intent: "keyed import damage handoff".to_owned(),
+                        normalized_intent: None,
+                        active_step_ids: Vec::new(),
+                    })
+                    .unwrap();
+            }
             let mut request = import_request();
             request.import_id = Some(format!("import:physical-{fixture}"));
             let artifact = manager
                 .import_artifact(&request, &mut Cursor::new(b"physical replay".as_slice()))
+                .unwrap();
+            let mut shared_import = import_request();
+            shared_import.task_id = "T-shared".to_owned();
+            manager
+                .import_artifact(
+                    &shared_import,
+                    &mut Cursor::new(b"physical replay".as_slice()),
+                )
+                .unwrap();
+            manager
+                .allocate_artifact_output(&allocation(&format!("alloc-replay-{fixture}")))
+                .unwrap();
+            let pending = publication(
+                &format!("pub-replay-{fixture}"),
+                &format!("alloc-replay-{fixture}"),
+            );
+            manager
+                .reserve_publication(&pending, &canonical_json(&pending).unwrap())
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                    [],
+                )
+                .unwrap();
+            for task_id in ["T-shared", "T-unrelated"] {
+                let allocation_id = format!("alloc-{task_id}-{fixture}");
+                let mut output = allocation(&allocation_id);
+                output.task_id = task_id.to_owned();
+                manager.allocate_artifact_output(&output).unwrap();
+                let mut pending = publication(&format!("pub-{task_id}-{fixture}"), &allocation_id);
+                pending.task_id = task_id.to_owned();
+                manager
+                    .reserve_publication(&pending, &canonical_json(&pending).unwrap())
+                    .unwrap();
+            }
+            manager
+                .connection
+                .execute(
+                    "UPDATE tasks SET state='RUNNING'
+                     WHERE task_id IN ('T-shared','T-unrelated')",
+                    [],
+                )
                 .unwrap();
             let storage_ref = manager
                 .connection
@@ -24404,6 +24973,28 @@ mod tests {
             } else {
                 std::fs::write(&path, b"corrupt").unwrap();
             }
+            CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| {
+                    Err(TaskManagerError::Io(std::io::Error::other(
+                        "injected content hash handoff failure",
+                    )))
+                }));
+            });
+            assert!(matches!(
+                manager.import_artifact(&request, &mut PanicReader),
+                Err(TaskManagerError::Io(_))
+            ));
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "RUNNING"
+            );
             assert!(matches!(
                 manager.import_artifact(&request, &mut PanicReader),
                 Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
@@ -24419,6 +25010,32 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(states, ("failed".to_owned(), expected_state.to_owned()));
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "RECOVERING"
+            );
+            for (task_id, expected_state) in
+                [("T-shared", "RECOVERING"), ("T-unrelated", "RUNNING")]
+            {
+                assert_eq!(
+                    manager
+                        .connection
+                        .query_row(
+                            "SELECT state FROM tasks WHERE task_id=?1",
+                            [task_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                    expected_state
+                );
+            }
         }
     }
 

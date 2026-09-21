@@ -6656,12 +6656,21 @@ fn resolved_publication_recovery_subject(
         )
         .optional()?;
     Ok(match publication {
-        Some((state, _, _)) if state == "ABORTED" => Some(RecoveryResolution {
-            certainty: "FAILED_NO_EFFECT".to_owned(),
-            safe_action: "CLEAN_STAGING",
-            reason_code: "RECOVERY_FAILED_NO_EFFECT",
-            event_status: "cancelled",
-        }),
+        Some((state, _, _))
+            if state == "ABORTED"
+                && artifact_store::aborted_publication_receipt_authenticates(
+                    transaction,
+                    task_id,
+                    publication_id,
+                )? =>
+        {
+            Some(RecoveryResolution {
+                certainty: "FAILED_NO_EFFECT".to_owned(),
+                safe_action: "CLEAN_STAGING",
+                reason_code: "RECOVERY_FAILED_NO_EFFECT",
+                event_status: "cancelled",
+            })
+        }
         Some((state, _, _))
             if state == "FAILED"
                 && artifact_store::failed_expired_publication_receipt_authenticates(
@@ -6709,7 +6718,22 @@ fn resolved_recovery_subject(
     inventory_id: &str,
 ) -> Result<Option<RecoveryResolution>> {
     if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
-        let certainty = transaction
+        let mut attempts = Vec::new();
+        for record in stored_provider_invocations(transaction, task_id)?
+            .into_iter()
+            .filter(|record| record.attempt_id == attempt_id)
+        {
+            if let Some(resolution) =
+                authenticated_provider_invocation_resolution(task_id, &record)?
+            {
+                attempts.push(resolution);
+            }
+        }
+        if attempts.len() != 1 {
+            return Ok(None);
+        }
+        let resolution = attempts.into_iter().next().expect("length checked");
+        let stored_certainty = transaction
             .query_row(
                 "SELECT outcome_certainty FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
                 params![task_id, attempt_id],
@@ -6717,7 +6741,10 @@ fn resolved_recovery_subject(
             )
             .optional()?
             .flatten();
-        return Ok(certainty.and_then(recovery_resolution));
+        return Ok(
+            (stored_certainty.as_deref() == Some(resolution.certainty.as_str()))
+                .then_some(resolution),
+        );
     }
     if let Some(publication_id) = inventory_id.strip_prefix("publication:") {
         return resolved_publication_recovery_subject(transaction, task_id, publication_id);
