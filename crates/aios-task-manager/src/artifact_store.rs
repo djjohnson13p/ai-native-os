@@ -7239,14 +7239,16 @@ fn replayable_reader_admission_for_grant(
     let candidates = {
         let mut statement = connection.prepare(
             "SELECT operation_id,details_json FROM operations
-             WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
-               AND binding_id=?4 AND attempt_id=?5
-               AND transaction_class='reversible_local' AND effect_class='ARTIFACT_READ'
-               AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
+             WHERE effect_class='ARTIFACT_READ'
                AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-pending-delivery'
+               AND json_extract(details_json,'$.task_id')=?1
+               AND json_extract(details_json,'$.semantic_program_hash')=?2
+               AND json_extract(details_json,'$.node_id')=?3
+               AND json_extract(details_json,'$.binding_id')=?4
+               AND json_extract(details_json,'$.attempt_id')=?5
                AND json_extract(details_json,'$.artifact_id')=?6
                AND json_extract(details_json,'$.grant_id')=?7
-             ORDER BY operation_id",
+             ORDER BY prepared_at,operation_id",
         )?;
         let rows = statement.query_map(
             params![
@@ -7262,44 +7264,38 @@ fn replayable_reader_admission_for_grant(
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if candidates.len() > 1 {
-        return Err(TaskManagerError::InvalidRecord(
-            "stored Artifact reader admission is ambiguous",
-        ));
-    }
-    let Some((operation_id, details)) = candidates.into_iter().next() else {
-        return Ok(None);
-    };
-    let stored: ArtifactReaderAdmission = serde_json::from_str(&details)?;
-    if stored.grant_id != grant_id {
-        return Err(TaskManagerError::InvalidRecord(
-            "stored Artifact reader admission is invalid",
-        ));
-    }
-    let admission = GrantAdmission {
-        grant_id: grant_id.to_owned(),
-        one_shot_consumed: stored.one_shot_consumed,
-    };
-    if authenticate_reader_admission(
-        connection,
-        &operation_id,
-        task_id,
-        execution,
-        artifact_id,
-        &admission,
-        checked_at,
-        true,
-    )? {
-        if delivered_in_process.contains(&operation_id) {
-            return Ok(None);
+    let mut replayable = None;
+    for (operation_id, details) in candidates {
+        let stored: ArtifactReaderAdmission = serde_json::from_str(&details)?;
+        if stored.grant_id != grant_id {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid",
+            ));
         }
-        Ok(Some(ReplayableReaderAdmission {
-            operation_id,
-            grant_admission: admission,
-        }))
-    } else {
-        Ok(None)
+        let admission = GrantAdmission {
+            grant_id: grant_id.to_owned(),
+            one_shot_consumed: stored.one_shot_consumed,
+        };
+        if !authenticate_reader_admission(
+            connection,
+            &operation_id,
+            task_id,
+            execution,
+            artifact_id,
+            &admission,
+            checked_at,
+            true,
+        )? {
+            continue;
+        }
+        if replayable.is_none() && !delivered_in_process.contains(&operation_id) {
+            replayable = Some(ReplayableReaderAdmission {
+                operation_id,
+                grant_admission: admission,
+            });
+        }
     }
+    Ok(replayable)
 }
 
 #[allow(
@@ -20711,6 +20707,243 @@ mod tests {
                 )
                 .unwrap(),
             4
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded-grant fixture covers concurrent unopened readers, sibling tamper rejection, and delivery"
+    )]
+    fn bounded_read_grant_issues_three_unopened_readers_and_rejects_tampered_sibling() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"three pending readers".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "three-pending-readers",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=3
+                 WHERE grant_id='grant-three-pending-readers-0'",
+                [],
+            )
+            .unwrap();
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+
+        let mut first = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut second = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let second_operation = second
+            .reader_admission
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET node_id='forged-node' WHERE operation_id=?1",
+                [&second_operation],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-three-pending-readers-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET node_id='compose_report' WHERE operation_id=?1",
+                [&second_operation],
+            )
+            .unwrap();
+        let mut third = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations
+                     WHERE effect_class='ARTIFACT_READ'
+                       AND json_extract(external_receipt,'$.kind')=
+                           'artifact-reader-admission-pending-delivery'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        for reader in [&mut first, &mut second, &mut third] {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"three pending readers");
+        }
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-three-pending-readers-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restart coverage exercises deterministic recovery of every pending bounded-grant admission"
+    )]
+    fn restart_reissues_each_pending_reader_once_before_consuming_another_grant_use() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"recover pending reader queue".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "recover-reader-queue",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=2
+                 WHERE grant_id='grant-recover-reader-queue-0'",
+                [],
+            )
+            .unwrap();
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let first = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let second = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let pending_operations = {
+            let mut statement = manager
+                .connection
+                .prepare(
+                    "SELECT operation_id FROM operations
+                     WHERE effect_class='ARTIFACT_READ'
+                       AND json_extract(external_receipt,'$.kind')=
+                           'artifact-reader-admission-pending-delivery'
+                     ORDER BY prepared_at,operation_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(pending_operations.len(), 2);
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CREATED',active_program_revision=NULL,
+                        active_step_ids_json='[]' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        drop(first);
+        drop(second);
+        drop(scope);
+        drop(session);
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING',active_program_revision=1,
+                        active_step_ids_json='[\"compose_report\"]'
+                 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let session = reopened
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = reopened
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut first = reopened
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut second = reopened
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        assert_eq!(
+            first.reader_admission.as_ref().unwrap().operation_id,
+            pending_operations[0]
+        );
+        assert_eq!(
+            second.reader_admission.as_ref().unwrap().operation_id,
+            pending_operations[1]
+        );
+        assert!(matches!(
+            reopened.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        for reader in [&mut first, &mut second] {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"recover pending reader queue");
+        }
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-recover-reader-queue-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
         );
     }
 
