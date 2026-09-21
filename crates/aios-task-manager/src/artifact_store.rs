@@ -10813,6 +10813,7 @@ mod tests {
             ),
             ("node_id", "forged-node"),
             ("binding_id", "forged-binding"),
+            ("attempt_id", "forged-attempt"),
         ]
         .into_iter()
         .enumerate()
