@@ -6651,7 +6651,7 @@ fn resolve_staging_seal_evidence(
         match final_seal {
             StagingSealEvidence::Complete(_) => {
                 store.remove_file(safe_internal_ref(&pending_reference)?)?;
-                return sync_cap_directory(store, "staging");
+                return sync_completed_staging_seal_directory(store);
             }
             StagingSealEvidence::Truncated => {
                 store.remove_file(safe_internal_ref(seal_reference)?)?;
@@ -6664,15 +6664,14 @@ fn resolve_staging_seal_evidence(
             store,
             safe_internal_ref(seal_reference)?,
         )?;
-        return sync_cap_directory(store, "staging");
+        return sync_completed_staging_seal_directory(store);
     }
 
     if matches!(final_seal, StagingSealEvidence::Complete(_)) {
         if matches!(pending, StagingSealEvidence::Truncated) {
             store.remove_file(safe_internal_ref(&pending_reference)?)?;
-            sync_cap_directory(store, "staging")?;
         }
-        return Ok(());
+        return sync_completed_staging_seal_directory(store);
     }
 
     let has_incomplete_evidence = matches!(pending, StagingSealEvidence::Truncated)
@@ -6717,6 +6716,11 @@ fn write_staging_seal_atomically(store: &Dir, seal_reference: &str, bytes: &[u8]
         store,
         safe_internal_ref(seal_reference)?,
     )?;
+    sync_completed_staging_seal_directory(store)
+}
+
+fn sync_completed_staging_seal_directory(store: &Dir) -> Result<()> {
+    durability_step("sync-staging-seal-final")?;
     sync_cap_directory(store, "staging")
 }
 
@@ -13408,6 +13412,83 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn complete_final_seal_retries_directory_sync_before_acknowledging_success() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-final-sync-replay";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "final-sync-replay",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, allocation_id);
+        writer.write_all(b"directory sync retry").unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some("sync-staging-seal-final".to_owned())));
+        });
+        assert!(matches!(writer.finish(), Err(TaskManagerError::Io(_))));
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let seal_reference = seal_ref(&staging_ref);
+        assert!(manager.artifact_store_root.join(&seal_reference).exists());
+        assert!(
+            !manager
+                .artifact_store_root
+                .join(format!("{seal_reference}.pending"))
+                .exists()
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        assert!(matches!(
+            manager.retry_bound_artifact_output_finish(&session, allocation_id),
+            Err(TaskManagerError::Io(_))
+        ));
+        let failed_operations =
+            DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        assert_eq!(
+            failed_operations
+                .iter()
+                .filter(|operation| operation.as_str() == "sync-staging-seal-final")
+                .count(),
+            2
+        );
+
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), None));
+        });
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, allocation_id)
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, allocation_id)
+                .unwrap(),
+            20
+        );
+        let successful_operations =
+            DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
+        assert_eq!(
+            successful_operations
+                .iter()
+                .filter(|operation| operation.as_str() == "sync-staging-seal-final")
+                .count(),
+            2
         );
     }
 
