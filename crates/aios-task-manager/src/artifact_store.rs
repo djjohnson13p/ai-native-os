@@ -3312,6 +3312,31 @@ impl TaskManager {
                 "stored Artifact export operation is invalid",
             ));
         }
+        let operation_authentication =
+            authenticate_export_operation(&self.connection, operation_id, &row.3)?;
+        let Some(Err(TaskManagerError::InvalidRecord(authenticated_code))) =
+            operation_authentication
+        else {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored Artifact export operation is invalid",
+            ));
+        };
+        if !matches!(
+            (row.1.as_str(), row.2.as_deref(), authenticated_code),
+            (
+                "UNKNOWN",
+                Some("OUTCOME_UNKNOWN"),
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ) | (
+                "FAILED",
+                Some("FAILED_NO_EFFECT"),
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+            )
+        ) {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored Artifact export operation is invalid",
+            ));
+        }
         let subject = ArtifactExportReconciliationSubject::from_intent(operation_id, &intent);
         let subject_json = canonical_json(&subject)?;
         let mut subject_hasher = Sha256::new();
@@ -10776,6 +10801,83 @@ mod tests {
                 ))
             ));
             assert_eq!(opened.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn public_reconciliation_replay_authenticates_denormalized_operation_context() {
+        for (index, (column, forged)) in [
+            (
+                "semantic_program_hash",
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+            ("node_id", "forged-node"),
+            ("binding_id", "forged-binding"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = TempDir::new().unwrap();
+            let verifier = Arc::new(export_no_effect_verifier(
+                "user-selected-file",
+                "evidence:context-bound-replay",
+                char::from_digit(u32::try_from(index + 1).unwrap(), 16).unwrap(),
+            ));
+            let mut manager = manager_with_export_verifiers(&temp, vec![verifier.clone()]);
+            let artifact = manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"context-bound replay".as_slice()),
+                )
+                .unwrap();
+            let scope = manager
+                .scope_owned_artifact_reads(
+                    "T-artifact",
+                    std::slice::from_ref(&artifact.artifact_id),
+                )
+                .unwrap();
+            let operation_id = format!("export-context-tamper-{index}");
+            let mut destination = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    deferred(FinalizeFailureWriter::default()),
+                )
+                .unwrap();
+            assert!(
+                manager
+                    .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                    .is_err()
+            );
+            manager
+                .reconcile_unknown_artifact_export_no_effect(&operation_id)
+                .unwrap();
+            manager
+                .connection
+                .execute_batch("PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    &format!("UPDATE operations SET {column}=?2 WHERE operation_id=?1"),
+                    params![operation_id, forged],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch("PRAGMA foreign_keys=ON;")
+                .unwrap();
+
+            assert!(matches!(
+                manager.reconcile_unknown_artifact_export_no_effect(&operation_id),
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT"
+                ))
+            ));
+            assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
         }
     }
 
