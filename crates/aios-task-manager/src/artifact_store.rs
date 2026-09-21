@@ -783,6 +783,7 @@ impl ArtifactStagingWriter {
             &self.writer_session_id,
             self.writer_generation,
         )?;
+        ensure_writer_unsealed(&self.store, &self.seal_ref)?;
         let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
             "Artifact staging writer is already finalized",
         ))?;
@@ -811,6 +812,7 @@ impl ArtifactStagingWriter {
             &self.writer_session_id,
             self.writer_generation,
         )?;
+        ensure_writer_unsealed(&self.store, &self.seal_ref)?;
         let sealed = SealedStaging {
             version: SEALED_STAGING_VERSION,
             allocation_id: self.allocation_id.clone(),
@@ -841,6 +843,8 @@ impl Write for ArtifactStagingWriter {
             self.writer_generation,
         )
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        ensure_writer_unsealed(&self.store, &self.seal_ref)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         let length = u64::try_from(buffer.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
         })?;
@@ -880,6 +884,8 @@ impl Write for ArtifactStagingWriter {
             self.writer_generation,
         )
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        ensure_writer_unsealed(&self.store, &self.seal_ref)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         self.file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
@@ -1795,8 +1801,15 @@ impl TaskManager {
             && artifact.labels == request.labels
             && artifact.integrity.as_ref().is_some_and(|integrity| {
                 integrity.state == Some(ArtifactIntegrityState::Verified)
-                    && integrity.verified_at.as_deref() == created_at
                     && integrity.verifier.as_deref() == Some("artifact-store:sha256")
+                    && match (integrity.verified_at.as_deref(), created_at) {
+                        (Some(verified_at), Some(created_at)) => parse_time(verified_at)
+                            .and_then(|verified| {
+                                parse_time(created_at).map(|created| verified >= created)
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    }
             });
         let event_exact = event_jsons.len() == 1
             && event.as_ref().is_some_and(|event| {
@@ -2013,10 +2026,11 @@ impl TaskManager {
         let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
         let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
         writer_finish_step()?;
+        let final_now = self.clock.now();
         validate_writer_fence(
             &transaction,
             allocation_id,
-            &now,
+            &final_now,
             &self.lease_owner,
             self.lease_epoch,
             allocation.writer_grant_admission.as_ref(),
@@ -7901,6 +7915,17 @@ fn internal_ref_exists(store: &Dir, reference: &str) -> Result<bool> {
     }
 }
 
+fn ensure_writer_unsealed(store: &Dir, seal_reference: &str) -> Result<()> {
+    if internal_ref_exists(store, seal_reference)?
+        || internal_ref_exists(store, &format!("{seal_reference}.pending"))?
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+        ));
+    }
+    Ok(())
+}
+
 fn seal_ref(staging_ref: &str) -> String {
     format!("{staging_ref}.sealed")
 }
@@ -8770,6 +8795,16 @@ mod tests {
         }
     }
 
+    struct MutableClock {
+        now: Arc<Mutex<String>>,
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> String {
+            self.now.lock().unwrap().clone()
+        }
+    }
+
     fn deferred<W: ArtifactExportWriter + 'static>(
         writer: W,
     ) -> impl FnOnce() -> std::io::Result<W> {
@@ -9027,6 +9062,30 @@ mod tests {
         let mut manager = TaskManager::open_with_clock(
             temp.path().join("task-manager.sqlite"),
             Box::new(FixedClock),
+        )
+        .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "exercise Artifact storage".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        manager
+    }
+
+    fn manager_with_mutable_clock(temp: &TempDir, now: &Arc<Mutex<String>>) -> TaskManager {
+        let mut manager = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(MutableClock {
+                now: Arc::clone(now),
+            }),
         )
         .unwrap();
         manager
@@ -15677,6 +15736,110 @@ mod tests {
     }
 
     #[test]
+    fn retry_finish_sync_failure_fences_the_retained_writer_from_complete_seal() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-retry-sync-writer-fence";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "retry-sync-writer-fence",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut retained = open_bound(&mut manager, allocation_id);
+        retained.write_all(b"sealed before sync failure").unwrap();
+        retained.flush().unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some("sync-staging-seal-final".to_owned())));
+        });
+        assert!(matches!(
+            manager.retry_bound_artifact_output_finish(&session, allocation_id),
+            Err(TaskManagerError::Io(_))
+        ));
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        assert!(
+            manager
+                .artifact_store_root
+                .join(seal_ref(&staging_ref))
+                .exists()
+        );
+        assert!(retained.write_all(b"must not append").is_err());
+        assert!(retained.flush().is_err());
+        assert!(retained.finish().is_err());
+
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), None));
+        });
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, allocation_id)
+                .unwrap(),
+            26
+        );
+        DURABILITY_TEST_CONTROL.with(|control| {
+            control.borrow_mut().take();
+        });
+    }
+
+    #[test]
+    fn retry_finish_uses_fresh_post_hash_time_for_expiry_fence() {
+        let temp = TempDir::new().unwrap();
+        let now = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &now);
+        let allocation_id = "alloc-retry-fresh-time";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "retry-fresh-time",
+            &[],
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, allocation_id);
+        writer.write_all(b"expires while hashing").unwrap();
+        writer.flush().unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let advanced = Arc::clone(&now);
+        WRITER_FINISH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *advanced.lock().unwrap() = "2026-09-20T00:00:00Z".to_owned();
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.retry_bound_artifact_output_finish(&session, allocation_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        assert!(
+            !manager
+                .artifact_store_root
+                .join(seal_ref(&staging_ref))
+                .exists()
+        );
+    }
+
+    #[test]
     fn complete_pending_seal_rejects_changed_staging_and_survives_retry_and_reopen() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
@@ -17150,6 +17313,56 @@ mod tests {
     }
 
     #[test]
+    fn keyed_import_replays_after_later_read_and_export_integrity_verification() {
+        struct PanicReader;
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a keyed import replay must not read its source")
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let now = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &now);
+        let mut request = import_request();
+        request.import_id = Some("import:later-integrity-verification".to_owned());
+        let artifact = manager
+            .import_artifact(&request, &mut Cursor::new(b"verified later".as_slice()))
+            .unwrap();
+        *now.lock().unwrap() = "2026-09-19T22:30:00Z".to_owned();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        drop(reader);
+        assert_eq!(bytes, b"verified later");
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-keyed-import-after-read",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        manager
+            .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+            .unwrap();
+
+        let replayed = manager.import_artifact(&request, &mut PanicReader).unwrap();
+        assert_eq!(replayed.artifact_id, artifact.artifact_id);
+        assert_eq!(
+            replayed.integrity.unwrap().verified_at.as_deref(),
+            Some("2026-09-19T22:30:00Z")
+        );
+    }
+
+    #[test]
     fn keyed_import_replay_authenticates_every_immutable_artifact_field() {
         struct PanicReader;
         impl Read for PanicReader {
@@ -17183,24 +17396,21 @@ mod tests {
             "UPDATE artifacts SET media_type='application/forged' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET format='forged' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET size_bytes=size_bytes+1 WHERE artifact_id=?1".to_owned(),
-            format!(
-                "UPDATE artifacts SET content_hash='{forged_hash}' WHERE artifact_id=?1"
-            ),
+            format!("UPDATE artifacts SET content_hash='{forged_hash}' WHERE artifact_id=?1"),
             "UPDATE artifacts SET sensitivity='secret' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET retention_class='persistent' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET expires_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
                 .to_owned(),
             "UPDATE artifacts SET origin_kind='system' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET origin_task_id='T-forged' WHERE artifact_id=?1".to_owned(),
-            "UPDATE artifacts SET origin_program_hash='sha256:aaaa' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET origin_program_hash='sha256:aaaa' WHERE artifact_id=?1"
+                .to_owned(),
             "UPDATE artifacts SET origin_node_id='forged-node' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET origin_binding_id='forged-binding' WHERE artifact_id=?1"
                 .to_owned(),
             "UPDATE artifacts SET origin_provider_id='forged-provider' WHERE artifact_id=?1"
                 .to_owned(),
             "UPDATE artifacts SET integrity_state='pending' WHERE artifact_id=?1".to_owned(),
-            "UPDATE artifacts SET integrity_verified_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
-                .to_owned(),
             "UPDATE artifacts SET integrity_verifier='forged' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET labels_json='[\"forged\"]' WHERE artifact_id=?1".to_owned(),
             "UPDATE artifacts SET created_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
