@@ -66,6 +66,16 @@ impl Sensitivity {
     fn parse(value: &str) -> Result<Self> {
         serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
     }
+
+    fn propagation_rank(&self) -> u8 {
+        match self {
+            Self::Public => 0,
+            Self::Local => 1,
+            Self::Private => 2,
+            Self::Confidential => 3,
+            Self::Secret => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +99,15 @@ impl RetentionClass {
 
     fn parse(value: &str) -> Result<Self> {
         serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
+    }
+
+    fn propagation_rank(&self) -> u8 {
+        match self {
+            Self::Ephemeral => 0,
+            Self::Task => 1,
+            Self::Persistent => 2,
+            Self::UserManaged => 3,
+        }
     }
 }
 
@@ -402,6 +421,7 @@ pub struct ArtifactOutputAllocation {
     pub attempt_id: Option<String>,
     pub output_port: Option<String>,
     pub expected_semantic_type: Option<String>,
+    #[serde(default)]
     pub allowed_media_types: Vec<String>,
     pub max_size_bytes: Option<u64>,
     pub sensitivity: Sensitivity,
@@ -781,6 +801,7 @@ pub struct ArtifactReader {
     authority: ReadAuthority,
     artifact_id: String,
     grant_admission: Option<GrantAdmission>,
+    reader_admission_delivered: bool,
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
 
@@ -795,11 +816,36 @@ impl ArtifactReader {
     pub fn handle(&self) -> &ArtifactHandle {
         &self.handle
     }
+
+    fn ensure_admission_delivered(&mut self) -> Result<()> {
+        if self.reader_admission_delivered {
+            return Ok(());
+        }
+        let (Some(execution), Some(admission)) = (
+            self.authority.execution.as_ref(),
+            self.grant_admission.as_ref(),
+        ) else {
+            self.reader_admission_delivered = true;
+            return Ok(());
+        };
+        mark_reader_admission_delivered(
+            &mut self.authority_connection,
+            &self.task_id,
+            execution,
+            &self.artifact_id,
+            admission,
+            &self.clock.now(),
+        )?;
+        self.reader_admission_delivered = true;
+        Ok(())
+    }
 }
 
 impl Read for ArtifactReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         validate_reader_fence(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        self.ensure_admission_delivered()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         self.file.read(buffer)
     }
@@ -808,6 +854,8 @@ impl Read for ArtifactReader {
 impl Seek for ArtifactReader {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         validate_reader_fence(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        self.ensure_admission_delivered()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         self.file.seek(position)
     }
@@ -1008,9 +1056,13 @@ pub struct ArtifactReconciliationReport {
 )]
 pub(super) fn initialize_root(
     store_lock: Option<&StoreLock>,
-    connection: &Connection,
+    connection: &mut Connection,
 ) -> Result<(PathBuf, Dir, Option<Arc<EphemeralStoreCleanup>>)> {
-    let (root, database_identity, stored_root_identity) = if let Some(lock) = store_lock {
+    let (root, database_identity, stored_database_identity, stored_root_identity) = if let Some(
+        lock,
+    ) =
+        store_lock
+    {
         let file_name = lock
             .identity
             .canonical_path
@@ -1032,21 +1084,20 @@ pub(super) fn initialize_root(
             )
             .optional()?;
         match stored {
-            Some((stored_identity, stored_root, root_identity)) => {
-                if stored_identity != identity {
-                    return Err(TaskManagerError::InvalidRecord(
-                        "Artifact store root binding does not match the locked database identity",
-                    ));
-                }
-                (PathBuf::from(stored_root), identity, Some(root_identity))
-            }
-            None => (proposed, identity, None),
+            Some((stored_identity, stored_root, root_identity)) => (
+                PathBuf::from(stored_root),
+                identity,
+                Some(stored_identity),
+                Some(root_identity),
+            ),
+            None => (proposed, identity, None, None),
         }
     } else {
         let token = random_token(connection)?;
         (
             std::env::temp_dir().join(format!("aios-task-manager-{token}")),
             format!("memory:{token}"),
+            None,
             None,
         )
     };
@@ -1087,12 +1138,20 @@ pub(super) fn initialize_root(
             ))?,
     )?;
     let root_identity = opened_identity.persistent_key();
-    if stored_root_identity
-        .as_deref()
-        .is_some_and(|stored| stored != root_identity)
+    let binding_is_current = stored_database_identity.as_deref() == Some(&database_identity)
+        && stored_root_identity.as_deref() == Some(&root_identity);
+    #[cfg(windows)]
+    let binding_is_authenticated_legacy = store_lock.is_some_and(|lock| {
+        stored_database_identity.as_deref() == Some(lock.identity.legacy_persistent_key().as_str())
+            && stored_root_identity.as_deref()
+                == Some(opened_identity.legacy_persistent_key().as_str())
+    });
+    #[cfg(not(windows))]
+    let binding_is_authenticated_legacy = false;
+    if stored_database_identity.is_some() && !binding_is_current && !binding_is_authenticated_legacy
     {
         return Err(TaskManagerError::InvalidRecord(
-            "Artifact store root identity does not match its database binding",
+            "Artifact store root binding does not match its opened database and root identities",
         ));
     }
     secure_store_root(&canonical_root, created)?;
@@ -1105,6 +1164,26 @@ pub(super) fn initialize_root(
         .ok_or(TaskManagerError::InvalidRecord(
             "Artifact store root is not UTF-8",
         ))?;
+    if binding_is_authenticated_legacy {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE artifact_store_binding
+             SET database_identity=?1,root_identity=?2
+             WHERE singleton_id=1 AND database_identity=?3 AND root_identity=?4",
+            params![
+                database_identity,
+                root_identity,
+                stored_database_identity,
+                stored_root_identity
+            ],
+        )?;
+        if changed != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact store legacy identity migration lost its authenticated binding",
+            ));
+        }
+        transaction.commit()?;
+    }
     connection.execute(
         "INSERT INTO artifact_store_binding(singleton_id,database_identity,canonical_root,root_identity,bound_at) VALUES (1,?1,?2,?3,?4) ON CONFLICT(singleton_id) DO NOTHING",
         params![database_identity, canonical_text, root_identity, OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| TaskManagerError::InvalidRecord("Artifact store binding time could not be formatted"))?],
@@ -1893,9 +1972,6 @@ impl TaskManager {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let event = event_jsons
-            .first()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
         let content_hash = artifact.content_hash.as_ref().map(ContentHash::tagged);
         let created_at = artifact.created_at.as_deref();
         let metadata_exact = artifact.artifact_id == artifact_id
@@ -1927,33 +2003,6 @@ impl TaskManager {
                         _ => false,
                     }
             });
-        let event_exact = event_jsons.len() == 1
-            && event.as_ref().is_some_and(|event| {
-                event.get("task_id").and_then(serde_json::Value::as_str)
-                    == Some(request.task_id.as_str())
-                    && event.get("event_type").and_then(serde_json::Value::as_str)
-                        == Some("artifact.imported")
-                    && event.get("status").and_then(serde_json::Value::as_str) == Some("success")
-                    && event.get("timestamp").and_then(serde_json::Value::as_str) == created_at
-                    && event
-                        .pointer("/details/request_digest")
-                        .and_then(serde_json::Value::as_str)
-                        == import_request_digest(request).ok().as_deref()
-                    && event
-                        .get("output_artifacts")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|values| {
-                            values.as_slice() == [serde_json::Value::String(artifact_id.clone())]
-                        })
-                    && event
-                        .pointer("/details/content_hash")
-                        .and_then(serde_json::Value::as_str)
-                        == content_hash.as_deref()
-                    && event
-                        .pointer("/details/size_bytes")
-                        .and_then(serde_json::Value::as_u64)
-                        == artifact.size_bytes
-            });
         let attachment_exact = self.connection.query_row(
             "SELECT COUNT(*)=1 FROM task_artifacts
              WHERE task_id=?1 AND artifact_id=?2 AND role='input' AND node_id IS NULL",
@@ -1963,7 +2012,7 @@ impl TaskManager {
         let blob = self
             .connection
             .query_row(
-                "SELECT size_bytes,storage_ref,durability_state FROM artifact_blobs
+                "SELECT size_bytes,storage_ref,durability_state,created_at FROM artifact_blobs
              WHERE content_hash=?1 AND size_bytes=?2",
                 params![content_hash, artifact.size_bytes.map(to_i64).transpose()?],
                 |row| {
@@ -1971,11 +2020,72 @@ impl TaskManager {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
         let blob_exact = blob.as_ref().is_some_and(|blob| blob.2 == "DURABLE");
+        let import_actor = self
+            .connection
+            .query_row(
+                "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1",
+                [&request.task_id],
+                |row| {
+                    Ok(Actor {
+                        kind: row.get(0)?,
+                        id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        let blob_reused = match (blob.as_ref(), created_at, content_hash.as_deref()) {
+            (Some(blob), Some(created_at), Some(content_hash)) => {
+                blob.3 != created_at
+                    || self.connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artifacts
+                         WHERE content_hash=?1 AND artifact_id<>?2 AND created_at<=?3)",
+                        params![content_hash, artifact_id, created_at],
+                        |row| row.get::<_, bool>(0),
+                    )?
+            }
+            _ => false,
+        };
+        let expected_event = match (
+            import_actor,
+            created_at,
+            content_hash.as_deref(),
+            artifact.size_bytes,
+        ) {
+            (Some(actor), Some(created_at), Some(content_hash), Some(size_bytes)) => Some(json!({
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id("artifact-imported", &artifact_id),
+                "task_id": request.task_id,
+                "event_type": "artifact.imported",
+                "timestamp": created_at,
+                "actor": actor,
+                "input_artifacts": [],
+                "output_artifacts": [artifact_id],
+                "status": "success",
+                "details": {
+                    "content_hash": content_hash,
+                    "size_bytes": size_bytes,
+                    "blob_reused": blob_reused,
+                    "import_id": request.import_id,
+                    "request_digest": import_request_digest(request)?,
+                }
+            })),
+            _ => None,
+        };
+        let event_exact = event_jsons.len() == 1
+            && expected_event.as_ref().is_some_and(|expected| {
+                event_jsons.first().is_some_and(|stored| {
+                    serde_json::from_str::<serde_json::Value>(stored)
+                        .ok()
+                        .as_ref()
+                        == Some(expected)
+                })
+            });
         let exact = metadata_exact
             && event_exact
             && attachment_exact
@@ -1989,7 +2099,7 @@ impl TaskManager {
         let expected_hash = content_hash.ok_or(TaskManagerError::InvalidRecord(
             "stored Artifact import receipt is invalid",
         ))?;
-        let (expected_size, storage_ref, _) = blob.ok_or(TaskManagerError::InvalidRecord(
+        let (expected_size, storage_ref, _, _) = blob.ok_or(TaskManagerError::InvalidRecord(
             "stored Artifact import receipt is invalid",
         ))?;
         match hash_internal_file(&self.artifact_store_dir, &storage_ref) {
@@ -2068,6 +2178,7 @@ impl TaskManager {
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
         ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         validate_requested_execution_scope(&transaction, request, &created_at)?;
+        validate_bound_output_policy(&transaction, request)?;
         transaction.execute(
             "INSERT INTO artifact_output_allocations (allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,created_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ALLOCATED',?13,?14,?15,?14)",
             params![request.allocation_id,request.task_id,request.semantic_program_hash,request.node_id,request.binding_id,request.attempt_id,request.output_port,request.expected_semantic_type,serde_json::to_string(&request.allowed_media_types)?,request.max_size_bytes.map(to_i64).transpose()?,request.sensitivity.as_str(),request.retention.as_str(),staging_ref,created_at,request.expires_at],
@@ -2839,8 +2950,9 @@ impl TaskManager {
                     execution,
                     artifact_id,
                     &now,
+                    &self.delivered_reader_admissions,
                 )?
-                .map(|admission| admission.grant_id)
+                .map(|admission| admission.grant_admission.grant_id)
                 .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
             };
             grant_ids.insert(artifact_id.clone(), grant_id);
@@ -2994,6 +3106,7 @@ impl TaskManager {
             artifact_id,
             &prepared.handle,
             &admitted_at,
+            &self.delivered_reader_admissions,
         )?;
         let commit = transaction
             .commit()
@@ -3010,21 +3123,28 @@ impl TaskManager {
                     artifact_id,
                     &admission.grant_id,
                     &admitted_at,
+                    &self.delivered_reader_admissions,
                 )?;
             }
             return Err(error);
         }
+        let reader_admission_delivered = grant_admission.is_none();
         if let (Some(execution), Some(admission)) =
             (&scope.authority.execution, grant_admission.as_ref())
         {
-            mark_reader_admission_delivered(
-                &mut self.connection,
+            let replay = replayable_reader_admission_for_grant(
+                &self.connection,
                 &scope.task_id,
                 execution,
                 artifact_id,
-                admission,
-                &self.clock.now(),
-            )?;
+                &admission.grant_id,
+                &admitted_at,
+                &self.delivered_reader_admissions,
+            )?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid",
+            ))?;
+            self.delivered_reader_admissions.insert(replay.operation_id);
         }
         Ok(ArtifactReader {
             file: prepared.file,
@@ -3038,6 +3158,7 @@ impl TaskManager {
             authority: scope.authority.clone(),
             artifact_id: artifact_id.to_owned(),
             grant_admission,
+            reader_admission_delivered,
             _store_cleanup: self.artifact_store_cleanup.clone(),
         })
     }
@@ -3509,6 +3630,7 @@ impl TaskManager {
             artifact_id,
             &prepared_reader.handle,
             &admitted_at,
+            &self.delivered_reader_admissions,
         )?;
         destination.grant_admission = match (
             scope.authority.execution.as_ref(),
@@ -3570,7 +3692,7 @@ impl TaskManager {
             scope.authority.execution.as_ref(),
             reader_grant_admission.as_ref(),
         ) {
-            mark_reader_admission_delivered(
+            let operation_id = mark_reader_admission_delivered(
                 &mut self.connection,
                 &scope.task_id,
                 execution,
@@ -3578,6 +3700,7 @@ impl TaskManager {
                 admission,
                 &self.clock.now(),
             )?;
+            self.delivered_reader_admissions.insert(operation_id);
         }
         destination.consumed = true;
         let writer_factory =
@@ -3615,6 +3738,7 @@ impl TaskManager {
             authority: scope.authority.clone(),
             artifact_id: artifact_id.to_owned(),
             grant_admission: reader_grant_admission,
+            reader_admission_delivered: true,
             _store_cleanup: self.artifact_store_cleanup.clone(),
         };
         let exported = match copy_export_bounded(
@@ -5478,6 +5602,65 @@ fn validate_requested_execution_scope(
     }
 }
 
+/// Provider output classification is inherited from authenticated durable inputs. v0.1 has no
+/// declassification capability, so providers cannot lower sensitivity or choose a different
+/// retention policy. Source nodes use the control-plane defaults already used by allocations.
+fn validate_bound_output_policy(
+    connection: &Connection,
+    request: &OutputAllocationRequest,
+) -> Result<()> {
+    let (Some(binding_id), Some(attempt_id)) =
+        (request.binding_id.as_deref(), request.attempt_id.as_deref())
+    else {
+        return Ok(());
+    };
+    let input_artifacts_json = connection
+        .query_row(
+            "SELECT input_artifacts_json FROM step_executions
+             WHERE attempt_id=?1 AND task_id=?2 AND semantic_program_hash=?3
+               AND node_id=?4 AND binding_id=?5",
+            params![
+                attempt_id,
+                request.task_id,
+                request.semantic_program_hash,
+                request.node_id,
+                binding_id
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+    let input_artifact_ids: Vec<String> = input_artifacts_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default();
+    let mut sensitivity = Sensitivity::Private;
+    let mut retention = RetentionClass::Task;
+    for artifact_id in &input_artifact_ids {
+        let (stored_sensitivity, stored_retention) = connection
+            .query_row(
+                "SELECT sensitivity,retention_class FROM artifacts WHERE artifact_id=?1",
+                [artifact_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let candidate_sensitivity = Sensitivity::parse(&stored_sensitivity)?;
+        if candidate_sensitivity.propagation_rank() > sensitivity.propagation_rank() {
+            sensitivity = candidate_sensitivity;
+        }
+        let candidate_retention = RetentionClass::parse(&stored_retention)?;
+        if candidate_retention.propagation_rank() > retention.propagation_rank() {
+            retention = candidate_retention;
+        }
+    }
+    if request.sensitivity != sensitivity || request.retention != retention {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    Ok(())
+}
+
 fn validate_allocation_execution_scope(
     connection: &Connection,
     allocation_id: &str,
@@ -6300,6 +6483,7 @@ fn admit_prepared_artifact_reader(
     artifact_id: &str,
     handle: &ArtifactHandle,
     admitted_at: &str,
+    delivered_in_process: &BTreeSet<String>,
 ) -> Result<Option<GrantAdmission>> {
     ensure_task_is_not_recovering(connection, &scope.task_id)?;
     let integrity_current = connection.query_row(
@@ -6337,8 +6521,9 @@ fn admit_prepared_artifact_reader(
             artifact_id,
             grant_id,
             admitted_at,
+            delivered_in_process,
         )? {
-            Some(admission)
+            Some(admission.grant_admission)
         } else {
             let admission = admit_operation_grant(
                 connection,
@@ -6669,6 +6854,11 @@ fn authenticate_reader_admission(
     .is_some())
 }
 
+struct ReplayableReaderAdmission {
+    operation_id: String,
+    grant_admission: GrantAdmission,
+}
+
 fn replayable_reader_admission_for_grant(
     connection: &Connection,
     task_id: &str,
@@ -6676,7 +6866,8 @@ fn replayable_reader_admission_for_grant(
     artifact_id: &str,
     grant_id: &str,
     checked_at: &str,
-) -> Result<Option<GrantAdmission>> {
+    delivered_in_process: &BTreeSet<String>,
+) -> Result<Option<ReplayableReaderAdmission>> {
     let candidates = {
         let mut statement = connection.prepare(
             "SELECT operation_id,details_json FROM operations
@@ -6731,12 +6922,22 @@ fn replayable_reader_admission_for_grant(
         checked_at,
         true,
     )? {
-        Ok(Some(admission))
+        if delivered_in_process.contains(&operation_id) {
+            return Ok(None);
+        }
+        Ok(Some(ReplayableReaderAdmission {
+            operation_id,
+            grant_admission: admission,
+        }))
     } else {
         Ok(None)
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticates pending and replayed delivery receipts before one atomic provenance update"
+)]
 fn mark_reader_admission_delivered(
     connection: &mut Connection,
     task_id: &str,
@@ -6744,7 +6945,7 @@ fn mark_reader_admission_delivered(
     artifact_id: &str,
     admission: &GrantAdmission,
     delivered_at: &str,
-) -> Result<()> {
+) -> Result<String> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidates = {
         let mut statement = transaction.prepare(
@@ -6753,7 +6954,10 @@ fn mark_reader_admission_delivered(
                AND binding_id=?4 AND attempt_id=?5
                AND transaction_class='reversible_local' AND effect_class='ARTIFACT_READ'
                AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
-               AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-pending-delivery'
+               AND json_extract(external_receipt,'$.kind') IN (
+                   'artifact-reader-admission-pending-delivery',
+                   'artifact-reader-admission-delivered'
+               )
                AND json_extract(details_json,'$.artifact_id')=?6
                AND json_extract(details_json,'$.grant_id')=?7
              ORDER BY operation_id",
@@ -6778,6 +6982,25 @@ fn mark_reader_admission_delivered(
         ));
     }
     let (operation_id, pending_receipt) = &candidates[0];
+    let existing_receipt: ArtifactReaderAdmissionReceipt = serde_json::from_str(pending_receipt)?;
+    if existing_receipt.kind == "artifact-reader-admission-delivered" {
+        if !authenticate_reader_admission(
+            &transaction,
+            operation_id,
+            task_id,
+            execution,
+            artifact_id,
+            admission,
+            delivered_at,
+            false,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid",
+            ));
+        }
+        transaction.commit()?;
+        return Ok(operation_id.clone());
+    }
     if !authenticate_reader_admission(
         &transaction,
         operation_id,
@@ -6838,8 +7061,25 @@ fn mark_reader_admission_delivered(
             "stored Artifact reader admission is invalid",
         ));
     }
-    transaction.commit()?;
-    Ok(())
+    let commit = transaction
+        .commit()
+        .map_err(TaskManagerError::from)
+        .and_then(|()| reader_delivery_commit_result_step());
+    if let Err(error) = commit {
+        if !authenticate_reader_admission(
+            connection,
+            operation_id,
+            task_id,
+            execution,
+            artifact_id,
+            admission,
+            delivered_at,
+            false,
+        )? {
+            return Err(error);
+        }
+    }
+    Ok(operation_id.clone())
 }
 
 fn replayable_reader_admission(
@@ -6848,7 +7088,8 @@ fn replayable_reader_admission(
     execution: &ExecutionAuthority,
     artifact_id: &str,
     checked_at: &str,
-) -> Result<Option<GrantAdmission>> {
+    delivered_in_process: &BTreeSet<String>,
+) -> Result<Option<ReplayableReaderAdmission>> {
     let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
     let mut matches = Vec::new();
     for grant_id in grant_ids {
@@ -6859,6 +7100,7 @@ fn replayable_reader_admission(
             artifact_id,
             &grant_id,
             checked_at,
+            delivered_in_process,
         )? {
             matches.push(admission);
         }
@@ -8126,6 +8368,18 @@ fn unresolved_export_effect_exists(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     for (operation_id, state, certainty, details_json) in rows {
+        if state == "STARTED" {
+            let authenticated =
+                authenticate_export_operation(connection, &operation_id, &details_json)?;
+            if matches!(
+                authenticated,
+                Some(Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+                )))
+            ) {
+                continue;
+            }
+        }
         if matches!(state.as_str(), "PREPARED" | "STARTED" | "UNKNOWN")
             || matches!(
                 certainty.as_deref(),
@@ -9738,6 +9992,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static READER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static READER_DELIVERY_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static WRITER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -9831,6 +10087,16 @@ fn writer_write_commit_result_step() -> Result<()> {
 #[cfg(test)]
 fn reader_admission_commit_result_step() -> Result<()> {
     READER_ADMISSION_COMMIT_RESULT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn reader_delivery_commit_result_step() -> Result<()> {
+    READER_DELIVERY_COMMIT_RESULT_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook()?;
         }
@@ -9947,6 +10213,15 @@ fn writer_write_commit_result_step() -> Result<()> {
     reason = "test response-loss injection shares the reader admission commit-result boundary"
 )]
 fn reader_admission_commit_result_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test response-loss injection shares the reader delivery commit-result boundary"
+)]
+fn reader_delivery_commit_result_step() -> Result<()> {
     Ok(())
 }
 
@@ -17522,6 +17797,44 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_legacy_creation_time_binding_migrates_both_opened_handle_identities_atomically() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("legacy-windows-binding.sqlite");
+        let manager = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let database_identity = manager.store_lock.as_ref().unwrap().identity.clone();
+        let root_file = open_store_root_bound(&manager.artifact_store_root)
+            .unwrap()
+            .into_std_file();
+        let root_identity =
+            super::super::store_identity(&manager.artifact_store_root, &root_file).unwrap();
+        let legacy_database = database_identity.legacy_persistent_key();
+        let legacy_root = root_identity.legacy_persistent_key();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_store_binding SET database_identity=?1,root_identity=?2
+                 WHERE singleton_id=1",
+                params![legacy_database, legacy_root],
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let migrated = reopened
+            .connection
+            .query_row(
+                "SELECT database_identity,root_identity FROM artifact_store_binding
+                 WHERE singleton_id=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated.0, database_identity.persistent_key());
+        assert_eq!(migrated.1, root_identity.persistent_key());
+    }
+
     #[test]
     fn initial_and_nested_directory_durability_orders_child_before_parent() {
         let temp = TempDir::new().unwrap();
@@ -18593,6 +18906,79 @@ mod tests {
     }
 
     #[test]
+    fn output_allocation_wire_defaults_omitted_allowed_media_types() {
+        let mut value = serde_json::to_value(ArtifactOutputAllocation {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            allocation_id: "allocation:wire-default".to_owned(),
+            task_id: "T-artifact".to_owned(),
+            semantic_program_hash: allocation("unused").semantic_program_hash,
+            node_id: "compose_report".to_owned(),
+            binding_id: None,
+            attempt_id: None,
+            output_port: Some("report".to_owned()),
+            expected_semantic_type: Some("artifact.report@1".to_owned()),
+            allowed_media_types: Vec::new(),
+            max_size_bytes: None,
+            sensitivity: Sensitivity::Private,
+            retention: RetentionClass::Task,
+            state: ArtifactAllocationState::Allocated,
+            publication_id: None,
+            published_artifact_id: None,
+            created_at: "2026-09-19T22:00:00Z".to_owned(),
+            expires_at: "2026-09-19T23:00:00Z".to_owned(),
+            updated_at: None,
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("allowed_media_types");
+        let decoded: ArtifactOutputAllocation = serde_json::from_value(value).unwrap();
+        assert!(decoded.allowed_media_types.is_empty());
+    }
+
+    #[test]
+    fn bound_output_policy_is_conservatively_derived_from_durable_attempt_inputs() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let mut input_request = import_request();
+        input_request.sensitivity = Sensitivity::Secret;
+        input_request.retention = RetentionClass::Persistent;
+        let input = manager
+            .import_artifact(
+                &input_request,
+                &mut Cursor::new(b"classified input".as_slice()),
+            )
+            .unwrap();
+        let allocation_id = "allocation:derived-classification";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "derived-classification",
+            std::slice::from_ref(&input.artifact_id),
+            &[("artifact.write", "output-allocation", allocation_id)],
+        );
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let mut request = allocation(allocation_id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        assert!(matches!(
+            manager.allocate_bound_artifact_output(&session, &request),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert!(
+            manager
+                .get_artifact_output_allocation(allocation_id)
+                .unwrap()
+                .is_none()
+        );
+
+        request.sensitivity = Sensitivity::Secret;
+        request.retention = RetentionClass::Persistent;
+        let created = manager
+            .allocate_bound_artifact_output(&session, &request)
+            .unwrap();
+        assert_eq!(created.sensitivity, Sensitivity::Secret);
+        assert_eq!(created.retention, RetentionClass::Persistent);
+    }
+
+    #[test]
     fn keyed_import_replays_after_lost_commit_response_without_reading_source() {
         struct PanicReader;
         impl Read for PanicReader {
@@ -18695,6 +19081,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-driven test covers immutable metadata and the complete import provenance envelope"
+    )]
     fn keyed_import_replay_authenticates_every_immutable_artifact_field() {
         struct PanicReader;
         impl Read for PanicReader {
@@ -18764,6 +19154,67 @@ mod tests {
             manager
                 .connection
                 .execute_batch("ROLLBACK TO metadata_tamper; RELEASE metadata_tamper")
+                .unwrap();
+        }
+
+        let (sequence, previous_hash, original_event_json) = manager
+            .connection
+            .query_row(
+                "SELECT sequence,previous_event_hash,event_json FROM provenance_events
+                 WHERE task_id='T-artifact' AND event_type='artifact.imported'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER provenance_events_no_update")
+            .unwrap();
+        for mutation in [
+            ("actor", json!({"kind":"user","id":"user:forged"})),
+            ("schema_version", json!("9.9")),
+            ("input_artifacts", json!(["artifact:forged"])),
+            ("details.blob_reused", json!(true)),
+        ] {
+            manager
+                .connection
+                .execute_batch("SAVEPOINT import_event_tamper")
+                .unwrap();
+            let mut event: serde_json::Value = serde_json::from_str(&original_event_json).unwrap();
+            if mutation.0 == "details.blob_reused" {
+                event["details"]["blob_reused"] = mutation.1;
+            } else {
+                event[mutation.0] = mutation.1;
+            }
+            let event_json = canonical_json(&event).unwrap();
+            let event_hash = provenance_hash(
+                "T-artifact",
+                u64::try_from(sequence).unwrap(),
+                previous_hash.as_deref(),
+                &event,
+            )
+            .unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE provenance_events SET event_json=?1,event_hash=?2
+                     WHERE task_id='T-artifact' AND sequence=?3",
+                    params![event_json, event_hash, sequence],
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.import_artifact(&request, &mut PanicReader),
+                Err(TaskManagerError::InvalidRecord(_))
+            ));
+            manager
+                .connection
+                .execute_batch("ROLLBACK TO import_event_tamper; RELEASE import_event_tamper")
                 .unwrap();
         }
     }
@@ -18864,6 +19315,28 @@ mod tests {
             ))
         ));
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        let fresh_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&fresh_calls);
+        let mut fresh = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-after-proven-no-effect-admission",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::<u8>::new())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut fresh)
+                .unwrap(),
+            b"export response loss".len() as u64
+        );
+        assert_eq!(fresh_calls.load(Ordering::SeqCst), 1);
         manager.reconcile_export_operations_startup().unwrap();
         assert_eq!(
             manager
@@ -19255,6 +19728,13 @@ mod tests {
         let mut reader = reopened
             .open_artifact_reader(&scope, &artifact.artifact_id)
             .unwrap();
+        READER_DELIVERY_COMMIT_RESULT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected late reader delivery commit result",
+                )))
+            }));
+        });
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"reader response loss");
@@ -19273,6 +19753,78 @@ mod tests {
             reopened.scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id)),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+    }
+
+    #[test]
+    fn reader_delivery_remains_replayable_when_process_stops_before_first_access() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"deferred delivery".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "reader-delivery-crash",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT json_extract(external_receipt,'$.kind') FROM operations
+                     WHERE effect_class='ARTIFACT_READ'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "artifact-reader-admission-pending-delivery"
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CREATED',active_program_revision=NULL,active_step_ids_json='[]'
+                 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        drop(reader);
+        drop(scope);
+        drop(session);
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING',active_program_revision=1,
+                 active_step_ids_json='[\"compose_report\"]' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let session = reopened
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = reopened
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut reader = reopened
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"deferred delivery");
     }
 
     #[test]

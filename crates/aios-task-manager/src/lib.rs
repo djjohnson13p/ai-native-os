@@ -26,7 +26,7 @@ pub use artifact_store::{
     VerifiedArtifactExportNoEffect,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -458,6 +458,10 @@ pub struct TaskManager {
     artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
     artifact_export_verifiers:
         BTreeMap<String, Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
+    /// Reader admissions returned by this live process but not yet durably marked delivered.
+    /// Persisted pending admissions can be rehydrated after process loss without allowing two
+    /// simultaneous handles in one manager lifetime.
+    delivered_reader_admissions: BTreeSet<String>,
 }
 
 pub trait Clock: Send + Sync {
@@ -491,6 +495,8 @@ struct StoreIdentity {
     volume_serial_number: u64,
     #[cfg(windows)]
     file_index: u64,
+    #[cfg(windows)]
+    creation_time: u64,
 }
 
 impl PartialEq for StoreIdentity {
@@ -528,6 +534,11 @@ impl StoreIdentity {
             format!("path:{}", self.canonical_path.display())
         }
     }
+
+    #[cfg(windows)]
+    fn legacy_persistent_key(&self) -> String {
+        format!("windows:{}", self.creation_time)
+    }
 }
 
 fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
@@ -544,11 +555,15 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::fs::MetadataExt as _;
+
         let information = winx::winapi_util::file::information(file)?;
+        let metadata = file.metadata()?;
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
             volume_serial_number: information.volume_serial_number(),
             file_index: information.file_index(),
+            creation_time: metadata.creation_time(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -778,7 +793,7 @@ impl TaskManager {
     }
 
     fn initialize(
-        connection: Connection,
+        mut connection: Connection,
         clock: Box<dyn Clock>,
         store_lock: Option<StoreLock>,
         database_locator: DatabaseLocator,
@@ -800,7 +815,7 @@ impl TaskManager {
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
-            artifact_store::initialize_root(store_lock.as_ref(), &connection)?;
+            artifact_store::initialize_root(store_lock.as_ref(), &mut connection)?;
         let artifact_scope_issuer =
             connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
         let mut artifact_export_verifiers = BTreeMap::new();
@@ -836,6 +851,7 @@ impl TaskManager {
             store_lock,
             artifact_store_cleanup,
             artifact_export_verifiers,
+            delivered_reader_admissions: BTreeSet::new(),
         };
         manager.verify_all_provenance_chains()?;
         manager.reconcile_export_operations_startup()?;
