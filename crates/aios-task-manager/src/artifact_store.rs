@@ -4083,6 +4083,8 @@ impl TaskManager {
         assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
         let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
         ensure_task_is_not_recovering(&transaction, &intent.task_id)?;
+        ensure_no_unknown_artifact_export(&transaction, &intent.task_id)?;
+        ensure_artifact_integrity_durable(&transaction, &intent.artifact_id)?;
         validate_export_destination_fence(
             &transaction,
             &self.clock,
@@ -7407,19 +7409,7 @@ fn mark_reader_admission_delivered(
     assert_manager_lease(&transaction, lease_owner, lease_epoch)?;
     ensure_task_is_not_recovering(&transaction, task_id)?;
     ensure_no_unknown_artifact_export(&transaction, task_id)?;
-    let intact = transaction.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM artifacts a
-             JOIN artifact_blobs b ON b.content_hash=a.content_hash
-             WHERE a.artifact_id=?1 AND a.integrity_state='verified'
-               AND b.durability_state='DURABLE'
-         )",
-        [artifact_id],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !intact {
-        return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
-    }
+    ensure_artifact_integrity_durable(&transaction, artifact_id)?;
     if load_execution_authority(&transaction, task_id, &execution.binding_id, delivered_at)?
         != *execution
     {
@@ -7596,19 +7586,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
     }
     ensure_task_is_not_recovering(&reader.authority_connection, &reader.task_id)?;
     ensure_no_unknown_artifact_export(&reader.authority_connection, &reader.task_id)?;
-    let intact = reader.authority_connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM artifacts a
-             JOIN artifact_blobs b ON b.content_hash=a.content_hash
-             WHERE a.artifact_id=?1 AND a.integrity_state='verified'
-               AND b.durability_state='DURABLE'
-         )",
-        [&reader.artifact_id],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !intact {
-        return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
-    }
+    ensure_artifact_integrity_durable(&reader.authority_connection, &reader.artifact_id)?;
     let now = reader.clock.now();
     match &reader.authority.execution {
         Some(execution) => {
@@ -9041,6 +9019,24 @@ fn ensure_no_unknown_artifact_export(connection: &Connection, task_id: &str) -> 
         ))
     } else {
         Ok(())
+    }
+}
+
+fn ensure_artifact_integrity_durable(connection: &Connection, artifact_id: &str) -> Result<()> {
+    let intact = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM artifacts a
+             JOIN artifact_blobs b ON b.content_hash=a.content_hash
+             WHERE a.artifact_id=?1 AND a.integrity_state='verified'
+               AND b.durability_state='DURABLE'
+         )",
+        [artifact_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if intact {
+        Ok(())
+    } else {
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
     }
 }
 
@@ -22316,7 +22312,14 @@ mod tests {
         reason = "table-like scenarios exercise recovery, revocation, and supersession at the same arming boundary"
     )]
     fn export_arming_rechecks_recovery_revocation_and_attempt_supersession() {
-        for scenario in ["recovery", "revocation", "supersession"] {
+        for scenario in [
+            "recovery",
+            "revocation",
+            "supersession",
+            "artifact-integrity",
+            "blob-durability",
+            "unknown-export",
+        ] {
             let temp = TempDir::new().unwrap();
             let database = temp.path().join("task-manager.sqlite");
             let mut manager = manager(&temp);
@@ -22359,6 +22362,7 @@ mod tests {
             let registry_id = format!("registry-arm-{scenario}");
             let database_for_hook = database.clone();
             let scenario_for_hook = scenario.to_owned();
+            let artifact_id = artifact.artifact_id.clone();
             EXPORT_BEFORE_ARM_TEST_HOOK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {
                     let connection = Connection::open(database_for_hook)?;
@@ -22384,6 +22388,39 @@ mod tests {
                                  VALUES ('attempt-arm-later','T-artifact','{program_hash}','{registry_id}','compose_report','binding-arm-later',2,1,'RUNNING','[]','[]','2026-09-19T00:01:00Z','2026-09-19T00:01:00Z');"
                             ))?;
                         }
+                        "artifact-integrity" => {
+                            connection.execute(
+                                "UPDATE artifacts SET integrity_state='failed'
+                                 WHERE artifact_id=?1",
+                                [&artifact_id],
+                            )?;
+                        }
+                        "blob-durability" => {
+                            connection.execute(
+                                "UPDATE artifact_blobs SET durability_state='CORRUPT'
+                                 WHERE content_hash=(SELECT content_hash FROM artifacts
+                                     WHERE artifact_id=?1)",
+                                [&artifact_id],
+                            )?;
+                        }
+                        "unknown-export" => {
+                            connection.execute(
+                                "INSERT INTO operations(
+                                     operation_id,task_id,transaction_class,effect_class,
+                                     idempotency_key,state,outcome_certainty,details_json,prepared_at
+                                 ) VALUES (
+                                     'export-arm-unknown-sibling','T-artifact',
+                                     'irreversible_external','DATA_EGRESS',
+                                     'export-arm-unknown-sibling','UNKNOWN','OUTCOME_UNKNOWN',?1,
+                                     '2026-09-19T00:01:00Z'
+                                 )",
+                                [canonical_json(&json!({
+                                    "version": 2,
+                                    "artifact_id": artifact_id,
+                                    "destination_class": "user-selected-file"
+                                }))?],
+                            )?;
+                        }
                         _ => unreachable!(),
                     }
                     Ok(())
@@ -22391,7 +22428,7 @@ mod tests {
             });
             assert!(matches!(
                 manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
-                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+                Err(TaskManagerError::InvalidRecord(_))
             ));
             assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
