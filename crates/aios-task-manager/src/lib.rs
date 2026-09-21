@@ -1439,20 +1439,23 @@ impl TaskManager {
         }
         // Artifact reconciliation runs before this scan and can discover a
         // consequential subject after a Task has already entered RECOVERING.
-        // Persist a fresh immutable inventory for that exact current set. Do
-        // not rewrite the Task's transition-backed recovery pointer: the new
-        // subject is reconciled through this assessment while the original
-        // transition provenance remains immutable.
+        // Persist a fresh immutable inventory and advance the transition-backed
+        // active pointer so supported reconciliation APIs can discover it.
         let recovering_tasks = {
             let mut statement = self.connection.prepare(
-                "SELECT task_id,revision FROM tasks WHERE state='RECOVERING' ORDER BY task_id",
+                "SELECT task_id,revision,json_extract(recovery_json,'$.unknown_operations_ref')
+                 FROM tasks WHERE state='RECOVERING' ORDER BY task_id",
             )?;
             let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (task_id, revision) in recovering_tasks {
+        for (task_id, revision, active_recovery_ref) in recovering_tasks {
             if newly_recovered.contains(&task_id) {
                 continue;
             }
@@ -1462,6 +1465,15 @@ impl TaskManager {
             if inventory.is_empty() {
                 continue;
             }
+            if let Some(active_recovery_ref) = active_recovery_ref.as_deref() {
+                if self
+                    .recovery_unknown_operation_ids(active_recovery_ref)?
+                    .as_deref()
+                    == Some(inventory.as_slice())
+                {
+                    continue;
+                }
+            }
             let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
             self.persist_recovery_inventory(
                 &recovery_ref,
@@ -1470,6 +1482,43 @@ impl TaskManager {
                 &inventory,
                 &self.clock.now(),
             )?;
+            let result = self.transition_impl(
+                &TransitionRequest {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    transition_id: startup_recovery_transition_id(&task_id, revision),
+                    task_id,
+                    expected_revision: revision,
+                    expected_state: TaskState::Recovering,
+                    to_state: TaskState::Recovering,
+                    requested_by: Actor {
+                        kind: "system-service".to_owned(),
+                        id: "service:recovery".to_owned(),
+                    },
+                    reason: TransitionReason {
+                        code: "TASK_RECOVERY_REQUIRED".to_owned(),
+                        message: Some(
+                            "startup refreshed the active uncertain-operation inventory".to_owned(),
+                        ),
+                        related_ids: vec![recovery_ref.clone()],
+                    },
+                    mutation: TaskMutation {
+                        recovery: Some(RecoveryMutation {
+                            unknown_operation_ids: Vec::new(),
+                            unknown_operations_ref: Some(recovery_ref),
+                            last_known_daemon_instance: None,
+                        }),
+                        ..TaskMutation::default()
+                    },
+                },
+                false,
+                true,
+            )?;
+            if !result.applied {
+                return Err(TaskManagerError::InvalidRecord(
+                    "startup recovery inventory refresh was not applied",
+                ));
+            }
+            results.push(result);
         }
         Ok(results)
     }
@@ -1497,18 +1546,24 @@ impl TaskManager {
     }
 
     pub(crate) fn persist_recovery_inventory_for_task(&mut self, task_id: &str) -> Result<String> {
-        let (revision, state) = self
+        let (revision, state, active_recovery_ref) = self
             .connection
             .query_row(
-                "SELECT revision,state FROM tasks WHERE task_id=?1",
+                "SELECT revision,state,json_extract(recovery_json,'$.unknown_operations_ref')
+                 FROM tasks WHERE task_id=?1",
                 [task_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord(
                 "terminal recovery Task does not exist",
             ))?;
-        let _ = state;
         let revision = u64::try_from(revision)
             .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
         let inventory = unresolved_execution_ids(&self.connection, task_id)?;
@@ -1516,6 +1571,17 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery inventory requires consequential evidence",
             ));
+        }
+        if state == "RECOVERING" {
+            if let Some(active_recovery_ref) = active_recovery_ref.as_deref() {
+                if self
+                    .recovery_unknown_operation_ids(active_recovery_ref)?
+                    .as_deref()
+                    == Some(inventory.as_slice())
+                {
+                    return Ok(active_recovery_ref.to_owned());
+                }
+            }
         }
         let recovery_ref = recovery_operations_ref(task_id, revision, &inventory)?;
         self.persist_recovery_inventory(
@@ -1525,6 +1591,44 @@ impl TaskManager {
             &inventory,
             &self.clock.now(),
         )?;
+        if state == "RECOVERING" {
+            let result = self.transition_impl(
+                &TransitionRequest {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    transition_id: startup_recovery_transition_id(task_id, revision),
+                    task_id: task_id.to_owned(),
+                    expected_revision: revision,
+                    expected_state: TaskState::Recovering,
+                    to_state: TaskState::Recovering,
+                    requested_by: Actor {
+                        kind: "system-service".to_owned(),
+                        id: "service:recovery".to_owned(),
+                    },
+                    reason: TransitionReason {
+                        code: "TASK_RECOVERY_REQUIRED".to_owned(),
+                        message: Some(
+                            "refreshed the active uncertain-operation inventory".to_owned(),
+                        ),
+                        related_ids: vec![recovery_ref.clone()],
+                    },
+                    mutation: TaskMutation {
+                        recovery: Some(RecoveryMutation {
+                            unknown_operation_ids: Vec::new(),
+                            unknown_operations_ref: Some(recovery_ref.clone()),
+                            last_known_daemon_instance: None,
+                        }),
+                        ..TaskMutation::default()
+                    },
+                },
+                false,
+                true,
+            )?;
+            if !result.applied {
+                return Err(TaskManagerError::InvalidRecord(
+                    "recovery inventory refresh was not applied",
+                ));
+            }
+        }
         Ok(recovery_ref)
     }
 
@@ -4849,7 +4953,8 @@ fn allowed_transition(from: TaskState, to: TaskState) -> bool {
         Paused => matches!(to, Planning | Runnable | Recovering | Cancelled | Failed),
         Recovering => matches!(
             to,
-            Planning
+            Recovering
+                | Planning
                 | Runnable
                 | Running
                 | WaitingForInput

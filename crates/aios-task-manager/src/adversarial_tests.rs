@@ -941,22 +941,22 @@ fn seed_completion_fixture_with_identity(
                  content_hash, size_bytes, storage_ref, durability_state,
                  created_at, verified_at
              ) VALUES (
-                 'sha256:artifact-output', 42, 'blob://completion/output',
+                 'sha256:4444444444444444444444444444444444444444444444444444444444444444', 42, 'blob://completion/output',
                  'DURABLE', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifacts (
                  artifact_id, uri, semantic_type, media_type, sensitivity, retention_class, origin_kind,
                  origin_task_id, origin_program_hash, origin_node_id,
                  origin_binding_id, origin_provider_id, size_bytes, content_hash,
-                 integrity_state, integrity_verified_at, labels_json, created_at
+                 integrity_state, integrity_verified_at, integrity_verifier, labels_json, created_at
              ) VALUES (
                  'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe',
                  'artifact://artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'artifact.report@1',
                  'application/json', 'local', 'task', 'task', 'T-completion',
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'provider:test',
-                 42, 'sha256:artifact-output', 'verified',
-                 '2026-09-19T00:00:00Z', '[]', '2026-09-19T00:00:00Z'
+                 42, 'sha256:4444444444444444444444444444444444444444444444444444444444444444', 'verified',
+                 '2026-09-19T00:00:00Z', 'artifact-store:sha256', '[]', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
@@ -1007,7 +1007,7 @@ fn seed_completion_fixture_with_identity(
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-completion', 'allocation-completion',
-                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'sha256:artifact-output', ?2, ?1,
+                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'sha256:4444444444444444444444444444444444444444444444444444444444444444', ?2, ?1,
                  '2026-09-19T00:00:00Z',
                  CASE WHEN ?1 = 'COMMITTED' THEN '2026-09-19T00:00:00Z' END
              )",
@@ -1036,7 +1036,7 @@ fn seed_completion_fixture_with_identity(
             "details": {
                 "publication_id": "publication-completion",
                 "allocation_id": "allocation-completion",
-                "content_hash": "sha256:artifact-output",
+                "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
                 "size_bytes": 42,
                 "blob_reused": false
             }
@@ -1055,7 +1055,7 @@ fn seed_completion_fixture_with_identity(
             "semantic_type": "artifact.report@1",
             "media_type": "application/json",
             "size_bytes": 42,
-            "content_hash": "sha256:artifact-output",
+            "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
             "blob_reused": false,
             "provenance_event_id": appended.event_id,
             "provenance_event_hash": appended.event_hash,
@@ -1332,7 +1332,7 @@ fn coherent_mislinked_publication_is_rejected_by_replay_inventory_and_completion
         "details": {
             "publication_id": "publication-completion",
             "allocation_id": "allocation-completion",
-            "content_hash": "sha256:artifact-output",
+            "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
             "size_bytes": 42,
             "blob_reused": false
         }
@@ -3445,7 +3445,7 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager.connection.execute(
-        "UPDATE artifact_blobs SET durability_state = 'CORRUPT' WHERE content_hash = 'sha256:artifact-output'",
+        "UPDATE artifact_blobs SET durability_state = 'CORRUPT' WHERE content_hash = 'sha256:4444444444444444444444444444444444444444444444444444444444444444'",
         [],
     ).unwrap();
     assert_eq!(
@@ -3518,6 +3518,104 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
     let recovered = manager.reconcile_live_execution("T-live-recovery").unwrap();
     assert!(recovered.applied);
     assert_eq!(recovered.current_state, Some(TaskState::Recovering));
+}
+
+#[test]
+fn refreshed_recovery_inventory_becomes_active_without_rewriting_history() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("refresh-recovery.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-recovery", TaskState::Running);
+    manager
+        .connection
+        .execute(
+            "INSERT INTO operations (
+                operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+                outcome_certainty,prepared_at
+             ) VALUES (
+                'operation-r1','T-refresh-recovery',?1,'node-1','NETWORK','UNKNOWN',
+                'OUTCOME_UNKNOWN',?2
+             )",
+            rusqlite::params![HASH, TEST_TIME],
+        )
+        .unwrap();
+    let recovered = manager
+        .reconcile_live_execution("T-refresh-recovery")
+        .unwrap();
+    assert!(recovered.applied);
+    let first = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    assert_eq!(first.state, TaskState::Recovering);
+    let first_ref = first
+        .recovery
+        .as_ref()
+        .and_then(|value| value["unknown_operations_ref"].as_str())
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&first_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1"]
+    );
+
+    manager
+        .connection
+        .execute(
+            "INSERT INTO operations (
+                operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+                outcome_certainty,prepared_at
+             ) VALUES (
+                'operation-r2','T-refresh-recovery',?1,'node-1','NETWORK','UNKNOWN',
+                'OUTCOME_UNKNOWN',?2
+             )",
+            rusqlite::params![HASH, TEST_TIME],
+        )
+        .unwrap();
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let refreshed = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    let second_ref = refreshed
+        .recovery
+        .as_ref()
+        .and_then(|value| value["unknown_operations_ref"].as_str())
+        .unwrap()
+        .to_owned();
+    assert_eq!(refreshed.state, TaskState::Recovering);
+    assert_eq!(refreshed.revision, first.revision + 1);
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        refreshed
+            .recovery
+            .as_ref()
+            .and_then(|value| value["unknown_operations_ref"].as_str()),
+        Some(second_ref.as_str())
+    );
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&first_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1"]
+    );
+    manager
+        .connection
+        .execute(
+            "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1
+             WHERE operation_id IN ('operation-r1','operation-r2')",
+            [TEST_TIME],
+        )
+        .unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
 }
 
 #[test]
@@ -4439,7 +4537,7 @@ fn completion_requires_present_durable_hash_matching_verified_blob() {
     for (name, mutation, expected_reason) in [
         (
             "blob-missing",
-            "UPDATE artifact_blobs SET durability_state='MISSING' WHERE content_hash='sha256:artifact-output'",
+            "UPDATE artifact_blobs SET durability_state='MISSING' WHERE content_hash='sha256:4444444444444444444444444444444444444444444444444444444444444444'",
             "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
@@ -6842,7 +6940,7 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
         (
             "missing-blob",
             "UPDATE artifact_blobs SET durability_state='MISSING'
-             WHERE content_hash='sha256:artifact-output'",
+             WHERE content_hash='sha256:4444444444444444444444444444444444444444444444444444444444444444'",
         ),
         (
             "unverified-artifact",
@@ -6925,7 +7023,7 @@ fn committed_publication_recovery_rejects_rogue_allocation_alias() {
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-rogue', 'allocation-rogue', 'T-completion',
-                 '{COMPLETION_ARTIFACT_ID}', 'sha256:artifact-output', '{{}}', 'COMMITTED',
+                 '{COMPLETION_ARTIFACT_ID}', 'sha256:4444444444444444444444444444444444444444444444444444444444444444', '{{}}', 'COMMITTED',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );"
         ))
