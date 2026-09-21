@@ -12,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(not(unix))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -899,13 +900,20 @@ pub(super) fn initialize_root(
     let cleanup = store_lock
         .is_none()
         .then(|| Arc::new(EphemeralStoreCleanup { root: root.clone() }));
+    let directory = open_store_root_bound(&root)?;
+    root_open_step(&root)?;
+    let root_file = directory.try_clone()?.into_std_file();
+    validate_opened_store_root(&root, &root_file)?;
+    let opened_identity = super::store_identity(&root, &root_file)?;
     reject_reparse_root(&root)?;
     let canonical_root = root.canonicalize()?;
-    if created {
-        secure_store_root(&canonical_root, true)?;
+    let current_path = open_store_root_bound(&canonical_root)?;
+    let current_path_file = current_path.into_std_file();
+    if super::store_identity(&canonical_root, &current_path_file)? != opened_identity {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact store root changed while it was being opened",
+        ));
     }
-    let directory = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
-    root_open_step(&canonical_root)?;
     // A previous attempt may have created the directory and failed before its
     // parent entry was durable. Always repeat both syncs before acknowledging
     // the root, including on retry when it already exists.
@@ -919,16 +927,6 @@ pub(super) fn initialize_root(
                 "Artifact store root has no parent directory",
             ))?,
     )?;
-    let root_file = directory.try_clone()?.into_std_file();
-    validate_opened_store_root(&canonical_root, &root_file)?;
-    let opened_identity = super::store_identity(&canonical_root, &root_file)?;
-    let current_path = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
-    let current_path_file = current_path.into_std_file();
-    if super::store_identity(&canonical_root, &current_path_file)? != opened_identity {
-        return Err(TaskManagerError::InvalidRecord(
-            "Artifact store root changed while it was being opened",
-        ));
-    }
     let root_identity = opened_identity.persistent_key();
     if stored_root_identity
         .as_deref()
@@ -938,9 +936,7 @@ pub(super) fn initialize_root(
             "Artifact store root identity does not match its database binding",
         ));
     }
-    if !created {
-        secure_store_root(&canonical_root, false)?;
-    }
+    secure_store_root(&canonical_root, created)?;
     create_durable_ancestors(&directory, "blobs/sha256")?;
     create_durable_ancestors(&directory, "staging")?;
     create_durable_ancestors(&directory, "quarantine")?;
@@ -965,9 +961,41 @@ fn create_store_root(root: &Path) -> std::io::Result<()> {
     builder.mode(0o700).create(root)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn create_store_root(root: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(root)
+    create_windows_private_store_root(root)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_store_root(_root: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private Artifact store root creation is unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn open_store_root_bound(root: &Path) -> Result<Dir> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            TaskManagerError::InvalidRecord("Artifact store root must be a real directory")
+        } else {
+            TaskManagerError::Io(std::io::Error::from(error))
+        }
+    })?;
+    Ok(Dir::from_std_file(File::from(descriptor)))
+}
+
+#[cfg(not(unix))]
+fn open_store_root_bound(root: &Path) -> Result<Dir> {
+    Ok(Dir::open_ambient_dir(root, ambient_authority())?)
 }
 
 #[cfg(unix)]
@@ -1165,6 +1193,53 @@ fn windows_current_user_sid() -> Result<String> {
         ))?;
     let _ = SID.set(sid.clone());
     Ok(sid)
+}
+
+#[cfg(windows)]
+fn create_windows_private_store_root(root: &Path) -> std::io::Result<()> {
+    const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$security = New-Object Security.AccessControl.DirectorySecurity
+$security.SetAccessRuleProtection($true, $false)
+$security.SetOwner($sid)
+$inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$propagation = [Security.AccessControl.PropagationFlags]::None
+$full = [Security.AccessControl.FileSystemRights]::FullControl
+$allow = [Security.AccessControl.AccessControlType]::Allow
+$security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, $full, $inheritance, $propagation, $allow)))
+$security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, $full, $inheritance, $propagation, $allow)))
+try {
+  [void][System.IO.Directory]::CreateDirectory($env:AIOS_ARTIFACT_STORE_ROOT, $security)
+} catch [System.IO.IOException] {
+  if ([System.IO.Directory]::Exists($env:AIOS_ARTIFACT_STORE_ROOT)) { exit 17 }
+  throw
+}
+"#;
+    validate_trusted_windows_executable(Path::new(POWERSHELL)).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+    })?;
+    let output = std::process::Command::new(POWERSHELL)
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env_clear()
+        .env("AIOS_ARTIFACT_STORE_ROOT", root)
+        .env("PATH", r"C:\Windows\System32")
+        .env("SystemRoot", r"C:\Windows")
+        .env("windir", r"C:\Windows")
+        .current_dir(r"C:\Windows\System32")
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else if output.status.code() == Some(17) {
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Artifact store root could not be created with a private ACL",
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -2394,6 +2469,7 @@ impl TaskManager {
     /// Seals a provider export writer to the exact Artifact, destination class, attempt, and
     /// `data.egress` grant selected by the trusted control plane.
     #[allow(
+        clippy::too_many_lines,
         clippy::too_many_arguments,
         reason = "the trusted destination issuer binds the complete export operation tuple"
     )]
@@ -2443,6 +2519,68 @@ impl TaskManager {
         )? != *execution
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let stored_intent_json = self
+            .connection
+            .query_row(
+                "SELECT details_json FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(stored_intent_json) = stored_intent_json {
+            let stored: ArtifactExportIntent = serde_json::from_str(&stored_intent_json)?;
+            if stored.version != 1
+                || stored.task_id != scope.task_id
+                || stored.artifact_id != artifact_id
+                || stored.destination_class != destination_class
+                || stored.max_size_bytes != max_size_bytes
+                || stored.principal_kind != "provider"
+                || stored.principal_id != execution.principal_id
+                || stored.semantic_program_hash.as_deref()
+                    != Some(execution.semantic_program_hash.as_str())
+                || stored.node_id.as_deref() != Some(execution.node_id.as_str())
+                || stored.binding_id.as_deref() != Some(execution.binding_id.as_str())
+                || stored.attempt_id.as_deref() != Some(execution.attempt_id.as_str())
+                || stored.grant_id.is_none()
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+                ));
+            }
+            let artifact = self
+                .get_artifact(artifact_id)?
+                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_NOT_FOUND"))?;
+            if stored.content_hash != *artifact.content_hash.tagged()
+                || artifact.size_bytes > max_size_bytes
+                || canonical_json(&stored)? != stored_intent_json
+                || authenticate_export_operation(
+                    &self.connection,
+                    operation_id,
+                    &stored_intent_json,
+                )?
+                .is_none()
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+                ));
+            }
+            return Ok(ArtifactExportDestination {
+                writer_factory: Some(Box::new(writer_factory)),
+                writer: None,
+                external_effect_possible: false,
+                operation_id: operation_id.to_owned(),
+                intent_json: stored_intent_json,
+                issuer_id: self.artifact_scope_issuer.clone(),
+                scope_id: scope.scope_id.clone(),
+                task_id: scope.task_id.clone(),
+                artifact_id: artifact_id.to_owned(),
+                destination_class: destination_class.to_owned(),
+                authority: scope.authority.clone(),
+                expected_grant_id: stored.grant_id,
+                grant_admission: None,
+                consumed: false,
+            });
         }
         let grant = exact_operation_grant(
             &self.connection,
@@ -2593,6 +2731,14 @@ impl TaskManager {
             &destination.operation_id,
             &destination.intent_json,
         )? {
+            if matches!(
+                &replay,
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ) {
+                self.ensure_unknown_export_recovery_inventory(&scope.task_id)?;
+            }
             return replay;
         }
         if destination.consumed {
@@ -2903,15 +3049,32 @@ impl TaskManager {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
+        if matches!(state.as_deref(), Some("RUNNING" | "VERIFYING" | "PAUSED")) {
+            live_recovery_handoff_step()?;
+        }
+        self.ensure_unknown_export_recovery_inventory(task_id)
+    }
+
+    fn ensure_unknown_export_recovery_inventory(&mut self, task_id: &str) -> Result<()> {
+        let state = self
+            .connection
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         match state.as_deref() {
             Some("RUNNING" | "VERIFYING" | "PAUSED") => {
-                live_recovery_handoff_step()?;
                 self.reconcile_live_execution(task_id)?;
             }
             Some("COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK") => {
                 self.persist_terminal_recovery_inventory_for_task(task_id)?;
             }
-            Some("RECOVERING") | None => {}
+            Some("RECOVERING") => {
+                self.persist_recovery_inventory_for_task(task_id)?;
+            }
+            None => {}
             Some(_) => {
                 self.persist_recovery_inventory_for_task(task_id)?;
             }
@@ -3159,41 +3322,66 @@ impl TaskManager {
         let task = self
             .connection
             .query_row(
-                "SELECT state,revision,json_extract(recovery_json,'$.unknown_operations_ref')
+                "SELECT state,json_extract(recovery_json,'$.unknown_operations_ref')
                  FROM tasks WHERE task_id=?1",
                 [&row.0],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord(
                 "Artifact export reconciliation Task does not exist",
             ))?;
-        let recovery_ref = if task.0 == "RECOVERING" {
-            task.2.ok_or(TaskManagerError::InvalidRecord(
-                "Artifact export reconciliation requires an active recovery epoch",
-            ))?
+        let challenged = self
+            .connection
+            .query_row(
+                "SELECT recovery_assessment_id,subject_hash
+                 FROM artifact_export_reconciliation_challenges WHERE operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let recovery_ref = if let Some((recovery_ref, stored_subject_hash)) = challenged {
+            if stored_subject_hash != subject_hash {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Artifact export reconciliation challenge conflicts with its subject",
+                ));
+            }
+            recovery_ref
         } else {
-            self.connection
-                .query_row(
-                    "SELECT r.assessment_id
-                     FROM recovery_assessments r
-                     JOIN recovery_unknown_operations u ON u.assessment_id=r.assessment_id
-                     WHERE r.task_id=?1 AND r.subject_kind='task' AND r.basis_revision=?2
-                       AND u.operation_id=?3
-                     ORDER BY r.created_at DESC,r.assessment_id DESC LIMIT 1",
-                    params![row.0, task.1, inventory_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "Artifact export lacks persisted recovery inventory",
-                ))?
+            let active = if task.0 == "RECOVERING" {
+                if let Some(recovery_ref) = task.1 {
+                    self.connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations
+                             WHERE assessment_id=?1 AND operation_id=?2)",
+                            params![recovery_ref, inventory_id],
+                            |row| row.get::<_, bool>(0),
+                        )?
+                        .then_some(recovery_ref)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(active) = active {
+                active
+            } else {
+                self.connection
+                    .query_row(
+                        "SELECT r.assessment_id
+                         FROM recovery_assessments r
+                         JOIN recovery_unknown_operations u ON u.assessment_id=r.assessment_id
+                         WHERE r.task_id=?1 AND r.subject_kind='task' AND u.operation_id=?2
+                         ORDER BY r.created_at DESC,r.assessment_id DESC LIMIT 1",
+                        params![row.0, inventory_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "Artifact export lacks persisted recovery inventory",
+                    ))?
+            }
         };
         let inventoried = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
@@ -3370,6 +3558,19 @@ impl TaskManager {
             [reconciled_at],
         )?;
         transaction.commit()?;
+        let task_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT task_id FROM operations
+                 WHERE transaction_class='irreversible_external' AND effect_class='DATA_EGRESS'
+                   AND state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'
+                 ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for task_id in task_ids {
+            self.ensure_unknown_export_recovery_inventory(&task_id)?;
+        }
         Ok(())
     }
 
@@ -3449,6 +3650,17 @@ impl TaskManager {
                 continue;
             }
             let (size, hash) = hash_internal_file(&self.artifact_store_dir, &relative)?;
+            let expected_hash = content_hash_from_blob_ref(&relative)?;
+            if hash != expected_hash {
+                quarantine_orphan_blob_path(&self.artifact_store_dir, &relative, &hash)?;
+                findings.push(ArtifactReconciliationFinding {
+                    kind: ArtifactReconciliationKind::BlobCorrupt,
+                    allocation_id: None,
+                    content_hash: Some(expected_hash),
+                    artifact_ids: Vec::new(),
+                });
+                continue;
+            }
             if known.contains(&hash) {
                 continue;
             }
@@ -3493,7 +3705,8 @@ impl TaskManager {
                 state.as_str(),
                 "ALLOCATED" | "FAILED" | "ABORTED" | "PUBLISHED"
             ) {
-                for residue in [staging_ref.clone(), seal_ref(staging_ref)] {
+                let seal = seal_ref(staging_ref);
+                for residue in [staging_ref.clone(), seal.clone(), format!("{seal}.pending")] {
                     match self
                         .artifact_store_dir
                         .remove_file(safe_internal_ref(&residue)?)
@@ -6208,32 +6421,61 @@ fn unresolved_export_effect_exists(
     connection: &Connection,
     intent: &ArtifactExportIntent,
 ) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM operations
-                 WHERE task_id=?1
-                   AND transaction_class='irreversible_external'
-                   AND effect_class='DATA_EGRESS'
-                   AND json_extract(details_json,'$.version')=1
-                   AND json_extract(details_json,'$.task_id')=?1
-                   AND json_extract(details_json,'$.artifact_id')=?2
-                   AND json_extract(details_json,'$.content_hash')=?3
-                   AND json_extract(details_json,'$.destination_class')=?4
-                   AND (
-                       state IN ('PREPARED','STARTED','UNKNOWN')
-                       OR outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN')
-                   )
-             )",
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT operation_id,state,outcome_certainty,details_json FROM operations
+             WHERE task_id=?1
+               AND transaction_class='irreversible_external'
+               AND effect_class='DATA_EGRESS'
+               AND json_extract(details_json,'$.version')=1
+               AND json_extract(details_json,'$.task_id')=?1
+               AND json_extract(details_json,'$.artifact_id')=?2
+               AND json_extract(details_json,'$.content_hash')=?3
+               AND json_extract(details_json,'$.destination_class')=?4",
+        )?;
+        let rows = statement.query_map(
             params![
                 &intent.task_id,
                 &intent.artifact_id,
                 &intent.content_hash,
                 &intent.destination_class,
             ],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (operation_id, state, certainty, details_json) in rows {
+        if matches!(state.as_str(), "PREPARED" | "STARTED" | "UNKNOWN")
+            || matches!(
+                certainty.as_deref(),
+                Some("FAILED_PARTIAL_EFFECT" | "OUTCOME_UNKNOWN")
+            )
+        {
+            return Ok(true);
+        }
+        if state == "FAILED" && certainty.as_deref() == Some("FAILED_NO_EFFECT") {
+            let authenticated =
+                authenticate_export_operation(connection, &operation_id, &details_json)?;
+            if !matches!(
+                authenticated,
+                Some(Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+                )))
+            ) {
+                return Err(TaskManagerError::InvalidRecord(
+                    "stored Artifact export reconciliation is invalid",
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn ensure_no_unknown_artifact_export(connection: &Connection, task_id: &str) -> Result<()> {
@@ -6427,9 +6669,12 @@ fn authenticate_export_operation(
             }
             Ok(size)
         }
-        ("FAILED", Some("FAILED_NO_EFFECT")) => Err(TaskManagerError::InvalidRecord(
-            "ARTIFACT_EXPORT_FAILED_NO_EFFECT",
-        )),
+        ("FAILED", Some("FAILED_NO_EFFECT")) => {
+            authenticate_reconciled_export_no_effect(connection, operation_id, &intent)?;
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT",
+            ))
+        }
         ("STARTED" | "PREPARED" | "UNKNOWN", None | Some("OUTCOME_UNKNOWN"))
         | ("FAILED", Some("FAILED_PARTIAL_EFFECT")) => Err(TaskManagerError::InvalidRecord(
             "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
@@ -6441,6 +6686,152 @@ fn authenticate_export_operation(
         }
     };
     Ok(Some(replay))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "replay checks the challenge, full provenance, evidence fields, inventory, and resolved assessment as one authentication boundary"
+)]
+fn authenticate_reconciled_export_no_effect(
+    connection: &Connection,
+    operation_id: &str,
+    intent: &ArtifactExportIntent,
+) -> Result<()> {
+    let challenged = connection
+        .query_row(
+            "SELECT recovery_assessment_id,subject_hash,challenge
+             FROM artifact_export_reconciliation_challenges WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    // Every reachable export failure after durable admission crossed an
+    // external-effect-capable callback boundary. Mutable operation columns can never establish
+    // no-effect certainty without the challenge-bound immutable reconciliation evidence.
+    let Some((recovery_ref, stored_subject_hash, challenge)) = challenged else {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export reconciliation is invalid",
+        ));
+    };
+    let subject = ArtifactExportReconciliationSubject::from_intent(operation_id, intent);
+    let mut subject_hasher = Sha256::new();
+    subject_hasher.update(b"AIOS-ARTIFACT-EXPORT-RECONCILIATION-SUBJECT\0v1\0");
+    subject_hasher.update(canonical_json(&subject)?.as_bytes());
+    let subject_hash = tagged_digest(subject_hasher);
+    if stored_subject_hash != subject_hash
+        || !super::verify_provenance_through(connection, &intent.task_id, None)?
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export reconciliation is invalid",
+        ));
+    }
+    let event_jsons = {
+        let mut statement = connection.prepare(
+            "SELECT event_json FROM provenance_events
+             WHERE task_id=?1 AND event_type='execution.completed'
+               AND json_extract(event_json,'$.details.operation_id')=?2
+               AND json_extract(event_json,'$.details.export_reconciliation.challenge')=?3",
+        )?;
+        let rows = statement
+            .query_map(params![intent.task_id, operation_id, challenge], |row| {
+                row.get::<_, String>(0)
+            })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if event_jsons.len() != 1 {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export reconciliation is invalid",
+        ));
+    }
+    let event: serde_json::Value = serde_json::from_str(&event_jsons[0])?;
+    let evidence_ref = event
+        .pointer("/details/export_reconciliation/evidence_ref")
+        .and_then(serde_json::Value::as_str);
+    let verifier_id = event
+        .pointer("/details/export_reconciliation/verifier_id")
+        .and_then(serde_json::Value::as_str);
+    let proof_hash = event
+        .pointer("/details/export_reconciliation/proof_hash")
+        .and_then(serde_json::Value::as_str);
+    let observed_at = event
+        .pointer("/details/export_reconciliation/observed_at")
+        .and_then(serde_json::Value::as_str);
+    if event
+        .pointer("/actor/kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("system-service")
+        || event
+            .pointer("/actor/id")
+            .and_then(serde_json::Value::as_str)
+            != Some("service:recovery")
+        || event.get("status").and_then(serde_json::Value::as_str) != Some("failure")
+        || event
+            .pointer("/details/certainty")
+            .and_then(serde_json::Value::as_str)
+            != Some("FAILED_NO_EFFECT")
+        || event
+            .pointer("/details/export_reconciliation/subject_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(subject_hash.as_str())
+        || event
+            .pointer("/details/export_reconciliation/recovery_ref")
+            .and_then(serde_json::Value::as_str)
+            != Some(recovery_ref.as_str())
+        || verifier_id.is_none()
+        || evidence_ref.is_none()
+        || proof_hash.is_none()
+        || observed_at.is_none()
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export reconciliation is invalid",
+        ));
+    }
+    validate_id(
+        verifier_id.unwrap_or_default(),
+        256,
+        "invalid Artifact export reconciliation verifier",
+    )?;
+    validate_id(
+        evidence_ref.unwrap_or_default(),
+        256,
+        "invalid Artifact export reconciliation evidence reference",
+    )?;
+    validate_hash(proof_hash.unwrap_or_default())?;
+    parse_time(observed_at.unwrap_or_default())?;
+    let assessed = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM recovery_assessments subject
+             JOIN recovery_assessments aggregate
+               ON aggregate.assessment_id=?1
+              AND aggregate.recovery_epoch_id=subject.recovery_epoch_id
+              AND aggregate.task_id=subject.task_id
+             JOIN recovery_unknown_operations inventory
+               ON inventory.assessment_id=aggregate.assessment_id
+              AND inventory.operation_id=?3
+             WHERE subject.task_id=?2 AND subject.subject_kind='external-operation'
+               AND subject.subject_id=?3 AND subject.certainty='FAILED_NO_EFFECT'
+               AND subject.safe_action='MARK_ATTEMPT_FAILED'
+               AND json_extract(subject.assessment_json,'$.external_reconciliation_required')=0
+         )",
+        params![
+            recovery_ref,
+            intent.task_id,
+            format!("operation:{operation_id}")
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !assessed {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export reconciliation is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn physical_blob_refs(store: &Dir) -> Result<Vec<String>> {
@@ -6482,6 +6873,51 @@ fn physical_blob_refs(store: &Dir) -> Result<Vec<String>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+fn content_hash_from_blob_ref(reference: &str) -> Result<String> {
+    let parts = reference.split('/').collect::<Vec<_>>();
+    let digest = parts.get(4).copied().unwrap_or_default();
+    if parts.len() != 5
+        || parts[0] != "blobs"
+        || parts[1] != "sha256"
+        || parts[2].len() != 2
+        || parts[3].len() != 2
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || parts[2] != &digest[..2]
+        || parts[3] != &digest[2..4]
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact blob path does not encode a canonical content hash",
+        ));
+    }
+    Ok(format!("sha256:{digest}"))
+}
+
+fn quarantine_orphan_blob_path(store: &Dir, reference: &str, actual_hash: &str) -> Result<()> {
+    let digest = actual_hash
+        .strip_prefix("sha256:")
+        .ok_or(TaskManagerError::InvalidRecord(
+            "Artifact content hash is invalid",
+        ))?;
+    let target = format!(
+        "quarantine/orphan-path-hash-{}-{}",
+        digest,
+        placement_token(reference)
+    );
+    store.rename(
+        safe_internal_ref(reference)?,
+        store,
+        safe_internal_ref(&target)?,
+    )?;
+    if let Some(parent) = Path::new(reference).parent().and_then(Path::to_str) {
+        sync_cap_directory(store, parent)?;
+    }
+    sync_cap_directory(store, "quarantine")?;
+    Ok(())
 }
 
 fn reconcile_pending_blob_placements(store: &Dir) -> Result<Vec<Option<String>>> {
@@ -8459,6 +8895,86 @@ mod tests {
     }
 
     #[test]
+    fn bound_export_exact_replay_reconstructs_after_one_shot_grant_consumption() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"one shot export replay".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "export-consumed-replay",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut first = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export-consumed-replay",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut first)
+                .unwrap(),
+            22
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-export-consumed-replay-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "CONSUMED:1"
+        );
+
+        let opened = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&opened);
+        let mut replay = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export-consumed-replay",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut replay)
+                .unwrap(),
+            22
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn revoked_egress_after_destination_issuance_fails_before_copy() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -9238,7 +9754,15 @@ mod tests {
         manager
             .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery")
             .unwrap();
-        // A response-loss retry authenticates and reuses the immutable resolution event.
+        // A delayed response-loss retry resolves through the durable challenge and assessment,
+        // even if an unrelated Task revision has advanced in the meantime.
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET revision=revision+1 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
         manager
             .reconcile_unknown_artifact_export_no_effect("export-finalize-recovery")
             .unwrap();
@@ -9268,6 +9792,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one response-loss fixture proves the unknown row, absent inventory, deterministic repair, lifecycle handoff, and access fence"
+    )]
     fn failed_live_recovery_handoff_propagates_and_fences_artifact_operations() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -9328,11 +9856,50 @@ mod tests {
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-handoff-failure'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
         assert!(matches!(
-            manager.scope_artifact_reads(&session, &[artifact.artifact_id.clone()]),
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-handoff-failure'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RECOVERING"
+        );
+        assert!(matches!(
+            manager.scope_artifact_reads(&session, &[artifact.artifact_id.clone()]),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
     }
 
@@ -10107,6 +10674,109 @@ mod tests {
                 .unwrap(),
             "0:UNKNOWN:OUTCOME_UNKNOWN"
         );
+    }
+
+    #[test]
+    fn reconciled_no_effect_replay_requires_its_authenticated_provenance_and_assessment() {
+        for tamper in ["event", "assessment"] {
+            let temp = TempDir::new().unwrap();
+            let verifier = Arc::new(export_no_effect_verifier(
+                "user-selected-file",
+                "evidence:authenticated-replay",
+                'a',
+            ));
+            let mut manager = manager_with_export_verifiers(&temp, vec![verifier]);
+            let artifact = manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"authenticated replay".as_slice()),
+                )
+                .unwrap();
+            let scope = manager
+                .scope_owned_artifact_reads(
+                    "T-artifact",
+                    std::slice::from_ref(&artifact.artifact_id),
+                )
+                .unwrap();
+            let operation_id = format!("export-reconciled-tamper-{tamper}");
+            let mut destination = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    deferred(FinalizeFailureWriter::default()),
+                )
+                .unwrap();
+            assert!(
+                manager
+                    .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                    .is_err()
+            );
+            manager
+                .reconcile_unknown_artifact_export_no_effect(&operation_id)
+                .unwrap();
+            if tamper == "event" {
+                manager
+                    .connection
+                    .execute_batch(
+                        "DROP TRIGGER provenance_events_no_delete;
+                         DELETE FROM provenance_events
+                         WHERE event_type='execution.completed'
+                           AND json_extract(event_json,'$.details.export_reconciliation') IS NOT NULL;",
+                    )
+                    .unwrap();
+            } else {
+                manager
+                    .connection
+                    .execute(
+                        "DELETE FROM recovery_assessments
+                         WHERE subject_kind='external-operation' AND subject_id=?1",
+                        [format!("operation:{operation_id}")],
+                    )
+                    .unwrap();
+            }
+            let mut replay = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    deferred(Vec::new()),
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.export_artifact(&scope, &artifact.artifact_id, &mut replay),
+                Err(TaskManagerError::InvalidRecord(
+                    "stored Artifact export reconciliation is invalid"
+                ))
+            ));
+            assert!(replay.writer.is_none());
+            let opened = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&opened);
+            let mut fresh = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &format!("export-after-reconciled-tamper-{tamper}"),
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Ok(Vec::new())
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.export_artifact(&scope, &artifact.artifact_id, &mut fresh),
+                Err(TaskManagerError::InvalidRecord(
+                    "stored Artifact export reconciliation is invalid"
+                ))
+            ));
+            assert_eq!(opened.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -10910,6 +11580,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cleanup fixture covers every terminal allocation state and preserves live staging evidence"
+    )]
     fn allocated_staging_residue_is_removed_without_wedging_writer_retry() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -10932,6 +11606,15 @@ mod tests {
             b"stale seal",
         )
         .unwrap();
+        std::fs::write(
+            resolve_internal_ref(
+                &manager.artifact_store_root,
+                &format!("{}.pending", seal_ref(&staging_ref)),
+            )
+            .unwrap(),
+            b"stale pending seal",
+        )
+        .unwrap();
 
         let report = manager.reconcile_artifacts_startup().unwrap();
         assert!(!staging_path.exists());
@@ -10939,6 +11622,14 @@ mod tests {
             !resolve_internal_ref(&manager.artifact_store_root, &seal_ref(&staging_ref))
                 .unwrap()
                 .exists()
+        );
+        assert!(
+            !resolve_internal_ref(
+                &manager.artifact_store_root,
+                &format!("{}.pending", seal_ref(&staging_ref)),
+            )
+            .unwrap()
+            .exists()
         );
         assert!(
             !report
@@ -10972,6 +11663,13 @@ mod tests {
                 .write(seal_ref(&staging_ref), b"terminal seal")
                 .unwrap();
             manager
+                .artifact_store_dir
+                .write(
+                    format!("{}.pending", seal_ref(&staging_ref)),
+                    b"terminal pending seal",
+                )
+                .unwrap();
+            manager
                 .connection
                 .execute(
                     "UPDATE artifact_output_allocations SET state=?2 WHERE allocation_id=?1",
@@ -10984,6 +11682,12 @@ mod tests {
                 !manager
                     .artifact_store_root
                     .join(seal_ref(&staging_ref))
+                    .exists()
+            );
+            assert!(
+                !manager
+                    .artifact_store_root
+                    .join(format!("{}.pending", seal_ref(&staging_ref)))
                     .exists()
             );
         }
@@ -11067,6 +11771,44 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn orphan_blob_path_must_encode_the_recomputed_content_hash() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let claimed = "0".repeat(64);
+        let relative = format!("blobs/sha256/00/00/{claimed}");
+        manager
+            .artifact_store_dir
+            .create_dir_all("blobs/sha256/00/00")
+            .unwrap();
+        manager
+            .artifact_store_dir
+            .write(&relative, b"bytes whose hash is not zero")
+            .unwrap();
+
+        let report = manager.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobCorrupt
+                && finding.content_hash.as_deref() == Some(&format!("sha256:{claimed}"))
+        }));
+        assert!(!manager.artifact_store_root.join(relative).exists());
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifact_blobs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(manager.artifact_store_root.join("quarantine"))
+                .unwrap()
+                .count(),
+            1
         );
     }
 
@@ -13825,6 +14567,22 @@ mod tests {
             std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_store_root_is_created_with_a_private_acl_at_creation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("atomic-private-root");
+        create_store_root(&root).unwrap();
+        let opened = open_store_root_bound(&root).unwrap();
+        let file = opened.into_std_file();
+        let information = winx::winapi_util::file::information(&file).unwrap();
+        validate_windows_store_security(
+            &root,
+            Some((information.volume_serial_number(), information.file_index())),
+        )
+        .unwrap();
     }
 
     #[test]
