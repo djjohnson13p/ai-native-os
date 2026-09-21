@@ -1425,6 +1425,23 @@ impl TaskManager {
         &mut self,
         task_id: &str,
     ) -> Result<String> {
+        let state = self.connection.query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if !matches!(
+            state.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
+        ) {
+            return Err(TaskManagerError::InvalidRecord(
+                "terminal recovery inventory requires a terminal Task",
+            ));
+        }
+        self.persist_recovery_inventory_for_task(task_id)
+    }
+
+    pub(crate) fn persist_recovery_inventory_for_task(&mut self, task_id: &str) -> Result<String> {
         let (revision, state) = self
             .connection
             .query_row(
@@ -1436,20 +1453,13 @@ impl TaskManager {
             .ok_or(TaskManagerError::InvalidRecord(
                 "terminal recovery Task does not exist",
             ))?;
-        if !matches!(
-            state.as_str(),
-            "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
-        ) {
-            return Err(TaskManagerError::InvalidRecord(
-                "terminal recovery inventory requires a terminal Task",
-            ));
-        }
+        let _ = state;
         let revision = u64::try_from(revision)
             .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
         let inventory = unresolved_execution_ids(&self.connection, task_id)?;
         if inventory.is_empty() {
             return Err(TaskManagerError::InvalidRecord(
-                "terminal recovery inventory requires consequential evidence",
+                "recovery inventory requires consequential evidence",
             ));
         }
         let recovery_ref = recovery_operations_ref(task_id, revision, &inventory)?;
@@ -3062,7 +3072,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3105,6 +3115,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0007_artifact_owner_export_context",
         "artifact-owner-export-context-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0008_artifact_export_reconciliation_challenge",
+        "artifact-export-reconciliation-challenge-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3219,6 +3234,14 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
             return Err(TaskManagerError::InvalidRecord(
                 "Artifact owner export context migration is incomplete",
             ));
+        }
+        let has_v8 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0008_artifact_export_reconciliation_challenge')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v8 {
+            require_migration_tables(connection, &["artifact_export_reconciliation_challenges"])?;
         }
     }
     let has_steps = connection.query_row(
@@ -3491,6 +3514,21 @@ fn migrate_task_manager_schema(
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0007_artifact_owner_export_context', 'artifact-owner-export-context-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS artifact_export_reconciliation_challenges (
+                 operation_id TEXT PRIMARY KEY,
+                 recovery_assessment_id TEXT NOT NULL,
+                 subject_hash TEXT NOT NULL,
+                 challenge TEXT NOT NULL UNIQUE,
+                 issued_at TEXT NOT NULL,
+                 FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+                 FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+             );",
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0008_artifact_export_reconciliation_challenge', 'artifact-export-reconciliation-challenge-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
         Ok(())

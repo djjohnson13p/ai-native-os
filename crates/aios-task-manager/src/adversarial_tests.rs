@@ -469,7 +469,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        7
+        8
     );
 }
 
@@ -3201,7 +3201,7 @@ fn unknown_newer_migration_and_recovery_inventory_tamper_fail_closed() {
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch(
         "CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
-         INSERT INTO schema_migrations VALUES ('0005_future', 'future', '2026-09-19T00:00:00Z');",
+         INSERT INTO schema_migrations VALUES ('0009_future', 'future', '2026-09-19T00:00:00Z');",
     ).unwrap();
     drop(connection);
     assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
@@ -3945,6 +3945,8 @@ fn persisted_step_timestamp_and_migration_chain_are_strict() {
         "0004_task_manager_review_hardening",
         "0005_artifact_store_root_binding",
         "0006_artifact_writer_admission",
+        "0007_artifact_owner_export_context",
+        "0008_artifact_export_reconciliation_challenge",
     ] {
         assert_eq!(
             manager
@@ -4930,6 +4932,45 @@ fn artifact_writer_admission_columns_are_added_by_the_ordered_migration() {
             .unwrap(),
         "artifact-writer-admission-v0.1"
     );
+}
+
+#[test]
+fn export_reconciliation_challenge_migration_is_ordered_and_fail_closed() {
+    let directory = tempdir().unwrap();
+    let upgrade = directory.path().join("challenge-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&upgrade, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&upgrade).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE artifact_export_reconciliation_challenges;
+             DELETE FROM schema_migrations
+             WHERE migration_id='0008_artifact_export_reconciliation_challenge';",
+        )
+        .unwrap();
+    drop(connection);
+    let manager = TaskManager::open_with_clock(&upgrade, Box::new(FixedClock)).unwrap();
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='artifact_export_reconciliation_challenges') || ':' ||
+                        (SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0008_artifact_export_reconciliation_challenge' AND checksum='artifact-export-reconciliation-challenge-v0.1')",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1:1"
+    );
+    drop(manager);
+
+    let stamped = directory.path().join("challenge-stamped-missing.sqlite3");
+    drop(TaskManager::open_with_clock(&stamped, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&stamped).unwrap();
+    connection
+        .execute_batch("DROP TABLE artifact_export_reconciliation_challenges;")
+        .unwrap();
+    drop(connection);
+    assert!(TaskManager::open_with_clock(&stamped, Box::new(FixedClock)).is_err());
 }
 
 #[test]

@@ -693,6 +693,16 @@ CREATE TABLE IF NOT EXISTS recovery_unknown_operations (
     FOREIGN KEY (assessment_id) REFERENCES recovery_assessments(assessment_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS artifact_export_reconciliation_challenges (
+    operation_id              TEXT PRIMARY KEY,
+    recovery_assessment_id    TEXT NOT NULL,
+    subject_hash              TEXT NOT NULL,
+    challenge                 TEXT NOT NULL UNIQUE,
+    issued_at                 TEXT NOT NULL,
+    FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+);
+
 -- ---------------------------------------------------------------------------
 -- Skills / adaptive reuse metadata
 -- ---------------------------------------------------------------------------
