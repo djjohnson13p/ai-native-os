@@ -31,7 +31,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -461,7 +461,7 @@ pub struct TaskManager {
     /// Reader admissions returned by this live process but not yet durably marked delivered.
     /// Persisted pending admissions can be rehydrated after process loss without allowing two
     /// simultaneous handles in one manager lifetime.
-    delivered_reader_admissions: BTreeSet<String>,
+    delivered_reader_admissions: Arc<Mutex<BTreeSet<String>>>,
 }
 
 pub trait Clock: Send + Sync {
@@ -853,7 +853,7 @@ impl TaskManager {
             store_lock,
             artifact_store_cleanup,
             artifact_export_verifiers,
-            delivered_reader_admissions: BTreeSet::new(),
+            delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
         };
         manager.verify_all_provenance_chains()?;
         manager.migrate_legacy_keyed_import_receipts()?;
@@ -4215,6 +4215,35 @@ fn unresolved_provider_invocation_ids(
         .collect())
 }
 
+fn committed_publication_structurally_valid(
+    connection: &Connection,
+    task_id: &str,
+    publication_id: &str,
+) -> Result<bool> {
+    artifact_store::committed_publication_receipt_authenticates(connection, task_id, publication_id)
+}
+
+fn unresolved_committed_publication_ids(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    let ids = query_strings(
+        connection,
+        "SELECT publication_id FROM artifact_publications
+         WHERE task_id=?1 AND state='COMMITTED' ORDER BY publication_id",
+        task_id,
+    )?;
+    ids.into_iter()
+        .filter_map(
+            |id| match committed_publication_structurally_valid(connection, task_id, &id) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(id)),
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
 fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Vec<String>> {
     let mut ids = query_strings(
         connection,
@@ -4226,17 +4255,18 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
               WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))
              UNION ALL
              SELECT 'publication:' || publication_id FROM artifact_publications
-              WHERE task_id = ?1 AND (state = 'PENDING' OR (state = 'COMMITTED' AND EXISTS (
-                  SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash = a.content_hash
-                  WHERE a.artifact_id = artifact_publications.artifact_id
-                    AND (a.integrity_state = 'failed' OR b.durability_state IN ('MISSING', 'CORRUPT'))
-              )))
+              WHERE task_id = ?1 AND state = 'PENDING'
              UNION ALL
              SELECT 'grant:' || grant_id FROM authority_grants
               WHERE task_id = ?1 AND state = 'ACTIVE'
         ) ORDER BY recovery_id",
         task_id,
     )?;
+    ids.extend(
+        unresolved_committed_publication_ids(connection, task_id)?
+            .into_iter()
+            .map(|id| format!("publication:{id}")),
+    );
     ids.extend(unresolved_provider_invocation_ids(connection, task_id)?);
     ids.extend(unresolved_credential_use_ids(connection, task_id)?);
     ids.sort();
@@ -4248,13 +4278,7 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('PREPARED', 'STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM artifact_publications p
-                 WHERE p.task_id = ?1 AND p.state = 'COMMITTED' AND EXISTS (
-                     SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash = a.content_hash
-                     WHERE a.artifact_id = p.artifact_id
-                       AND (a.integrity_state = 'failed' OR b.durability_state IN ('MISSING', 'CORRUPT'))
-                 ))",
+               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL)))",
             [task_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -4268,7 +4292,14 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
     .map_err(|_| {
         TaskManagerError::InvalidRecord("provider-invocation count exceeds supported range")
     })?;
-    Ok(unresolved_without_receipts + unresolved_credentials + unresolved_invocations)
+    let unresolved_publications = i64::try_from(
+        unresolved_committed_publication_ids(transaction, task_id)?.len(),
+    )
+    .map_err(|_| TaskManagerError::InvalidRecord("publication count exceeds supported range"))?;
+    Ok(unresolved_without_receipts
+        + unresolved_credentials
+        + unresolved_invocations
+        + unresolved_publications)
 }
 
 struct RecoverySubject {
@@ -4442,11 +4473,7 @@ fn load_recovery_subjects(
             });
         }
     }
-    for id in query_strings(
-        transaction,
-        "SELECT publication_id FROM artifact_publications WHERE task_id = ?1 AND state = 'COMMITTED' AND EXISTS (SELECT 1 FROM artifacts a LEFT JOIN artifact_blobs b ON b.content_hash=a.content_hash WHERE a.artifact_id=artifact_publications.artifact_id AND (a.integrity_state='failed' OR b.durability_state IN ('MISSING','CORRUPT'))) ORDER BY publication_id",
-        task_id,
-    )? {
+    for id in unresolved_committed_publication_ids(transaction, task_id)? {
         subjects.push(RecoverySubject {
             kind: "artifact-publication",
             id: format!("publication:{id}"),
@@ -4454,7 +4481,7 @@ fn load_recovery_subjects(
             certainty: "FAILED_PARTIAL_EFFECT".to_owned(),
             safe_action: "FAIL_TASK",
             reason_code: "RECOVERY_ARTIFACT_INTEGRITY_FAILED",
-            observation: "committed Artifact publication references missing or corrupt bytes"
+            observation: "committed Artifact publication lacks complete authenticated structural or blob proof"
                 .to_owned(),
         });
     }
@@ -6314,6 +6341,21 @@ fn resolved_publication_recovery_subject(
             reason_code: "RECOVERY_FAILED_NO_EFFECT",
             event_status: "cancelled",
         }),
+        Some((state, _, _))
+            if state == "FAILED"
+                && artifact_store::failed_expired_publication_receipt_authenticates(
+                    transaction,
+                    task_id,
+                    publication_id,
+                )? =>
+        {
+            Some(RecoveryResolution {
+                certainty: "FAILED_NO_EFFECT".to_owned(),
+                safe_action: "CLEAN_STAGING",
+                reason_code: "RECOVERY_FAILED_NO_EFFECT",
+                event_status: "failure",
+            })
+        }
         Some((state, allocation_id, Some(artifact_id))) if state == "COMMITTED" => {
             let active_steps = transaction
                 .query_row(

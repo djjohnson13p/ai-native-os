@@ -10,6 +10,8 @@ const CONTRACT_HASH: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 const SUITE_HASH: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 const TEST_TIME: &str = "2026-09-19T00:00:00Z";
+const COMPLETION_ARTIFACT_ID: &str =
+    "artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe";
 
 struct FixedClock;
 
@@ -931,7 +933,7 @@ fn seed_completion_fixture_with_identity(
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', 'node-completion',
                  'binding-completion', 'provider:test', '0.1.0', 1, 3,
-                 'SUCCEEDED', 'COMPLETED', '[]', '[\"artifact-output\"]',
+                 'SUCCEEDED', 'COMPLETED', '[]', '[\"artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe\"]',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );
@@ -946,14 +948,15 @@ fn seed_completion_fixture_with_identity(
                  artifact_id, uri, semantic_type, media_type, sensitivity, retention_class, origin_kind,
                  origin_task_id, origin_program_hash, origin_node_id,
                  origin_binding_id, origin_provider_id, size_bytes, content_hash,
-                 integrity_state, integrity_verified_at, created_at
+                 integrity_state, integrity_verified_at, labels_json, created_at
              ) VALUES (
-                 'artifact-output', 'artifact://completion/output', 'artifact.report@1',
-                 'application/json', 'local', 'task', 'provider', 'T-completion',
+                 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe',
+                 'artifact://artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'artifact.report@1',
+                 'application/json', 'local', 'task', 'task', 'T-completion',
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'provider:test',
                  42, 'sha256:artifact-output', 'verified',
-                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
+                 '2026-09-19T00:00:00Z', '[]', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
@@ -965,13 +968,13 @@ fn seed_completion_fixture_with_identity(
                  'node-completion', 'binding-completion',
                  'attempt-completion', 'report', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
                  'publication-completion',
-                 'artifact-output', '2026-09-19T00:00:00Z',
+                 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', '2026-09-19T00:00:00Z',
                  '2026-09-20T00:00:00Z'
              );
              INSERT INTO task_artifacts (
                  task_id, artifact_id, role, node_id, added_at
              ) VALUES (
-                 'T-completion', 'artifact-output', 'output',
+                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'output',
                  'node-completion', '2026-09-19T00:00:00Z'
              );
              UPDATE tasks SET
@@ -984,6 +987,18 @@ fn seed_completion_fixture_with_identity(
              WHERE task_id = 'T-completion';",
         )
         .unwrap();
+    let publication_request = ArtifactPublicationRequest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        publication_id: "publication-completion".to_owned(),
+        allocation_id: "allocation-completion".to_owned(),
+        task_id: "T-completion".to_owned(),
+        expected_allocation_state: ArtifactExpectedState::Writing,
+        semantic_type: Some("artifact.report@1".to_owned()),
+        media_type: "application/json".to_owned(),
+        format: None,
+        lineage: ArtifactLineage::default(),
+        labels: Vec::new(),
+    };
     manager
         .connection
         .execute(
@@ -992,13 +1007,68 @@ fn seed_completion_fixture_with_identity(
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-completion', 'allocation-completion',
-                 'T-completion', 'artifact-output', 'sha256:artifact-output', '{}', ?1,
+                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'sha256:artifact-output', ?2, ?1,
                  '2026-09-19T00:00:00Z',
                  CASE WHEN ?1 = 'COMMITTED' THEN '2026-09-19T00:00:00Z' END
              )",
-            [publication_state],
+            rusqlite::params![
+                publication_state,
+                canonical_json(&publication_request).unwrap()
+            ],
         )
         .unwrap();
+    if publication_state == "COMMITTED" {
+        let transaction = manager.connection.transaction().unwrap();
+        let publication_event = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "event_id": artifact_store::event_id("artifact-created", COMPLETION_ARTIFACT_ID),
+            "task_id": "T-completion",
+            "event_type": "artifact.created",
+            "timestamp": TEST_TIME,
+            "actor": {"kind":"system-service","id":"service:artifact-store"},
+            "semantic_program_hash": HASH,
+            "step_id": "node-completion",
+            "execution_binding_id": "binding-completion",
+            "provider_id": "provider:test",
+            "input_artifacts": [],
+            "output_artifacts": [COMPLETION_ARTIFACT_ID],
+            "status": "success",
+            "details": {
+                "publication_id": "publication-completion",
+                "allocation_id": "allocation-completion",
+                "content_hash": "sha256:artifact-output",
+                "size_bytes": 42,
+                "blob_reused": false
+            }
+        });
+        let appended = append_event(&transaction, "T-completion", &publication_event).unwrap();
+        let result = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "publication_id": "publication-completion",
+            "allocation_id": "allocation-completion",
+            "task_id": "T-completion",
+            "published": true,
+            "reason_code": "ARTIFACT_PUBLICATION_APPLIED",
+            "message": null,
+            "artifact_id": COMPLETION_ARTIFACT_ID,
+            "artifact_uri": format!("artifact://{COMPLETION_ARTIFACT_ID}"),
+            "semantic_type": "artifact.report@1",
+            "media_type": "application/json",
+            "size_bytes": 42,
+            "content_hash": "sha256:artifact-output",
+            "blob_reused": false,
+            "provenance_event_id": appended.event_id,
+            "provenance_event_hash": appended.event_hash,
+            "resulted_at": TEST_TIME
+        });
+        transaction
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                rusqlite::params!["publication-completion", canonical_json(&result).unwrap()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
     manager
         .connection
         .execute(
@@ -1006,6 +1076,16 @@ fn seed_completion_fixture_with_identity(
             [verification_snapshot],
         )
         .unwrap();
+    let verification_artifacts = verification_artifacts
+        .iter()
+        .map(|artifact_id| {
+            if *artifact_id == "artifact-output" {
+                COMPLETION_ARTIFACT_ID
+            } else {
+                *artifact_id
+            }
+        })
+        .collect::<Vec<_>>();
     let transaction = manager.connection.transaction().unwrap();
     let verification = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -1103,14 +1183,233 @@ fn completion_request(id: &str) -> TransitionRequest {
 fn verifying_completes_with_current_program_exact_step_publication_and_coverage() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    assert!(
+        committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap(),
+        "stored result: {}",
+        manager
+            .connection
+            .query_row(
+                "SELECT result_json FROM artifact_publications WHERE publication_id='publication-completion'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+    );
 
     let result = manager
         .transition(&completion_request("tr-completion-valid"))
         .unwrap();
-    assert!(result.applied);
+    assert!(result.applied, "{}", result.reason_code);
     assert_eq!(result.current_state, Some(TaskState::Completed));
     assert_eq!(result.current_revision, Some(3));
     assert!(manager.verify_provenance("T-completion").unwrap());
+}
+
+#[test]
+fn forged_committed_publication_receipt_enters_inventory_and_blocks_completion() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    let raw = manager
+        .connection
+        .query_row(
+            "SELECT result_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let mut forged: Value = serde_json::from_str(&raw).unwrap();
+    forged["size_bytes"] = serde_json::json!(43);
+    manager
+        .connection
+        .execute(
+            "UPDATE artifact_publications SET result_json=?1
+             WHERE publication_id='publication-completion'",
+            [canonical_json(&forged).unwrap()],
+        )
+        .unwrap();
+
+    assert!(
+        !committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap()
+    );
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-completion".to_owned())
+    );
+    let result = manager
+        .transition(&completion_request("tr-completion-forged-publication"))
+        .unwrap();
+    assert!(!result.applied);
+    let task = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(task.state, TaskState::Verifying);
+    assert_eq!(task.revision, 2);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "constructs a fully coherent but nondeterministically identified publication to exercise the shared replay/recovery proof"
+)]
+fn coherent_mislinked_publication_is_rejected_by_replay_inventory_and_completion() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    let rogue_id =
+        "artifact:v1:sha256:9999999999999999999999999999999999999999999999999999999999999999";
+    let rogue_uri = format!("artifact://{rogue_id}");
+    manager
+        .connection
+        .execute_batch(
+            "DROP TRIGGER provenance_events_no_delete;
+             DELETE FROM provenance_events
+              WHERE task_id='T-completion'
+                AND sequence >= (SELECT sequence FROM provenance_events
+                                  WHERE task_id='T-completion'
+                                    AND event_type='artifact.created');",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO artifacts(
+                 artifact_id,uri,semantic_type,media_type,format,size_bytes,content_hash,
+                 sensitivity,retention_class,expires_at,origin_kind,origin_task_id,
+                 origin_program_hash,origin_node_id,origin_binding_id,origin_provider_id,
+                 integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at)
+             SELECT ?1,?2,semantic_type,media_type,format,size_bytes,content_hash,
+                    sensitivity,retention_class,expires_at,origin_kind,origin_task_id,
+                    origin_program_hash,origin_node_id,origin_binding_id,origin_provider_id,
+                    integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at
+               FROM artifacts WHERE artifact_id=?3",
+            rusqlite::params![rogue_id, rogue_uri, COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO task_artifacts(task_id,artifact_id,role,node_id,added_at)
+             SELECT task_id,?1,role,node_id,added_at FROM task_artifacts
+              WHERE task_id='T-completion' AND artifact_id=?2",
+            rusqlite::params![rogue_id, COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute_batch(&format!(
+            "UPDATE artifact_output_allocations SET published_artifact_id='{rogue_id}'
+              WHERE allocation_id='allocation-completion';
+             UPDATE artifact_publications SET artifact_id='{rogue_id}'
+              WHERE publication_id='publication-completion';
+             UPDATE step_executions SET output_artifacts_json='[\"{rogue_id}\"]'
+              WHERE attempt_id='attempt-completion';"
+        ))
+        .unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    let publication_event = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": artifact_store::event_id("artifact-created", rogue_id),
+        "task_id": "T-completion",
+        "event_type": "artifact.created",
+        "timestamp": TEST_TIME,
+        "actor": {"kind":"system-service","id":"service:artifact-store"},
+        "semantic_program_hash": HASH,
+        "step_id": "node-completion",
+        "execution_binding_id": "binding-completion",
+        "provider_id": "provider:test",
+        "input_artifacts": [],
+        "output_artifacts": [rogue_id],
+        "status": "success",
+        "details": {
+            "publication_id": "publication-completion",
+            "allocation_id": "allocation-completion",
+            "content_hash": "sha256:artifact-output",
+            "size_bytes": 42,
+            "blob_reused": false
+        }
+    });
+    let appended = append_event(&transaction, "T-completion", &publication_event).unwrap();
+    let raw_result = transaction
+        .query_row(
+            "SELECT result_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let mut result: Value = serde_json::from_str(&raw_result).unwrap();
+    result["artifact_id"] = serde_json::json!(rogue_id);
+    result["artifact_uri"] = serde_json::json!(rogue_uri);
+    result["provenance_event_id"] = serde_json::json!(appended.event_id);
+    result["provenance_event_hash"] = serde_json::json!(appended.event_hash);
+    transaction
+        .execute(
+            "UPDATE artifact_publications SET result_json=?1
+             WHERE publication_id='publication-completion'",
+            [canonical_json(&result).unwrap()],
+        )
+        .unwrap();
+    let verification = serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":"event:verification:completion",
+        "task_id":"T-completion",
+        "event_type":"verification.completed",
+        "timestamp":TEST_TIME,
+        "actor":{"kind":"system-service","id":"service:verifier"},
+        "semantic_program_hash":HASH,
+        "registry_snapshot_id":"snapshot-completion",
+        "validation_result_id":"validation-completion",
+        "input_artifacts":[rogue_id],
+        "output_artifacts":[],
+        "status":"success"
+    });
+    append_event(&transaction, "T-completion", &verification).unwrap();
+    transaction.commit().unwrap();
+
+    assert!(
+        !committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap()
+    );
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-completion".to_owned())
+    );
+    let request_json = manager
+        .connection
+        .query_row(
+            "SELECT request_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let request: ArtifactPublicationRequest = serde_json::from_str(&request_json).unwrap();
+    assert_eq!(
+        manager
+            .publish_artifact_output(&request)
+            .unwrap()
+            .reason_code,
+        "ARTIFACT_INTEGRITY_FAILED"
+    );
+    let completion = manager
+        .transition(&completion_request("tr-completion-mislinked-publication"))
+        .unwrap();
+    assert!(!completion.applied);
+    assert_eq!(completion.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
 }
 
 #[test]
@@ -1459,7 +1758,7 @@ fn completion_rejects_unknown_attempt_wrong_allocation_identity_and_verification
             .transition(&completion_request("tr-wrong-allocation"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 
     let mut stale_identity = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -2335,17 +2634,20 @@ fn completion_uses_program_ports_and_rejects_self_report_or_artifact_aliasing() 
 
     let mut alias = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut alias, HASH, &["artifact-output"], "COMMITTED");
-    alias.connection.execute_batch(
-        "UPDATE semantic_program_revisions SET program_json = '{\"nodes\":[{\"id\":\"node-completion\",\"outputs\":{\"report\":\"artifact.report@1\",\"receipt\":\"artifact.report@1\"}}]}' WHERE task_id = 'T-completion' AND program_revision = 1;
-         INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', 'artifact-output', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
-         INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at, committed_at) VALUES ('publication-alias', 'allocation-alias', 'T-completion', 'artifact-output', '{}', 'COMMITTED', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
-    ).unwrap();
+    alias
+        .connection
+        .execute_batch(&format!(
+            "UPDATE semantic_program_revisions SET program_json = '{{\"nodes\":[{{\"id\":\"node-completion\",\"outputs\":{{\"report\":\"artifact.report@1\",\"receipt\":\"artifact.report@1\"}}}}]}}' WHERE task_id = 'T-completion' AND program_revision = 1;
+             INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', '{COMPLETION_ARTIFACT_ID}', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
+             INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at, committed_at) VALUES ('publication-alias', 'allocation-alias', 'T-completion', '{COMPLETION_ARTIFACT_ID}', '{{}}', 'COMMITTED', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');"
+        ))
+        .unwrap();
     assert_eq!(
         alias
             .transition(&completion_request("tr-output-alias"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 }
 
@@ -3903,7 +4205,8 @@ fn actual_running_admission_requires_complete_current_output_allocations() {
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
-             UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';",
+             UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         ).unwrap();
         seed_resolved_empty_recovery(&mut manager, "T-completion", 2);
         manager.connection.execute(mutation, []).unwrap();
@@ -4104,7 +4407,8 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         ).unwrap();
         seed_resolved_empty_recovery(&mut manager, "T-completion", 2);
         manager.connection.execute(mutation, []).unwrap();
@@ -4146,7 +4450,7 @@ fn completion_requires_present_durable_hash_matching_verified_blob() {
         (
             "hash-mismatch",
             "UPDATE artifact_publications SET content_hash='sha256:mismatch' WHERE publication_id='publication-completion'",
-            "TASK_COMPLETION_GATE_FAILED",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -4157,7 +4461,17 @@ fn completion_requires_present_durable_hash_matching_verified_blob() {
                 [TEST_TIME],
             ).unwrap();
         }
-        manager.connection.execute(mutation, []).unwrap();
+        if name == "integrity-failed" {
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute(mutation, []).unwrap();
+        }
         assert_eq!(
             manager
                 .transition(&completion_request(&format!("tr-blob-{name}")))
@@ -4464,6 +4778,7 @@ fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
         r"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
            UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
            UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+           DELETE FROM artifact_publications WHERE publication_id='publication-completion';
            INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-later',1,1,'PENDING','NOT_STARTED','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
     ).unwrap();
     let result = manager
@@ -4605,7 +4920,17 @@ fn verifying_requires_exact_durable_candidate_outputs_for_every_active_port() {
                 [],
             )
             .unwrap();
-        manager.connection.execute_batch(mutation).unwrap();
+        if name == "missing-artifact" {
+            manager
+                .connection
+                .execute(
+                    "DELETE FROM task_artifacts WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute_batch(mutation).unwrap();
+        }
         let result = manager
             .transition(&request(
                 &format!("tr-verifying-output-{name}"),
@@ -5150,7 +5475,7 @@ fn completion_authenticates_verification_event_row_and_chain() {
         .transition(&completion_request("tr-verification-row-forged"))
         .unwrap();
     assert!(!result.applied);
-    assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED");
+    assert_eq!(result.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
 }
 
 #[test]
@@ -5397,13 +5722,19 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
 fn completion_checks_semantic_types_and_the_current_provenance_head() {
     let mut wrong_type = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut wrong_type, HASH, &["artifact-output"], "COMMITTED");
-    wrong_type.connection.execute("UPDATE artifacts SET semantic_type='artifact.wrong@1' WHERE artifact_id='artifact-output'", []).unwrap();
+    wrong_type
+        .connection
+        .execute(
+            "UPDATE artifacts SET semantic_type='artifact.wrong@1' WHERE artifact_id=?1",
+            [COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
     assert_eq!(
         wrong_type
             .transition(&completion_request("tr-wrong-semantic-type"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 
     let mut corrupt_suffix = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -5420,7 +5751,7 @@ fn completion_checks_semantic_types_and_the_current_provenance_head() {
             .transition(&completion_request("tr-corrupt-suffix"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 }
 
@@ -5704,7 +6035,8 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
                 "DROP TRIGGER execution_bindings_no_update;
                  UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
                  UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-                 UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+                 UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+                 DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
             )
             .unwrap();
         match tamper {
@@ -5802,7 +6134,8 @@ fn prepare_completion_for_admission(manager: &TaskManager) {
         .execute_batch(
             "UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         )
         .unwrap();
 }
@@ -6136,26 +6469,31 @@ fn failure_code_must_match_machine_reason_code_pattern() {
 
 #[test]
 fn completion_enforces_every_output_allocation_constraint() {
-    for (name, mutation) in [
+    for (name, mutation, expected_reason) in [
         (
             "max-size",
             "UPDATE artifact_output_allocations SET max_size_bytes=41 WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "media-type",
             "UPDATE artifact_output_allocations SET allowed_media_types_json='[\"text/plain\"]' WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "malformed-media-types",
             "UPDATE artifact_output_allocations SET allowed_media_types_json='{}' WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "sensitivity",
             "UPDATE artifact_output_allocations SET sensitivity='secret' WHERE allocation_id='allocation-completion'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "retention",
             "UPDATE artifact_output_allocations SET retention='persistent' WHERE allocation_id='allocation-completion'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -6164,7 +6502,7 @@ fn completion_enforces_every_output_allocation_constraint() {
         let result = manager
             .transition(&completion_request(&format!("tr-allocation-{name}")))
             .unwrap();
-        assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED", "{name}");
+        assert_eq!(result.reason_code, expected_reason, "{name}");
         assert_eq!(
             manager.get_task("T-completion").unwrap().unwrap().state,
             TaskState::Verifying
@@ -6537,7 +6875,17 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                 "valid:{name}"
             );
         }
-        manager.connection.execute(mutation, []).unwrap();
+        if name == "unverified-artifact" {
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute(mutation, []).unwrap();
+        }
         let transaction = manager.connection.transaction().unwrap();
         assert!(
             resolved_recovery_subject(
@@ -6550,12 +6898,15 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
             "{name}"
         );
     }
+}
 
+#[test]
+fn committed_publication_recovery_rejects_rogue_allocation_alias() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager
         .connection
-        .execute_batch(
+        .execute_batch(&format!(
             "INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
                  binding_id, attempt_id, output_port, expected_semantic_type,
@@ -6566,7 +6917,7 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'attempt-completion',
                  'rogue', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
-                 'publication-rogue', 'artifact-output',
+                 'publication-rogue', '{COMPLETION_ARTIFACT_ID}',
                  '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z'
              );
              INSERT INTO artifact_publications (
@@ -6574,10 +6925,10 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-rogue', 'allocation-rogue', 'T-completion',
-                 'artifact-output', 'sha256:artifact-output', '{}', 'COMMITTED',
+                 '{COMPLETION_ARTIFACT_ID}', 'sha256:artifact-output', '{{}}', 'COMMITTED',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
-             );",
-        )
+             );"
+        ))
         .unwrap();
     let transaction = manager.connection.transaction().unwrap();
     assert!(
