@@ -479,7 +479,8 @@ impl Clock for SystemClock {
 }
 
 struct StoreLock {
-    _database_file: File,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    database_file: File,
     _lock_file: File,
     identity: StoreIdentity,
 }
@@ -495,8 +496,6 @@ struct StoreIdentity {
     volume_serial_number: u64,
     #[cfg(windows)]
     file_index: u64,
-    #[cfg(windows)]
-    creation_time: u64,
 }
 
 impl PartialEq for StoreIdentity {
@@ -534,11 +533,6 @@ impl StoreIdentity {
             format!("path:{}", self.canonical_path.display())
         }
     }
-
-    #[cfg(windows)]
-    fn legacy_persistent_key(&self) -> String {
-        format!("windows:{}", self.creation_time)
-    }
 }
 
 fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
@@ -555,15 +549,11 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-
         let information = winx::winapi_util::file::information(file)?;
-        let metadata = file.metadata()?;
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
             volume_serial_number: information.volume_serial_number(),
             file_index: information.file_index(),
-            creation_time: metadata.creation_time(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -623,7 +613,7 @@ fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
         .open(lock_path)?;
     file.try_lock_exclusive()?;
     Ok(StoreLock {
-        _database_file: database_file,
+        database_file,
         _lock_file: file,
         identity,
     })
@@ -670,6 +660,18 @@ where
         DatabaseLocator::File(path.to_path_buf()),
         export_verifiers,
     )
+}
+
+/// Explicit trusted offline upgrade for the historical Windows creation-time Artifact-store
+/// binding. Ordinary open deliberately refuses that spoofable identity format.
+#[cfg(windows)]
+pub(crate) fn rebind_legacy_windows_artifact_store(path: &Path) -> Result<()> {
+    let lock = acquire_store_lock(path)?;
+    let mut connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    verify_locked_store_identity(&connection, &lock)?;
+    preflight_migration_state(&connection)?;
+    artifact_store::rebind_legacy_windows_root(&lock, &mut connection)
 }
 
 fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {

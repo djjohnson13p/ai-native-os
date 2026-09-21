@@ -1140,16 +1140,10 @@ pub(super) fn initialize_root(
     let root_identity = opened_identity.persistent_key();
     let binding_is_current = stored_database_identity.as_deref() == Some(&database_identity)
         && stored_root_identity.as_deref() == Some(&root_identity);
-    #[cfg(windows)]
-    let binding_is_authenticated_legacy = store_lock.is_some_and(|lock| {
-        stored_database_identity.as_deref() == Some(lock.identity.legacy_persistent_key().as_str())
-            && stored_root_identity.as_deref()
-                == Some(opened_identity.legacy_persistent_key().as_str())
-    });
-    #[cfg(not(windows))]
-    let binding_is_authenticated_legacy = false;
-    if stored_database_identity.is_some() && !binding_is_current && !binding_is_authenticated_legacy
-    {
+    // The historical `windows:{creation_time}` format is not an object identity: creation time can
+    // be copied onto a replacement. It therefore cannot authorize an automatic rebind to the
+    // stronger volume/file-index identity. Such stores require an explicit trusted offline rebind.
+    if stored_database_identity.is_some() && !binding_is_current {
         return Err(TaskManagerError::InvalidRecord(
             "Artifact store root binding does not match its opened database and root identities",
         ));
@@ -1164,31 +1158,131 @@ pub(super) fn initialize_root(
         .ok_or(TaskManagerError::InvalidRecord(
             "Artifact store root is not UTF-8",
         ))?;
-    if binding_is_authenticated_legacy {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE artifact_store_binding
-             SET database_identity=?1,root_identity=?2
-             WHERE singleton_id=1 AND database_identity=?3 AND root_identity=?4",
-            params![
-                database_identity,
-                root_identity,
-                stored_database_identity,
-                stored_root_identity
-            ],
-        )?;
-        if changed != 1 {
-            return Err(TaskManagerError::InvalidRecord(
-                "Artifact store legacy identity migration lost its authenticated binding",
-            ));
-        }
-        transaction.commit()?;
-    }
     connection.execute(
         "INSERT INTO artifact_store_binding(singleton_id,database_identity,canonical_root,root_identity,bound_at) VALUES (1,?1,?2,?3,?4) ON CONFLICT(singleton_id) DO NOTHING",
         params![database_identity, canonical_text, root_identity, OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| TaskManagerError::InvalidRecord("Artifact store binding time could not be formatted"))?],
     )?;
     Ok((canonical_root, directory, cleanup))
+}
+
+#[cfg(windows)]
+fn parse_legacy_windows_identity(value: &str) -> Result<u64> {
+    let digits = value
+        .strip_prefix("windows:")
+        .filter(|digits| {
+            !digits.is_empty()
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && (digits.len() == 1 || !digits.starts_with('0'))
+        })
+        .ok_or(TaskManagerError::InvalidRecord(
+            "Artifact store binding is not an exact legacy Windows identity",
+        ))?;
+    digits.parse().map_err(|_| {
+        TaskManagerError::InvalidRecord(
+            "Artifact store binding is not an exact legacy Windows identity",
+        )
+    })
+}
+
+/// Upgrades the spoofable historical creation-time identities only through an explicit trusted
+/// offline boundary. The caller holds the identity-bound database lock for this whole operation.
+#[cfg(windows)]
+pub(super) fn rebind_legacy_windows_root(
+    store_lock: &StoreLock,
+    connection: &mut Connection,
+) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let (stored_database_identity, stored_root, stored_root_identity) = connection.query_row(
+        "SELECT database_identity,canonical_root,root_identity
+             FROM artifact_store_binding WHERE singleton_id=1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    let stored_database_creation = parse_legacy_windows_identity(&stored_database_identity)?;
+    let stored_root_creation = parse_legacy_windows_identity(&stored_root_identity)?;
+    if store_lock.database_file.metadata()?.creation_time() != stored_database_creation {
+        return Err(TaskManagerError::InvalidRecord(
+            "legacy Windows database binding does not match the locked database",
+        ));
+    }
+
+    let file_name = store_lock
+        .identity
+        .canonical_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(TaskManagerError::InvalidRecord(
+            "Task store path has no portable file name",
+        ))?;
+    let expected_root = store_lock
+        .identity
+        .canonical_path
+        .with_file_name(format!("{file_name}.artifacts"))
+        .canonicalize()?;
+    let persisted_root = PathBuf::from(&stored_root).canonicalize()?;
+    if persisted_root != expected_root {
+        return Err(TaskManagerError::InvalidRecord(
+            "legacy Windows Artifact store root is outside its locked database binding",
+        ));
+    }
+
+    let directory = open_store_root_bound(&persisted_root)?;
+    let root_file = directory.try_clone()?.into_std_file();
+    validate_opened_store_root(&persisted_root, &root_file)?;
+    reject_reparse_root(&persisted_root)?;
+    secure_store_root(&persisted_root, false)?;
+    if root_file.metadata()?.creation_time() != stored_root_creation {
+        return Err(TaskManagerError::InvalidRecord(
+            "legacy Windows root binding does not match the opened Artifact store",
+        ));
+    }
+    let current_root_identity = super::store_identity(&persisted_root, &root_file)?;
+    let reopened_root = open_store_root_bound(&persisted_root)?.into_std_file();
+    if super::store_identity(&persisted_root, &reopened_root)? != current_root_identity {
+        return Err(TaskManagerError::InvalidRecord(
+            "Artifact store root changed during trusted legacy rebind",
+        ));
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let changed = connection.execute(
+            "UPDATE artifact_store_binding
+             SET database_identity=?1,root_identity=?2,bound_at=?3
+             WHERE singleton_id=1 AND database_identity=?4 AND canonical_root=?5
+               AND root_identity=?6",
+            params![
+                store_lock.identity.persistent_key(),
+                current_root_identity.persistent_key(),
+                OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| {
+                    TaskManagerError::InvalidRecord(
+                        "Artifact store binding time could not be formatted",
+                    )
+                })?,
+                stored_database_identity,
+                stored_root,
+                stored_root_identity,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "legacy Windows Artifact store binding changed during trusted rebind",
+            ));
+        }
+        connection.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -1917,7 +2011,35 @@ impl TaskManager {
                 "status": "success",
                 "details": {"content_hash":content_hash,"size_bytes":size,"blob_reused":reused,"import_id":request.import_id,"request_digest":request_digest}
             });
-            append_event(&transaction, &request.task_id, &event)?;
+            let appended = append_event(&transaction, &request.task_id, &event)?;
+            if let Some(import_id) = request.import_id.as_deref() {
+                let operation_id = keyed_import_operation_id(&request.task_id, import_id);
+                let details = canonical_json(&json!({
+                    "version": 1,
+                    "kind": "keyed-artifact-import",
+                    "task_id": request.task_id,
+                    "import_id": import_id,
+                    "artifact_id": artifact_id,
+                    "request_digest": request_digest,
+                }))?;
+                let receipt = canonical_json(&json!({
+                    "version": 1,
+                    "kind": "keyed-artifact-import-committed",
+                    "operation_id": operation_id,
+                    "blob_reused": reused,
+                    "provenance_event_id": appended.event_id,
+                    "provenance_event_hash": appended.event_hash,
+                }))?;
+                transaction.execute(
+                    "INSERT INTO operations(
+                        operation_id,task_id,transaction_class,effect_class,idempotency_key,
+                        state,outcome_certainty,external_receipt,details_json,
+                        prepared_at,started_at,finished_at
+                     ) VALUES (?1,?2,'reversible_local','ARTIFACT_IMPORT',?1,
+                               'SUCCEEDED','COMPLETED',?3,?4,?5,?5,?5)",
+                    params![operation_id, request.task_id, receipt, details, created_at],
+                )?;
+            }
             commit_attempted = true;
             transaction.commit()?;
             import_commit_result_step()?;
@@ -2039,18 +2161,8 @@ impl TaskManager {
                 },
             )
             .optional()?;
-        let blob_reused = match (blob.as_ref(), created_at, content_hash.as_deref()) {
-            (Some(blob), Some(created_at), Some(content_hash)) => {
-                blob.3 != created_at
-                    || self.connection.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM artifacts
-                         WHERE content_hash=?1 AND artifact_id<>?2 AND created_at<=?3)",
-                        params![content_hash, artifact_id, created_at],
-                        |row| row.get::<_, bool>(0),
-                    )?
-            }
-            _ => false,
-        };
+        let blob_reused =
+            authenticate_keyed_import_receipt(&self.connection, request, &artifact_id, created_at)?;
         let expected_event = match (
             import_actor,
             created_at,
@@ -7061,21 +7173,36 @@ fn mark_reader_admission_delivered(
             "stored Artifact reader admission is invalid",
         ));
     }
+    reader_delivery_commit_step()?;
     let commit = transaction
         .commit()
         .map_err(TaskManagerError::from)
         .and_then(|()| reader_delivery_commit_result_step());
     if let Err(error) = commit {
-        if !authenticate_reader_admission(
-            connection,
-            operation_id,
-            task_id,
-            execution,
-            artifact_id,
-            admission,
-            delivered_at,
-            false,
-        )? {
+        let durable_receipt = connection
+            .query_row(
+                "SELECT external_receipt FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let durably_delivered = durable_receipt
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<ArtifactReaderAdmissionReceipt>(value).ok())
+            .is_some_and(|receipt| receipt.kind == "artifact-reader-admission-delivered");
+        if !durably_delivered
+            || !authenticate_reader_admission(
+                connection,
+                operation_id,
+                task_id,
+                execution,
+                artifact_id,
+                admission,
+                delivered_at,
+                false,
+            )?
+        {
             return Err(error);
         }
     }
@@ -8186,6 +8313,122 @@ fn import_request_digest(request: &ImportArtifactRequest) -> Result<String> {
     hasher.update(b"AIOS-ARTIFACT-IMPORT-REQUEST\0v1\0");
     hasher.update(canonical_json(request)?.as_bytes());
     Ok(tagged_digest(hasher))
+}
+
+fn keyed_import_operation_id(task_id: &str, import_id: &str) -> String {
+    event_id(
+        "artifact-import-receipt",
+        &format!("{task_id}\0{import_id}"),
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticates the complete secondary keyed-import receipt and provenance binding"
+)]
+fn authenticate_keyed_import_receipt(
+    connection: &Connection,
+    request: &ImportArtifactRequest,
+    artifact_id: &str,
+    created_at: Option<&str>,
+) -> Result<bool> {
+    let import_id = request
+        .import_id
+        .as_deref()
+        .ok_or(TaskManagerError::InvalidRecord(
+            "stored Artifact import receipt is invalid",
+        ))?;
+    let operation_id = keyed_import_operation_id(&request.task_id, import_id);
+    let row = connection
+        .query_row(
+            "SELECT task_id,transaction_class,effect_class,idempotency_key,state,
+                    outcome_certainty,external_receipt,details_json,prepared_at,started_at,finished_at
+             FROM operations WHERE operation_id=?1",
+            [&operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord(
+            "stored Artifact import receipt is invalid",
+        ))?;
+    let details_json = row.7.as_deref().ok_or(TaskManagerError::InvalidRecord(
+        "stored Artifact import receipt is invalid",
+    ))?;
+    let receipt_json = row.6.as_deref().ok_or(TaskManagerError::InvalidRecord(
+        "stored Artifact import receipt is invalid",
+    ))?;
+    let receipt: serde_json::Value = serde_json::from_str(receipt_json)?;
+    let blob_reused = receipt
+        .get("blob_reused")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(TaskManagerError::InvalidRecord(
+            "stored Artifact import receipt is invalid",
+        ))?;
+    let expected_details = json!({
+        "version": 1,
+        "kind": "keyed-artifact-import",
+        "task_id": request.task_id,
+        "import_id": import_id,
+        "artifact_id": artifact_id,
+        "request_digest": import_request_digest(request)?,
+    });
+    let event_id = event_id("artifact-imported", artifact_id);
+    let event_hash = connection
+        .query_row(
+            "SELECT event_hash FROM provenance_events WHERE task_id=?1 AND event_id=?2",
+            params![request.task_id, event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let exact = row.0 == request.task_id
+        && row.1.as_deref() == Some("reversible_local")
+        && row.2 == "ARTIFACT_IMPORT"
+        && row.3.as_deref() == Some(operation_id.as_str())
+        && row.4 == "SUCCEEDED"
+        && row.5.as_deref() == Some("COMPLETED")
+        && serde_json::from_str::<serde_json::Value>(details_json)? == expected_details
+        && canonical_json(&expected_details)? == details_json
+        && receipt.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && receipt.get("kind").and_then(serde_json::Value::as_str)
+            == Some("keyed-artifact-import-committed")
+        && receipt
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(operation_id.as_str())
+        && receipt
+            .get("provenance_event_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(event_id.as_str())
+        && receipt
+            .get("provenance_event_hash")
+            .and_then(serde_json::Value::as_str)
+            == event_hash.as_deref()
+        && canonical_json(&receipt)? == receipt_json
+        && created_at.is_some_and(|created_at| {
+            row.8 == created_at
+                && row.9.as_deref() == Some(created_at)
+                && row.10.as_deref() == Some(created_at)
+        });
+    if !exact {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact import receipt is invalid",
+        ));
+    }
+    Ok(blob_reused)
 }
 
 struct ExportCopyFailure {
@@ -9992,6 +10235,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static READER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static READER_DELIVERY_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static READER_DELIVERY_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static WRITER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -10097,6 +10342,16 @@ fn reader_admission_commit_result_step() -> Result<()> {
 #[cfg(test)]
 fn reader_delivery_commit_result_step() -> Result<()> {
     READER_DELIVERY_COMMIT_RESULT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn reader_delivery_commit_step() -> Result<()> {
+    READER_DELIVERY_COMMIT_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook()?;
         }
@@ -10222,6 +10477,15 @@ fn reader_admission_commit_result_step() -> Result<()> {
     reason = "test response-loss injection shares the reader delivery commit-result boundary"
 )]
 fn reader_delivery_commit_result_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test rollback injection shares the reader delivery commit boundary"
+)]
+fn reader_delivery_commit_step() -> Result<()> {
     Ok(())
 }
 
@@ -17799,18 +18063,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_legacy_creation_time_binding_migrates_both_opened_handle_identities_atomically() {
+    fn windows_legacy_creation_time_binding_requires_trusted_offline_rebind() {
+        use std::os::windows::fs::MetadataExt as _;
+
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("legacy-windows-binding.sqlite");
         let manager = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
-        let database_identity = manager.store_lock.as_ref().unwrap().identity.clone();
-        let root_file = open_store_root_bound(&manager.artifact_store_root)
-            .unwrap()
-            .into_std_file();
-        let root_identity =
-            super::super::store_identity(&manager.artifact_store_root, &root_file).unwrap();
-        let legacy_database = database_identity.legacy_persistent_key();
-        let legacy_root = root_identity.legacy_persistent_key();
+        let legacy_database = format!(
+            "windows:{}",
+            std::fs::metadata(&database).unwrap().creation_time()
+        );
+        let legacy_root = format!(
+            "windows:{}",
+            std::fs::metadata(&manager.artifact_store_root)
+                .unwrap()
+                .creation_time()
+        );
         manager
             .connection
             .execute(
@@ -17821,9 +18089,14 @@ mod tests {
             .unwrap();
         drop(manager);
 
-        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
-        let migrated = reopened
-            .connection
+        assert!(matches!(
+            TaskManager::open_with_clock(&database, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store root binding does not match its opened database and root identities"
+            ))
+        ));
+        let persisted = Connection::open(&database)
+            .unwrap()
             .query_row(
                 "SELECT database_identity,root_identity FROM artifact_store_binding
                  WHERE singleton_id=1",
@@ -17831,8 +18104,76 @@ mod tests {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .unwrap();
-        assert_eq!(migrated.0, database_identity.persistent_key());
-        assert_eq!(migrated.1, root_identity.persistent_key());
+        assert_eq!(persisted, (legacy_database, legacy_root));
+
+        super::super::rebind_legacy_windows_artifact_store(&database).unwrap();
+        let rebound = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT database_identity,root_identity FROM artifact_store_binding
+                 WHERE singleton_id=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert!(rebound.0.starts_with("windows:"));
+        assert!(rebound.0.matches(':').count() == 2);
+        assert!(rebound.1.starts_with("windows:"));
+        assert!(rebound.1.matches(':').count() == 2);
+        TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ordinary_open_rejects_replaced_root_with_copied_legacy_timestamp() {
+        use std::os::windows::fs::MetadataExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("legacy-replaced-root.sqlite");
+        let manager = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let root = manager.artifact_store_root.clone();
+        let displaced = temp.path().join("displaced-artifact-root");
+        let database_creation = std::fs::metadata(&database).unwrap().creation_time();
+        let root_creation = std::fs::metadata(&root).unwrap().creation_time();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_store_binding SET database_identity=?1,root_identity=?2
+                 WHERE singleton_id=1",
+                params![
+                    format!("windows:{database_creation}"),
+                    format!("windows:{root_creation}")
+                ],
+            )
+            .unwrap();
+        drop(manager);
+
+        std::fs::rename(&root, &displaced).unwrap();
+        create_store_root(&root).unwrap();
+        let status = std::process::Command::new(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($path,$ticks) [System.IO.Directory]::SetCreationTimeUtc($path,[DateTime]::FromFileTimeUtc([Int64]$ticks)) }",
+            root.to_str().unwrap(),
+            &root_creation.to_string(),
+        ])
+        .status()
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().creation_time(),
+            root_creation
+        );
+        assert!(matches!(
+            TaskManager::open_with_clock(&database, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "Artifact store root binding does not match its opened database and root identities"
+            ))
+        ));
     }
 
     #[test]
@@ -19031,6 +19372,75 @@ mod tests {
     }
 
     #[test]
+    fn keyed_import_replay_uses_causal_receipt_when_blob_imports_share_a_timestamp() {
+        struct PanicReader;
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a keyed import replay must not read its source")
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let now = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &now);
+        let mut first_request = import_request();
+        first_request.import_id = Some("import:same-clock-first".to_owned());
+        let mut second_request = first_request.clone();
+        second_request.import_id = Some("import:same-clock-second".to_owned());
+        let bytes = b"same blob and same timestamp";
+        let first = manager
+            .import_artifact(&first_request, &mut Cursor::new(bytes.as_slice()))
+            .unwrap();
+        let second = manager
+            .import_artifact(&second_request, &mut Cursor::new(bytes.as_slice()))
+            .unwrap();
+
+        for (request, expected_reused) in [(&first_request, false), (&second_request, true)] {
+            let operation_id =
+                keyed_import_operation_id(&request.task_id, request.import_id.as_deref().unwrap());
+            let receipt: serde_json::Value = serde_json::from_str(
+                &manager
+                    .connection
+                    .query_row(
+                        "SELECT external_receipt FROM operations WHERE operation_id=?1",
+                        [&operation_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                receipt
+                    .get("blob_reused")
+                    .and_then(serde_json::Value::as_bool),
+                Some(expected_reused)
+            );
+            manager.import_artifact(request, &mut PanicReader).unwrap();
+        }
+        assert_ne!(first.artifact_id, second.artifact_id);
+
+        let first_operation = keyed_import_operation_id(
+            &first_request.task_id,
+            first_request.import_id.as_deref().unwrap(),
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE operations
+                 SET external_receipt=json_set(external_receipt,'$.blob_reused',1)
+                 WHERE operation_id=?1",
+                [&first_operation],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.import_artifact(&first_request, &mut PanicReader),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact import receipt is invalid"
+            ))
+        ));
+    }
+
+    #[test]
     fn keyed_import_replays_after_later_read_and_export_integrity_verification() {
         struct PanicReader;
         impl Read for PanicReader {
@@ -19658,6 +20068,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one response-loss test distinguishes rollback from committed late delivery while preserving one-shot grant accounting"
+    )]
     fn reader_admission_response_loss_replays_once_without_second_grant_use() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
@@ -19728,6 +20142,30 @@ mod tests {
         let mut reader = reopened
             .open_artifact_reader(&scope, &artifact.artifact_id)
             .unwrap();
+        READER_DELIVERY_COMMIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected reader delivery rollback",
+                )))
+            }));
+        });
+        let mut probe = [0_u8; 1];
+        assert_eq!(
+            reader.read(&mut probe).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT json_extract(external_receipt,'$.kind') FROM operations
+                     WHERE effect_class='ARTIFACT_READ'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "artifact-reader-admission-pending-delivery"
+        );
         READER_DELIVERY_COMMIT_RESULT_TEST_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 Err(TaskManagerError::Io(std::io::Error::other(
