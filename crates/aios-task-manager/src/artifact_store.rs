@@ -2649,6 +2649,7 @@ impl TaskManager {
         if session.issuer_id != self.artifact_scope_issuer {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        ensure_task_is_not_recovering(&self.connection, &session.task_id)?;
         let intent_json = self
             .connection
             .query_row(
@@ -3756,7 +3757,8 @@ impl TaskManager {
         }
         let staged = {
             let mut statement = self.connection.prepare(
-                "SELECT a.allocation_id,a.staging_ref,a.state,a.expires_at,t.state,a.publication_id
+                "SELECT a.allocation_id,a.staging_ref,a.state,a.expires_at,t.state,a.task_id,
+                        a.publication_id
                  FROM artifact_output_allocations a
                  JOIN tasks t ON t.task_id=a.task_id
                  WHERE a.staging_ref IS NOT NULL
@@ -3769,14 +3771,15 @@ impl TaskManager {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut removed_terminal_residue = false;
         let mut staged = staged;
-        for (allocation_id, staging_ref, state, expires_at, task_state, publication_id) in
+        for (allocation_id, staging_ref, state, expires_at, task_state, task_id, publication_id) in
             &mut staged
         {
             let expired = parse_time(expires_at)? <= parse_time(&reconciled_at)?;
@@ -3795,23 +3798,46 @@ impl TaskManager {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
-                if let Some(publication_id) = publication_id.as_deref() {
-                    let request_json = transaction
-                        .query_row(
-                            "SELECT request_json FROM artifact_publications
-                             WHERE publication_id=?1 AND allocation_id=?2 AND state='PENDING'",
-                            params![publication_id, allocation_id.as_str()],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()?
-                        .ok_or(TaskManagerError::InvalidRecord(
+                let pending_publications = {
+                    let mut statement = transaction.prepare(
+                        "SELECT publication_id,task_id,request_json FROM artifact_publications
+                         WHERE allocation_id=?1 AND state='PENDING'
+                         ORDER BY publication_id LIMIT 2",
+                    )?;
+                    let rows = statement.query_map([allocation_id.as_str()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                if pending_publications.len() > 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "stored pending Artifact publication is invalid",
+                    ));
+                }
+                let pending_publication = pending_publications.into_iter().next();
+                if let Some(expected_publication_id) = publication_id.as_deref() {
+                    if pending_publication.as_ref().map(|row| row.0.as_str())
+                        != Some(expected_publication_id)
+                    {
+                        return Err(TaskManagerError::InvalidRecord(
                             "stored pending Artifact publication is invalid",
-                        ))?;
-                    let request: ArtifactPublicationRequest = serde_json::from_str(&request_json)?;
+                        ));
+                    }
+                }
+                if let Some((pending_publication_id, pending_task_id, request_json)) =
+                    pending_publication.as_ref()
+                {
+                    let request: ArtifactPublicationRequest = serde_json::from_str(request_json)?;
                     validate_publication_request(&request)?;
-                    if canonical_json(&request)? != request_json
-                        || request.publication_id != publication_id
+                    if canonical_json(&request)? != *request_json
+                        || request.publication_id != *pending_publication_id
                         || request.allocation_id != *allocation_id
+                        || pending_task_id != task_id
+                        || request.task_id != *task_id
                     {
                         return Err(TaskManagerError::InvalidRecord(
                             "stored pending Artifact publication is invalid",
@@ -3822,12 +3848,15 @@ impl TaskManager {
                     let changed = transaction.execute(
                         "UPDATE artifact_publications
                          SET state=?2,result_json=?3,committed_at=?4
-                         WHERE publication_id=?1 AND state='PENDING'",
+                         WHERE publication_id=?1 AND allocation_id=?5 AND task_id=?6
+                           AND state='PENDING'",
                         params![
-                            publication_id,
+                            pending_publication_id,
                             publication_state,
                             canonical_json(&result)?,
                             reconciled_at,
+                            allocation_id.as_str(),
+                            task_id.as_str(),
                         ],
                     )?;
                     if changed != 1 {
@@ -3835,20 +3864,27 @@ impl TaskManager {
                             "ARTIFACT_ALLOCATION_STATE_CONFLICT",
                         ));
                     }
-                } else if state == "FINALIZING" {
+                } else if state == "FINALIZING" || publication_id.is_some() {
                     return Err(TaskManagerError::InvalidRecord(
                         "stored finalizing Artifact allocation has no publication",
                     ));
                 }
+                let resolved_publication_id = pending_publication
+                    .as_ref()
+                    .map(|row| row.0.as_str())
+                    .or(publication_id.as_deref());
                 let changed = transaction.execute(
                     "UPDATE artifact_output_allocations
-                     SET state=?2,updated_at=?3
-                     WHERE allocation_id=?1 AND state=?4",
+                     SET state=?2,updated_at=?3,publication_id=COALESCE(publication_id,?5)
+                     WHERE allocation_id=?1 AND task_id=?6 AND state=?4
+                       AND (publication_id IS NULL OR publication_id=?5)",
                     params![
                         allocation_id.as_str(),
                         target_state,
                         reconciled_at,
-                        state.as_str()
+                        state.as_str(),
+                        resolved_publication_id,
+                        task_id.as_str(),
                     ],
                 )?;
                 if changed != 1 {
@@ -3888,13 +3924,13 @@ impl TaskManager {
         }
         let staged_by_ref = staged
             .into_iter()
-            .filter(|(_, _, state, _, _, _)| {
+            .filter(|(_, _, state, _, _, _, _)| {
                 !matches!(
                     state.as_str(),
                     "ALLOCATED" | "FAILED" | "ABORTED" | "EXPIRED" | "PUBLISHED"
                 )
             })
-            .map(|(allocation_id, staging_ref, _, _, _, _)| (staging_ref, allocation_id))
+            .map(|(allocation_id, staging_ref, _, _, _, _, _)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut removed_import_residue = false;
         for entry in self.artifact_store_dir.read_dir("staging")? {
@@ -9166,6 +9202,31 @@ mod tests {
             "CONSUMED:1"
         );
 
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.replay_bound_artifact_export(&session, "export-consumed-replay"),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .replay_bound_artifact_export(&session, "export-consumed-replay")
+                .unwrap(),
+            22
+        );
+
         let opened = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&opened);
         let mut replay = manager
@@ -10619,6 +10680,122 @@ mod tests {
         for residue in [staging_ref, seal.clone(), format!("{seal}.pending")] {
             assert!(!terminal_manager.artifact_store_root.join(residue).exists());
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers reserve-before-link crash, startup receipt, residue cleanup, and reopen idempotency"
+    )]
+    fn startup_terminalizes_publication_reserved_before_allocation_link() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let request = publication("pub-reserved-crash", "alloc-reserved-crash");
+        let staging_ref = {
+            let mut manager = manager(&temp);
+            manager
+                .allocate_artifact_output(&allocation(&request.allocation_id))
+                .unwrap();
+            write_output(
+                &mut manager,
+                &request.allocation_id,
+                b"reserved publication crash residue",
+            );
+            let request_json = canonical_json(&request).unwrap();
+            manager
+                .reserve_publication(&request, &request_json)
+                .unwrap();
+            let (staging_ref, linked_publication) = manager
+                .connection
+                .query_row(
+                    "SELECT staging_ref,publication_id FROM artifact_output_allocations
+                     WHERE allocation_id=?1",
+                    [&request.allocation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(linked_publication, None);
+            let seal = seal_ref(&staging_ref);
+            let pending_ref = format!("{seal}.pending");
+            let mut pending = manager
+                .artifact_store_dir
+                .open_with(
+                    safe_internal_ref(&pending_ref).unwrap(),
+                    CapOpenOptions::new().write(true).create_new(true),
+                )
+                .unwrap();
+            secure_cap_file_permissions(&pending).unwrap();
+            pending.write_all(b"pending residue").unwrap();
+            pending.sync_all().unwrap();
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifact_output_allocations
+                     SET expires_at='2026-09-19T21:00:00Z'
+                     WHERE allocation_id=?1",
+                    [&request.allocation_id],
+                )
+                .unwrap();
+            staging_ref
+        };
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let (allocation_state, linked_publication) = reopened
+            .connection
+            .query_row(
+                "SELECT state,publication_id FROM artifact_output_allocations
+                 WHERE allocation_id=?1",
+                [&request.allocation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(allocation_state, "EXPIRED");
+        assert_eq!(
+            linked_publication.as_deref(),
+            Some(request.publication_id.as_str())
+        );
+        let (publication_state, stored_result_json) = reopened
+            .connection
+            .query_row(
+                "SELECT state,result_json FROM artifact_publications WHERE publication_id=?1",
+                [&request.publication_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(publication_state, "FAILED");
+        let result: ArtifactPublicationResult = serde_json::from_str(&stored_result_json).unwrap();
+        assert_eq!(result.reason_code, "ARTIFACT_ALLOCATION_EXPIRED");
+        assert!(!result.published);
+        assert_eq!(result.message, None);
+        assert_eq!(canonical_json(&result).unwrap(), stored_result_json);
+        let seal = seal_ref(&staging_ref);
+        for residue in [staging_ref.clone(), seal.clone(), format!("{seal}.pending")] {
+            assert!(!reopened.artifact_store_root.join(residue).exists());
+        }
+        drop(reopened);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        let replayed_result_json = reopened
+            .connection
+            .query_row(
+                "SELECT result_json FROM artifact_publications WHERE publication_id=?1",
+                [&request.publication_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(replayed_result_json, stored_result_json);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state || ':' || publication_id
+                     FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [&request.allocation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "EXPIRED:pub-reserved-crash"
+        );
     }
 
     #[test]
@@ -12386,7 +12563,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_publication_can_be_authenticated_aborted_and_reported_for_terminal_task() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers explicit abort, changed-request conflict, and terminal-Task startup abort"
+    )]
+    fn pending_publication_can_be_authenticated_and_aborted_for_terminal_task() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
         let mut manager = manager(&temp);
@@ -12471,12 +12652,27 @@ mod tests {
             reopened
                 .connection
                 .query_row(
-                    "SELECT COUNT(*) FROM recovery_unknown_operations WHERE operation_id='publication:pub-terminal-pending'",
+                    "SELECT p.state || ':' || a.state
+                     FROM artifact_publications p
+                     JOIN artifact_output_allocations a USING(allocation_id)
+                     WHERE p.publication_id='pub-terminal-pending'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ABORTED:ABORTED"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='publication:pub-terminal-pending'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            1
+            0
         );
     }
 
