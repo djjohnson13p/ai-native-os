@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[cfg(not(unix))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -629,6 +629,21 @@ struct PreDestinationExportAdmission {
     kind: String,
     operation_id: String,
     intent_hash: String,
+    provenance_event_id: String,
+    provenance_event_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArmedExportAdmission {
+    version: u8,
+    kind: String,
+    operation_id: String,
+    intent_hash: String,
+    admission_event_id: String,
+    admission_event_hash: String,
+    provenance_event_id: String,
+    provenance_event_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,6 +660,18 @@ struct ArtifactReaderAdmission {
     principal_id: String,
     grant_id: String,
     one_shot_consumed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactReaderAdmissionReceipt {
+    version: u8,
+    kind: String,
+    operation_id: String,
+    admission_event_id: String,
+    admission_event_hash: String,
+    delivery_event_id: Option<String>,
+    delivery_event_hash: Option<String>,
 }
 
 /// Exact durable export identity presented to a trusted external-outcome verifier.
@@ -2990,11 +3017,12 @@ impl TaskManager {
             (&scope.authority.execution, grant_admission.as_ref())
         {
             mark_reader_admission_delivered(
-                &self.connection,
+                &mut self.connection,
                 &scope.task_id,
                 execution,
                 artifact_id,
                 admission,
+                &self.clock.now(),
             )?;
         }
         Ok(ArtifactReader {
@@ -3354,15 +3382,6 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
         let admitted_at = self.clock.now();
-        let pre_destination_receipt = canonical_json(&PreDestinationExportAdmission {
-            version: 1,
-            kind: "pre-destination-admission".to_owned(),
-            operation_id: destination.operation_id.clone(),
-            intent_hash: canonical_text_digest(
-                "aios.artifact-export.intent.v1",
-                &destination.intent_json,
-            ),
-        })?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3374,6 +3393,25 @@ impl TaskManager {
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
             ));
         }
+        let intent_hash =
+            canonical_text_digest("aios.artifact-export.intent.v1", &destination.intent_json);
+        let admission_event = export_phase_event(
+            &intent,
+            &destination.operation_id,
+            "pre-destination-admission",
+            &admitted_at,
+            &intent_hash,
+            None,
+        );
+        let appended_admission = append_event(&transaction, &intent.task_id, &admission_event)?;
+        let pre_destination_receipt = canonical_json(&PreDestinationExportAdmission {
+            version: 1,
+            kind: "pre-destination-admission".to_owned(),
+            operation_id: destination.operation_id.clone(),
+            intent_hash,
+            provenance_event_id: appended_admission.event_id,
+            provenance_event_hash: appended_admission.event_hash,
+        })?;
         transaction.execute(
             "INSERT INTO operations(
                 operation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,
@@ -3447,21 +3485,26 @@ impl TaskManager {
                 "ARTIFACT_EXPORT_FAILED_NO_EFFECT",
             ));
         }
+        export_before_arm_step()?;
         self.arm_export_effect_boundary(
             &destination.operation_id,
             &destination.intent_json,
             &pre_destination_receipt,
+            &scope.authority,
+            reader_grant_admission.as_ref(),
+            destination.grant_admission.as_ref(),
         )?;
         if let (Some(execution), Some(admission)) = (
             scope.authority.execution.as_ref(),
             reader_grant_admission.as_ref(),
         ) {
             mark_reader_admission_delivered(
-                &self.connection,
+                &mut self.connection,
                 &scope.task_id,
                 execution,
                 artifact_id,
                 admission,
+                &self.clock.now(),
             )?;
         }
         destination.consumed = true;
@@ -3699,16 +3742,85 @@ impl TaskManager {
         operation_id: &str,
         intent_json: &str,
         pre_destination_receipt: &str,
+        authority: &ReadAuthority,
+        reader_grant_admission: Option<&GrantAdmission>,
+        egress_grant_admission: Option<&GrantAdmission>,
     ) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
+        ensure_task_is_not_recovering(&transaction, &intent.task_id)?;
+        validate_export_destination_fence(
+            &transaction,
+            &self.clock,
+            &intent.task_id,
+            authority,
+            &intent.destination_class,
+            egress_grant_admission,
+        )?;
+        match (&authority.execution, reader_grant_admission) {
+            (Some(execution), Some(admission))
+                if exact_operation_grant(
+                    &transaction,
+                    &intent.task_id,
+                    execution,
+                    "artifact.read",
+                    "artifact",
+                    &intent.artifact_id,
+                    &self.clock.now(),
+                    Some(admission),
+                )?
+                .is_some() => {}
+            (None, None) => {}
+            _ => return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
+        }
+        if !authenticate_pre_destination_export_admission(
+            &transaction,
+            operation_id,
+            intent_json,
+            pre_destination_receipt,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        let admission: PreDestinationExportAdmission =
+            serde_json::from_str(pre_destination_receipt)?;
+        let armed_at = self.clock.now();
+        let armed_event = export_phase_event(
+            &intent,
+            operation_id,
+            "effect-boundary-armed",
+            &armed_at,
+            &admission.intent_hash,
+            Some((
+                admission.provenance_event_id.as_str(),
+                admission.provenance_event_hash.as_str(),
+            )),
+        );
+        let appended_armed = append_event(&transaction, &intent.task_id, &armed_event)?;
+        let armed_receipt = canonical_json(&ArmedExportAdmission {
+            version: 1,
+            kind: "effect-boundary-armed".to_owned(),
+            operation_id: operation_id.to_owned(),
+            intent_hash: admission.intent_hash,
+            admission_event_id: admission.provenance_event_id,
+            admission_event_hash: admission.provenance_event_hash,
+            provenance_event_id: appended_armed.event_id,
+            provenance_event_hash: appended_armed.event_hash,
+        })?;
         let changed = transaction.execute(
-            "UPDATE operations SET external_receipt=NULL
+            "UPDATE operations SET external_receipt=?4
              WHERE operation_id=?1 AND details_json=?2 AND state='STARTED'
                AND outcome_certainty IS NULL AND external_receipt=?3",
-            params![operation_id, intent_json, pre_destination_receipt],
+            params![
+                operation_id,
+                intent_json,
+                pre_destination_receipt,
+                armed_receipt
+            ],
         )?;
         if changed != 1 {
             return Err(TaskManagerError::InvalidRecord(
@@ -3717,7 +3829,12 @@ impl TaskManager {
         }
         let commit = transaction.commit();
         if commit.is_ok()
-            || authenticate_armed_export_operation(&self.connection, operation_id, intent_json)?
+            || authenticate_armed_export_operation(
+                &self.connection,
+                operation_id,
+                intent_json,
+                &armed_receipt,
+            )?
         {
             Ok(())
         } else {
@@ -3985,6 +4102,11 @@ impl TaskManager {
                 "stored Artifact export operation is invalid",
             ));
         }
+        if !super::verify_provenance_through(&self.connection, &row.0, None)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact export reconciliation requires an intact provenance chain",
+            ));
+        }
         let operation_authentication =
             authenticate_export_operation(&self.connection, operation_id, &row.3)?;
         let Some(Err(TaskManagerError::InvalidRecord(authenticated_code))) =
@@ -4245,12 +4367,11 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
-        let pre_destination = {
+        let started_exports = {
             let mut statement = transaction.prepare(
                 "SELECT operation_id,details_json,external_receipt FROM operations
                  WHERE transaction_class='irreversible_external' AND effect_class='DATA_EGRESS'
                    AND state='STARTED' AND outcome_certainty IS NULL
-                   AND json_extract(external_receipt,'$.kind')='pre-destination-admission'
                  ORDER BY operation_id",
             )?;
             let rows = statement.query_map([], |row| {
@@ -4262,35 +4383,52 @@ impl TaskManager {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (operation_id, intent_json, receipt) in pre_destination {
-            if !authenticate_pre_destination_export_admission(
+        for (operation_id, intent_json, receipt) in started_exports {
+            let pre_destination = authenticate_pre_destination_export_admission(
                 &transaction,
                 &operation_id,
                 &intent_json,
                 &receipt,
-            )? {
+            )?;
+            let armed = authenticate_armed_export_operation(
+                &transaction,
+                &operation_id,
+                &intent_json,
+                &receipt,
+            )?;
+            if pre_destination == armed {
                 return Err(TaskManagerError::InvalidRecord(
-                    "stored Artifact export pre-destination admission is invalid",
+                    "stored Artifact export effect phase is invalid",
                 ));
             }
-            transaction.execute(
-                "UPDATE operations
-                 SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',finished_at=started_at
-                 WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
-                   AND state='STARTED' AND outcome_certainty IS NULL",
-                params![operation_id, intent_json, receipt],
-            )?;
+            if pre_destination {
+                let changed = transaction.execute(
+                    "UPDATE operations
+                     SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',finished_at=started_at
+                     WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
+                       AND state='STARTED' AND outcome_certainty IS NULL",
+                    params![operation_id, intent_json, receipt],
+                )?;
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "stored Artifact export pre-destination admission is invalid",
+                    ));
+                }
+            } else {
+                let changed = transaction.execute(
+                    "UPDATE operations
+                     SET state='UNKNOWN',outcome_certainty='OUTCOME_UNKNOWN',finished_at=?4
+                     WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
+                       AND state='STARTED' AND outcome_certainty IS NULL",
+                    params![operation_id, intent_json, receipt, reconciled_at],
+                )?;
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "stored Artifact export armed phase is invalid",
+                    ));
+                }
+            }
         }
-        transaction.execute(
-            "UPDATE operations
-             SET state='UNKNOWN',outcome_certainty='OUTCOME_UNKNOWN',finished_at=?1
-             WHERE transaction_class='irreversible_external' AND effect_class='DATA_EGRESS'
-               AND state='STARTED' AND outcome_certainty IS NULL
-               AND json_extract(details_json,'$.version')=1
-               AND json_type(details_json,'$.artifact_id')='text'
-               AND json_type(details_json,'$.destination_class')='text'",
-            [reconciled_at],
-        )?;
         transaction.commit()?;
         let task_ids = {
             let mut statement = self.connection.prepare(
@@ -6122,7 +6260,7 @@ fn admit_operation_grant(
 }
 
 fn admit_prepared_artifact_reader(
-    connection: &Connection,
+    connection: &Transaction<'_>,
     scope: &ArtifactReadScope,
     artifact_id: &str,
     handle: &ArtifactHandle,
@@ -6211,7 +6349,7 @@ fn admit_prepared_artifact_reader(
 }
 
 fn persist_reader_admission(
-    connection: &Connection,
+    connection: &Transaction<'_>,
     task_id: &str,
     execution: &ExecutionAuthority,
     artifact_id: &str,
@@ -6222,7 +6360,7 @@ fn persist_reader_admission(
         "artifact-reader-admission",
         &format!("{task_id}\0{}", random_token(connection)?),
     );
-    let details = canonical_json(&ArtifactReaderAdmission {
+    let stored = ArtifactReaderAdmission {
         version: 1,
         operation_id: operation_id.clone(),
         task_id: task_id.to_owned(),
@@ -6234,6 +6372,18 @@ fn persist_reader_admission(
         principal_id: execution.principal_id.clone(),
         grant_id: admission.grant_id.clone(),
         one_shot_consumed: admission.one_shot_consumed,
+    };
+    let details = canonical_json(&stored)?;
+    let event = reader_admission_event(&stored, "admitted", admitted_at, None);
+    let appended = append_event(connection, task_id, &event)?;
+    let receipt = canonical_json(&ArtifactReaderAdmissionReceipt {
+        version: 1,
+        kind: "artifact-reader-admission-pending-delivery".to_owned(),
+        operation_id: operation_id.clone(),
+        admission_event_id: appended.event_id,
+        admission_event_hash: appended.event_hash,
+        delivery_event_id: None,
+        delivery_event_hash: None,
     })?;
     connection.execute(
         "INSERT INTO operations(
@@ -6251,16 +6401,100 @@ fn persist_reader_admission(
             execution.attempt_id,
             details,
             admitted_at,
-            canonical_json(
-                &json!({"version":1,"kind":"artifact-reader-admission-pending-delivery"})
-            )?,
+            receipt,
         ],
     )?;
     Ok(())
 }
 
+fn reader_admission_event(
+    admission: &ArtifactReaderAdmission,
+    phase: &str,
+    timestamp: &str,
+    admission_event: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let (event_kind, event_type, status, predecessor_id, predecessor_hash) = match admission_event {
+        Some((event_id, event_hash)) => (
+            "artifact-reader-delivered",
+            "execution.completed",
+            "success",
+            Some(event_id),
+            Some(event_hash),
+        ),
+        None => (
+            "artifact-reader-admitted",
+            "execution.started",
+            "pending",
+            None,
+            None,
+        ),
+    };
+    json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":event_id(event_kind,&admission.operation_id),
+        "task_id":admission.task_id,
+        "step_id":admission.node_id,
+        "event_type":event_type,
+        "timestamp":timestamp,
+        "actor":{"kind":"provider","id":admission.principal_id},
+        "semantic_program_hash":admission.semantic_program_hash,
+        "execution_binding_id":admission.binding_id,
+        "provider_id":admission.principal_id,
+        "authority_token_id":admission.grant_id,
+        "input_artifacts":[admission.artifact_id],
+        "output_artifacts":[],
+        "status":status,
+        "details":{
+            "operation_id":admission.operation_id,
+            "phase":phase,
+            "admission_event_id":predecessor_id,
+            "admission_event_hash":predecessor_hash,
+        },
+    })
+}
+
+fn authenticate_reader_admission_event(
+    connection: &Connection,
+    admission: &ArtifactReaderAdmission,
+    phase: &str,
+    event_id: &str,
+    event_hash: &str,
+    admission_event: Option<(&str, &str)>,
+) -> Result<bool> {
+    let expected_type = if admission_event.is_some() {
+        "execution.completed"
+    } else {
+        "execution.started"
+    };
+    let row = connection
+        .query_row(
+            "SELECT timestamp,event_hash,event_json FROM provenance_events
+             WHERE task_id=?1 AND event_id=?2 AND event_type=?3",
+            params![admission.task_id, event_id, expected_type],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((timestamp, stored_hash, event_json)) = row else {
+        return Ok(false);
+    };
+    let expected = reader_admission_event(admission, phase, &timestamp, admission_event);
+    Ok(
+        event_id == expected["event_id"].as_str().unwrap_or_default()
+            && stored_hash == event_hash
+            && serde_json::from_str::<serde_json::Value>(&event_json)? == expected
+            && super::verify_provenance_through(connection, &admission.task_id, None)?,
+    )
+}
+
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "authenticates the complete durable reader admission tuple"
 )]
 fn authenticate_reader_admission(
@@ -6308,12 +6542,49 @@ fn authenticate_reader_admission(
         "stored Artifact reader admission is invalid",
     ))?;
     let stored: ArtifactReaderAdmission = serde_json::from_str(details_json)?;
-    let pending_receipt =
-        canonical_json(&json!({"version":1,"kind":"artifact-reader-admission-pending-delivery"}))?;
-    let delivered_receipt =
-        canonical_json(&json!({"version":1,"kind":"artifact-reader-admission-delivered"}))?;
-    let pending = row.10.as_deref() == Some(pending_receipt.as_str());
-    let receipt_exact = pending || row.10.as_deref() == Some(delivered_receipt.as_str());
+    let receipt_json = row.10.as_deref().ok_or(TaskManagerError::InvalidRecord(
+        "stored Artifact reader admission is invalid",
+    ))?;
+    let receipt: ArtifactReaderAdmissionReceipt = serde_json::from_str(receipt_json)?;
+    let pending = receipt.kind == "artifact-reader-admission-pending-delivery";
+    let delivered = receipt.kind == "artifact-reader-admission-delivered";
+    let admission_event_exact = authenticate_reader_admission_event(
+        connection,
+        &stored,
+        "admitted",
+        &receipt.admission_event_id,
+        &receipt.admission_event_hash,
+        None,
+    )?;
+    let delivery_event_id = event_id("artifact-reader-delivered", operation_id);
+    let delivery_event_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE task_id=?1 AND event_id=?2)",
+        params![task_id, delivery_event_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let delivery_event_exact = match (
+        receipt.delivery_event_id.as_deref(),
+        receipt.delivery_event_hash.as_deref(),
+    ) {
+        (Some(event_id), Some(event_hash)) => authenticate_reader_admission_event(
+            connection,
+            &stored,
+            "delivered",
+            event_id,
+            event_hash,
+            Some((
+                receipt.admission_event_id.as_str(),
+                receipt.admission_event_hash.as_str(),
+            )),
+        )?,
+        _ => false,
+    };
+    let receipt_exact = receipt.version == 1
+        && receipt.operation_id == operation_id
+        && canonical_json(&receipt)? == receipt_json
+        && admission_event_exact
+        && (pending && !delivery_event_exists && !delivery_event_exact
+            || delivered && delivery_event_exists && delivery_event_exact);
     let exact = stored
         == ArtifactReaderAdmission {
             version: 1,
@@ -6371,8 +6642,6 @@ fn replayable_reader_admission_for_grant(
     grant_id: &str,
     checked_at: &str,
 ) -> Result<Option<GrantAdmission>> {
-    let pending =
-        canonical_json(&json!({"version":1,"kind":"artifact-reader-admission-pending-delivery"}))?;
     let candidates = {
         let mut statement = connection.prepare(
             "SELECT operation_id,details_json FROM operations
@@ -6380,9 +6649,9 @@ fn replayable_reader_admission_for_grant(
                AND binding_id=?4 AND attempt_id=?5
                AND transaction_class='reversible_local' AND effect_class='ARTIFACT_READ'
                AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
-               AND external_receipt=?6
-               AND json_extract(details_json,'$.artifact_id')=?7
-               AND json_extract(details_json,'$.grant_id')=?8
+               AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-pending-delivery'
+               AND json_extract(details_json,'$.artifact_id')=?6
+               AND json_extract(details_json,'$.grant_id')=?7
              ORDER BY operation_id",
         )?;
         let rows = statement.query_map(
@@ -6392,7 +6661,6 @@ fn replayable_reader_admission_for_grant(
                 execution.node_id,
                 execution.binding_id,
                 execution.attempt_id,
-                pending,
                 artifact_id,
                 grant_id,
             ],
@@ -6435,26 +6703,24 @@ fn replayable_reader_admission_for_grant(
 }
 
 fn mark_reader_admission_delivered(
-    connection: &Connection,
+    connection: &mut Connection,
     task_id: &str,
     execution: &ExecutionAuthority,
     artifact_id: &str,
     admission: &GrantAdmission,
+    delivered_at: &str,
 ) -> Result<()> {
-    let pending =
-        canonical_json(&json!({"version":1,"kind":"artifact-reader-admission-pending-delivery"}))?;
-    let delivered =
-        canonical_json(&json!({"version":1,"kind":"artifact-reader-admission-delivered"}))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidates = {
-        let mut statement = connection.prepare(
-            "SELECT operation_id FROM operations
+        let mut statement = transaction.prepare(
+            "SELECT operation_id,external_receipt FROM operations
              WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
                AND binding_id=?4 AND attempt_id=?5
                AND transaction_class='reversible_local' AND effect_class='ARTIFACT_READ'
                AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
-               AND external_receipt=?6
-               AND json_extract(details_json,'$.artifact_id')=?7
-               AND json_extract(details_json,'$.grant_id')=?8
+               AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-pending-delivery'
+               AND json_extract(details_json,'$.artifact_id')=?6
+               AND json_extract(details_json,'$.grant_id')=?7
              ORDER BY operation_id",
         )?;
         let rows = statement.query_map(
@@ -6464,11 +6730,10 @@ fn mark_reader_admission_delivered(
                 execution.node_id,
                 execution.binding_id,
                 execution.attempt_id,
-                pending,
                 artifact_id,
                 admission.grant_id,
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -6477,17 +6742,68 @@ fn mark_reader_admission_delivered(
             "stored Artifact reader admission is invalid",
         ));
     }
-    let changed = connection.execute(
+    let (operation_id, pending_receipt) = &candidates[0];
+    if !authenticate_reader_admission(
+        &transaction,
+        operation_id,
+        task_id,
+        execution,
+        artifact_id,
+        admission,
+        delivered_at,
+        true,
+    )? {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact reader admission is invalid",
+        ));
+    }
+    let stored: ArtifactReaderAdmission = transaction
+        .query_row(
+            "SELECT details_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .and_then(|details| {
+            serde_json::from_str(&details).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })?;
+    let pending: ArtifactReaderAdmissionReceipt = serde_json::from_str(pending_receipt)?;
+    let event = reader_admission_event(
+        &stored,
+        "delivered",
+        delivered_at,
+        Some((
+            pending.admission_event_id.as_str(),
+            pending.admission_event_hash.as_str(),
+        )),
+    );
+    let appended = append_event(&transaction, task_id, &event)?;
+    let delivered = canonical_json(&ArtifactReaderAdmissionReceipt {
+        version: 1,
+        kind: "artifact-reader-admission-delivered".to_owned(),
+        operation_id: operation_id.clone(),
+        admission_event_id: pending.admission_event_id,
+        admission_event_hash: pending.admission_event_hash,
+        delivery_event_id: Some(appended.event_id),
+        delivery_event_hash: Some(appended.event_hash),
+    })?;
+    let changed = transaction.execute(
         "UPDATE operations SET external_receipt=?2
          WHERE operation_id=?1 AND external_receipt=?3 AND state='SUCCEEDED'
            AND outcome_certainty='COMPLETED'",
-        params![candidates[0], delivered, pending],
+        params![operation_id, delivered, pending_receipt],
     )?;
     if changed != 1 {
         return Err(TaskManagerError::InvalidRecord(
             "stored Artifact reader admission is invalid",
         ));
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -7899,6 +8215,9 @@ fn authenticate_export_operation(
             receipt,
         )
     })?;
+    let armed_admission = row.10.as_deref().map_or(Ok(false), |receipt| {
+        authenticate_armed_export_operation(connection, operation_id, intent_json, receipt)
+    })?;
     let replay = match (row.8.as_str(), row.9.as_deref()) {
         ("SUCCEEDED", Some("COMPLETED")) => {
             let receipt: serde_json::Value = serde_json::from_str(row.10.as_deref().ok_or(
@@ -8036,9 +8355,12 @@ fn authenticate_export_operation(
         ("STARTED", None) if pre_destination_admission => Err(TaskManagerError::InvalidRecord(
             "ARTIFACT_EXPORT_FAILED_NO_EFFECT",
         )),
+        ("STARTED", None) | ("UNKNOWN", Some("OUTCOME_UNKNOWN")) if armed_admission => Err(
+            TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OUTCOME_UNKNOWN"),
+        ),
         ("STARTED" | "PREPARED" | "UNKNOWN", None | Some("OUTCOME_UNKNOWN"))
         | ("FAILED", Some("FAILED_PARTIAL_EFFECT")) => Err(TaskManagerError::InvalidRecord(
-            "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+            "stored Artifact export effect phase is invalid",
         )),
         _ => {
             return Err(TaskManagerError::InvalidRecord(
@@ -8047,6 +8369,105 @@ fn authenticate_export_operation(
         }
     };
     Ok(Some(replay))
+}
+
+fn export_phase_event(
+    intent: &ArtifactExportIntent,
+    operation_id: &str,
+    phase: &str,
+    timestamp: &str,
+    intent_hash: &str,
+    admission_event: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let (actor, provider_id) = if intent.principal_kind == "provider" {
+        (
+            json!({"kind":"provider","id":intent.principal_id}),
+            Some(intent.principal_id.clone()),
+        )
+    } else {
+        (
+            json!({"kind":intent.principal_kind,"id":intent.principal_id}),
+            None,
+        )
+    };
+    let (event_kind, predecessor_id, predecessor_hash) = match admission_event {
+        Some((event_id, event_hash)) => (
+            "artifact-export-effect-armed",
+            Some(event_id),
+            Some(event_hash),
+        ),
+        None => ("artifact-export-pre-destination", None, None),
+    };
+    json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":event_id(event_kind,operation_id),
+        "task_id":intent.task_id,
+        "step_id":intent.node_id,
+        "event_type":"execution.started",
+        "timestamp":timestamp,
+        "actor":actor,
+        "semantic_program_hash":intent.semantic_program_hash,
+        "execution_binding_id":intent.binding_id,
+        "provider_id":provider_id,
+        "authority_token_id":intent.grant_id,
+        "input_artifacts":[intent.artifact_id],
+        "output_artifacts":[],
+        "status":"pending",
+        "details":{
+            "operation_id":operation_id,
+            "phase":phase,
+            "intent_hash":intent_hash,
+            "admission_event_id":predecessor_id,
+            "admission_event_hash":predecessor_hash,
+        },
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "authenticates the complete immutable export phase tuple"
+)]
+fn authenticate_export_phase_event(
+    connection: &Connection,
+    intent: &ArtifactExportIntent,
+    operation_id: &str,
+    phase: &str,
+    intent_hash: &str,
+    event_id: &str,
+    event_hash: &str,
+    admission_event: Option<(&str, &str)>,
+) -> Result<bool> {
+    let row = connection
+        .query_row(
+            "SELECT timestamp,event_hash,event_json FROM provenance_events
+             WHERE task_id=?1 AND event_id=?2 AND event_type='execution.started'",
+            params![intent.task_id, event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((timestamp, stored_hash, event_json)) = row else {
+        return Ok(false);
+    };
+    let expected = export_phase_event(
+        intent,
+        operation_id,
+        phase,
+        &timestamp,
+        intent_hash,
+        admission_event,
+    );
+    Ok(
+        event_id == expected["event_id"].as_str().unwrap_or_default()
+            && stored_hash == event_hash
+            && serde_json::from_str::<serde_json::Value>(&event_json)? == expected
+            && super::verify_provenance_through(connection, &intent.task_id, None)?,
+    )
 }
 
 fn authenticate_pre_destination_export_admission(
@@ -8068,6 +8489,28 @@ fn authenticate_pre_destination_export_admission(
     {
         return Ok(false);
     }
+    let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
+    if !authenticate_export_phase_event(
+        connection,
+        &intent,
+        operation_id,
+        "pre-destination-admission",
+        &receipt.intent_hash,
+        &receipt.provenance_event_id,
+        &receipt.provenance_event_hash,
+        None,
+    )? {
+        return Ok(false);
+    }
+    let armed_event_id = event_id("artifact-export-effect-armed", operation_id);
+    let armed_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE task_id=?1 AND event_id=?2)",
+        params![intent.task_id, armed_event_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if armed_exists {
+        return Ok(false);
+    }
     let exact = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM operations
          WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
@@ -8084,13 +8527,52 @@ fn authenticate_armed_export_operation(
     connection: &Connection,
     operation_id: &str,
     intent_json: &str,
+    receipt_json: &str,
 ) -> Result<bool> {
+    let receipt: ArmedExportAdmission = match serde_json::from_str(receipt_json) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(false),
+    };
+    let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
+    if receipt.version != 1
+        || receipt.kind != "effect-boundary-armed"
+        || receipt.operation_id != operation_id
+        || receipt.intent_hash
+            != canonical_text_digest("aios.artifact-export.intent.v1", intent_json)
+        || canonical_json(&receipt)? != receipt_json
+        || !authenticate_export_phase_event(
+            connection,
+            &intent,
+            operation_id,
+            "pre-destination-admission",
+            &receipt.intent_hash,
+            &receipt.admission_event_id,
+            &receipt.admission_event_hash,
+            None,
+        )?
+        || !authenticate_export_phase_event(
+            connection,
+            &intent,
+            operation_id,
+            "effect-boundary-armed",
+            &receipt.intent_hash,
+            &receipt.provenance_event_id,
+            &receipt.provenance_event_hash,
+            Some((
+                receipt.admission_event_id.as_str(),
+                receipt.admission_event_hash.as_str(),
+            )),
+        )?
+    {
+        return Ok(false);
+    }
     let exact = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM operations
-         WHERE operation_id=?1 AND details_json=?2 AND state='STARTED'
-           AND outcome_certainty IS NULL AND external_receipt IS NULL
+         WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
+           AND ((state='STARTED' AND outcome_certainty IS NULL)
+                OR (state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'))
            AND transaction_class='irreversible_external' AND effect_class='DATA_EGRESS')",
-        params![operation_id, intent_json],
+        params![operation_id, intent_json, receipt_json],
         |row| row.get::<_, bool>(0),
     )?;
     Ok(exact)
@@ -9098,6 +9580,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static EXPORT_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static EXPORT_BEFORE_ARM_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_RESERVATION_RACE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -9213,6 +9697,16 @@ fn export_admission_commit_result_step() -> Result<()> {
 }
 
 #[cfg(test)]
+fn export_before_arm_step() -> Result<()> {
+    EXPORT_BEFORE_ARM_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn export_reservation_race_step() -> Result<()> {
     EXPORT_RESERVATION_RACE_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -9309,6 +9803,15 @@ fn writer_admission_commit_result_step() -> Result<()> {
     reason = "test response-loss injection shares the production export admission commit boundary"
 )]
 fn export_admission_commit_result_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test race injection shares the production export arming boundary"
+)]
+fn export_before_arm_step() -> Result<()> {
     Ok(())
 }
 
@@ -18620,6 +19123,257 @@ mod tests {
             reopened.scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id)),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+    }
+
+    #[test]
+    fn forged_pre_destination_phase_cannot_downgrade_a_genuine_unknown_export() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"unknown export".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-forged-pre-destination",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                || -> std::io::Result<Vec<u8>> {
+                    Err(std::io::Error::other("effect-capable factory failed"))
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        let armed_json = manager
+            .connection
+            .query_row(
+                "SELECT external_receipt FROM operations
+                 WHERE operation_id='export-forged-pre-destination'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let armed: ArmedExportAdmission = serde_json::from_str(&armed_json).unwrap();
+        let forged_pre = canonical_json(&PreDestinationExportAdmission {
+            version: 1,
+            kind: "pre-destination-admission".to_owned(),
+            operation_id: armed.operation_id.clone(),
+            intent_hash: armed.intent_hash.clone(),
+            provenance_event_id: armed.admission_event_id.clone(),
+            provenance_event_hash: armed.admission_event_hash.clone(),
+        })
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET state='STARTED',outcome_certainty=NULL,finished_at=NULL,
+                        external_receipt=?2 WHERE operation_id=?1",
+                params![armed.operation_id, forged_pre],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.reconcile_export_operations_startup(),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact export effect phase is invalid"
+            ))
+        ));
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET external_receipt=NULL
+                 WHERE operation_id='export-forged-pre-destination'",
+                [],
+            )
+            .unwrap();
+        assert!(manager.reconcile_export_operations_startup().is_err());
+    }
+
+    #[test]
+    fn delivered_one_shot_reader_marker_cannot_be_rolled_back_to_pending() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"one delivered reader".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "reader-delivery-tamper",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one delivered reader");
+        drop(reader);
+
+        let (operation_id, delivered_json) = manager
+            .connection
+            .query_row(
+                "SELECT operation_id,external_receipt FROM operations
+                 WHERE effect_class='ARTIFACT_READ'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let delivered: ArtifactReaderAdmissionReceipt =
+            serde_json::from_str(&delivered_json).unwrap();
+        assert_eq!(delivered.kind, "artifact-reader-admission-delivered");
+        let forged_pending = canonical_json(&ArtifactReaderAdmissionReceipt {
+            version: 1,
+            kind: "artifact-reader-admission-pending-delivery".to_owned(),
+            operation_id: operation_id.clone(),
+            admission_event_id: delivered.admission_event_id,
+            admission_event_hash: delivered.admission_event_hash,
+            delivery_event_id: None,
+            delivery_event_hash: None,
+        })
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET external_receipt=?2 WHERE operation_id=?1",
+                params![operation_id, forged_pending],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord(
+                "stored Artifact reader admission is invalid"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-reader-delivery-tamper-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "table-like scenarios exercise recovery, revocation, and supersession at the same arming boundary"
+    )]
+    fn export_arming_rechecks_recovery_revocation_and_attempt_supersession() {
+        for scenario in ["recovery", "revocation", "supersession"] {
+            let temp = TempDir::new().unwrap();
+            let database = temp.path().join("task-manager.sqlite");
+            let mut manager = manager(&temp);
+            let artifact = manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(format!("arming {scenario}").as_bytes()),
+                )
+                .unwrap();
+            let (binding_id, _) = install_one_shot_binding(
+                &manager,
+                &format!("arm-{scenario}"),
+                std::slice::from_ref(&artifact.artifact_id),
+                &[
+                    ("artifact.read", "artifact", &artifact.artifact_id),
+                    ("data.egress", "destination", "user-selected-file"),
+                ],
+            );
+            let session = session_for_binding(&manager, "T-artifact", &binding_id);
+            let scope = manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+                .unwrap();
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&factory_calls);
+            let mut destination = manager
+                .issue_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    &format!("export-arm-{scenario}"),
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(Vec::<u8>::new())
+                    },
+                )
+                .unwrap();
+            let program_hash = allocation("unused").semantic_program_hash;
+            let registry_id = format!("registry-arm-{scenario}");
+            let database_for_hook = database.clone();
+            let scenario_for_hook = scenario.to_owned();
+            EXPORT_BEFORE_ARM_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let connection = Connection::open(database_for_hook)?;
+                    match scenario_for_hook.as_str() {
+                        "recovery" => {
+                            connection.execute(
+                                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                                [],
+                            )?;
+                        }
+                        "revocation" => {
+                            connection.execute(
+                                "UPDATE authority_grants SET state='REVOKED'
+                                 WHERE grant_id='grant-arm-revocation-1'",
+                                [],
+                            )?;
+                        }
+                        "supersession" => {
+                            connection.execute_batch(&format!(
+                                "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,capability,provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
+                                 VALUES ('binding-arm-later','attempt-arm-later','T-artifact','{program_hash}','{registry_id}','0.1','compose_report','document.compose','provider:sequential','1',2,'[]','[]','profile:test','{{}}','{{}}','2026-09-19T00:01:00Z');
+                                 INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,binding_id,attempt_number,revision,state,input_artifacts_json,output_artifacts_json,created_at,updated_at)
+                                 VALUES ('attempt-arm-later','T-artifact','{program_hash}','{registry_id}','compose_report','binding-arm-later',2,1,'RUNNING','[]','[]','2026-09-19T00:01:00Z','2026-09-19T00:01:00Z');"
+                            ))?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }));
+            });
+            assert!(matches!(
+                manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ));
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT json_extract(external_receipt,'$.kind') FROM operations
+                         WHERE operation_id=?1",
+                        [format!("export-arm-{scenario}")],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "pre-destination-admission"
+            );
+        }
     }
 
     #[cfg(windows)]
