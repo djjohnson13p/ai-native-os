@@ -1503,17 +1503,20 @@ impl TaskManager {
             }
             Err(error) => return Err(error),
         };
+        import_commit_step()?;
         let created_at = self.clock.now();
         let artifact_id = artifact_id("import", &token);
         let uri = ArtifactUri::new(&artifact_id);
         let labels_json = serde_json::to_string(&request.labels)?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let import_actor = transaction
+        let committed = (|| -> Result<()> {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+            ensure_task_is_not_recovering(&transaction, &request.task_id)?;
+            let import_actor = transaction
             .query_row(
                 "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1 AND state NOT IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK','ROLLING_BACK')",
                 [&request.task_id],
@@ -1526,29 +1529,35 @@ impl TaskManager {
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-        upsert_durable_blob(&transaction, &content_hash, size, &storage_ref, &created_at)?;
-        transaction.execute(
+            upsert_durable_blob(&transaction, &content_hash, size, &storage_ref, &created_at)?;
+            transaction.execute(
             "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,format,size_bytes,content_hash,sensitivity,retention_class,expires_at,origin_kind,origin_task_id,integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'verified',?13,'artifact-store:sha256',?14,?13)",
             params![artifact_id, uri.as_str(), request.semantic_type, request.media_type, request.format, to_i64(size)?, content_hash, request.sensitivity.as_str(), request.retention.as_str(), request.expires_at, request.origin_kind.as_str(), request.task_id, created_at, labels_json],
         )?;
-        transaction.execute(
+            transaction.execute(
             "INSERT INTO task_artifacts(task_id,artifact_id,role,node_id,added_at) VALUES (?1,?2,'input',NULL,?3)",
             params![request.task_id, artifact_id, created_at],
         )?;
-        let event = json!({
-            "schema_version": SCHEMA_VERSION,
-            "event_id": event_id("artifact-imported", &artifact_id),
-            "task_id": request.task_id,
-            "event_type": "artifact.imported",
-            "timestamp": created_at,
-            "actor": import_actor,
-            "input_artifacts": [],
-            "output_artifacts": [artifact_id],
-            "status": "success",
-            "details": {"content_hash":content_hash,"size_bytes":size,"blob_reused":reused}
-        });
-        append_event(&transaction, &request.task_id, &event)?;
-        transaction.commit()?;
+            let event = json!({
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id("artifact-imported", &artifact_id),
+                "task_id": request.task_id,
+                "event_type": "artifact.imported",
+                "timestamp": created_at,
+                "actor": import_actor,
+                "input_artifacts": [],
+                "output_artifacts": [artifact_id],
+                "status": "success",
+                "details": {"content_hash":content_hash,"size_bytes":size,"blob_reused":reused}
+            });
+            append_event(&transaction, &request.task_id, &event)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if committed.is_err() && !reused {
+            self.remove_uncommitted_blob(&storage_ref)?;
+        }
+        committed?;
         self.get_artifact(&artifact_id)?
             .ok_or(TaskManagerError::InvalidRecord(
                 "imported Artifact disappeared",
@@ -1583,6 +1592,7 @@ impl TaskManager {
                 && existing.retention == request.retention
                 && existing.expires_at == request.expires_at;
             return if exact {
+                ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
                 Ok(existing)
             } else {
                 Err(TaskManagerError::InvalidRecord(
@@ -1604,12 +1614,14 @@ impl TaskManager {
         ensure_no_unknown_artifact_export(&self.connection, &request.task_id)?;
         let created_at = self.clock.now();
         let staging_ref = format!("staging/output-{}", random_token(&self.connection)?);
+        allocation_commit_step()?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         validate_requested_execution_scope(&transaction, request, &created_at)?;
         transaction.execute(
             "INSERT INTO artifact_output_allocations (allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,created_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ALLOCATED',?13,?14,?15,?14)",
@@ -1883,6 +1895,7 @@ impl TaskManager {
                 return Ok(publication_conflict(request, self.clock.now()));
             }
             if state == "COMMITTED" {
+                ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
                 return self.authenticate_committed_publication(
                     request,
                     result_json.as_deref(),
@@ -1890,6 +1903,7 @@ impl TaskManager {
                 );
             }
             if state == "FAILED" {
+                ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
                 return authenticate_failed_publication(request, result_json.as_deref());
             }
             if state != "PENDING" {
@@ -1985,12 +1999,20 @@ impl TaskManager {
         let resulted_at = self.clock.now();
         let artifact_id = artifact_id("publication", &request.publication_id);
         let artifact_uri = ArtifactUri::new(&artifact_id);
+        publication_commit_step()?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        if let Err(error) = ensure_task_is_not_recovering(&transaction, &request.task_id) {
+            drop(transaction);
+            if !blob_reused {
+                self.remove_uncommitted_blob(&storage_ref)?;
+            }
+            return Err(error);
+        }
         let pending_exact = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND request_json=?4 AND state='PENDING')",
             params![request.publication_id,request.allocation_id,request.task_id,request_json],
@@ -2568,6 +2590,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &scope.task_id)?;
         let unresolved_duplicate = unresolved_export_effect_exists(&transaction, &intent)?;
         if unresolved_duplicate {
             return Err(TaskManagerError::InvalidRecord(
@@ -2795,6 +2818,7 @@ impl TaskManager {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+            ensure_task_is_not_recovering(&transaction, &scope.task_id)?;
             let appended = append_event(&transaction, &scope.task_id, &event)?;
             let receipt = json!({
                 "version":1,
@@ -3355,6 +3379,7 @@ impl TaskManager {
         request: &ArtifactPublicationRequest,
         request_json: &str,
     ) -> Result<()> {
+        publication_reservation_step()?;
         let now = self.clock.now();
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
@@ -3362,6 +3387,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         let allocation = load_allocation_row(&transaction, &request.allocation_id)?.ok_or(
             TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
         )?;
@@ -3395,6 +3421,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         let pending_exact = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND request_json=?4 AND state='PENDING')",
             params![request.publication_id, request.allocation_id, request.task_id, request_json],
@@ -3427,6 +3454,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         let pending_exact = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND request_json=?4 AND state='PENDING')",
             params![request.publication_id,request.allocation_id,request.task_id,request_json],
@@ -3462,6 +3490,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
         transaction.execute(
             "UPDATE artifact_publications SET state='FAILED',result_json=?2,committed_at=?3 WHERE publication_id=?1 AND state='PENDING'",
             params![request.publication_id, serde_json::to_string(&result)?, now],
@@ -5458,6 +5487,24 @@ fn upsert_durable_blob(
 }
 
 impl TaskManager {
+    fn remove_uncommitted_blob(&self, storage_ref: &str) -> Result<()> {
+        match self
+            .artifact_store_dir
+            .remove_file(safe_internal_ref(storage_ref)?)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let parent = Path::new(storage_ref)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or(TaskManagerError::InvalidRecord(
+                "invalid Artifact blob reference",
+            ))?;
+        sync_cap_directory(&self.artifact_store_dir, parent)
+    }
+
     fn place_blob(
         &mut self,
         staging_ref: &str,
@@ -6645,6 +6692,14 @@ type ExportCompletionTestHook = Box<dyn FnOnce() -> Result<()>>;
 
 #[cfg(test)]
 thread_local! {
+    static IMPORT_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ALLOCATION_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static PUBLICATION_RESERVATION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static PUBLICATION_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_RESERVATION_RACE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -6660,6 +6715,46 @@ thread_local! {
 }
 
 #[cfg(test)]
+fn import_commit_step() -> Result<()> {
+    IMPORT_COMMIT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn allocation_commit_step() -> Result<()> {
+    ALLOCATION_COMMIT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn publication_reservation_step() -> Result<()> {
+    PUBLICATION_RESERVATION_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn publication_commit_step() -> Result<()> {
+    PUBLICATION_COMMIT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn export_reservation_race_step() -> Result<()> {
     EXPORT_RESERVATION_RACE_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -6667,6 +6762,42 @@ fn export_reservation_race_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test import race injection shares the production commit boundary"
+)]
+fn import_commit_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test allocation race injection shares the production commit boundary"
+)]
+fn allocation_commit_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test publication race injection shares the production reservation boundary"
+)]
+fn publication_reservation_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test publication race injection shares the production commit boundary"
+)]
+fn publication_commit_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8979,6 +9110,356 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn import_rechecks_recovery_after_streaming_and_removes_uncommitted_blob() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let database = temp.path().join("task-manager.sqlite");
+        IMPORT_COMMIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"raced import".as_slice()),
+            ),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        for query in [
+            "SELECT COUNT(*) FROM artifact_blobs",
+            "SELECT COUNT(*) FROM artifacts",
+            "SELECT COUNT(*) FROM task_artifacts",
+            "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.imported'",
+        ] {
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(query, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(manager.artifact_store_root.join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            physical_blob_refs(&manager.artifact_store_dir)
+                .unwrap()
+                .len(),
+            0
+        );
+
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"raced import".as_slice()),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn allocation_rechecks_recovery_inside_admission_transaction() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let database = temp.path().join("task-manager.sqlite");
+        let request = allocation("alloc-recovery-race");
+        ALLOCATION_COMMIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.allocate_artifact_output(&request),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert!(
+            manager
+                .get_artifact_output_allocation(&request.allocation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_type='artifact.created'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .allocate_artifact_output(&request)
+                .unwrap()
+                .allocation_id,
+            request.allocation_id
+        );
+    }
+
+    #[test]
+    fn publication_rechecks_recovery_before_reservation_and_preserves_staged_output() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let request = allocation("alloc-publication-recovery-race");
+        manager.allocate_artifact_output(&request).unwrap();
+        write_output(&mut manager, &request.allocation_id, b"publication race");
+        let publication = publication("pub-publication-recovery-race", &request.allocation_id);
+        let database = temp.path().join("task-manager.sqlite");
+        PUBLICATION_RESERVATION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        let denied = manager.publish_artifact_output(&publication).unwrap();
+        assert!(!denied.published);
+        assert_eq!(denied.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_publications WHERE publication_id=?1",
+                    [&publication.publication_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .get_artifact_output_allocation(&request.allocation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactAllocationState::Writing
+        );
+        assert_no_created_artifact_metadata(&manager);
+
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let committed = manager.publish_artifact_output(&publication).unwrap();
+        assert!(committed.published);
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.publish_artifact_output(&publication),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifacts WHERE artifact_id=?1",
+                    [committed.artifact_id.as_deref().unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn publication_rechecks_recovery_after_blob_placement_before_final_commit() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let request = allocation("alloc-publication-final-race");
+        manager.allocate_artifact_output(&request).unwrap();
+        write_output(
+            &mut manager,
+            &request.allocation_id,
+            b"final publication race",
+        );
+        let staging_ref = load_allocation_row(&manager.connection, &request.allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let publication = publication("pub-publication-final-race", &request.allocation_id);
+        let database = temp.path().join("task-manager.sqlite");
+        PUBLICATION_COMMIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.publish_artifact_output(&publication),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_no_created_artifact_metadata(&manager);
+        assert_eq!(
+            manager
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifact_blobs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            physical_blob_refs(&manager.artifact_store_dir).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(
+            resolve_internal_ref(&manager.artifact_store_root, &staging_ref)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            resolve_internal_ref(&manager.artifact_store_root, &seal_ref(&staging_ref))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || COALESCE(result_json,'') FROM artifact_publications WHERE publication_id=?1",
+                    [&publication.publication_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "PENDING:"
+        );
+        assert_eq!(
+            manager
+                .get_artifact_output_allocation(&request.allocation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactAllocationState::Finalizing
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .publish_artifact_output(&publication)
+                .unwrap()
+                .published
+        );
+    }
+
+    #[test]
+    fn export_success_commit_rechecks_recovery_after_destination_finalize() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"export recovery race".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-recovery-commit-race",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        EXPORT_COMPLETION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-recovery-commit-race'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [event_id("artifact-exported", "export-recovery-commit-race")],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
     }
 

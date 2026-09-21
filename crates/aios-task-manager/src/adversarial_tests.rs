@@ -4661,7 +4661,7 @@ fn locked_store_identity_rejects_path_retarget_before_connection_use() {
     let path = directory.path().join("identity.sqlite3");
     let original = directory.path().join("original.sqlite3");
     assert!(
-        open_locked_store(&path, Box::new(FixedClock), |locked_path| {
+        open_locked_store(&path, Box::new(FixedClock), Vec::new(), |locked_path| {
             std::fs::rename(locked_path, &original).unwrap();
             OpenOptions::new()
                 .create(true)
