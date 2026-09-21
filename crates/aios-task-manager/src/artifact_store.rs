@@ -1198,7 +1198,7 @@ fn windows_current_user_sid() -> Result<String> {
 #[cfg(windows)]
 fn create_windows_private_store_root(root: &Path) -> std::io::Result<()> {
     const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-    const SCRIPT: &str = r#"
+    const SCRIPT: &str = r"
 $ErrorActionPreference = 'Stop'
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $system = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
@@ -1217,7 +1217,7 @@ try {
   if ([System.IO.Directory]::Exists($env:AIOS_ARTIFACT_STORE_ROOT)) { exit 17 }
   throw
 }
-"#;
+";
     validate_trusted_windows_executable(Path::new(POWERSHELL)).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
     })?;
@@ -1596,6 +1596,7 @@ impl TaskManager {
         let labels_json = serde_json::to_string(&request.labels)?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
+        let mut commit_attempted = false;
         let committed = (|| -> Result<()> {
             let transaction = self
                 .connection
@@ -1637,11 +1638,13 @@ impl TaskManager {
                 "details": {"content_hash":content_hash,"size_bytes":size,"blob_reused":reused}
             });
             append_event(&transaction, &request.task_id, &event)?;
+            commit_attempted = true;
             transaction.commit()?;
+            import_commit_result_step()?;
             Ok(())
         })();
-        if committed.is_err() && !reused {
-            self.remove_uncommitted_blob(&storage_ref)?;
+        if committed.is_err() && !reused && !commit_attempted {
+            self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
         }
         committed?;
         self.get_artifact(&artifact_id)?
@@ -2193,7 +2196,7 @@ impl TaskManager {
             "input_artifacts":request.lineage.input_artifact_ids,
             "output_artifacts":[artifact_id],
             "status":"success",
-            "details":{"allocation_id":request.allocation_id,"publication_id":request.publication_id,"content_hash":content_hash,"size_bytes":size}
+            "details":{"allocation_id":request.allocation_id,"publication_id":request.publication_id,"content_hash":content_hash,"size_bytes":size,"blob_reused":blob_reused}
         });
         let appended = append_event(&transaction, &request.task_id, &event)?;
         let result = ArtifactPublicationResult {
@@ -2630,6 +2633,53 @@ impl TaskManager {
             grant_admission: None,
             consumed: false,
         })
+    }
+
+    /// Replays the durable result of an exact provider-bound export operation.
+    ///
+    /// This boundary performs no Artifact read, destination open, or grant admission. It is
+    /// therefore usable after response loss even when the original `artifact.read` and
+    /// `data.egress` grants were one-shot and have already been consumed.
+    pub fn replay_bound_artifact_export(
+        &self,
+        session: &ProviderArtifactSession,
+        operation_id: &str,
+    ) -> Result<u64> {
+        validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
+        if session.issuer_id != self.artifact_scope_issuer {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let intent_json = self
+            .connection
+            .query_row(
+                "SELECT details_json FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ))?;
+        let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
+        if intent.version != 1
+            || canonical_json(&intent)? != intent_json
+            || intent.task_id != session.task_id
+            || intent.principal_kind != "provider"
+            || intent.principal_id != session.authority.principal_id
+            || intent.semantic_program_hash.as_deref()
+                != Some(session.authority.semantic_program_hash.as_str())
+            || intent.node_id.as_deref() != Some(session.authority.node_id.as_str())
+            || intent.binding_id.as_deref() != Some(session.authority.binding_id.as_str())
+            || intent.attempt_id.as_deref() != Some(session.authority.attempt_id.as_str())
+            || intent.grant_id.is_none()
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        authenticate_export_operation(&self.connection, operation_id, &intent_json)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT"),
+        )?
     }
 
     /// Seals an owner-mediated export writer after owner authentication has already completed.
@@ -3706,19 +3756,109 @@ impl TaskManager {
         }
         let staged = {
             let mut statement = self.connection.prepare(
-                "SELECT allocation_id,staging_ref,state FROM artifact_output_allocations WHERE staging_ref IS NOT NULL ORDER BY allocation_id",
+                "SELECT a.allocation_id,a.staging_ref,a.state,a.expires_at,t.state,a.publication_id
+                 FROM artifact_output_allocations a
+                 JOIN tasks t ON t.task_id=a.task_id
+                 WHERE a.staging_ref IS NOT NULL
+                 ORDER BY a.allocation_id",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut removed_terminal_residue = false;
-        for (allocation_id, staging_ref, state) in &staged {
+        let mut staged = staged;
+        for (allocation_id, staging_ref, state, expires_at, task_state, publication_id) in
+            &mut staged
+        {
+            let expired = parse_time(expires_at)? <= parse_time(&reconciled_at)?;
+            let terminal_task = matches!(
+                task_state.as_str(),
+                "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
+            );
+            if matches!(state.as_str(), "WRITING" | "FINALIZING") && (expired || terminal_task) {
+                let target_state = if expired { "EXPIRED" } else { "ABORTED" };
+                let reason_code = if expired {
+                    "ARTIFACT_ALLOCATION_EXPIRED"
+                } else {
+                    "ARTIFACT_ALLOCATION_STATE_CONFLICT"
+                };
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+                if let Some(publication_id) = publication_id.as_deref() {
+                    let request_json = transaction
+                        .query_row(
+                            "SELECT request_json FROM artifact_publications
+                             WHERE publication_id=?1 AND allocation_id=?2 AND state='PENDING'",
+                            params![publication_id, allocation_id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .ok_or(TaskManagerError::InvalidRecord(
+                            "stored pending Artifact publication is invalid",
+                        ))?;
+                    let request: ArtifactPublicationRequest = serde_json::from_str(&request_json)?;
+                    validate_publication_request(&request)?;
+                    if canonical_json(&request)? != request_json
+                        || request.publication_id != publication_id
+                        || request.allocation_id != *allocation_id
+                    {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "stored pending Artifact publication is invalid",
+                        ));
+                    }
+                    let result = publication_failure(&request, reason_code, reconciled_at.clone());
+                    let publication_state = if expired { "FAILED" } else { "ABORTED" };
+                    let changed = transaction.execute(
+                        "UPDATE artifact_publications
+                         SET state=?2,result_json=?3,committed_at=?4
+                         WHERE publication_id=?1 AND state='PENDING'",
+                        params![
+                            publication_id,
+                            publication_state,
+                            canonical_json(&result)?,
+                            reconciled_at,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                        ));
+                    }
+                } else if state == "FINALIZING" {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "stored finalizing Artifact allocation has no publication",
+                    ));
+                }
+                let changed = transaction.execute(
+                    "UPDATE artifact_output_allocations
+                     SET state=?2,updated_at=?3
+                     WHERE allocation_id=?1 AND state=?4",
+                    params![
+                        allocation_id.as_str(),
+                        target_state,
+                        reconciled_at,
+                        state.as_str()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ));
+                }
+                transaction.commit()?;
+                target_state.clone_into(state);
+            }
             if matches!(state.as_str(), "WRITING" | "FINALIZING") {
                 reconcile_interrupted_staging_seal(
                     &self.artifact_store_dir,
@@ -3728,7 +3868,7 @@ impl TaskManager {
             }
             if matches!(
                 state.as_str(),
-                "ALLOCATED" | "FAILED" | "ABORTED" | "PUBLISHED"
+                "ALLOCATED" | "FAILED" | "ABORTED" | "EXPIRED" | "PUBLISHED"
             ) {
                 let seal = seal_ref(staging_ref);
                 for residue in [staging_ref.clone(), seal.clone(), format!("{seal}.pending")] {
@@ -3748,13 +3888,13 @@ impl TaskManager {
         }
         let staged_by_ref = staged
             .into_iter()
-            .filter(|(_, _, state)| {
+            .filter(|(_, _, state, _, _, _)| {
                 !matches!(
                     state.as_str(),
-                    "ALLOCATED" | "FAILED" | "ABORTED" | "PUBLISHED"
+                    "ALLOCATED" | "FAILED" | "ABORTED" | "EXPIRED" | "PUBLISHED"
                 )
             })
-            .map(|(allocation_id, staging_ref, _)| (staging_ref, allocation_id))
+            .map(|(allocation_id, staging_ref, _, _, _, _)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut removed_import_residue = false;
         for entry in self.artifact_store_dir.read_dir("staging")? {
@@ -4126,6 +4266,10 @@ impl TaskManager {
                     .pointer("/details/size_bytes")
                     .and_then(serde_json::Value::as_u64)
                     == Some(size)
+                && event
+                    .pointer("/details/blob_reused")
+                    .and_then(serde_json::Value::as_bool)
+                    == result.blob_reused
         });
         let lineage = {
             let mut statement = self.connection.prepare(
@@ -4164,6 +4308,7 @@ impl TaskManager {
             && result.task_id == request.task_id
             && result.published
             && result.reason_code == "ARTIFACT_PUBLICATION_APPLIED"
+            && result.message.is_none()
             && result.blob_reused.is_some()
             && row.0 == artifact_id("publication", &request.publication_id)
             && result.artifact_id.as_deref() == Some(row.0.as_str())
@@ -5949,6 +6094,27 @@ fn upsert_durable_blob(
 }
 
 impl TaskManager {
+    fn remove_uncommitted_blob_if_unreferenced(
+        &self,
+        content_hash: &str,
+        storage_ref: &str,
+    ) -> Result<()> {
+        let adopted = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM artifact_blobs WHERE content_hash=?1 AND storage_ref=?2
+                UNION ALL
+                SELECT 1 FROM artifacts WHERE content_hash=?1
+             )",
+            params![content_hash, storage_ref],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if adopted {
+            Ok(())
+        } else {
+            self.remove_uncommitted_blob(storage_ref)
+        }
+    }
+
     fn remove_uncommitted_blob(&self, storage_ref: &str) -> Result<()> {
         match self
             .artifact_store_dir
@@ -7552,6 +7718,8 @@ type ExportCompletionTestHook = Box<dyn FnOnce() -> Result<()>>;
 thread_local! {
     static IMPORT_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static IMPORT_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static ALLOCATION_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static PUBLICATION_RESERVATION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -7577,6 +7745,16 @@ thread_local! {
 #[cfg(test)]
 fn import_commit_step() -> Result<()> {
     IMPORT_COMMIT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn import_commit_result_step() -> Result<()> {
+    IMPORT_COMMIT_RESULT_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook()?;
         }
@@ -7640,6 +7818,15 @@ fn export_reservation_race_step() -> Result<()> {
     reason = "test import race injection shares the production commit boundary"
 )]
 fn import_commit_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test import response-loss injection shares the production commit result boundary"
+)]
+fn import_commit_result_step() -> Result<()> {
     Ok(())
 }
 
@@ -8920,8 +9107,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers initial one-shot admission, in-process replay, and restart replay in one protocol regression"
+    )]
     fn bound_export_exact_replay_reconstructs_after_one_shot_grant_consumption() {
         let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
         let mut manager = manager(&temp);
         let artifact = manager
             .import_artifact(
@@ -8997,6 +9189,47 @@ mod tests {
             22
         );
         assert_eq!(opened.load(Ordering::SeqCst), 0);
+
+        // The binding fixture installs execution state directly. Restore the provenance-backed
+        // Task view before reopening, then re-establish the fixture's execution view afterward.
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks
+                 SET state='CREATED',active_program_revision=NULL,active_step_ids_json='[]'
+                 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        drop(replay);
+        drop(first);
+        drop(scope);
+        drop(session);
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE tasks
+                 SET state='RUNNING',active_program_revision=1,
+                     active_step_ids_json='[\"compose_report\"]'
+                 WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let session = reopened
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        assert!(matches!(
+            reopened.scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id)),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            reopened
+                .replay_bound_artifact_export(&session, "export-consumed-replay")
+                .unwrap(),
+            22
+        );
     }
 
     #[test]
@@ -10200,6 +10433,192 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn late_import_commit_error_retains_the_adopted_blob_and_metadata() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        IMPORT_COMMIT_RESULT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected lost import commit response",
+                )))
+            }));
+        });
+
+        assert!(matches!(
+            manager.import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"durable despite response loss".as_slice()),
+            ),
+            Err(TaskManagerError::Io(_))
+        ));
+        let (artifact_id, storage_ref, content_hash) = manager
+            .connection
+            .query_row(
+                "SELECT a.artifact_id,b.storage_ref,a.content_hash
+                 FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hash_internal_file(&manager.artifact_store_dir, &storage_ref)
+                .unwrap()
+                .1,
+            content_hash
+        );
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened
+                .get_artifact(&artifact_id)
+                .unwrap()
+                .unwrap()
+                .content_hash
+                .tagged(),
+            content_hash
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers expired, already-terminal, and terminal-Task allocation cleanup as one startup matrix"
+    )]
+    fn startup_terminalizes_unfinishable_allocations_and_cleans_all_staging_evidence() {
+        let expired_temp = TempDir::new().unwrap();
+        let mut expired_manager = manager(&expired_temp);
+        for (allocation_id, already_expired) in [
+            ("alloc-expired-writing", false),
+            ("alloc-expired-row", true),
+        ] {
+            expired_manager
+                .allocate_artifact_output(&allocation(allocation_id))
+                .unwrap();
+            let mut writer = expired_manager.open_artifact_output(allocation_id).unwrap();
+            writer.write_all(b"sensitive residue").unwrap();
+            if already_expired {
+                writer.finish().unwrap();
+            } else {
+                drop(writer);
+            }
+            let staging_ref = expired_manager
+                .connection
+                .query_row(
+                    "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [allocation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let seal = seal_ref(&staging_ref);
+            expired_manager
+                .artifact_store_dir
+                .write(format!("{seal}.pending"), b"pending residue")
+                .unwrap();
+            expired_manager
+                .connection
+                .execute(
+                    "UPDATE artifact_output_allocations
+                     SET state=CASE WHEN ?2 THEN 'EXPIRED' ELSE state END,
+                         expires_at='2026-09-19T21:00:00Z'
+                     WHERE allocation_id=?1",
+                    params![allocation_id, already_expired],
+                )
+                .unwrap();
+        }
+        expired_manager.reconcile_artifacts_startup().unwrap();
+        for allocation_id in ["alloc-expired-writing", "alloc-expired-row"] {
+            let (state, staging_ref) = expired_manager
+                .connection
+                .query_row(
+                    "SELECT state,staging_ref FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [allocation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "EXPIRED");
+            let seal = seal_ref(&staging_ref);
+            for residue in [staging_ref, seal.clone(), format!("{seal}.pending")] {
+                assert!(!expired_manager.artifact_store_root.join(residue).exists());
+            }
+        }
+
+        let terminal_temp = TempDir::new().unwrap();
+        let mut terminal_manager = manager(&terminal_temp);
+        terminal_manager
+            .allocate_artifact_output(&allocation("alloc-terminal-finalizing"))
+            .unwrap();
+        write_output(
+            &mut terminal_manager,
+            "alloc-terminal-finalizing",
+            b"terminal residue",
+        );
+        let request = publication("pub-terminal-finalizing", "alloc-terminal-finalizing");
+        let request_json = canonical_json(&request).unwrap();
+        terminal_manager
+            .reserve_publication(&request, &request_json)
+            .unwrap();
+        terminal_manager
+            .begin_reserved_publication(&request, &request_json)
+            .unwrap();
+        let staging_ref = terminal_manager
+            .connection
+            .query_row(
+                "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id=?1",
+                [&request.allocation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let seal = seal_ref(&staging_ref);
+        terminal_manager
+            .artifact_store_dir
+            .write(format!("{seal}.pending"), b"pending residue")
+            .unwrap();
+        terminal_manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+
+        terminal_manager.reconcile_artifacts_startup().unwrap();
+        assert_eq!(
+            terminal_manager
+                .connection
+                .query_row(
+                    "SELECT state FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [&request.allocation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ABORTED"
+        );
+        assert_eq!(
+            terminal_manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || json_extract(result_json,'$.reason_code')
+                     FROM artifact_publications WHERE publication_id=?1",
+                    [&request.publication_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ABORTED:ARTIFACT_ALLOCATION_STATE_CONFLICT"
+        );
+        for residue in [staging_ref, seal.clone(), format!("{seal}.pending")] {
+            assert!(!terminal_manager.artifact_store_root.join(residue).exists());
+        }
     }
 
     #[test]
@@ -15494,6 +15913,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "authenticates the complete committed publication receipt and durable blob replay path"
+    )]
     fn committed_replay_authenticates_receipt_rows_and_blob_bytes() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -15514,6 +15937,35 @@ mod tests {
         let missing_reuse = manager.publish_artifact_output(&request).unwrap();
         assert!(!missing_reuse.published);
         assert_eq!(missing_reuse.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                params![
+                    request.publication_id,
+                    serde_json::to_string(&original).unwrap()
+                ],
+            )
+            .unwrap();
+        let mut forged_reuse = original.clone();
+        forged_reuse.blob_reused = original.blob_reused.map(|value| !value);
+        let mut forged_message = original.clone();
+        forged_message.message = Some("forged success detail".to_owned());
+        for forged in [forged_reuse, forged_message] {
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                    params![
+                        request.publication_id,
+                        serde_json::to_string(&forged).unwrap()
+                    ],
+                )
+                .unwrap();
+            let rejected = manager.publish_artifact_output(&request).unwrap();
+            assert!(!rejected.published);
+            assert_eq!(rejected.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        }
         manager
             .connection
             .execute(
