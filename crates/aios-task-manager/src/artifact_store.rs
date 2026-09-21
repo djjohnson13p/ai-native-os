@@ -7238,16 +7238,9 @@ fn replayable_reader_admission_for_grant(
 ) -> Result<Option<ReplayableReaderAdmission>> {
     let candidates = {
         let mut statement = connection.prepare(
-            "SELECT operation_id,details_json FROM operations
-             WHERE effect_class='ARTIFACT_READ'
-               AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-pending-delivery'
-               AND json_extract(details_json,'$.task_id')=?1
-               AND json_extract(details_json,'$.semantic_program_hash')=?2
-               AND json_extract(details_json,'$.node_id')=?3
-               AND json_extract(details_json,'$.binding_id')=?4
-               AND json_extract(details_json,'$.attempt_id')=?5
-               AND json_extract(details_json,'$.artifact_id')=?6
-               AND json_extract(details_json,'$.grant_id')=?7
+            "SELECT operation_id,details_json,external_receipt FROM operations
+             WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
+               AND binding_id=?4 AND attempt_id=?5 AND effect_class='ARTIFACT_READ'
              ORDER BY prepared_at,operation_id",
         )?;
         let rows = statement.query_map(
@@ -7257,38 +7250,48 @@ fn replayable_reader_admission_for_grant(
                 execution.node_id,
                 execution.binding_id,
                 execution.attempt_id,
-                artifact_id,
-                grant_id,
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     let mut replayable = None;
-    for (operation_id, details) in candidates {
+    for (operation_id, details, receipt) in candidates {
+        let details = details.ok_or(TaskManagerError::InvalidRecord(
+            "stored Artifact reader admission is invalid",
+        ))?;
         let stored: ArtifactReaderAdmission = serde_json::from_str(&details)?;
-        if stored.grant_id != grant_id {
-            return Err(TaskManagerError::InvalidRecord(
+        let receipt: ArtifactReaderAdmissionReceipt =
+            serde_json::from_str(receipt.as_deref().ok_or(TaskManagerError::InvalidRecord(
                 "stored Artifact reader admission is invalid",
-            ));
-        }
+            ))?)?;
         let admission = GrantAdmission {
-            grant_id: grant_id.to_owned(),
+            grant_id: stored.grant_id.clone(),
             one_shot_consumed: stored.one_shot_consumed,
         };
-        if !authenticate_reader_admission(
+        let authenticated = authenticate_reader_admission(
             connection,
             &operation_id,
             task_id,
             execution,
-            artifact_id,
+            &stored.artifact_id,
             &admission,
             checked_at,
-            true,
-        )? {
-            continue;
-        }
-        if replayable.is_none() && !delivered_in_process.contains(&operation_id) {
+            false,
+        )?;
+        if authenticated
+            && stored.artifact_id == artifact_id
+            && stored.grant_id == grant_id
+            && receipt.kind == "artifact-reader-admission-pending-delivery"
+            && replayable.is_none()
+            && !delivered_in_process.contains(&operation_id)
+        {
             replayable = Some(ReplayableReaderAdmission {
                 operation_id,
                 grant_admission: admission,
@@ -20755,38 +20758,64 @@ mod tests {
             .unwrap()
             .operation_id
             .clone();
-        manager
+        let exact_details = manager
             .connection
-            .execute(
-                "UPDATE operations SET node_id='forged-node' WHERE operation_id=?1",
+            .query_row(
+                "SELECT details_json FROM operations WHERE operation_id=?1",
                 [&second_operation],
+                |row| row.get::<_, String>(0),
             )
             .unwrap();
-        assert!(matches!(
-            manager.open_artifact_reader(&scope, &artifact.artifact_id),
-            Err(TaskManagerError::InvalidRecord(
-                "stored Artifact reader admission is invalid"
-            ))
-        ));
-        assert_eq!(
+        for (path, forged) in [
+            ("$.node_id", "forged-node"),
+            ("$.artifact_id", "artifact:forged"),
+            ("$.grant_id", "grant-forged"),
+        ] {
             manager
                 .connection
-                .query_row(
-                    "SELECT uses_consumed FROM authority_grants
-                     WHERE grant_id='grant-three-pending-readers-0'",
-                    [],
-                    |row| row.get::<_, i64>(0),
+                .execute(
+                    "UPDATE operations SET details_json=json_set(details_json,?2,?3)
+                     WHERE operation_id=?1",
+                    params![second_operation, path, forged],
                 )
-                .unwrap(),
-            2
-        );
-        manager
-            .connection
-            .execute(
-                "UPDATE operations SET node_id='compose_report' WHERE operation_id=?1",
-                [&second_operation],
-            )
-            .unwrap();
+                .unwrap();
+            assert!(matches!(
+                manager.open_artifact_reader(&scope, &artifact.artifact_id),
+                Err(TaskManagerError::InvalidRecord(
+                    "stored Artifact reader admission is invalid"
+                ))
+            ));
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT uses_consumed FROM authority_grants
+                         WHERE grant_id='grant-three-pending-readers-0'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM operations WHERE effect_class='ARTIFACT_READ'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+            manager
+                .connection
+                .execute(
+                    "UPDATE operations SET details_json=?2 WHERE operation_id=?1",
+                    params![second_operation, exact_details],
+                )
+                .unwrap();
+        }
         let mut third = manager
             .open_artifact_reader(&scope, &artifact.artifact_id)
             .unwrap();
