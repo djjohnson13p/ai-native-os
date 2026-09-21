@@ -269,6 +269,8 @@ CREATE TABLE IF NOT EXISTS artifact_output_allocations (
     writer_grant_one_shot_consumed INTEGER CHECK (
         writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1)
     ),
+    writer_session_id       TEXT,
+    writer_generation       INTEGER NOT NULL DEFAULT 0 CHECK (writer_generation >= 0),
     publication_id          TEXT,
     published_artifact_id   TEXT,
     staging_ref             TEXT,

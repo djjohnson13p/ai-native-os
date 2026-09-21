@@ -469,7 +469,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
 }
 
@@ -3201,7 +3201,7 @@ fn unknown_newer_migration_and_recovery_inventory_tamper_fail_closed() {
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch(
         "CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
-         INSERT INTO schema_migrations VALUES ('0009_future', 'future', '2026-09-19T00:00:00Z');",
+         INSERT INTO schema_migrations VALUES ('0010_future', 'future', '2026-09-19T00:00:00Z');",
     ).unwrap();
     drop(connection);
     assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
@@ -4931,6 +4931,51 @@ fn artifact_writer_admission_columns_are_added_by_the_ordered_migration() {
             )
             .unwrap(),
         "artifact-writer-admission-v0.1"
+    );
+}
+
+#[test]
+fn artifact_writer_session_fencing_columns_are_added_by_the_ordered_migration() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("writer-session-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE artifact_output_allocations DROP COLUMN writer_session_id;
+             ALTER TABLE artifact_output_allocations DROP COLUMN writer_generation;
+             DELETE FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_session_id"
+        )
+        .unwrap()
+    );
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_generation"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "artifact-writer-session-fencing-v0.1"
     );
 }
 

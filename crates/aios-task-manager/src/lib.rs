@@ -3108,7 +3108,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3156,6 +3156,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0008_artifact_export_reconciliation_challenge",
         "artifact-export-reconciliation-challenge-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0009_artifact_writer_session_fencing",
+        "artifact-writer-session-fencing-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3279,6 +3284,26 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         if has_v8 {
             require_migration_tables(connection, &["artifact_export_reconciliation_challenges"])?;
         }
+        let has_v9 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v9
+            && (!table_has_column(
+                connection,
+                "artifact_output_allocations",
+                "writer_session_id",
+            )? || !table_has_column(
+                connection,
+                "artifact_output_allocations",
+                "writer_generation",
+            )?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "artifact writer session fencing migration is incomplete",
+            ));
+        }
     }
     let has_steps = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'step_executions')",
@@ -3353,6 +3378,16 @@ fn migrate_task_manager_schema(
         connection,
         "0007_artifact_owner_export_context",
         "artifact-owner-export-context-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0008_artifact_export_reconciliation_challenge",
+        "artifact-export-reconciliation-challenge-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0009_artifact_writer_session_fencing",
+        "artifact-writer-session-fencing-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -3479,6 +3514,24 @@ fn migrate_task_manager_schema(
                 "ALTER TABLE artifact_output_allocations ADD COLUMN writer_grant_one_shot_consumed INTEGER CHECK (writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1));",
             )?;
         }
+        if !table_has_column(
+            connection,
+            "artifact_output_allocations",
+            "writer_session_id",
+        )? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_session_id TEXT;",
+            )?;
+        }
+        if !table_has_column(
+            connection,
+            "artifact_output_allocations",
+            "writer_generation",
+        )? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_generation INTEGER NOT NULL DEFAULT 0 CHECK (writer_generation >= 0);",
+            )?;
+        }
         if operations_require_rebuild {
             if challenge_table_exists {
                 connection.execute_batch(
@@ -3594,6 +3647,10 @@ fn migrate_task_manager_schema(
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0008_artifact_export_reconciliation_challenge', 'artifact-export-reconciliation-challenge-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0009_artifact_writer_session_fencing', 'artifact-writer-session-fencing-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
         let foreign_key_failures = connection.query_row(

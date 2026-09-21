@@ -144,6 +144,7 @@ impl ArtifactOriginKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentHash {
     pub algorithm: String,
     pub value: String,
@@ -191,6 +192,7 @@ impl ArtifactUri {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactOrigin {
     pub kind: ArtifactOriginKind,
     pub task_id: Option<String>,
@@ -216,6 +218,7 @@ impl ArtifactIntegrityState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactIntegrity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<ArtifactIntegrityState>,
@@ -224,6 +227,7 @@ pub struct ArtifactIntegrity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRetention {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<RetentionClass>,
@@ -231,6 +235,7 @@ pub struct ArtifactRetention {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactHandle {
     pub artifact_id: String,
     pub uri: ArtifactUri,
@@ -738,6 +743,8 @@ pub struct ArtifactStagingWriter {
     lease_epoch: i64,
     grant_admission: Option<GrantAdmission>,
     allocation_id: String,
+    writer_session_id: String,
+    writer_generation: i64,
     seal_ref: String,
     maximum: u64,
     written: u64,
@@ -763,19 +770,25 @@ impl ArtifactStagingWriter {
     }
 
     pub fn finish(mut self) -> Result<u64> {
+        let transaction = self
+            .authority_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_writer_fence(
-            &self.authority_connection,
+            &transaction,
             &self.allocation_id,
             &self.clock.now(),
             &self.lease_owner,
             self.lease_epoch,
             self.grant_admission.as_ref(),
+            &self.writer_session_id,
+            self.writer_generation,
         )?;
         let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
             "Artifact staging writer is already finalized",
         ))?;
         file.flush()?;
         file.sync_all()?;
+        transaction.commit()?;
         file.seek(SeekFrom::Start(0))?;
         let (size_bytes, content_hash) = hash_reader(&mut file)?;
         if size_bytes != self.written {
@@ -785,13 +798,18 @@ impl ArtifactStagingWriter {
         }
         drop(file);
         writer_finish_step()?;
+        let transaction = self
+            .authority_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_writer_fence(
-            &self.authority_connection,
+            &transaction,
             &self.allocation_id,
             &self.clock.now(),
             &self.lease_owner,
             self.lease_epoch,
             self.grant_admission.as_ref(),
+            &self.writer_session_id,
+            self.writer_generation,
         )?;
         let sealed = SealedStaging {
             version: SEALED_STAGING_VERSION,
@@ -801,19 +819,26 @@ impl ArtifactStagingWriter {
         };
         let bytes = serde_json::to_vec(&sealed)?;
         write_staging_seal_atomically(&self.store, &self.seal_ref, &bytes)?;
+        transaction.commit()?;
         Ok(self.written)
     }
 }
 
 impl Write for ArtifactStagingWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let transaction = self
+            .authority_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
         validate_writer_fence(
-            &self.authority_connection,
+            &transaction,
             &self.allocation_id,
             &self.clock.now(),
             &self.lease_owner,
             self.lease_epoch,
             self.grant_admission.as_ref(),
+            &self.writer_session_id,
+            self.writer_generation,
         )
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         let length = u64::try_from(buffer.len()).map_err(|_| {
@@ -830,27 +855,36 @@ impl Write for ArtifactStagingWriter {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
             .write(buffer)?;
-        self.written = self
+        let total = self
             .written
             .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
             .ok_or_else(|| std::io::Error::other("staging byte count overflow"))?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        self.written = total;
         Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let transaction = self
+            .authority_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
         validate_writer_fence(
-            &self.authority_connection,
+            &transaction,
             &self.allocation_id,
             &self.clock.now(),
             &self.lease_owner,
             self.lease_epoch,
             self.grant_admission.as_ref(),
+            &self.writer_session_id,
+            self.writer_generation,
         )
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         self.file
             .as_mut()
             .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
-            .flush()
+            .flush()?;
+        transaction.commit().map_err(std::io::Error::other)
     }
 }
 
@@ -1698,6 +1732,10 @@ impl TaskManager {
             ))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "authenticates every immutable imported Artifact field and its provenance in one replay boundary"
+    )]
     fn replay_keyed_import(
         &self,
         request: &ImportArtifactRequest,
@@ -1733,12 +1771,45 @@ impl TaskManager {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let exact = event_jsons.len() == 1
-            && serde_json::from_str::<serde_json::Value>(&event_jsons[0]).is_ok_and(|event| {
-                event
-                    .pointer("/details/request_digest")
-                    .and_then(serde_json::Value::as_str)
-                    == import_request_digest(request).ok().as_deref()
+        let event = event_jsons
+            .first()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+        let content_hash = artifact.content_hash.as_ref().map(ContentHash::tagged);
+        let created_at = artifact.created_at.as_deref();
+        let metadata_exact = artifact.artifact_id == artifact_id
+            && artifact.uri.as_str() == ArtifactUri::new(&artifact_id).as_str()
+            && artifact.semantic_type == request.semantic_type
+            && artifact.media_type == request.media_type
+            && artifact.format == request.format
+            && artifact.sensitivity == request.sensitivity
+            && artifact.retention.as_ref().is_some_and(|retention| {
+                retention.class.as_ref() == Some(&request.retention)
+                    && retention.expires_at == request.expires_at
+            })
+            && artifact.origin.kind == request.origin_kind
+            && artifact.origin.task_id.as_deref() == Some(request.task_id.as_str())
+            && artifact.origin.semantic_program_hash.is_none()
+            && artifact.origin.step_id.is_none()
+            && artifact.origin.execution_binding_id.is_none()
+            && artifact.origin.provider_id.is_none()
+            && artifact.labels == request.labels
+            && artifact.integrity.as_ref().is_some_and(|integrity| {
+                integrity.state == Some(ArtifactIntegrityState::Verified)
+                    && integrity.verified_at.as_deref() == created_at
+                    && integrity.verifier.as_deref() == Some("artifact-store:sha256")
+            });
+        let event_exact = event_jsons.len() == 1
+            && event.as_ref().is_some_and(|event| {
+                event.get("task_id").and_then(serde_json::Value::as_str)
+                    == Some(request.task_id.as_str())
+                    && event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("artifact.imported")
+                    && event.get("status").and_then(serde_json::Value::as_str) == Some("success")
+                    && event.get("timestamp").and_then(serde_json::Value::as_str) == created_at
+                    && event
+                        .pointer("/details/request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        == import_request_digest(request).ok().as_deref()
                     && event
                         .get("output_artifacts")
                         .and_then(serde_json::Value::as_array)
@@ -1748,22 +1819,28 @@ impl TaskManager {
                     && event
                         .pointer("/details/content_hash")
                         .and_then(serde_json::Value::as_str)
-                        == artifact
-                            .content_hash
-                            .as_ref()
-                            .map(ContentHash::tagged)
-                            .as_deref()
+                        == content_hash.as_deref()
                     && event
                         .pointer("/details/size_bytes")
                         .and_then(serde_json::Value::as_u64)
                         == artifact.size_bytes
-            })
-            && self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM task_artifacts
-                 WHERE task_id=?1 AND artifact_id=?2 AND role='input')",
-                params![request.task_id, artifact_id],
-                |row| row.get::<_, bool>(0),
-            )?
+            });
+        let attachment_exact = self.connection.query_row(
+            "SELECT COUNT(*)=1 FROM task_artifacts
+             WHERE task_id=?1 AND artifact_id=?2 AND role='input' AND node_id IS NULL",
+            params![request.task_id, artifact_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let blob_exact = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_blobs
+             WHERE content_hash=?1 AND size_bytes=?2 AND durability_state='DURABLE')",
+            params![content_hash, artifact.size_bytes.map(to_i64).transpose()?],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let exact = metadata_exact
+            && event_exact
+            && attachment_exact
+            && blob_exact
             && super::verify_provenance_through(&self.connection, &request.task_id, None)?;
         if !exact {
             return Err(TaskManagerError::InvalidRecord(
@@ -1881,14 +1958,45 @@ impl TaskManager {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        validate_writer_fence(
-            &self.connection,
+        let now = self.clock.now();
+        let writer_session_id = random_token(&self.connection)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let allocation = validate_writer_authority(
+            &transaction,
             allocation_id,
-            &self.clock.now(),
+            &now,
             &self.lease_owner,
             self.lease_epoch,
             allocation.writer_grant_admission.as_ref(),
         )?;
+        let writer_generation =
+            allocation
+                .writer_generation
+                .checked_add(1)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact writer generation exhausted",
+                ))?;
+        let changed = transaction.execute(
+            "UPDATE artifact_output_allocations
+             SET writer_session_id=?2,writer_generation=?3,updated_at=?4
+             WHERE allocation_id=?1 AND state='WRITING'
+               AND writer_generation=?5 AND writer_session_id IS ?6",
+            params![
+                allocation_id,
+                writer_session_id,
+                writer_generation,
+                now,
+                allocation.writer_generation,
+                allocation.writer_session_id
+            ],
+        )?;
+        if changed != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+            ));
+        }
         let staging_ref =
             allocation
                 .staging_ref
@@ -1906,12 +2014,14 @@ impl TaskManager {
         let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
         writer_finish_step()?;
         validate_writer_fence(
-            &self.connection,
+            &transaction,
             allocation_id,
-            &self.clock.now(),
+            &now,
             &self.lease_owner,
             self.lease_epoch,
             allocation.writer_grant_admission.as_ref(),
+            &writer_session_id,
+            writer_generation,
         )?;
         resolve_staging_seal_evidence(
             &self.artifact_store_dir,
@@ -1923,6 +2033,7 @@ impl TaskManager {
             &hash,
             true,
         )?;
+        transaction.commit()?;
         Ok(size)
     }
 
@@ -1946,6 +2057,7 @@ impl TaskManager {
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
         let now = self.clock.now();
+        let writer_session_id = random_token(&self.connection)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1962,7 +2074,7 @@ impl TaskManager {
             ));
         };
         if allocation.state == "WRITING" {
-            validate_writer_fence(
+            validate_writer_authority(
                 &transaction,
                 allocation_id,
                 &now,
@@ -1978,7 +2090,7 @@ impl TaskManager {
                     "ARTIFACT_ALLOCATION_STATE_CONFLICT",
                 ));
             }
-            let file = self.artifact_store_dir.open_with(
+            let mut file = self.artifact_store_dir.open_with(
                 safe_internal_ref(&staging_ref)?,
                 CapOpenOptions::new().read(true).write(true),
             )?;
@@ -1990,7 +2102,35 @@ impl TaskManager {
             if written > maximum {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
             }
-            drop(transaction);
+            let cursor = file.seek(SeekFrom::End(0))?;
+            if cursor != written || file.metadata()?.len() != written {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                ));
+            }
+            let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
+                TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
+            )?;
+            let changed = transaction.execute(
+                "UPDATE artifact_output_allocations
+                 SET writer_session_id=?2,writer_generation=?3,updated_at=?4
+                 WHERE allocation_id=?1 AND state='WRITING'
+                   AND writer_generation=?5 AND writer_session_id IS ?6",
+                params![
+                    allocation_id,
+                    writer_session_id,
+                    writer_generation,
+                    now,
+                    allocation.writer_generation,
+                    allocation.writer_session_id
+                ],
+            )?;
+            if changed != 1 {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                ));
+            }
+            transaction.commit()?;
             return Ok(ArtifactStagingWriter {
                 file: Some(file),
                 store: writer_store,
@@ -2000,6 +2140,8 @@ impl TaskManager {
                 lease_epoch,
                 grant_admission: allocation.writer_grant_admission,
                 allocation_id: allocation_id.to_owned(),
+                writer_session_id,
+                writer_generation,
                 seal_ref: seal,
                 maximum,
                 written,
@@ -2069,10 +2211,18 @@ impl TaskManager {
                 return Err(error);
             }
         };
-        transaction.execute(
+        let writer_generation =
+            allocation
+                .writer_generation
+                .checked_add(1)
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact writer generation exhausted",
+                ))?;
+        let changed = transaction.execute(
             "UPDATE artifact_output_allocations
-             SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,updated_at=?4
-             WHERE allocation_id=?1 AND state='ALLOCATED'",
+             SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,
+                 writer_session_id=?4,writer_generation=?5,updated_at=?6
+             WHERE allocation_id=?1 AND state='ALLOCATED' AND writer_generation=?7",
             params![
                 allocation_id,
                 grant_admission
@@ -2081,9 +2231,21 @@ impl TaskManager {
                 grant_admission
                     .as_ref()
                     .map(|admission| admission.one_shot_consumed),
-                now
+                writer_session_id,
+                writer_generation,
+                now,
+                allocation.writer_generation
             ],
         )?;
+        if changed != 1 {
+            drop(file);
+            let _ = self
+                .artifact_store_dir
+                .remove_file(safe_internal_ref(&staging_ref)?);
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+            ));
+        }
         let commit_result = transaction
             .commit()
             .map_err(TaskManagerError::from)
@@ -2094,6 +2256,8 @@ impl TaskManager {
                 durable.state == "WRITING"
                     && durable.staging_ref.as_deref() == Some(staging_ref.as_str())
                     && durable.writer_grant_admission == grant_admission
+                    && durable.writer_session_id.as_deref() == Some(writer_session_id.as_str())
+                    && durable.writer_generation == writer_generation
             });
             if !exact {
                 drop(file);
@@ -2112,6 +2276,8 @@ impl TaskManager {
             lease_epoch: self.lease_epoch,
             grant_admission,
             allocation_id: allocation_id.to_owned(),
+            writer_session_id,
+            writer_generation,
             seal_ref: seal_ref(&staging_ref),
             maximum: allocation
                 .max_size_bytes
@@ -4804,6 +4970,8 @@ struct AllocationRow {
     retention: String,
     state: String,
     writer_grant_admission: Option<GrantAdmission>,
+    writer_session_id: Option<String>,
+    writer_generation: i64,
     staging_ref: Option<String>,
     expires_at: String,
 }
@@ -4812,8 +4980,13 @@ fn load_allocation_row(
     connection: &Connection,
     allocation_id: &str,
 ) -> Result<Option<AllocationRow>> {
-    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,writer_grant_id,writer_grant_one_shot_consumed,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,Option<String>>(11)?,row.get::<_,Option<bool>>(12)?,row.get::<_,Option<String>>(13)?,row.get::<_,String>(14)?))).optional()?;
+    let row=connection.query_row("SELECT task_id,semantic_program_hash,node_id,binding_id,attempt_id,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,writer_grant_id,writer_grant_one_shot_consumed,writer_session_id,writer_generation,staging_ref,expires_at FROM artifact_output_allocations WHERE allocation_id=?1",[allocation_id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,Option<String>>(11)?,row.get::<_,Option<bool>>(12)?,row.get::<_,Option<String>>(13)?,row.get::<_,i64>(14)?,row.get::<_,Option<String>>(15)?,row.get::<_,String>(16)?))).optional()?;
     row.map(|row| {
+        if row.14 < 0 {
+            return Err(TaskManagerError::InvalidRecord(
+                "invalid Artifact writer generation",
+            ));
+        }
         Ok(AllocationRow {
             task_id: row.0,
             semantic_program_hash: row.1,
@@ -4847,8 +5020,10 @@ fn load_allocation_row(
                     return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
                 }
             },
-            staging_ref: row.13,
-            expires_at: row.14,
+            writer_session_id: row.13,
+            writer_generation: row.14,
+            staging_ref: row.15,
+            expires_at: row.16,
         })
     })
     .transpose()
@@ -4925,6 +5100,10 @@ fn validate_allocation_execution_scope(
     validate_requested_execution_scope(connection, &request, now)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the writer fence binds manager lease, grant admission, and durable writer generation as one authority tuple"
+)]
 fn validate_writer_fence(
     connection: &Connection,
     allocation_id: &str,
@@ -4932,7 +5111,33 @@ fn validate_writer_fence(
     lease_owner: &str,
     lease_epoch: i64,
     grant_admission: Option<&GrantAdmission>,
+    writer_session_id: &str,
+    writer_generation: i64,
 ) -> Result<()> {
+    let allocation = validate_writer_authority(
+        connection,
+        allocation_id,
+        now,
+        lease_owner,
+        lease_epoch,
+        grant_admission,
+    )?;
+    if allocation.writer_session_id.as_deref() != Some(writer_session_id)
+        || allocation.writer_generation != writer_generation
+    {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    Ok(())
+}
+
+fn validate_writer_authority(
+    connection: &Connection,
+    allocation_id: &str,
+    now: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+    grant_admission: Option<&GrantAdmission>,
+) -> Result<AllocationRow> {
     let owns_fence = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id=1 AND owner_id=?1 AND fence_epoch=?2)",
         params![lease_owner, lease_epoch],
@@ -4970,12 +5175,13 @@ fn validate_writer_fence(
         if !valid {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        Ok(())
+        Ok(allocation)
     } else {
         if allocation.writer_grant_admission.is_some() || grant_admission.is_some() {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        validate_allocation_execution_scope(connection, allocation_id, &allocation, now)
+        validate_allocation_execution_scope(connection, allocation_id, &allocation, now)?;
+        Ok(allocation)
     }
 }
 
@@ -16567,6 +16773,66 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_owned(), json!(true));
         assert!(serde_json::from_value::<ArtifactPublicationResult>(result).is_err());
+
+        let handle = json!({
+            "artifact_id":"artifact:closed",
+            "uri":"artifact://artifact:closed",
+            "semantic_type":"text.plain@1",
+            "media_type":"text/plain",
+            "format":"txt",
+            "size_bytes":1,
+            "content_hash":{"algorithm":"sha256","value":"a"},
+            "origin":{"kind":"user","task_id":"T-artifact"},
+            "sensitivity":"local",
+            "retention":{"class":"task","expires_at":null},
+            "integrity":{"state":"verified","verified_at":null,"verifier":null},
+            "labels":[],
+            "created_at":null
+        });
+        for path in ["", "/content_hash", "/origin", "/retention", "/integrity"] {
+            let mut forged = handle.clone();
+            forged
+                .pointer_mut(path)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .insert("unexpected".to_owned(), json!(true));
+            assert!(serde_json::from_value::<ArtifactHandle>(forged).is_err());
+        }
+    }
+
+    #[test]
+    fn writer_reopen_fences_the_prior_generation_and_appends_at_authenticated_eof() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-writer-generation";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+
+        let mut first = manager.open_artifact_output(allocation_id).unwrap();
+        first.write_all(b"AAA").unwrap();
+        let mut resumed = manager.open_artifact_output(allocation_id).unwrap();
+        assert_eq!(resumed.bytes_written(), 3);
+        assert!(first.write_all(b"stale").is_err());
+        assert!(first.finish().is_err());
+
+        resumed.write_all(b"BBB").unwrap();
+        assert_eq!(resumed.finish().unwrap(), 6);
+        let staging_ref = load_allocation_row(&manager.connection, allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        assert_eq!(
+            std::fs::read(manager.artifact_store_root.join(&staging_ref)).unwrap(),
+            b"AAABBB"
+        );
+        assert!(matches!(
+            manager.open_artifact_output(allocation_id),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_ALLOCATION_STATE_CONFLICT"
+            ))
+        ));
     }
 
     #[test]
@@ -16881,6 +17147,83 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn keyed_import_replay_authenticates_every_immutable_artifact_field() {
+        struct PanicReader;
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a keyed import replay must not read its source")
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let mut request = import_request();
+        request.import_id = Some("import:metadata-authentication".to_owned());
+        request.semantic_type = Some("text.plain@1".to_owned());
+        request.format = Some("txt".to_owned());
+        request.labels = vec!["canonical".to_owned()];
+        let artifact = manager
+            .import_artifact(&request, &mut Cursor::new(b"immutable metadata".as_slice()))
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER published_artifacts_no_content_update;
+                 PRAGMA foreign_keys=OFF;",
+            )
+            .unwrap();
+
+        let forged_hash = format!("sha256:{}", "a".repeat(64));
+        let mutations = [
+            "UPDATE artifacts SET uri='artifact://forged' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET semantic_type='text.forged@1' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET media_type='application/forged' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET format='forged' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET size_bytes=size_bytes+1 WHERE artifact_id=?1".to_owned(),
+            format!(
+                "UPDATE artifacts SET content_hash='{forged_hash}' WHERE artifact_id=?1"
+            ),
+            "UPDATE artifacts SET sensitivity='secret' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET retention_class='persistent' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET expires_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
+                .to_owned(),
+            "UPDATE artifacts SET origin_kind='system' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET origin_task_id='T-forged' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET origin_program_hash='sha256:aaaa' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET origin_node_id='forged-node' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET origin_binding_id='forged-binding' WHERE artifact_id=?1"
+                .to_owned(),
+            "UPDATE artifacts SET origin_provider_id='forged-provider' WHERE artifact_id=?1"
+                .to_owned(),
+            "UPDATE artifacts SET integrity_state='pending' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET integrity_verified_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
+                .to_owned(),
+            "UPDATE artifacts SET integrity_verifier='forged' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET labels_json='[\"forged\"]' WHERE artifact_id=?1".to_owned(),
+            "UPDATE artifacts SET created_at='2027-01-01T00:00:00Z' WHERE artifact_id=?1"
+                .to_owned(),
+        ];
+        for mutation in mutations {
+            manager
+                .connection
+                .execute_batch("SAVEPOINT metadata_tamper")
+                .unwrap();
+            manager
+                .connection
+                .execute(&mutation, [&artifact.artifact_id])
+                .unwrap();
+            assert!(matches!(
+                manager.import_artifact(&request, &mut PanicReader),
+                Err(TaskManagerError::InvalidRecord(_))
+            ));
+            manager
+                .connection
+                .execute_batch("ROLLBACK TO metadata_tamper; RELEASE metadata_tamper")
+                .unwrap();
+        }
     }
 
     #[test]
