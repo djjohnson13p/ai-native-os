@@ -1321,6 +1321,7 @@ impl TaskManager {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut results = Vec::with_capacity(candidates.len());
+        let mut newly_recovered = std::collections::BTreeSet::new();
         for (task_id, revision, state) in candidates {
             let revision = u64::try_from(revision)
                 .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
@@ -1383,6 +1384,7 @@ impl TaskManager {
                     "startup recovery transition was not applied",
                 ));
             }
+            newly_recovered.insert(result.task_id.clone());
             results.push(result);
         }
         // Terminal state is immutable, but new consequential evidence may be
@@ -1401,6 +1403,40 @@ impl TaskManager {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for (task_id, revision) in terminal_tasks {
+            let revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let inventory = unresolved_execution_ids(&self.connection, &task_id)?;
+            if inventory.is_empty() {
+                continue;
+            }
+            let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
+            self.persist_recovery_inventory(
+                &recovery_ref,
+                &task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+            )?;
+        }
+        // Artifact reconciliation runs before this scan and can discover a
+        // consequential subject after a Task has already entered RECOVERING.
+        // Persist a fresh immutable inventory for that exact current set. Do
+        // not rewrite the Task's transition-backed recovery pointer: the new
+        // subject is reconciled through this assessment while the original
+        // transition provenance remains immutable.
+        let recovering_tasks = {
+            let mut statement = self.connection.prepare(
+                "SELECT task_id,revision FROM tasks WHERE state='RECOVERING' ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (task_id, revision) in recovering_tasks {
+            if newly_recovered.contains(&task_id) {
+                continue;
+            }
             let revision = u64::try_from(revision)
                 .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
             let inventory = unresolved_execution_ids(&self.connection, &task_id)?;
@@ -3322,9 +3358,23 @@ fn migrate_task_manager_schema(
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
     };
+    let has_owner_export_context = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let operations_require_rebuild = !has_owner_export_context
+        && (table_column_not_null(connection, "operations", "semantic_program_hash")?
+            || table_column_not_null(connection, "operations", "node_id")?);
+    let challenge_table_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_export_reconciliation_challenges')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let foreign_key_rebuild = transition_has_foreign_key || operations_require_rebuild;
     let foreign_keys_enabled =
         connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))?;
-    if transition_has_foreign_key {
+    if foreign_key_rebuild {
         connection.execute_batch("PRAGMA foreign_keys = OFF")?;
     }
     connection.execute_batch("BEGIN IMMEDIATE")?;
@@ -3429,15 +3479,13 @@ fn migrate_task_manager_schema(
                 "ALTER TABLE artifact_output_allocations ADD COLUMN writer_grant_one_shot_consumed INTEGER CHECK (writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1));",
             )?;
         }
-        let has_owner_export_context = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !has_owner_export_context
-            && (table_column_not_null(connection, "operations", "semantic_program_hash")?
-                || table_column_not_null(connection, "operations", "node_id")?)
-        {
+        if operations_require_rebuild {
+            if challenge_table_exists {
+                connection.execute_batch(
+                    "ALTER TABLE artifact_export_reconciliation_challenges
+                     RENAME TO artifact_export_reconciliation_challenges_legacy;",
+                )?;
+            }
             connection.execute_batch(
                 "DROP INDEX IF EXISTS ix_operations_task_state;
                  ALTER TABLE operations RENAME TO operations_legacy;
@@ -3471,6 +3519,23 @@ fn migrate_task_manager_schema(
                  DROP TABLE operations_legacy;
                  CREATE INDEX ix_operations_task_state ON operations(task_id,state);",
             )?;
+            if challenge_table_exists {
+                connection.execute_batch(
+                    "CREATE TABLE artifact_export_reconciliation_challenges (
+                         operation_id TEXT PRIMARY KEY,
+                         recovery_assessment_id TEXT NOT NULL,
+                         subject_hash TEXT NOT NULL,
+                         challenge TEXT NOT NULL UNIQUE,
+                         issued_at TEXT NOT NULL,
+                         FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+                         FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+                     );
+                     INSERT INTO artifact_export_reconciliation_challenges
+                     SELECT operation_id,recovery_assessment_id,subject_hash,challenge,issued_at
+                     FROM artifact_export_reconciliation_challenges_legacy;
+                     DROP TABLE artifact_export_reconciliation_challenges_legacy;",
+                )?;
+            }
         }
         let duplicate_publications = connection.query_row(
             "SELECT COUNT(*) FROM (SELECT allocation_id FROM artifact_publications GROUP BY allocation_id HAVING COUNT(*) > 1)",
@@ -3531,13 +3596,23 @@ fn migrate_task_manager_schema(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0008_artifact_export_reconciliation_challenge', 'artifact-export-reconciliation-challenge-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
+        let foreign_key_failures = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if foreign_key_failures != 0 {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration produced invalid foreign-key references",
+            ));
+        }
         Ok(())
     })();
     let result = match migration {
         Ok(()) => connection.execute_batch("COMMIT"),
         Err(error) => {
             connection.execute_batch("ROLLBACK")?;
-            return if transition_has_foreign_key && foreign_keys_enabled {
+            return if foreign_key_rebuild && foreign_keys_enabled {
                 connection.execute_batch("PRAGMA foreign_keys = ON")?;
                 Err(error)
             } else {
@@ -3545,7 +3620,7 @@ fn migrate_task_manager_schema(
             };
         }
     };
-    if transition_has_foreign_key && foreign_keys_enabled {
+    if foreign_key_rebuild && foreign_keys_enabled {
         connection.execute_batch("PRAGMA foreign_keys = ON")?;
     }
     result.map_err(Into::into)

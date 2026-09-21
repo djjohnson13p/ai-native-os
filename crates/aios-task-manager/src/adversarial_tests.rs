@@ -4971,6 +4971,74 @@ fn export_reconciliation_challenge_migration_is_ordered_and_fail_closed() {
         .unwrap();
     drop(connection);
     assert!(TaskManager::open_with_clock(&stamped, Box::new(FixedClock)).is_err());
+
+    let base_upgrade = directory.path().join("challenge-base-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&base_upgrade, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&base_upgrade).unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TABLE artifact_export_reconciliation_challenges;
+         DROP TABLE operations;
+         CREATE TABLE operations (
+             operation_id TEXT PRIMARY KEY,
+             task_id TEXT NOT NULL,
+             semantic_program_hash TEXT NOT NULL,
+             node_id TEXT NOT NULL,
+             binding_id TEXT,
+             attempt_id TEXT,
+             transaction_class TEXT,
+             effect_class TEXT NOT NULL,
+             idempotency_key TEXT,
+             state TEXT NOT NULL,
+             outcome_certainty TEXT,
+             external_receipt TEXT,
+             details_json TEXT,
+             prepared_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT
+         );
+         CREATE TABLE artifact_export_reconciliation_challenges (
+             operation_id TEXT PRIMARY KEY,
+             recovery_assessment_id TEXT NOT NULL,
+             subject_hash TEXT NOT NULL,
+             challenge TEXT NOT NULL UNIQUE,
+             issued_at TEXT NOT NULL,
+             FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+             FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+         );
+         DELETE FROM schema_migrations
+          WHERE migration_id IN ('0007_artifact_owner_export_context','0008_artifact_export_reconciliation_challenge');",
+    ).unwrap();
+    drop(connection);
+
+    let upgraded = TaskManager::open_with_clock(&base_upgrade, Box::new(FixedClock)).unwrap();
+    let foreign_targets = {
+        let mut statement = upgraded
+            .connection
+            .prepare("PRAGMA foreign_key_list(artifact_export_reconciliation_challenges)")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap();
+        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+    };
+    assert!(foreign_targets.iter().any(|target| target == "operations"));
+    assert!(
+        !foreign_targets
+            .iter()
+            .any(|target| target == "operations_legacy")
+    );
+    assert_eq!(
+        upgraded
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
