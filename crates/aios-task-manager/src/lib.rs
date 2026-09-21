@@ -1439,8 +1439,9 @@ impl TaskManager {
         }
         // Artifact reconciliation runs before this scan and can discover a
         // consequential subject after a Task has already entered RECOVERING.
-        // Persist a fresh immutable inventory and advance the transition-backed
-        // active pointer so supported reconciliation APIs can discover it.
+        // Persist a fresh immutable monotonic inventory for the current recovery
+        // episode. The Task's recovery-entry transition remains the lifecycle
+        // authority; active_recovery_inventory resolves later supersets.
         let recovering_tasks = {
             let mut statement = self.connection.prepare(
                 "SELECT task_id,revision,json_extract(recovery_json,'$.unknown_operations_ref')
@@ -1455,70 +1456,37 @@ impl TaskManager {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for (task_id, revision, active_recovery_ref) in recovering_tasks {
+        for (task_id, revision, _active_recovery_ref) in recovering_tasks {
             if newly_recovered.contains(&task_id) {
                 continue;
             }
             let revision = u64::try_from(revision)
                 .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
-            let inventory = unresolved_execution_ids(&self.connection, &task_id)?;
-            if inventory.is_empty() {
+            let current = unresolved_execution_ids(&self.connection, &task_id)?;
+            if current.is_empty() {
                 continue;
             }
-            if let Some(active_recovery_ref) = active_recovery_ref.as_deref() {
-                if self
-                    .recovery_unknown_operation_ids(active_recovery_ref)?
-                    .as_deref()
-                    == Some(inventory.as_slice())
-                {
-                    continue;
-                }
+            let Some(active) = active_recovery_inventory(&self.connection, &task_id)? else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "active recovery inventory does not exist",
+                ));
+            };
+            let mut inventory = active.operation_ids.clone();
+            inventory.extend(current);
+            inventory.sort();
+            inventory.dedup();
+            if inventory == active.operation_ids {
+                continue;
             }
             let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
-            self.persist_recovery_inventory(
+            self.persist_recovery_inventory_in_existing_episode(
                 &recovery_ref,
                 &task_id,
                 revision,
                 &inventory,
                 &self.clock.now(),
+                &active.recovery_ref,
             )?;
-            let result = self.transition_impl(
-                &TransitionRequest {
-                    schema_version: SCHEMA_VERSION.to_owned(),
-                    transition_id: startup_recovery_transition_id(&task_id, revision),
-                    task_id,
-                    expected_revision: revision,
-                    expected_state: TaskState::Recovering,
-                    to_state: TaskState::Recovering,
-                    requested_by: Actor {
-                        kind: "system-service".to_owned(),
-                        id: "service:recovery".to_owned(),
-                    },
-                    reason: TransitionReason {
-                        code: "TASK_RECOVERY_REQUIRED".to_owned(),
-                        message: Some(
-                            "startup refreshed the active uncertain-operation inventory".to_owned(),
-                        ),
-                        related_ids: vec![recovery_ref.clone()],
-                    },
-                    mutation: TaskMutation {
-                        recovery: Some(RecoveryMutation {
-                            unknown_operation_ids: Vec::new(),
-                            unknown_operations_ref: Some(recovery_ref),
-                            last_known_daemon_instance: None,
-                        }),
-                        ..TaskMutation::default()
-                    },
-                },
-                false,
-                true,
-            )?;
-            if !result.applied {
-                return Err(TaskManagerError::InvalidRecord(
-                    "startup recovery inventory refresh was not applied",
-                ));
-            }
-            results.push(result);
         }
         Ok(results)
     }
@@ -1546,7 +1514,7 @@ impl TaskManager {
     }
 
     pub(crate) fn persist_recovery_inventory_for_task(&mut self, task_id: &str) -> Result<String> {
-        let (revision, state, active_recovery_ref) = self
+        let (revision, state, _active_recovery_ref) = self
             .connection
             .query_row(
                 "SELECT revision,state,json_extract(recovery_json,'$.unknown_operations_ref')
@@ -1566,68 +1534,44 @@ impl TaskManager {
             ))?;
         let revision = u64::try_from(revision)
             .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
-        let inventory = unresolved_execution_ids(&self.connection, task_id)?;
-        if inventory.is_empty() {
+        let current = unresolved_execution_ids(&self.connection, task_id)?;
+        if current.is_empty() {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery inventory requires consequential evidence",
             ));
         }
+        let mut inventory = current;
+        let mut episode_ref = None;
         if state == "RECOVERING" {
-            if let Some(active_recovery_ref) = active_recovery_ref.as_deref() {
-                if self
-                    .recovery_unknown_operation_ids(active_recovery_ref)?
-                    .as_deref()
-                    == Some(inventory.as_slice())
-                {
-                    return Ok(active_recovery_ref.to_owned());
-                }
+            let active = active_recovery_inventory(&self.connection, task_id)?.ok_or(
+                TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+            )?;
+            inventory.extend(active.operation_ids.iter().cloned());
+            inventory.sort();
+            inventory.dedup();
+            if inventory == active.operation_ids {
+                return Ok(active.recovery_ref);
             }
+            episode_ref = Some(active.recovery_ref);
         }
         let recovery_ref = recovery_operations_ref(task_id, revision, &inventory)?;
-        self.persist_recovery_inventory(
-            &recovery_ref,
-            task_id,
-            revision,
-            &inventory,
-            &self.clock.now(),
-        )?;
-        if state == "RECOVERING" {
-            let result = self.transition_impl(
-                &TransitionRequest {
-                    schema_version: SCHEMA_VERSION.to_owned(),
-                    transition_id: startup_recovery_transition_id(task_id, revision),
-                    task_id: task_id.to_owned(),
-                    expected_revision: revision,
-                    expected_state: TaskState::Recovering,
-                    to_state: TaskState::Recovering,
-                    requested_by: Actor {
-                        kind: "system-service".to_owned(),
-                        id: "service:recovery".to_owned(),
-                    },
-                    reason: TransitionReason {
-                        code: "TASK_RECOVERY_REQUIRED".to_owned(),
-                        message: Some(
-                            "refreshed the active uncertain-operation inventory".to_owned(),
-                        ),
-                        related_ids: vec![recovery_ref.clone()],
-                    },
-                    mutation: TaskMutation {
-                        recovery: Some(RecoveryMutation {
-                            unknown_operation_ids: Vec::new(),
-                            unknown_operations_ref: Some(recovery_ref.clone()),
-                            last_known_daemon_instance: None,
-                        }),
-                        ..TaskMutation::default()
-                    },
-                },
-                false,
-                true,
+        if let Some(episode_ref) = episode_ref {
+            self.persist_recovery_inventory_in_existing_episode(
+                &recovery_ref,
+                task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+                &episode_ref,
             )?;
-            if !result.applied {
-                return Err(TaskManagerError::InvalidRecord(
-                    "recovery inventory refresh was not applied",
-                ));
-            }
+        } else {
+            self.persist_recovery_inventory(
+                &recovery_ref,
+                task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+            )?;
         }
         Ok(recovery_ref)
     }
@@ -1720,29 +1664,13 @@ impl TaskManager {
         &self,
         recovery_ref: &str,
     ) -> Result<Option<Vec<String>>> {
-        let basis = self
-            .connection
-            .query_row(
-                "SELECT task_id, basis_revision FROM recovery_assessments WHERE assessment_id = ?1 AND subject_kind = 'task'",
-                [recovery_ref],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            ).optional()?;
-        let Some((task_id, basis_revision)) = basis else {
-            return Ok(None);
-        };
-        let operations = query_strings(
-            &self.connection,
-            "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
-            recovery_ref,
-        )?;
-        let basis_revision = u64::try_from(basis_revision)
-            .map_err(|_| TaskManagerError::InvalidRecord("recovery basis revision is invalid"))?;
-        if recovery_operations_ref(&task_id, basis_revision, &operations)? != recovery_ref {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery inventory digest does not match its durable contents",
-            ));
-        }
-        Ok(Some(operations))
+        Ok(exact_recovery_inventory(&self.connection, recovery_ref)?
+            .map(|inventory| inventory.operation_ids))
+    }
+
+    pub(crate) fn active_recovery_inventory_ref(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(active_recovery_inventory(&self.connection, task_id)?
+            .map(|inventory| inventory.recovery_ref))
     }
 
     /// Records a trusted recovery observation for one historically inventoried
@@ -1763,9 +1691,21 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        let requested = exact_recovery_inventory(&transaction, recovery_ref)?.ok_or(
+            TaskManagerError::InvalidRecord("recovery inventory does not exist"),
+        )?;
+        let recovery_ref = active_recovery_inventory(&transaction, &requested.task_id)?
+            .filter(|active| {
+                active.recovery_epoch_id == requested.recovery_epoch_id
+                    && requested
+                        .operation_ids
+                        .iter()
+                        .all(|id| active.operation_ids.contains(id))
+            })
+            .map_or_else(|| recovery_ref.to_owned(), |active| active.recovery_ref);
         reconcile_recovery_subject_in_transaction(
             &transaction,
-            recovery_ref,
+            &recovery_ref,
             inventory_id,
             &observed_at,
         )?;
@@ -1803,6 +1743,41 @@ impl TaskManager {
             basis_revision,
             operation_ids,
             created_at,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn persist_recovery_inventory_in_existing_episode(
+        &mut self,
+        recovery_ref: &str,
+        task_id: &str,
+        basis_revision: u64,
+        operation_ids: &[String],
+        created_at: &str,
+        episode_root_ref: &str,
+    ) -> Result<()> {
+        let epoch_id = self.connection.query_row(
+            "SELECT recovery_epoch_id FROM recovery_assessments
+             WHERE assessment_id=?1 AND task_id=?2 AND subject_kind='task'",
+            params![episode_root_ref, task_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        Self::persist_recovery_inventory_in_transaction(
+            &transaction,
+            recovery_ref,
+            task_id,
+            basis_revision,
+            operation_ids,
+            created_at,
+            Some(&epoch_id),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1819,13 +1794,15 @@ impl TaskManager {
         basis_revision: u64,
         operation_ids: &[String],
         created_at: &str,
+        episode_epoch_id: Option<&str>,
     ) -> Result<()> {
         if recovery_operations_ref(task_id, basis_revision, operation_ids)? != recovery_ref {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery reference does not authenticate its basis and inventory",
             ));
         }
-        let epoch_id = format!("epoch:{recovery_ref}");
+        let default_epoch_id = format!("epoch:{recovery_ref}");
+        let epoch_id = episode_epoch_id.unwrap_or(&default_epoch_id);
         // An empty inventory is absence of evidence, not affirmative proof that
         // execution never started. The aggregate therefore remains conservative;
         // per-subject assessments below may record NOT_STARTED only from an
@@ -1842,16 +1819,44 @@ impl TaskManager {
             "INSERT OR IGNORE INTO recovery_epochs (recovery_epoch_id, started_at) VALUES (?1, ?2)",
             params![epoch_id, created_at],
         )?;
+        let mut materialized_inventory = std::collections::BTreeSet::new();
         for subject in load_recovery_subjects(transaction, task_id)? {
+            if let Some(inventory_id) = recovery_subject_inventory_id(subject.kind, &subject.id) {
+                materialized_inventory.insert(inventory_id);
+            }
             persist_recovery_subject_assessment(
                 transaction,
                 recovery_ref,
-                &epoch_id,
+                epoch_id,
                 task_id,
                 basis_revision,
                 &subject,
                 created_at,
             )?;
+        }
+        let mut carried_resolutions = Vec::new();
+        if episode_epoch_id.is_some() {
+            for inventory_id in operation_ids {
+                if !materialized_inventory.contains(inventory_id)
+                    && carry_forward_resolved_recovery_subject(
+                        transaction,
+                        recovery_ref,
+                        epoch_id,
+                        task_id,
+                        basis_revision,
+                        inventory_id,
+                        created_at,
+                    )?
+                {
+                    carried_resolutions.push(inventory_id.clone());
+                    materialized_inventory.insert(inventory_id.clone());
+                }
+            }
+            if materialized_inventory.len() != operation_ids.len() {
+                return Err(TaskManagerError::InvalidRecord(
+                    "recovery inventory lacks authenticated subject evidence",
+                ));
+            }
         }
         let existing = transaction
             .query_row(
@@ -1947,6 +1952,14 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery reference resolves to a different operation inventory",
             ));
+        }
+        for inventory_id in carried_resolutions {
+            reconcile_recovery_subject_in_transaction(
+                transaction,
+                recovery_ref,
+                &inventory_id,
+                created_at,
+            )?;
         }
         Ok(())
     }
@@ -2628,8 +2641,9 @@ pub(crate) fn reconcile_recovery_subject_in_transaction(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     let Some((assessment_id, subject_kind, subject_id, basis_revision, created_at)) =
-        rows.into_iter().find(|(_, kind, id, _, _)| {
+        rows.into_iter().find(|(assessment_id, kind, id, _, _)| {
             recovery_subject_inventory_id(kind, id).as_deref() == Some(inventory_id)
+                && recovery_subject_assessment_id(recovery_ref, kind, id) == *assessment_id
         })
     else {
         return Err(TaskManagerError::InvalidRecord(
@@ -3139,6 +3153,116 @@ fn recovery_operations_ref(
         write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(format!("recovery-operations:sha256:{hex}"))
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryInventory {
+    recovery_ref: String,
+    recovery_epoch_id: String,
+    task_id: String,
+    operation_ids: Vec<String>,
+}
+
+fn exact_recovery_inventory(
+    connection: &Connection,
+    recovery_ref: &str,
+) -> Result<Option<RecoveryInventory>> {
+    let basis = connection
+        .query_row(
+            "SELECT recovery_epoch_id,task_id,basis_revision FROM recovery_assessments
+             WHERE assessment_id=?1 AND subject_kind='task'",
+            [recovery_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((recovery_epoch_id, task_id, basis_revision)) = basis else {
+        return Ok(None);
+    };
+    let basis_revision = u64::try_from(basis_revision)
+        .map_err(|_| TaskManagerError::InvalidRecord("recovery basis revision is invalid"))?;
+    let operation_ids = query_strings(
+        connection,
+        "SELECT operation_id FROM recovery_unknown_operations
+         WHERE assessment_id=?1 ORDER BY ordinal",
+        recovery_ref,
+    )?;
+    if recovery_operations_ref(&task_id, basis_revision, &operation_ids)? != recovery_ref {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery inventory digest does not match its durable contents",
+        ));
+    }
+    Ok(Some(RecoveryInventory {
+        recovery_ref: recovery_ref.to_owned(),
+        recovery_epoch_id,
+        task_id,
+        operation_ids,
+    }))
+}
+
+fn active_recovery_inventory(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<RecoveryInventory>> {
+    let root_ref = connection
+        .query_row(
+            "SELECT json_extract(recovery_json,'$.unknown_operations_ref')
+             FROM tasks WHERE task_id=?1 AND state='RECOVERING'",
+            [task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(root_ref) = root_ref else {
+        return Ok(None);
+    };
+    let mut selected = exact_recovery_inventory(connection, &root_ref)?.ok_or(
+        TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+    )?;
+    let root_set = selected
+        .operation_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT assessment_id FROM recovery_assessments
+             WHERE task_id=?1 AND subject_kind='task' AND recovery_epoch_id=?2
+             ORDER BY assessment_id",
+        )?;
+        let rows = statement.query_map(params![task_id, selected.recovery_epoch_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut selected_set = root_set.clone();
+    for candidate_ref in candidates {
+        let candidate = exact_recovery_inventory(connection, &candidate_ref)?.ok_or(
+            TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+        )?;
+        let candidate_set = candidate
+            .operation_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !root_set.is_subset(&candidate_set) {
+            continue;
+        }
+        if selected_set.is_subset(&candidate_set) {
+            selected = candidate;
+            selected_set = candidate_set;
+        } else if !candidate_set.is_subset(&selected_set) {
+            return Err(TaskManagerError::InvalidRecord(
+                "active recovery inventories are not monotonic",
+            ));
+        }
+    }
+    Ok(Some(selected))
 }
 
 fn startup_recovery_transition_id(task_id: &str, revision: u64) -> String {
@@ -4410,7 +4534,8 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('PREPARED', 'STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL)))",
+               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
+               (SELECT COUNT(*) FROM artifact_publications WHERE task_id = ?1 AND state = 'PENDING')",
             [task_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -4717,6 +4842,70 @@ fn persist_recovery_subject_assessment(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "copies one authenticated subject into a new immutable recovery inventory"
+)]
+fn carry_forward_resolved_recovery_subject(
+    transaction: &Transaction<'_>,
+    recovery_ref: &str,
+    epoch_id: &str,
+    task_id: &str,
+    basis_revision: u64,
+    inventory_id: &str,
+    created_at: &str,
+) -> Result<bool> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT subject_kind,subject_id
+             FROM recovery_assessments
+             WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'
+             ORDER BY assessment_id",
+        )?;
+        let rows = statement.query_map(params![task_id, epoch_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (kind, id) in rows {
+        if recovery_subject_inventory_id(&kind, &id).as_deref() != Some(inventory_id) {
+            continue;
+        }
+        let Some(resolution) = resolved_recovery_subject(transaction, task_id, inventory_id)?
+        else {
+            continue;
+        };
+        let kind = match kind.as_str() {
+            "attempt" => "attempt",
+            "external-operation" => "external-operation",
+            "artifact-publication" => "artifact-publication",
+            "authority-grant" => "authority-grant",
+            _ => continue,
+        };
+        persist_recovery_subject_assessment(
+            transaction,
+            recovery_ref,
+            epoch_id,
+            task_id,
+            basis_revision,
+            &RecoverySubject {
+                kind,
+                id,
+                evidence_kind: "recovery-subject",
+                certainty: resolution.certainty,
+                safe_action: resolution.safe_action,
+                reason_code: resolution.reason_code,
+                observation:
+                    "authenticated terminal evidence became durable before inventory refresh"
+                        .to_owned(),
+            },
+            created_at,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn all_unique(values: &[String]) -> bool {
     values
         .iter()
@@ -4981,8 +5170,7 @@ fn allowed_transition(from: TaskState, to: TaskState) -> bool {
         Paused => matches!(to, Planning | Runnable | Recovering | Cancelled | Failed),
         Recovering => matches!(
             to,
-            Recovering
-                | Planning
+            Planning
                 | Runnable
                 | Running
                 | WaitingForInput
@@ -6645,30 +6833,16 @@ fn authenticated_recovery_resolution(
     reason = "keeps aggregate, inventory, and per-subject recovery authentication contiguous for audit"
 )]
 fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<bool> {
-    let recovery_json = transaction
-        .query_row(
-            "SELECT recovery_json FROM tasks WHERE task_id = ?1 AND state = 'RECOVERING'",
-            [task_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    let Some(recovery_json) = recovery_json else {
+    let Some(active_inventory) = active_recovery_inventory(transaction, task_id)? else {
         return Ok(false);
     };
-    let recovery: Value = serde_json::from_str(&recovery_json)?;
-    let Some(recovery_ref) = recovery
-        .get("unknown_operations_ref")
-        .and_then(Value::as_str)
-    else {
-        return Ok(false);
-    };
+    let recovery_ref = active_inventory.recovery_ref;
     let aggregate = transaction
         .query_row(
             "SELECT recovery_epoch_id, basis_revision, certainty, safe_action, assessment_json
          FROM recovery_assessments
          WHERE assessment_id = ?1 AND task_id = ?2 AND subject_kind = 'task' AND subject_id = ?2",
-            params![recovery_ref, task_id],
+            params![&recovery_ref, task_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -6689,7 +6863,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
     let inventory = query_strings(
         transaction,
         "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
-        recovery_ref,
+        &recovery_ref,
     )?;
     if recovery_operations_ref(task_id, basis_revision, &inventory)? != recovery_ref {
         return Ok(false);
@@ -6706,7 +6880,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         return Ok(false);
     }
     let aggregate_json: Value = serde_json::from_str(&assessment_json)?;
-    if aggregate_json.get("assessment_id").and_then(Value::as_str) != Some(recovery_ref)
+    if aggregate_json.get("assessment_id").and_then(Value::as_str) != Some(recovery_ref.as_str())
         || aggregate_json
             .pointer("/subject/kind")
             .and_then(Value::as_str)
@@ -6742,9 +6916,6 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if subject_rows.len() != inventory.len() {
-        return Ok(false);
-    }
     let mut covered_inventory = std::collections::BTreeSet::new();
     let mut authenticated_resolved_inventory = std::collections::BTreeSet::new();
     for (
@@ -6756,12 +6927,16 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         subject_json,
     ) in subject_rows
     {
+        if recovery_subject_assessment_id(&recovery_ref, &subject_kind, &subject_id)
+            != assessment_id
+        {
+            continue;
+        }
         let subject: Value = serde_json::from_str(&subject_json)?;
         let Some(inventory_id) = recovery_subject_inventory_id(&subject_kind, &subject_id) else {
             return Ok(false);
         };
-        if recovery_subject_assessment_id(recovery_ref, &subject_kind, &subject_id) != assessment_id
-            || !covered_inventory.insert(inventory_id.clone())
+        if !covered_inventory.insert(inventory_id.clone())
             || subject.get("assessment_id").and_then(Value::as_str) != Some(assessment_id.as_str())
             || subject.pointer("/subject/kind").and_then(Value::as_str)
                 != Some(subject_kind.as_str())
@@ -6782,7 +6957,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
             && authenticated_recovery_resolution(
                 transaction,
                 task_id,
-                recovery_ref,
+                &recovery_ref,
                 &inventory_id,
                 &subject,
             )?

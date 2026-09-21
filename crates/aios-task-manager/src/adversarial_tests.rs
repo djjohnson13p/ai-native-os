@@ -1445,10 +1445,82 @@ fn completion_rejects_stale_verification_missing_or_mismatched_coverage_and_unpu
         let result = manager
             .transition(&completion_request(&format!("tr-completion-{name}")))
             .unwrap();
-        assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED", "{name}");
+        assert_eq!(
+            result.reason_code,
+            if name == "unpublished-output" {
+                "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+            } else {
+                "TASK_COMPLETION_GATE_FAILED"
+            },
+            "{name}"
+        );
         let task = manager.get_task("T-completion").unwrap().unwrap();
         assert_eq!((task.state, task.revision), (TaskState::Verifying, 2));
     }
+}
+
+#[test]
+fn distinct_pending_publication_blocks_otherwise_valid_completion_until_aborted() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute(
+            "INSERT INTO artifact_output_allocations (
+                 allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,
+                 output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,
+                 sensitivity,retention,state,writer_generation,created_at,updated_at,expires_at
+             )
+             SELECT 'allocation-pending-extra',task_id,semantic_program_hash,node_id,NULL,NULL,
+                    'auxiliary',expected_semantic_type,allowed_media_types_json,max_size_bytes,
+                    sensitivity,retention,'WRITING',0,created_at,updated_at,expires_at
+             FROM artifact_output_allocations WHERE allocation_id='allocation-completion'",
+            [],
+        )
+        .unwrap();
+    let pending = ArtifactPublicationRequest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        publication_id: "publication-pending-extra".to_owned(),
+        allocation_id: "allocation-pending-extra".to_owned(),
+        task_id: "T-completion".to_owned(),
+        expected_allocation_state: ArtifactExpectedState::Writing,
+        semantic_type: Some("artifact.report@1".to_owned()),
+        media_type: "application/json".to_owned(),
+        format: None,
+        lineage: ArtifactLineage::default(),
+        labels: Vec::new(),
+    };
+    let pending_json = canonical_json(&pending).unwrap();
+    manager
+        .reserve_publication(&pending, &pending_json)
+        .unwrap();
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-pending-extra".to_owned())
+    );
+    assert!(matches!(
+        manager.scope_owned_artifact_reads("T-completion", &[COMPLETION_ARTIFACT_ID.to_owned()]),
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+    ));
+
+    let blocked = manager
+        .transition(&completion_request("tr-completion-pending-extra"))
+        .unwrap();
+    assert!(!blocked.applied);
+    assert_eq!(blocked.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
+    let unchanged = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(
+        (unchanged.state, unchanged.revision),
+        (TaskState::Verifying, 2)
+    );
+
+    manager.abort_pending_publication(&pending).unwrap();
+    let completed = manager
+        .transition(&completion_request("tr-completion-after-pending-abort"))
+        .unwrap();
+    assert!(completed.applied);
+    assert_eq!(completed.current_state, Some(TaskState::Completed));
 }
 
 #[test]
@@ -3521,6 +3593,10 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers refresh immutability, stale-reference rebasing, and successful recovery exit"
+)]
 fn refreshed_recovery_inventory_becomes_active_without_rewriting_history() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("refresh-recovery.sqlite3");
@@ -3575,21 +3651,19 @@ fn refreshed_recovery_inventory_becomes_active_without_rewriting_history() {
     drop(manager);
     let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
     let refreshed = manager.get_task("T-refresh-recovery").unwrap().unwrap();
-    let second_ref = refreshed
-        .recovery
-        .as_ref()
-        .and_then(|value| value["unknown_operations_ref"].as_str())
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-recovery")
         .unwrap()
-        .to_owned();
+        .unwrap();
     assert_eq!(refreshed.state, TaskState::Recovering);
-    assert_eq!(refreshed.revision, first.revision + 1);
+    assert_eq!(refreshed.revision, first.revision);
     assert_ne!(second_ref, first_ref);
     assert_eq!(
         refreshed
             .recovery
             .as_ref()
             .and_then(|value| value["unknown_operations_ref"].as_str()),
-        Some(second_ref.as_str())
+        Some(first_ref.as_str())
     );
     assert_eq!(
         manager
@@ -3613,9 +3687,182 @@ fn refreshed_recovery_inventory_becomes_active_without_rewriting_history() {
             [TEST_TIME],
         )
         .unwrap();
+    let first_assessment_id =
+        recovery_subject_assessment_id(&first_ref, "external-operation", "operation:operation-r1");
+    let first_assessment_before: String = manager
+        .connection
+        .query_row(
+            "SELECT assessment_json FROM recovery_assessments WHERE assessment_id=?1",
+            [&first_assessment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    manager
+        .reconcile_recovery_subject(&first_ref, "operation:operation-r1")
+        .unwrap();
     manager
         .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
         .unwrap();
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT assessment_json FROM recovery_assessments WHERE assessment_id=?1",
+                [&first_assessment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        first_assessment_before,
+        "refresh reconciliation must not rewrite historical evidence"
+    );
+    let current = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-refreshed-recovery-resolved",
+            "T-refresh-recovery",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
+}
+
+#[test]
+fn refreshed_recovery_inventory_carries_forward_already_resolved_subjects() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("refresh-resolved-recovery.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-resolved", TaskState::Running);
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r1','T-refresh-resolved',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_live_execution("T-refresh-resolved")
+        .unwrap();
+    let first_ref = manager
+        .active_recovery_inventory_ref("T-refresh-resolved")
+        .unwrap()
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r1'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&first_ref, "operation:operation-r1")
+        .unwrap();
+
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r2','T-refresh-resolved',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-resolved")
+        .unwrap()
+        .unwrap();
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r2'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
+    let current = manager.get_task("T-refresh-resolved").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-carried-forward-recovery-resolved",
+            "T-refresh-resolved",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
+}
+
+#[test]
+fn recovery_refresh_materializes_terminal_evidence_that_arrived_before_reconciliation() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("refresh-terminal-before-reconcile.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-terminal", TaskState::Running);
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r1','T-refresh-terminal',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_live_execution("T-refresh-terminal")
+        .unwrap();
+    let first_ref = manager
+        .active_recovery_inventory_ref("T-refresh-terminal")
+        .unwrap()
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r1'",
+        [TEST_TIME],
+    ).unwrap();
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r2','T-refresh-terminal',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-terminal")
+        .unwrap()
+        .unwrap();
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r2'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
+    let current = manager.get_task("T-refresh-terminal").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-terminal-before-reconcile-resolved",
+            "T-refresh-terminal",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
 }
 
 #[test]

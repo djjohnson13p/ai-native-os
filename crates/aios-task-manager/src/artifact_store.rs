@@ -3176,7 +3176,33 @@ impl TaskManager {
         if terminal_replay.is_some() {
             return self.publish_artifact_output(request);
         }
-        self.validate_provider_artifact_session(session)?;
+        let pending_request = self
+            .connection
+            .query_row(
+                "SELECT request_json FROM artifact_publications
+                 WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND state='PENDING'",
+                params![
+                    request.publication_id,
+                    request.allocation_id,
+                    request.task_id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(stored_request) = pending_request {
+            if stored_request != canonical_json(request)? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            ensure_task_is_not_recovering(&self.connection, &session.task_id)?;
+            ensure_no_unknown_artifact_export_except_publication(
+                &self.connection,
+                &session.task_id,
+                None,
+                Some(&request.publication_id),
+            )?;
+        } else {
+            self.validate_provider_artifact_session(session)?;
+        }
         if allocation.writer_grant_admission.is_none() {
             let committed_replay = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM artifact_publications WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3 AND state='COMMITTED')",
@@ -3712,6 +3738,7 @@ impl TaskManager {
         if handle.stored_integrity_state()? == ArtifactIntegrityState::Failed
             || matches!(durability_state.as_str(), "CORRUPT" | "MISSING")
         {
+            self.handoff_content_hash_damage(&handle.stored_content_hash()?.tagged())?;
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"));
         }
         let mut file = match self
@@ -4062,6 +4089,56 @@ impl TaskManager {
         )?
     }
 
+    /// Replays an exact durable owner export without reopening its Artifact or destination.
+    pub(crate) fn replay_owned_artifact_export(
+        &self,
+        task_id: &str,
+        operation_id: &str,
+    ) -> Result<u64> {
+        validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
+        let (principal_kind, principal_id) = self
+            .connection
+            .query_row(
+                "SELECT principal_kind,principal_id FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let intent_json = self
+            .connection
+            .query_row(
+                "SELECT details_json FROM operations WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ))?;
+        let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
+        if !matches!(
+            intent.version,
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+        ) || canonical_json(&intent)? != intent_json
+            || intent.task_id != task_id
+            || intent.principal_kind != principal_kind
+            || intent.principal_id != principal_id
+            || intent.semantic_program_hash.is_some()
+            || intent.node_id.is_some()
+            || intent.binding_id.is_some()
+            || intent.attempt_id.is_some()
+            || intent.grant_id.is_some()
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        authenticate_export_operation(&self.connection, operation_id, &intent_json)?.ok_or(
+            TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT"),
+        )?
+    }
+
     /// Seals an owner-mediated export writer after owner authentication has already completed.
     #[allow(
         clippy::too_many_lines,
@@ -4086,7 +4163,6 @@ impl TaskManager {
             256,
             "invalid Artifact export destination class",
         )?;
-        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         let now = self.clock.now();
         if scope.issuer_id != self.artifact_scope_issuer
             || scope.authority.execution.is_some()
@@ -4165,6 +4241,7 @@ impl TaskManager {
                 consumed: false,
             });
         }
+        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         let artifact = self
             .get_artifact(artifact_id)?
             .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_NOT_FOUND"))?;
@@ -4222,7 +4299,6 @@ impl TaskManager {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         if let Some(replay) = authenticate_export_operation(
             &self.connection,
             &destination.operation_id,
@@ -4238,6 +4314,7 @@ impl TaskManager {
             }
             return replay;
         }
+        ensure_task_is_not_recovering(&self.connection, &scope.task_id)?;
         if destination.consumed {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
@@ -4391,6 +4468,7 @@ impl TaskManager {
                 .map(|admission| &admission.grant_admission),
             destination.grant_admission.as_ref(),
         )?;
+        export_after_arm_step()?;
         destination.consumed = true;
         let writer_factory =
             destination
@@ -4401,8 +4479,9 @@ impl TaskManager {
                 ))?;
         // Opening or constructing an external destination may itself create,
         // truncate, or otherwise affect it, even when the callback returns an
-        // error before yielding a writer.
-        destination.external_effect_possible = true;
+        // error before yielding a writer. Failures before that callback are
+        // still deterministically no-effect.
+        let mut callback_invoked = false;
         let construction = (|| -> Result<W> {
             let transaction = self
                 .connection
@@ -4459,12 +4538,22 @@ impl TaskManager {
                     "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
                 ));
             }
+            callback_invoked = true;
             let writer = writer_factory()?;
             transaction.commit()?;
             Ok(writer)
         })();
+        destination.external_effect_possible = callback_invoked;
         destination.writer = if let Ok(writer) = construction {
             Some(writer)
+        } else if !callback_invoked {
+            self.finish_pre_callback_export_no_effect(
+                &destination.operation_id,
+                &destination.intent_json,
+            )?;
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT",
+            ));
         } else {
             self.finish_unknown_export_operation(
                 &destination.operation_id,
@@ -4839,6 +4928,80 @@ impl TaskManager {
         Ok(())
     }
 
+    fn finish_pre_callback_export_no_effect(
+        &mut self,
+        operation_id: &str,
+        intent_json: &str,
+    ) -> Result<()> {
+        let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
+        let finished_at = self.clock.now();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        let armed_receipt = transaction.query_row(
+            "SELECT external_receipt FROM operations
+             WHERE operation_id=?1 AND details_json=?2 AND state='STARTED'
+               AND outcome_certainty IS NULL",
+            params![operation_id, intent_json],
+            |row| row.get::<_, String>(0),
+        )?;
+        if !authenticate_armed_export_operation(
+            &transaction,
+            operation_id,
+            intent_json,
+            &armed_receipt,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        let event = json!({
+            "schema_version": SCHEMA_VERSION,
+            "event_id": event_id("artifact-export-no-effect", operation_id),
+            "task_id": intent.task_id,
+            "event_type": "execution.completed",
+            "timestamp": finished_at,
+            "actor": {"kind": "system-service", "id": "service:artifact-store"},
+            "input_artifacts": [intent.artifact_id],
+            "output_artifacts": [],
+            "status": "failure",
+            "details": {
+                "operation_id": operation_id,
+                "outcome_certainty": "FAILED_NO_EFFECT",
+                "effect_boundary": "destination-not-invoked"
+            }
+        });
+        let appended = append_event(&transaction, &intent.task_id, &event)?;
+        let receipt = canonical_json(&json!({
+            "version": 1,
+            "kind": "pre-destination-no-effect",
+            "provenance_event_id": appended.event_id,
+            "provenance_event_hash": appended.event_hash
+        }))?;
+        let changed = transaction.execute(
+            "UPDATE operations
+             SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',external_receipt=?4,
+                 finished_at=?5
+             WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
+               AND state='STARTED' AND outcome_certainty IS NULL",
+            params![
+                operation_id,
+                intent_json,
+                armed_receipt,
+                receipt,
+                finished_at
+            ],
+        )?;
+        if changed != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn ensure_export_reconciliation_challenge(
         &mut self,
         operation_id: &str,
@@ -5074,13 +5237,13 @@ impl TaskManager {
         subject_hasher.update(subject_json.as_bytes());
         let subject_hash = tagged_digest(subject_hasher);
         let inventory_id = format!("operation:{operation_id}");
-        let task = self
+        let task_state = self
             .connection
             .query_row(
-                "SELECT state,json_extract(recovery_json,'$.unknown_operations_ref')
+                "SELECT state
                  FROM tasks WHERE task_id=?1",
                 [&row.0],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
             .ok_or(TaskManagerError::InvalidRecord(
@@ -5103,8 +5266,8 @@ impl TaskManager {
             }
             recovery_ref
         } else {
-            let active = if task.0 == "RECOVERING" {
-                if let Some(recovery_ref) = task.1 {
+            let active = if task_state == "RECOVERING" {
+                if let Some(recovery_ref) = self.active_recovery_inventory_ref(&row.0)? {
                     self.connection
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations
@@ -5517,8 +5680,6 @@ impl TaskManager {
                 || artifact.1 != to_i64(size)?
                 || artifact.2 != row.2
                 || artifact.3.as_deref() != Some(row.1.as_str())
-                || artifact.4 != "verified"
-                || artifact.6 != "DURABLE"
                 || artifact.7 != 1
             {
                 return Err(TaskManagerError::InvalidRecord(
@@ -5541,6 +5702,14 @@ impl TaskManager {
                 Err(error) => return Err(error),
             };
             if let Some(durability_state) = damage {
+                if !matches!(artifact.4.as_str(), "verified" | "failed")
+                    || !matches!(artifact.6.as_str(), "DURABLE" | "MISSING" | "CORRUPT")
+                    || (artifact.6 != "DURABLE" && artifact.6 != durability_state)
+                {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "legacy keyed Artifact import metadata is invalid",
+                    ));
+                }
                 transaction.execute(
                     "UPDATE artifact_blobs SET durability_state=?2,verified_at=?3
                      WHERE content_hash=?1",
@@ -5548,28 +5717,49 @@ impl TaskManager {
                 )?;
                 transaction.execute(
                     "UPDATE artifacts SET integrity_state='failed',integrity_verified_at=?2
-                     WHERE artifact_id=?1",
-                    params![artifact_id, row.2],
+                     WHERE content_hash=?1",
+                    params![content_hash, row.2],
                 )?;
-                let damage_operation_id = event_id("legacy-artifact-import-damage", &artifact_id);
-                let damage_details = canonical_json(&json!({
-                    "version": 1,
-                    "kind": "legacy-keyed-artifact-import-damage",
-                    "artifact_id": artifact_id,
-                    "content_hash": content_hash,
-                    "durability_state": durability_state,
-                    "source_event_id": row.0,
-                }))?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO operations(
-                        operation_id,task_id,transaction_class,effect_class,idempotency_key,
-                        state,outcome_certainty,details_json,prepared_at,started_at,finished_at
-                     ) VALUES (?1,?2,'reversible_local','ARTIFACT_IMPORT',?1,
-                               'UNKNOWN','OUTCOME_UNKNOWN',?3,?4,?4,?4)",
-                    params![damage_operation_id, row.1, damage_details, row.2],
-                )?;
-                damaged_tasks.insert(row.1.clone());
+                let owners = {
+                    let mut statement = transaction.prepare(
+                        "SELECT DISTINCT ta.task_id,a.artifact_id
+                         FROM artifacts a
+                         JOIN task_artifacts ta ON ta.artifact_id=a.artifact_id
+                         WHERE a.content_hash=?1
+                         ORDER BY ta.task_id,a.artifact_id",
+                    )?;
+                    let rows = statement.query_map([&content_hash], |owner| {
+                        Ok((owner.get::<_, String>(0)?, owner.get::<_, String>(1)?))
+                    })?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for (owner_task_id, owner_artifact_id) in owners {
+                    let damage_operation_id =
+                        legacy_import_damage_operation_id(&owner_task_id, &owner_artifact_id);
+                    let damage_details = canonical_json(&json!({
+                        "version": 1,
+                        "kind": "legacy-keyed-artifact-import-damage",
+                        "artifact_id": owner_artifact_id,
+                        "content_hash": content_hash,
+                        "durability_state": durability_state,
+                        "migration_id": "0010_keyed_import_causal_receipts",
+                    }))?;
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO operations(
+                            operation_id,task_id,transaction_class,effect_class,idempotency_key,
+                            state,outcome_certainty,details_json,prepared_at,started_at,finished_at
+                         ) VALUES (?1,?2,'reversible_local','ARTIFACT_IMPORT',?1,
+                                   'UNKNOWN','OUTCOME_UNKNOWN',?3,?4,?4,?4)",
+                        params![damage_operation_id, owner_task_id, damage_details, row.2],
+                    )?;
+                    damaged_tasks.insert(owner_task_id);
+                }
                 continue;
+            }
+            if artifact.4 != "verified" || artifact.6 != "DURABLE" {
+                return Err(TaskManagerError::InvalidRecord(
+                    "legacy keyed Artifact import metadata is invalid",
+                ));
             }
             let operation_id = keyed_import_operation_id(&row.1, import_id);
             let (expected_details, expected_receipt) = keyed_import_receipt_payloads(
@@ -5658,6 +5848,7 @@ impl TaskManager {
                 revision,
                 &inventory,
                 &migration_at,
+                None,
             )?;
         }
         transaction.execute(
@@ -6022,7 +6213,7 @@ impl TaskManager {
         })
     }
 
-    fn reserve_publication(
+    pub(crate) fn reserve_publication(
         &mut self,
         request: &ArtifactPublicationRequest,
         request_json: &str,
@@ -6484,13 +6675,13 @@ impl TaskManager {
             }
             Err(TaskManagerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.mark_content_hash_failed(&row.1, "MISSING")?;
-                self.ensure_unknown_export_recovery_inventory(&request.task_id)?;
+                self.handoff_content_hash_damage(&row.1)?;
                 Ok(failed())
             }
             Err(error) => Err(error),
             Ok(_) => {
                 self.mark_integrity_failed(&row.0, &request.task_id, &row.1)?;
-                self.ensure_unknown_export_recovery_inventory(&request.task_id)?;
+                self.handoff_content_hash_damage(&row.1)?;
                 Ok(failed())
             }
         }
@@ -6529,6 +6720,7 @@ impl TaskManager {
                     if inventory.is_empty() {
                         Ok(())
                     } else {
+                        content_hash_handoff_step()?;
                         self.ensure_unknown_export_recovery_inventory(&task_id)
                     }
                 });
@@ -9958,6 +10150,13 @@ fn keyed_import_operation_id(task_id: &str, import_id: &str) -> String {
     )
 }
 
+fn legacy_import_damage_operation_id(task_id: &str, artifact_id: &str) -> String {
+    event_id(
+        "legacy-artifact-import-damage",
+        &format!("{task_id}\0{artifact_id}"),
+    )
+}
+
 fn keyed_import_receipt_payloads(
     task_id: &str,
     import_id: &str,
@@ -10331,6 +10530,30 @@ fn ensure_no_unknown_artifact_export_except(
     task_id: &str,
     exempt_operation_id: Option<&str>,
 ) -> Result<()> {
+    ensure_no_unknown_artifact_export_except_publication(
+        connection,
+        task_id,
+        exempt_operation_id,
+        None,
+    )
+}
+
+fn ensure_no_unknown_artifact_export_except_publication(
+    connection: &Connection,
+    task_id: &str,
+    exempt_operation_id: Option<&str>,
+    exempt_publication_id: Option<&str>,
+) -> Result<()> {
+    let pending_publication = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artifact_publications
+         WHERE task_id=?1 AND state='PENDING'
+           AND (?2 IS NULL OR publication_id<>?2))",
+        params![task_id, exempt_publication_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if pending_publication {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
     let rows = {
         let mut statement = connection.prepare(
             "SELECT operation_id,details_json FROM operations
@@ -12006,6 +12229,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static EXPORT_BEFORE_ARM_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static EXPORT_AFTER_ARM_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_RESERVATION_RACE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -12019,6 +12244,8 @@ thread_local! {
     static PUBLICATION_REPLAY_HASH_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static LIVE_RECOVERY_HANDOFF_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static CONTENT_HASH_HANDOFF_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -12170,6 +12397,25 @@ fn export_before_arm_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+fn export_after_arm_step() -> Result<()> {
+    EXPORT_AFTER_ARM_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "post-arm failure injection shares the production call signature"
+)]
+fn export_after_arm_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12375,6 +12621,25 @@ fn live_recovery_handoff_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+fn content_hash_handoff_step() -> Result<()> {
+    CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "content damage handoff failure injection shares the production call signature"
+)]
+fn content_hash_handoff_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -13878,6 +14143,13 @@ mod tests {
             original.writer.as_deref(),
             Some(b"exported once".as_slice())
         );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
 
         let mut fresh_replay = manager
             .issue_owned_artifact_export_destination(
@@ -13896,6 +14168,29 @@ mod tests {
             13
         );
         assert!(fresh_replay.writer.is_none());
+        let fresh_during_recovery = manager.issue_owned_artifact_export_destination(
+            &scope,
+            "export-fresh-operation-during-recovery",
+            &artifact.artifact_id,
+            "user-selected-file",
+            1_024,
+            deferred(Vec::new()),
+        );
+        assert!(
+            matches!(
+                fresh_during_recovery,
+                Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+            ),
+            "{:?}",
+            fresh_during_recovery.as_ref().err()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CREATED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
 
         assert!(matches!(
             manager.issue_owned_artifact_export_destination(
@@ -14928,12 +15223,16 @@ mod tests {
                 Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
             }));
         });
-        assert!(matches!(
-            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
-            Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
-            ))
-        ));
+        let outcome = manager.export_artifact(&scope, &artifact.artifact_id, &mut destination);
+        assert!(
+            matches!(
+                outcome,
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ),
+            "{outcome:?}"
+        );
         assert_eq!(factory_opens.load(Ordering::SeqCst), 1);
         assert_eq!(destination.writer.as_deref(), Some([].as_slice()));
         assert_eq!(
@@ -14947,12 +15246,16 @@ mod tests {
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
         );
-        assert!(matches!(
-            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
-            Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
-            ))
-        ));
+        let outcome = manager.export_artifact(&scope, &artifact.artifact_id, &mut destination);
+        assert!(
+            matches!(
+                outcome,
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ),
+            "{outcome:?}"
+        );
         assert_eq!(
             manager
                 .connection
@@ -15988,6 +16291,8 @@ mod tests {
                 &request.allocation_id,
                 request.publication_id.as_bytes(),
             );
+        }
+        for request in &requests {
             let request_json = canonical_json(request).unwrap();
             manager.reserve_publication(request, &request_json).unwrap();
             manager
@@ -16462,22 +16767,43 @@ mod tests {
                 deferred(Vec::new()),
             )
             .unwrap();
+        let revision = manager.get_task("T-artifact").unwrap().unwrap().revision;
+        let recovery_ref = crate::recovery_operations_ref("T-artifact", revision, &[]).unwrap();
+        manager
+            .persist_recovery_inventory(
+                &recovery_ref,
+                "T-artifact",
+                revision,
+                &[],
+                "2026-09-19T00:00:00Z",
+            )
+            .unwrap();
+        let recovery_json = canonical_json(&json!({
+            "unknown_operation_ids": [],
+            "unknown_operations_ref": recovery_ref,
+            "last_known_daemon_instance": null
+        }))
+        .unwrap();
         EXPORT_COMPLETION_TEST_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 Connection::open(database)?.execute(
-                    "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
-                    [],
+                    "UPDATE tasks SET state='RECOVERING',recovery_json=?1 WHERE task_id='T-artifact'",
+                    [recovery_json],
                 )?;
                 Ok(())
             }));
         });
 
-        assert!(matches!(
-            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
-            Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
-            ))
-        ));
+        let outcome = manager.export_artifact(&scope, &artifact.artifact_id, &mut destination);
+        assert!(
+            matches!(
+                outcome,
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ),
+            "{outcome:?}"
+        );
         assert_eq!(
             manager
                 .connection
@@ -17300,6 +17626,111 @@ mod tests {
         assert_eq!(conflict_count.load(Ordering::SeqCst), 1);
         assert_eq!(effect_order.load(Ordering::SeqCst), 1);
         assert_eq!(revocation_order.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn post_arm_pre_callback_rejection_is_authenticated_no_effect() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"pre callback fence".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&factory_calls);
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-pre-callback-no-effect",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        EXPORT_AFTER_ARM_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET principal_id='user:revoked-before-callback'
+                     WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+            ))
+        ));
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-pre-callback-no-effect'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "FAILED:FAILED_NO_EFFECT"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events
+                     WHERE event_id=?1 AND event_type='execution.completed'",
+                    [event_id(
+                        "artifact-export-no-effect",
+                        "export-pre-callback-no-effect"
+                    )],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET principal_id='user:test' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        let replay_calls = Arc::new(AtomicUsize::new(0));
+        let observed_replay_calls = Arc::clone(&replay_calls);
+        let mut replay = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-pre-callback-no-effect",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    observed_replay_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut replay),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+            ))
+        ));
+        assert_eq!(replay_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -18484,6 +18915,30 @@ mod tests {
             .remove_file(safe_internal_ref(&storage_ref).unwrap())
             .unwrap();
 
+        CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::InvalidRecord(
+                    "injected reader damage handoff failure",
+                ))
+            }));
+        });
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact_id),
+            Err(TaskManagerError::InvalidRecord(
+                "injected reader damage handoff failure"
+            ))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RUNNING"
+        );
         assert!(matches!(
             manager.open_artifact_reader(&scope, &artifact_id),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED"))
@@ -18578,9 +19033,6 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
-        let scope = manager
-            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact_id))
-            .unwrap();
         manager
             .connection
             .execute(
@@ -18593,15 +19045,11 @@ mod tests {
             .remove_file(safe_internal_ref(&storage_ref).unwrap())
             .unwrap();
 
-        let Err(damage_error) = manager.open_artifact_reader(&scope, &artifact_id) else {
-            panic!("damaged shared blob unexpectedly opened");
-        };
-        assert!(
-            matches!(
-                damage_error,
-                TaskManagerError::InvalidRecord("ARTIFACT_INTEGRITY_FAILED")
-            ),
-            "{damage_error:?}"
+        let publication_replay =
+            manager.publish_artifact_output(&publication("pub-shared-a", "alloc-shared-a"));
+        assert_eq!(
+            publication_replay.unwrap().reason_code,
+            "ARTIFACT_INTEGRITY_FAILED"
         );
         for (task_id, expected_state) in [
             ("A-input-only", "CREATED"),
@@ -19803,6 +20251,23 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn bound_provider_can_finish_only_its_exact_pending_publication() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let (allocation_id, _) = finish_bound_output(&mut manager, "pending-retry", "ONE_SHOT");
+        let request = publication("pub-pending-retry", &allocation_id);
+        let request_json = canonical_json(&request).unwrap();
+        manager
+            .reserve_publication(&request, &request_json)
+            .unwrap();
+        let session = session_for_allocation(&manager, &allocation_id);
+        let result = manager
+            .publish_bound_artifact_output(&session, &request)
+            .unwrap();
+        assert!(result.published);
     }
 
     #[test]
@@ -22996,6 +23461,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers two legacy imports sharing one damaged blob and their complete recovery evidence"
+    )]
     fn damaged_legacy_keyed_import_is_quarantined_into_recovery_instead_of_fabricated() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
@@ -23008,8 +23477,44 @@ mod tests {
                 &mut Cursor::new(b"legacy bytes that disappeared".as_slice()),
             )
             .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact-nonlegacy-owner".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "share a damaged legacy blob".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        let mut nonlegacy_request = request.clone();
+        nonlegacy_request.task_id = "T-artifact-nonlegacy-owner".to_owned();
+        nonlegacy_request.import_id = None;
+        let nonlegacy_artifact = manager
+            .import_artifact(
+                &nonlegacy_request,
+                &mut Cursor::new(b"legacy bytes that disappeared".as_slice()),
+            )
+            .unwrap();
+        assert_eq!(artifact.content_hash, nonlegacy_artifact.content_hash);
+        let mut second_request = request.clone();
+        second_request.import_id = Some("import:damaged-legacy-shared".to_owned());
+        let second_artifact = manager
+            .import_artifact(
+                &second_request,
+                &mut Cursor::new(b"legacy bytes that disappeared".as_slice()),
+            )
+            .unwrap();
+        assert_eq!(artifact.content_hash, second_artifact.content_hash);
         let operation_id =
             keyed_import_operation_id(&request.task_id, request.import_id.as_deref().unwrap());
+        let second_operation_id = keyed_import_operation_id(
+            &second_request.task_id,
+            second_request.import_id.as_deref().unwrap(),
+        );
         let storage_ref = manager
             .connection
             .query_row(
@@ -23021,8 +23526,8 @@ mod tests {
         manager
             .connection
             .execute(
-                "DELETE FROM operations WHERE operation_id=?1",
-                [&operation_id],
+                "DELETE FROM operations WHERE operation_id IN (?1,?2)",
+                params![operation_id, second_operation_id],
             )
             .unwrap();
         manager
@@ -23053,7 +23558,21 @@ mod tests {
                 .unwrap(),
             "failed:MISSING"
         );
-        let damage_operation_id = event_id("legacy-artifact-import-damage", &artifact.artifact_id);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT a.integrity_state || ':' || b.durability_state
+                     FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+                     WHERE a.artifact_id=?1",
+                    [&second_artifact.artifact_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "failed:MISSING"
+        );
+        let damage_operation_id =
+            legacy_import_damage_operation_id(&request.task_id, &artifact.artifact_id);
         assert_eq!(
             reopened
                 .connection
@@ -23078,6 +23597,41 @@ mod tests {
                 .unwrap(),
             1
         );
+        let second_damage_operation_id = legacy_import_damage_operation_id(
+            &second_request.task_id,
+            &second_artifact.artifact_id,
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id IN (?1,?2)",
+                    params![
+                        format!("operation:{damage_operation_id}"),
+                        format!("operation:{second_damage_operation_id}")
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let nonlegacy_damage_operation_id = legacy_import_damage_operation_id(
+            &nonlegacy_request.task_id,
+            &nonlegacy_artifact.artifact_id,
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations WHERE operation_id=?1",
+                    [format!("operation:{nonlegacy_damage_operation_id}")],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "every task owning the damaged blob needs recovery evidence"
+        );
         assert_eq!(
             reopened
                 .connection
@@ -23089,6 +23643,18 @@ mod tests {
                 .unwrap(),
             0,
             "migration must not fabricate a successful causal receipt"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id=?1",
+                    [&second_operation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "migration must not fabricate the second successful causal receipt"
         );
     }
 
@@ -23135,7 +23701,7 @@ mod tests {
                 .remove_file(safe_internal_ref(&storage_ref).unwrap())
                 .unwrap();
             let damage_operation_id =
-                event_id("legacy-artifact-import-damage", &artifact.artifact_id);
+                legacy_import_damage_operation_id(&request.task_id, &artifact.artifact_id);
             (artifact.artifact_id, damage_operation_id)
         };
 
@@ -25228,6 +25794,38 @@ mod tests {
         drop(manager);
 
         let mut reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.scope_owned_artifact_reads(
+                "T-artifact",
+                std::slice::from_ref(&artifact.artifact_id)
+            ),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            reopened
+                .replay_owned_artifact_export("T-artifact", operation_id)
+                .unwrap(),
+            bytes.len() as u64
+        );
+        assert!(
+            reopened
+                .replay_owned_artifact_export("T-artifact", "export-missing")
+                .is_err()
+        );
+        reopened
+            .connection
+            .execute(
+                "UPDATE tasks SET state='CREATED' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
         let scope = reopened
             .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
             .unwrap();
