@@ -30,6 +30,7 @@ use super::{
 const IMPORT_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const SEALED_STAGING_VERSION: u8 = 1;
+const PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION: u8 = 2;
 
 fn deserialize_omittable_non_null<'de, D, T>(
     deserializer: D,
@@ -3105,8 +3106,10 @@ impl TaskManager {
             .optional()?;
         if let Some(stored_intent_json) = stored_intent_json {
             let stored: ArtifactExportIntent = serde_json::from_str(&stored_intent_json)?;
-            if stored.version != 1
-                || stored.task_id != scope.task_id
+            if !matches!(
+                stored.version,
+                1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            ) || stored.task_id != scope.task_id
                 || stored.artifact_id != artifact_id
                 || stored.destination_class != destination_class
                 || stored.max_size_bytes != max_size_bytes
@@ -3175,7 +3178,7 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
         let intent_json = canonical_json(&ArtifactExportIntent {
-            version: 1,
+            version: PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION,
             task_id: scope.task_id.clone(),
             artifact_id: artifact_id.to_owned(),
             content_hash: artifact.stored_content_hash()?.tagged().clone(),
@@ -3234,8 +3237,10 @@ impl TaskManager {
                 "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
             ))?;
         let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
-        if intent.version != 1
-            || canonical_json(&intent)? != intent_json
+        if !matches!(
+            intent.version,
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+        ) || canonical_json(&intent)? != intent_json
             || intent.task_id != session.task_id
             || intent.principal_kind != "provider"
             || intent.principal_id != session.authority.principal_id
@@ -3298,7 +3303,7 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
         let intent_json = canonical_json(&ArtifactExportIntent {
-            version: 1,
+            version: PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION,
             task_id: scope.task_id.clone(),
             artifact_id: artifact_id.to_owned(),
             content_hash: artifact.stored_content_hash()?.tagged().clone(),
@@ -4378,56 +4383,19 @@ impl TaskManager {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(2)?,
                 ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for (operation_id, intent_json, receipt) in started_exports {
-            let pre_destination = authenticate_pre_destination_export_admission(
+            reconcile_started_export_operation(
                 &transaction,
                 &operation_id,
                 &intent_json,
-                &receipt,
+                receipt.as_deref(),
+                &reconciled_at,
             )?;
-            let armed = authenticate_armed_export_operation(
-                &transaction,
-                &operation_id,
-                &intent_json,
-                &receipt,
-            )?;
-            if pre_destination == armed {
-                return Err(TaskManagerError::InvalidRecord(
-                    "stored Artifact export effect phase is invalid",
-                ));
-            }
-            if pre_destination {
-                let changed = transaction.execute(
-                    "UPDATE operations
-                     SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',finished_at=started_at
-                     WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
-                       AND state='STARTED' AND outcome_certainty IS NULL",
-                    params![operation_id, intent_json, receipt],
-                )?;
-                if changed != 1 {
-                    return Err(TaskManagerError::InvalidRecord(
-                        "stored Artifact export pre-destination admission is invalid",
-                    ));
-                }
-            } else {
-                let changed = transaction.execute(
-                    "UPDATE operations
-                     SET state='UNKNOWN',outcome_certainty='OUTCOME_UNKNOWN',finished_at=?4
-                     WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
-                       AND state='STARTED' AND outcome_certainty IS NULL",
-                    params![operation_id, intent_json, receipt, reconciled_at],
-                )?;
-                if changed != 1 {
-                    return Err(TaskManagerError::InvalidRecord(
-                        "stored Artifact export armed phase is invalid",
-                    ));
-                }
-            }
         }
         transaction.commit()?;
         let task_ids = {
@@ -8066,7 +8034,7 @@ fn unresolved_export_effect_exists(
              WHERE task_id=?1
                AND transaction_class='irreversible_external'
                AND effect_class='DATA_EGRESS'
-               AND json_extract(details_json,'$.version')=1
+               AND json_extract(details_json,'$.version') IN (1,2)
                AND json_extract(details_json,'$.task_id')=?1
                AND json_extract(details_json,'$.artifact_id')=?2
                AND json_extract(details_json,'$.content_hash')=?3
@@ -8125,7 +8093,7 @@ fn ensure_no_unknown_artifact_export(connection: &Connection, task_id: &str) -> 
                AND transaction_class='irreversible_external'
                AND effect_class='DATA_EGRESS'
                AND state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN'
-               AND json_extract(details_json,'$.version')=1
+               AND json_extract(details_json,'$.version') IN (1,2)
                AND json_type(details_json,'$.artifact_id')='text'
                AND json_type(details_json,'$.destination_class')='text'
          )",
@@ -8152,6 +8120,95 @@ fn ensure_task_is_not_recovering(connection: &Connection, task_id: &str) -> Resu
     } else {
         Ok(())
     }
+}
+
+fn reconcile_started_export_operation(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    intent_json: &str,
+    receipt: Option<&str>,
+    reconciled_at: &str,
+) -> Result<()> {
+    let intent: ArtifactExportIntent = serde_json::from_str(intent_json)?;
+    if canonical_json(&intent)? != intent_json
+        || !matches!(
+            intent.version,
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+        )
+    {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export operation is invalid",
+        ));
+    }
+    let phase_history = export_phase_history_exists(transaction, &intent.task_id, operation_id)?;
+    let phase_aware = intent.version == PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION || phase_history;
+    if !phase_aware {
+        if !super::verify_provenance_through(transaction, &intent.task_id, None)?
+            || !matches!(
+                authenticate_export_operation(transaction, operation_id, intent_json)?,
+                Some(Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                )))
+            )
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored legacy Artifact export operation is invalid",
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE operations
+             SET state='UNKNOWN',outcome_certainty='OUTCOME_UNKNOWN',finished_at=?4
+             WHERE operation_id=?1 AND details_json=?2 AND external_receipt IS ?3
+               AND state='STARTED' AND outcome_certainty IS NULL",
+            params![operation_id, intent_json, receipt, reconciled_at],
+        )?;
+        if changed != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "stored legacy Artifact export operation is invalid",
+            ));
+        }
+        return Ok(());
+    }
+    let receipt = receipt.ok_or(TaskManagerError::InvalidRecord(
+        "stored Artifact export effect phase is invalid",
+    ))?;
+    let pre_destination = authenticate_pre_destination_export_admission(
+        transaction,
+        operation_id,
+        intent_json,
+        receipt,
+    )?;
+    let armed =
+        authenticate_armed_export_operation(transaction, operation_id, intent_json, receipt)?;
+    if pre_destination == armed {
+        return Err(TaskManagerError::InvalidRecord(
+            "stored Artifact export effect phase is invalid",
+        ));
+    }
+    let failure = if pre_destination {
+        "stored Artifact export pre-destination admission is invalid"
+    } else {
+        "stored Artifact export armed phase is invalid"
+    };
+    let changed = transaction.execute(
+        "UPDATE operations
+         SET state=CASE WHEN ?4 THEN 'FAILED' ELSE 'UNKNOWN' END,
+             outcome_certainty=CASE WHEN ?4 THEN 'FAILED_NO_EFFECT' ELSE 'OUTCOME_UNKNOWN' END,
+             finished_at=CASE WHEN ?4 THEN started_at ELSE ?5 END
+         WHERE operation_id=?1 AND details_json=?2 AND external_receipt=?3
+           AND state='STARTED' AND outcome_certainty IS NULL",
+        params![
+            operation_id,
+            intent_json,
+            receipt,
+            pre_destination,
+            reconciled_at
+        ],
+    )?;
+    if changed != 1 {
+        return Err(TaskManagerError::InvalidRecord(failure));
+    }
+    Ok(())
 }
 
 #[allow(
@@ -8194,6 +8251,10 @@ fn authenticate_export_operation(
         return Ok(None);
     };
     if row.0 != intent.task_id
+        || !matches!(
+            intent.version,
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+        )
         || row.1 != intent.semantic_program_hash
         || row.2 != intent.node_id
         || row.3 != intent.binding_id
@@ -8207,17 +8268,27 @@ fn authenticate_export_operation(
             "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
         ));
     }
-    let pre_destination_admission = row.10.as_deref().map_or(Ok(false), |receipt| {
-        authenticate_pre_destination_export_admission(
-            connection,
-            operation_id,
-            intent_json,
-            receipt,
-        )
-    })?;
-    let armed_admission = row.10.as_deref().map_or(Ok(false), |receipt| {
-        authenticate_armed_export_operation(connection, operation_id, intent_json, receipt)
-    })?;
+    let phase_history = export_phase_history_exists(connection, &intent.task_id, operation_id)?;
+    let phase_aware = intent.version == PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION || phase_history;
+    let pre_destination_admission = if phase_aware {
+        row.10.as_deref().map_or(Ok(false), |receipt| {
+            authenticate_pre_destination_export_admission(
+                connection,
+                operation_id,
+                intent_json,
+                receipt,
+            )
+        })?
+    } else {
+        false
+    };
+    let armed_admission = if phase_aware {
+        row.10.as_deref().map_or(Ok(false), |receipt| {
+            authenticate_armed_export_operation(connection, operation_id, intent_json, receipt)
+        })?
+    } else {
+        false
+    };
     let replay = match (row.8.as_str(), row.9.as_deref()) {
         ("SUCCEEDED", Some("COMPLETED")) => {
             let receipt: serde_json::Value = serde_json::from_str(row.10.as_deref().ok_or(
@@ -8358,6 +8429,9 @@ fn authenticate_export_operation(
         ("STARTED", None) | ("UNKNOWN", Some("OUTCOME_UNKNOWN")) if armed_admission => Err(
             TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OUTCOME_UNKNOWN"),
         ),
+        ("STARTED", None) | ("UNKNOWN", Some("OUTCOME_UNKNOWN")) if !phase_aware => Err(
+            TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OUTCOME_UNKNOWN"),
+        ),
         ("STARTED" | "PREPARED" | "UNKNOWN", None | Some("OUTCOME_UNKNOWN"))
         | ("FAILED", Some("FAILED_PARTIAL_EFFECT")) => Err(TaskManagerError::InvalidRecord(
             "stored Artifact export effect phase is invalid",
@@ -8369,6 +8443,27 @@ fn authenticate_export_operation(
         }
     };
     Ok(Some(replay))
+}
+
+fn export_phase_history_exists(
+    connection: &Connection,
+    task_id: &str,
+    operation_id: &str,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM provenance_events
+                 WHERE task_id=?1 AND event_id IN (?2,?3)
+             )",
+            params![
+                task_id,
+                event_id("artifact-export-pre-destination", operation_id),
+                event_id("artifact-export-effect-armed", operation_id),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
 }
 
 fn export_phase_event(
@@ -19198,6 +19293,170 @@ mod tests {
             )
             .unwrap();
         assert!(manager.reconcile_export_operations_startup().is_err());
+    }
+
+    #[test]
+    fn legacy_started_without_phase_receipt_upgrades_conservatively_to_unknown() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"legacy started export".as_slice()),
+            )
+            .unwrap();
+        let intent_json = canonical_json(&ArtifactExportIntent {
+            version: 1,
+            task_id: "T-artifact".to_owned(),
+            artifact_id: artifact.artifact_id.clone(),
+            content_hash: artifact.stored_content_hash().unwrap().tagged().clone(),
+            destination_class: "user-selected-file".to_owned(),
+            max_size_bytes: 1_024,
+            principal_kind: "user".to_owned(),
+            principal_id: "user:test".to_owned(),
+            semantic_program_hash: None,
+            node_id: None,
+            binding_id: None,
+            attempt_id: None,
+            grant_id: None,
+        })
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO operations(
+                    operation_id,task_id,transaction_class,effect_class,idempotency_key,
+                    state,outcome_certainty,external_receipt,details_json,
+                    prepared_at,started_at,finished_at
+                 ) VALUES (?1,'T-artifact','irreversible_external','DATA_EGRESS',?1,
+                           'STARTED',NULL,NULL,?2,?3,?3,NULL)",
+                params![
+                    "export-legacy-started-null",
+                    intent_json,
+                    "2026-09-19T21:00:00Z"
+                ],
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty || ':' ||
+                            CASE WHEN external_receipt IS NULL THEN 'null' ELSE 'present' END
+                     FROM operations WHERE operation_id='export-legacy-started-null'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN:null"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-legacy-started-null'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_reopens_into_inventory_and_uses_trusted_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let verifier = Arc::new(export_no_effect_verifier(
+            "user-selected-file",
+            "evidence:legacy-unknown",
+            '9',
+        ));
+        let mut manager = manager_with_export_verifiers(&temp, vec![verifier.clone()]);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"legacy unknown export".as_slice()),
+            )
+            .unwrap();
+        let intent_json = canonical_json(&ArtifactExportIntent {
+            version: 1,
+            task_id: "T-artifact".to_owned(),
+            artifact_id: artifact.artifact_id.clone(),
+            content_hash: artifact.stored_content_hash().unwrap().tagged().clone(),
+            destination_class: "user-selected-file".to_owned(),
+            max_size_bytes: 1_024,
+            principal_kind: "user".to_owned(),
+            principal_id: "user:test".to_owned(),
+            semantic_program_hash: None,
+            node_id: None,
+            binding_id: None,
+            attempt_id: None,
+            grant_id: None,
+        })
+        .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO operations(
+                    operation_id,task_id,transaction_class,effect_class,idempotency_key,
+                    state,outcome_certainty,external_receipt,details_json,
+                    prepared_at,started_at,finished_at
+                 ) VALUES (?1,'T-artifact','irreversible_external','DATA_EGRESS',?1,
+                           'UNKNOWN','OUTCOME_UNKNOWN',NULL,?2,?3,?3,?4)",
+                params![
+                    "export-legacy-unknown",
+                    intent_json,
+                    "2026-09-19T21:00:00Z",
+                    "2026-09-19T21:30:00Z"
+                ],
+            )
+            .unwrap();
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock_and_export_verifiers(
+            &database,
+            Box::new(FixedClock),
+            vec![verifier.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-legacy-unknown'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        reopened
+            .reconcile_unknown_artifact_export_no_effect("export-legacy-unknown")
+            .unwrap();
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        reopened
+            .reconcile_unknown_artifact_export_no_effect("export-legacy-unknown")
+            .unwrap();
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-legacy-unknown'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "FAILED:FAILED_NO_EFFECT"
+        );
     }
 
     #[test]
