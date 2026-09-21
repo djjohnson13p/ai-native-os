@@ -800,7 +800,7 @@ pub struct ArtifactReader {
     task_id: String,
     authority: ReadAuthority,
     artifact_id: String,
-    grant_admission: Option<GrantAdmission>,
+    reader_admission: Option<ReplayableReaderAdmission>,
     reader_admission_delivered: bool,
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
@@ -823,7 +823,7 @@ impl ArtifactReader {
         }
         let (Some(execution), Some(admission)) = (
             self.authority.execution.as_ref(),
-            self.grant_admission.as_ref(),
+            self.reader_admission.as_ref(),
         ) else {
             self.reader_admission_delivered = true;
             return Ok(());
@@ -833,7 +833,8 @@ impl ArtifactReader {
             &self.task_id,
             execution,
             &self.artifact_id,
-            admission,
+            &admission.operation_id,
+            &admission.grant_admission,
             &self.clock.now(),
         )?;
         self.reader_admission_delivered = true;
@@ -3205,7 +3206,7 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let grant_admission = admit_prepared_artifact_reader(
+        let reader_admission = admit_prepared_artifact_reader(
             &transaction,
             scope,
             artifact_id,
@@ -3219,37 +3220,27 @@ impl TaskManager {
             .and_then(|()| reader_admission_commit_result_step());
         if let Err(error) = commit {
             if let (Some(execution), Some(admission)) =
-                (&scope.authority.execution, grant_admission.as_ref())
+                (&scope.authority.execution, reader_admission.as_ref())
             {
-                let _ = replayable_reader_admission_for_grant(
+                if !authenticate_reader_admission(
                     &self.connection,
+                    &admission.operation_id,
                     &scope.task_id,
                     execution,
                     artifact_id,
-                    &admission.grant_id,
+                    &admission.grant_admission,
                     &admitted_at,
-                    &self.delivered_reader_admissions,
-                )?;
+                    true,
+                )? {
+                    return Err(error);
+                }
             }
             return Err(error);
         }
-        let reader_admission_delivered = grant_admission.is_none();
-        if let (Some(execution), Some(admission)) =
-            (&scope.authority.execution, grant_admission.as_ref())
-        {
-            let replay = replayable_reader_admission_for_grant(
-                &self.connection,
-                &scope.task_id,
-                execution,
-                artifact_id,
-                &admission.grant_id,
-                &admitted_at,
-                &self.delivered_reader_admissions,
-            )?
-            .ok_or(TaskManagerError::InvalidRecord(
-                "stored Artifact reader admission is invalid",
-            ))?;
-            self.delivered_reader_admissions.insert(replay.operation_id);
+        let reader_admission_delivered = reader_admission.is_none();
+        if let Some(admission) = reader_admission.as_ref() {
+            self.delivered_reader_admissions
+                .insert(admission.operation_id.clone());
         }
         Ok(ArtifactReader {
             file: prepared.file,
@@ -3262,7 +3253,7 @@ impl TaskManager {
             task_id: scope.task_id.clone(),
             authority: scope.authority.clone(),
             artifact_id: artifact_id.to_owned(),
-            grant_admission,
+            reader_admission,
             reader_admission_delivered,
             _store_cleanup: self.artifact_store_cleanup.clone(),
         })
@@ -3729,7 +3720,7 @@ impl TaskManager {
                 pre_destination_receipt,
             ],
         )?;
-        let reader_grant_admission = admit_prepared_artifact_reader(
+        let reader_admission = admit_prepared_artifact_reader(
             &transaction,
             scope,
             artifact_id,
@@ -3790,19 +3781,22 @@ impl TaskManager {
             &destination.intent_json,
             &pre_destination_receipt,
             &scope.authority,
-            reader_grant_admission.as_ref(),
+            reader_admission
+                .as_ref()
+                .map(|admission| &admission.grant_admission),
             destination.grant_admission.as_ref(),
         )?;
         if let (Some(execution), Some(admission)) = (
             scope.authority.execution.as_ref(),
-            reader_grant_admission.as_ref(),
+            reader_admission.as_ref(),
         ) {
             let operation_id = mark_reader_admission_delivered(
                 &mut self.connection,
                 &scope.task_id,
                 execution,
                 artifact_id,
-                admission,
+                &admission.operation_id,
+                &admission.grant_admission,
                 &self.clock.now(),
             )?;
             self.delivered_reader_admissions.insert(operation_id);
@@ -3842,7 +3836,7 @@ impl TaskManager {
             task_id: scope.task_id.clone(),
             authority: scope.authority.clone(),
             artifact_id: artifact_id.to_owned(),
-            grant_admission: reader_grant_admission,
+            reader_admission,
             reader_admission_delivered: true,
             _store_cleanup: self.artifact_store_cleanup.clone(),
         };
@@ -6855,7 +6849,7 @@ fn admit_prepared_artifact_reader(
     handle: &ArtifactHandle,
     admitted_at: &str,
     delivered_in_process: &BTreeSet<String>,
-) -> Result<Option<GrantAdmission>> {
+) -> Result<Option<ReplayableReaderAdmission>> {
     ensure_task_is_not_recovering(connection, &scope.task_id)?;
     let integrity_current = connection.query_row(
         "SELECT a.integrity_state,b.durability_state
@@ -6894,7 +6888,7 @@ fn admit_prepared_artifact_reader(
             admitted_at,
             delivered_in_process,
         )? {
-            Some(admission.grant_admission)
+            Some(admission)
         } else {
             let admission = admit_operation_grant(
                 connection,
@@ -6906,7 +6900,7 @@ fn admit_prepared_artifact_reader(
                 admitted_at,
                 grant_id,
             )?;
-            persist_reader_admission(
+            let operation_id = persist_reader_admission(
                 connection,
                 &scope.task_id,
                 execution,
@@ -6914,7 +6908,10 @@ fn admit_prepared_artifact_reader(
                 &admission,
                 admitted_at,
             )?;
-            Some(admission)
+            Some(ReplayableReaderAdmission {
+                operation_id,
+                grant_admission: admission,
+            })
         }
     } else {
         if capture_read_authority(connection, &scope.task_id, None, admitted_at)? != scope.authority
@@ -6946,7 +6943,7 @@ fn persist_reader_admission(
     artifact_id: &str,
     admission: &GrantAdmission,
     admitted_at: &str,
-) -> Result<()> {
+) -> Result<String> {
     let operation_id = event_id(
         "artifact-reader-admission",
         &format!("{task_id}\0{}", random_token(connection)?),
@@ -6995,7 +6992,7 @@ fn persist_reader_admission(
             receipt,
         ],
     )?;
-    Ok(())
+    Ok(operation_id)
 }
 
 fn reader_admission_event(
@@ -7314,46 +7311,23 @@ fn mark_reader_admission_delivered(
     task_id: &str,
     execution: &ExecutionAuthority,
     artifact_id: &str,
+    operation_id: &str,
     admission: &GrantAdmission,
     delivered_at: &str,
 ) -> Result<String> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let candidates = {
-        let mut statement = transaction.prepare(
-            "SELECT operation_id,external_receipt FROM operations
-             WHERE task_id=?1 AND semantic_program_hash=?2 AND node_id=?3
-               AND binding_id=?4 AND attempt_id=?5
-               AND transaction_class='reversible_local' AND effect_class='ARTIFACT_READ'
-               AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
-               AND json_extract(external_receipt,'$.kind') IN (
-                   'artifact-reader-admission-pending-delivery',
-                   'artifact-reader-admission-delivered'
-               )
-               AND json_extract(details_json,'$.artifact_id')=?6
-               AND json_extract(details_json,'$.grant_id')=?7
-             ORDER BY operation_id",
-        )?;
-        let rows = statement.query_map(
-            params![
-                task_id,
-                execution.semantic_program_hash,
-                execution.node_id,
-                execution.binding_id,
-                execution.attempt_id,
-                artifact_id,
-                admission.grant_id,
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    if candidates.len() != 1 {
-        return Err(TaskManagerError::InvalidRecord(
+    let pending_receipt = transaction
+        .query_row(
+            "SELECT external_receipt FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or(TaskManagerError::InvalidRecord(
             "stored Artifact reader admission is invalid",
-        ));
-    }
-    let (operation_id, pending_receipt) = &candidates[0];
-    let existing_receipt: ArtifactReaderAdmissionReceipt = serde_json::from_str(pending_receipt)?;
+        ))?;
+    let existing_receipt: ArtifactReaderAdmissionReceipt = serde_json::from_str(&pending_receipt)?;
     if existing_receipt.kind == "artifact-reader-admission-delivered" {
         if !authenticate_reader_admission(
             &transaction,
@@ -7370,7 +7344,7 @@ fn mark_reader_admission_delivered(
             ));
         }
         transaction.commit()?;
-        return Ok(operation_id.clone());
+        return Ok(operation_id.to_owned());
     }
     if !authenticate_reader_admission(
         &transaction,
@@ -7401,7 +7375,7 @@ fn mark_reader_admission_delivered(
                 )
             })
         })?;
-    let pending: ArtifactReaderAdmissionReceipt = serde_json::from_str(pending_receipt)?;
+    let pending: ArtifactReaderAdmissionReceipt = serde_json::from_str(&pending_receipt)?;
     let event = reader_admission_event(
         &stored,
         "delivered",
@@ -7415,7 +7389,7 @@ fn mark_reader_admission_delivered(
     let delivered = canonical_json(&ArtifactReaderAdmissionReceipt {
         version: 1,
         kind: "artifact-reader-admission-delivered".to_owned(),
-        operation_id: operation_id.clone(),
+        operation_id: operation_id.to_owned(),
         admission_event_id: pending.admission_event_id,
         admission_event_hash: pending.admission_event_hash,
         delivery_event_id: Some(appended.event_id),
@@ -7465,7 +7439,7 @@ fn mark_reader_admission_delivered(
             return Err(error);
         }
     }
-    Ok(operation_id.clone())
+    Ok(operation_id.to_owned())
 }
 
 fn replayable_reader_admission(
@@ -7536,7 +7510,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                 &now,
             )?;
             let admission = reader
-                .grant_admission
+                .reader_admission
                 .as_ref()
                 .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
             if current != *execution
@@ -7548,7 +7522,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                     "artifact",
                     &reader.artifact_id,
                     &now,
-                    Some(admission),
+                    Some(&admission.grant_admission),
                 )?
                 .is_none()
             {
@@ -20599,6 +20573,145 @@ mod tests {
             reopened.scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id)),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded-grant fixture covers sequential read and export admissions plus exact operation tamper rejection"
+    )]
+    fn finite_read_grant_delivers_each_exact_read_and_export_admission() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"four exact reader admissions".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "finite-reader-admissions",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "finite-reader-export"),
+            ],
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=4
+                 WHERE grant_id='grant-finite-reader-admissions-0'",
+                [],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=2
+                 WHERE grant_id='grant-finite-reader-admissions-1'",
+                [],
+            )
+            .unwrap();
+        let session = session_for_binding(&manager, "T-artifact", &binding_id);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+
+        let mut first = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut bytes = Vec::new();
+        first.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"four exact reader admissions");
+        drop(first);
+
+        let mut second = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let exact_operation = second
+            .reader_admission
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        second.reader_admission.as_mut().unwrap().operation_id =
+            "event:artifact-reader-admission:v1:sha256:forged".to_owned();
+        assert_eq!(
+            second.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        second.reader_admission.as_mut().unwrap().operation_id = exact_operation.clone();
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET node_id='forged-node' WHERE operation_id=?1",
+                [&exact_operation],
+            )
+            .unwrap();
+        assert_eq!(
+            second.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE operations SET node_id='compose_report' WHERE operation_id=?1",
+                [&exact_operation],
+            )
+            .unwrap();
+        bytes.clear();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"four exact reader admissions");
+        drop(second);
+
+        for index in 0..2 {
+            let operation_id = format!("export-finite-reader-{index}");
+            let mut destination = manager
+                .issue_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "finite-reader-export",
+                    1_024,
+                    deferred(Vec::new()),
+                )
+                .unwrap();
+            assert_eq!(
+                manager
+                    .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                    .unwrap(),
+                28
+            );
+        }
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations
+                     WHERE effect_class='ARTIFACT_READ'
+                       AND json_extract(external_receipt,'$.kind')=
+                           'artifact-reader-admission-delivered'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT uses_consumed FROM authority_grants
+                     WHERE grant_id='grant-finite-reader-admissions-0'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
     }
 
     #[test]
