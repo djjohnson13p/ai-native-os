@@ -521,7 +521,7 @@ fn verify_one_record(
     checkpoint: Option<&CheckpointExpectation>,
     verified_at: &str,
 ) -> std::result::Result<String, Box<VerificationResult>> {
-    let event_id = string_field(&record.event, "event_id").map(str::to_owned);
+    let event_id = string_field(&record.event, "event_id").and_then(diagnostic_event_id);
     let invalid = |code: &str, message: &str, head: Option<String>| {
         Box::new(failure(
             stream_id,
@@ -667,44 +667,35 @@ fn finish_verification(
 }
 
 /// Verifies journal records already loaded in their presented order.
+///
+/// # Errors
+/// Returns an error for an invalid stream ID, timestamp, or checkpoint expectation.
 #[allow(clippy::too_many_lines)]
 pub fn verify_records(
     records: &[JournalRecord],
     stream_id: &str,
     checkpoint: Option<&CheckpointExpectation>,
     verified_at: &str,
-) -> VerificationResult {
-    if validate_stream_id(stream_id).is_err()
-        || validate_timestamp(verified_at).is_err()
-        || validate_checkpoint(checkpoint).is_err()
-    {
-        return failure(
-            stream_id,
-            verified_at,
-            "PROVENANCE_SCHEMA_INVALID",
-            "verification request is invalid",
-            None,
-            None,
-            None,
-            None,
-        );
-    }
+) -> Result<VerificationResult> {
+    validate_stream_id(stream_id)?;
+    validate_timestamp(verified_at)?;
+    validate_checkpoint(checkpoint)?;
     let mut previous: Option<String> = None;
     let mut expected_sequence = 1_u64;
     let mut event_ids = std::collections::HashSet::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(event_id) = string_field(&record.event, "event_id") {
             if !event_ids.insert(event_id) {
-                return failure(
+                return Ok(failure(
                     stream_id,
                     verified_at,
                     "PROVENANCE_SCHEMA_INVALID",
                     "duplicate provenance event ID",
                     Some(record.sequence),
-                    Some(event_id.to_owned()),
+                    diagnostic_event_id(event_id),
                     previous,
                     checkpoint,
-                );
+                ));
             }
         }
         let expected_later = record.sequence > expected_sequence
@@ -721,17 +712,17 @@ pub fn verify_records(
             verified_at,
         ) {
             Ok(computed) => previous = Some(computed),
-            Err(failure) => return *failure,
+            Err(failure) => return Ok(*failure),
         }
         expected_sequence = expected_sequence.saturating_add(1);
     }
-    finish_verification(
+    Ok(finish_verification(
         stream_id,
         expected_sequence,
         previous,
         checkpoint,
         verified_at,
-    )
+    ))
 }
 /// Produces a separately hashed privacy-redacted projection and manifest.
 ///
@@ -2058,8 +2049,8 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         ("task.transitioned", "active_program") => validate_active_program(value),
         ("task.transitioned", "mutation_text_commitments") => validate_mutation_commitments(value),
         ("authorization.granted", "actions") => expect_safe_identifier_array(value, 64),
-        ("authorization.granted", "resource") => expect_identifier(value, 256),
-        ("authorization.granted", "resources") => expect_identifier_array(value, 64, 256),
+        ("authorization.granted", "resource") => expect_safe_identifier(value),
+        ("authorization.granted", "resources") => expect_safe_identifier_array(value, 64),
         ("plan.created" | "plan.revised", "plan_id") => expect_task_string(value, 256, true),
         ("plan.created" | "plan.revised", "revision") => expect_integer(value, 1, None),
         ("provider.selected" | "placement.selected", "locality") => {
@@ -2070,7 +2061,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         }
         ("execution.started", "attempt_id") => expect_identifier(value, 256),
         ("execution.started", "binding_id") => expect_identifier(value, 256),
-        ("execution.started", "node_id") => expect_identifier(value, 128),
+        ("execution.started", "node_id") => expect_identifier(value, 256),
         ("execution.started" | "execution.completed" | "execution.failed", "operation_id") => {
             expect_identifier(value, 256)
         }
@@ -2222,13 +2213,13 @@ fn validate_active_program(value: &Value) -> Result<()> {
         ],
     )?;
     expect_identifier(&object["program_id"], 256)?;
-    expect_token(&object["ir_version"], 64)?;
+    expect_token(&object["ir_version"], 256)?;
     expect_digest(&object["semantic_hash"])?;
     expect_identifier(&object["registry_snapshot_id"], 256)?;
     expect_nullable_identifier(&object["validation_result_id"], 256)?;
     expect_nullable_timestamp(&object["validated_at"])?;
     expect_nullable_identifier(&object["validator_id"], 256)?;
-    expect_nullable_token(&object["validator_version"], 128)?;
+    expect_nullable_token(&object["validator_version"], 256)?;
     expect_digest(&object["program_content_digest"])
 }
 
@@ -2283,7 +2274,7 @@ fn validate_export_reconciliation(value: &Value) -> Result<()> {
     expect_identifier(&object["verifier_id"], 256)?;
     expect_identifier(&object["evidence_ref"], 256)?;
     expect_digest(&object["proof_hash"])?;
-    expect_identifier(&object["challenge"], 128)?;
+    expect_identifier(&object["challenge"], 256)?;
     expect_timestamp(&object["observed_at"])?;
     expect_digest(&object["subject_hash"])?;
     expect_identifier(&object["recovery_ref"], 256)
@@ -2369,13 +2360,7 @@ fn expect_identifier(value: &Value, maximum: usize) -> Result<()> {
         .as_str()
         .ok_or_else(|| invalid_details("identifier detail must be a string"))?;
     let length = value.chars().count();
-    if length == 0
-        || length > maximum
-        || !value.chars().all(|character| {
-            character.is_alphanumeric()
-                || matches!(character, '.' | '_' | ':' | '/' | '@' | '+' | '-')
-        })
-    {
+    if length == 0 || length > maximum || value.chars().any(char::is_whitespace) {
         return Err(invalid_details("identifier detail has invalid syntax"));
     }
     Ok(())
@@ -2447,25 +2432,6 @@ fn expect_nullable_token(value: &Value, maximum: usize) -> Result<()> {
     expect_nullable_identifier(value, maximum)
 }
 
-fn expect_identifier_array(
-    value: &Value,
-    maximum_items: usize,
-    maximum_chars: usize,
-) -> Result<()> {
-    let values = value
-        .as_array()
-        .ok_or_else(|| invalid_details("identifier collection must be an array"))?;
-    if values.len() > maximum_items {
-        return Err(invalid_details(
-            "identifier collection exceeds its item bound",
-        ));
-    }
-    for value in values {
-        expect_identifier(value, maximum_chars)?;
-    }
-    Ok(())
-}
-
 fn expect_safe_identifier_array(value: &Value, maximum_items: usize) -> Result<()> {
     let values = value
         .as_array()
@@ -2474,17 +2440,13 @@ fn expect_safe_identifier_array(value: &Value, maximum_items: usize) -> Result<(
         return Err(invalid_details("action collection exceeds its item bound"));
     }
     for value in values {
-        let action = value
-            .as_str()
-            .ok_or_else(|| invalid_details("action must be a string"))?;
-        if action.is_empty()
-            || action.chars().count() > 256
-            || action.chars().any(char::is_whitespace)
-        {
-            return Err(invalid_details("action has invalid syntax"));
-        }
+        expect_safe_identifier(value)?;
     }
     Ok(())
+}
+
+fn expect_safe_identifier(value: &Value) -> Result<()> {
+    expect_identifier(value, 256)
 }
 
 fn expect_one_of(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -2680,6 +2642,10 @@ fn string_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
 }
 
+fn diagnostic_event_id(value: &str) -> Option<String> {
+    (!value.is_empty() && value.chars().count() <= 256).then(|| value.to_owned())
+}
+
 fn verifier() -> VerifierIdentity {
     VerifierIdentity {
         id: "aios-provenance".to_owned(),
@@ -2699,6 +2665,7 @@ fn failure(
     computed_head_hash: Option<String>,
     checkpoint: Option<&CheckpointExpectation>,
 ) -> VerificationResult {
+    let sequence = sequence.filter(|value| *value > 0);
     VerificationResult {
         schema_version: SCHEMA_VERSION.to_owned(),
         valid: false,
@@ -2714,7 +2681,7 @@ fn failure(
             code: code.to_owned(),
             message: message.to_owned(),
             sequence,
-            event_id,
+            event_id: event_id.filter(|id| !id.is_empty() && id.chars().count() <= 256),
             related: Vec::new(),
         }],
         diagnostics_truncated: false,
@@ -2957,27 +2924,36 @@ mod tests {
         let mut field = records.clone();
         field[2].event["status"] = json!("failure");
         assert_eq!(
-            verify_records(&field, &stream, None, NOW).diagnostics[0].code,
+            verify_records(&field, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
             "PROVENANCE_EVENT_HASH_MISMATCH"
         );
 
         let mut previous = records.clone();
         previous[3].previous_event_hash = Some(format!("sha256:{}", "a".repeat(64)));
         assert_eq!(
-            verify_records(&previous, &stream, None, NOW).diagnostics[0].code,
+            verify_records(&previous, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
             "PROVENANCE_PREVIOUS_HASH_MISMATCH"
         );
 
         let mut deleted = records.clone();
         deleted.remove(1);
-        let result = verify_records(&deleted, &stream, None, NOW);
+        let result = verify_records(&deleted, &stream, None, NOW).unwrap();
         assert_eq!(result.diagnostics[0].code, "PROVENANCE_SEQUENCE_GAP");
         assert_eq!(result.diagnostics[0].sequence, Some(3));
 
         let mut reordered = records;
         reordered.swap(1, 2);
         assert_eq!(
-            verify_records(&reordered, &stream, None, NOW).diagnostics[0].code,
+            verify_records(&reordered, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
             "PROVENANCE_SEQUENCE_ORDER_INVALID"
         );
     }
@@ -3537,7 +3513,7 @@ mod tests {
             checkpoint_id: "checkpoint:test".to_owned(),
             event_hash: format!("sha256:{}", "c".repeat(64)),
         };
-        let result = verify_records(&records, &stream, Some(&checkpoint), NOW);
+        let result = verify_records(&records, &stream, Some(&checkpoint), NOW).unwrap();
         assert_eq!(
             result.diagnostics[0].code,
             "PROVENANCE_CHECKPOINT_HEAD_MISMATCH"
@@ -4121,10 +4097,7 @@ mod tests {
             },
         ] {
             assert!(verify_stream(&connection, &stream, None, Some(&checkpoint), NOW).is_err());
-            assert_eq!(
-                verify_records(&records, &stream, Some(&checkpoint), NOW).diagnostics[0].code,
-                "PROVENANCE_SCHEMA_INVALID"
-            );
+            assert!(verify_records(&records, &stream, Some(&checkpoint), NOW).is_err());
         }
         connection
             .execute(
@@ -4133,6 +4106,104 @@ mod tests {
             )
             .unwrap();
         assert!(get_head(&connection, &stream).is_err());
+    }
+
+    #[test]
+    fn detached_verifier_rejects_invalid_request_metadata() {
+        assert!(verify_records(&[], "", None, "bad").is_err());
+        let stream = stream_id("T-provenance").unwrap();
+        assert!(verify_records(&[], &stream, None, "bad").is_err());
+        assert!(verify_records(&[], &stream, None, NOW).is_ok());
+    }
+
+    #[test]
+    fn verification_diagnostics_omit_invalid_event_ids() {
+        let mut connection = connection();
+        let mut records = append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        records[0].event["event_id"] = json!("x".repeat(257));
+        records[0].schema_version = "invalid".to_owned();
+        let detached = verify_records(&records, &stream, None, NOW).unwrap();
+        assert_eq!(detached.diagnostics[0].event_id, None);
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_id=?1 WHERE stream_id=?2",
+                params!["x".repeat(257), stream],
+            )
+            .unwrap();
+        let stored = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+        assert_eq!(stored.diagnostics[0].event_id, None);
+
+        records[0].sequence = 0;
+        let invalid_sequence = verify_records(&records, &stream, None, NOW).unwrap();
+        assert!(!invalid_sequence.valid);
+        assert_eq!(invalid_sequence.diagnostics[0].sequence, None);
+    }
+
+    #[test]
+    fn safe_identifier_details_follow_schema_scalar_and_whitespace_bounds() {
+        let safe = "!".repeat(256);
+        let mut authorization = event("T-safe-identifiers", 2);
+        authorization["event_type"] = json!("authorization.granted");
+        authorization["details"] = json!({
+            "actions":["$scope"],
+            "resource":"$scope",
+            "resources":[safe]
+        });
+        assert!(validate_event("T-safe-identifiers", &authorization).is_ok());
+        for key in ["resource", "resources"] {
+            let mut invalid = authorization.clone();
+            invalid["details"][key] = if key == "resource" {
+                json!("!".repeat(257))
+            } else {
+                json!(["!".repeat(257)])
+            };
+            assert!(validate_event("T-safe-identifiers", &invalid).is_err());
+            invalid["details"][key] = if key == "resource" {
+                json!("has space")
+            } else {
+                json!(["has space"])
+            };
+            assert!(validate_event("T-safe-identifiers", &invalid).is_err());
+        }
+
+        let mut execution = event("T-safe-identifiers", 2);
+        execution["event_type"] = json!("execution.started");
+        execution["details"] = json!({"node_id":"!".repeat(256), "attempt_id":"$scope"});
+        assert!(validate_event("T-safe-identifiers", &execution).is_ok());
+        execution["details"]["node_id"] = json!("!".repeat(257));
+        assert!(validate_event("T-safe-identifiers", &execution).is_err());
+
+        let mut transition = typed_transition_event("T-safe-identifiers");
+        transition["details"]["active_program"] = json!({
+            "program_id":"$scope",
+            "ir_version":"!".repeat(256),
+            "semantic_hash":format!("sha256:{}", "a".repeat(64)),
+            "registry_snapshot_id":"$scope",
+            "validation_result_id":"$scope",
+            "validated_at":NOW,
+            "validator_id":"$scope",
+            "validator_version":"!".repeat(256),
+            "program_content_digest":format!("sha256:{}", "b".repeat(64))
+        });
+        assert!(validate_event("T-safe-identifiers", &transition).is_ok());
+        transition["details"]["active_program"]["ir_version"] = json!("has space");
+        assert!(validate_event("T-safe-identifiers", &transition).is_err());
+
+        let mut completion = event("T-safe-identifiers", 2);
+        completion["event_type"] = json!("execution.completed");
+        completion["details"] = json!({"export_reconciliation":{
+            "verifier_id":"$scope",
+            "evidence_ref":"$scope",
+            "proof_hash":format!("sha256:{}", "a".repeat(64)),
+            "challenge":"!".repeat(256),
+            "observed_at":NOW,
+            "subject_hash":format!("sha256:{}", "b".repeat(64)),
+            "recovery_ref":"$scope"
+        }});
+        assert!(validate_event("T-safe-identifiers", &completion).is_ok());
+        completion["details"]["export_reconciliation"]["challenge"] = json!("!".repeat(257));
+        assert!(validate_event("T-safe-identifiers", &completion).is_err());
     }
 
     #[test]
@@ -4160,7 +4231,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verify_records(&records, &stream, None, NOW).diagnostics[0].code,
+            verify_records(&records, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
             "PROVENANCE_SCHEMA_INVALID"
         );
         drop(transaction);
@@ -4193,7 +4267,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verify_records(&records, &stream, None, NOW).diagnostics[0].code,
+            verify_records(&records, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
             "PROVENANCE_SCHEMA_INVALID"
         );
     }
