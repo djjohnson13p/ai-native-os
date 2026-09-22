@@ -16,9 +16,9 @@ mod artifact_store;
 
 pub use aios_provenance::{
     CheckpointExpectation as ProvenanceCheckpointExpectation,
-    ExportManifest as ProvenanceExportManifest, JournalRecord as ProvenanceJournalRecord,
-    PortableExport as ProvenancePortableExport, RecordPage as ProvenanceRecordPage,
-    StreamHead as ProvenanceStreamHead, VerificationResult as ProvenanceVerificationResult,
+    JournalRecord as ProvenanceJournalRecord, ProjectionPortableExport as ProvenancePortableExport,
+    RecordPage as ProvenanceRecordPage, StreamHead as ProvenanceStreamHead,
+    VerificationResult as ProvenanceVerificationResult,
 };
 pub use artifact_store::{
     ArtifactAllocationState, ArtifactExpectedState, ArtifactExportDestination,

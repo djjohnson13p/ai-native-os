@@ -95,6 +95,9 @@ No current AIOS contract is `STABLE`.
 | `provenance-journal-record.schema.json` | stream/sequence/hash-chain envelope around event payload |
 | `provenance-checkpoint.schema.json` | independently verifiable journal checkpoint |
 | `provenance-verification-result.schema.json` | stream verification result |
+| `provenance-projection-manifest.schema.json` | privacy-redacted portable projection descriptor |
+| `provenance-projected-record.schema.json` | independently hashed projected JSONL record |
+| `provenance-projection-verification-result.schema.json` | projection-only offline verification result and explicit limitations |
 | `provenance-reason-codes.json` | stable provenance diagnostics |
 
 ### Authority / approvals / policy

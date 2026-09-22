@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provenance-projected-record.schema.json",
+  "title": "Privacy-Redacted Provenance Projected Record v1",
+  "description": "The implementation applies the provenance event contract's closed path-specific projection: all non-fixed strings are bundle-local aliases; only fixed enums, timestamps, numbers, booleans, nulls, and validated private commitments remain literal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "projection_hash_profile", "bundle_id", "sequence", "previous_projection_hash", "projected_event", "projection_hash"],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "projection_hash_profile": {"const": "aios-provenance-redacted-projection-v1"},
+    "bundle_id": {"type": "string", "pattern": "^bundle:v1:[0-9a-f]{64}$"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "previous_projection_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "projected_event": {"type": "object"},
+    "projection_hash": {"$ref": "#/$defs/hash"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+}

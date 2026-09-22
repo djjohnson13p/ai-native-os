@@ -652,6 +652,8 @@ fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() 
         ["step one", "step=two", "step 👣", "step-e\u{301}"]
     );
     let export = manager.export_provenance(task_id).unwrap();
+    assert!(!export.records_jsonl.contains("Alice Smith"));
+    assert!(!export.records_jsonl.contains("My Workspace"));
     let verification = aios_provenance::verify_jsonl_export(
         &export.manifest_json,
         &export.records_jsonl,
@@ -720,9 +722,9 @@ fn new_task_opaque_identifiers_preserve_exact_hash_and_export_after_reopen() {
     assert_eq!(reopened_head, original_head);
     assert!(manager.verify_provenance(task_id).unwrap());
     let export = manager.export_provenance(task_id).unwrap();
-    assert!(export.records_jsonl.contains("user:Alice Smith="));
-    assert!(export.records_jsonl.contains("My Workspace="));
-    assert!(export.records_jsonl.contains("step one"));
+    assert!(!export.records_jsonl.contains("user:Alice Smith="));
+    assert!(!export.records_jsonl.contains("My Workspace="));
+    assert!(!export.records_jsonl.contains("step one"));
     let verification = aios_provenance::verify_jsonl_export(
         &export.manifest_json,
         &export.records_jsonl,
@@ -730,10 +732,16 @@ fn new_task_opaque_identifiers_preserve_exact_hash_and_export_after_reopen() {
     )
     .unwrap();
     assert!(verification.valid, "{verification:?}");
-    assert_eq!(
-        verification.computed_head_hash,
-        Some(original_head.event_hash)
-    );
+    assert_eq!(verification.scope, "exported-projection");
+    assert!(!verification.original_chain_verified_offline);
+    assert!(!verification.original_chain_linkage_proven);
+    let unchanged_head = aios_provenance::get_head(
+        &manager.connection,
+        &aios_provenance::stream_id(task_id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(unchanged_head, original_head);
 }
 
 #[test]
@@ -835,6 +843,9 @@ fn portable_provenance_export_is_private_and_reverifies_without_task_storage() {
     )
     .unwrap();
     assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.scope, "exported-projection");
+    assert!(!verification.original_chain_verified_offline);
+    assert!(!verification.original_chain_linkage_proven);
 }
 
 #[test]

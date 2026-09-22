@@ -26,7 +26,15 @@ const MAX_STRING_CHARS: usize = 4096;
 const MAX_ARRAY_ITEMS: usize = 512;
 const MAX_OBJECT_FIELDS: usize = 256;
 const HASH_DOMAIN: &[u8] = b"AIOS-PROVENANCE-EVENT\0v0.1\0";
+const PROJECTION_HASH_PROFILE: &str = "aios-provenance-redacted-projection-v1";
+const PROJECTION_RECORD_DOMAIN: &[u8] = b"AIOS-PROVENANCE-PROJECTION-RECORD\0v1\0";
+const PROJECTION_DESCRIPTOR_DOMAIN: &[u8] = b"AIOS-PROVENANCE-PROJECTION-DESCRIPTOR\0v1\0";
+const PROJECTION_ALIAS_DOMAIN: &[u8] = b"AIOS-PROVENANCE-PROJECTION-ALIAS\0v1\0";
 const EVENT_SCHEMA: &str = include_str!("../../../specs/provenance-event.schema.json");
+const PROJECTION_MANIFEST_SCHEMA: &str =
+    include_str!("../../../specs/provenance-projection-manifest.schema.json");
+const PROJECTED_RECORD_SCHEMA: &str =
+    include_str!("../../../specs/provenance-projected-record.schema.json");
 
 #[derive(Debug)]
 pub enum Error {
@@ -148,9 +156,10 @@ pub struct CheckpointExpectation {
     pub event_hash: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExportManifest {
+struct LegacyExportManifest {
     pub schema_version: String,
     pub export_profile: String,
     pub hash_profile: String,
@@ -161,9 +170,50 @@ pub struct ExportManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortableExport {
+pub struct ProjectionPortableExport {
     pub manifest_json: String,
     pub records_jsonl: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionManifest {
+    pub schema_version: String,
+    pub export_profile: String,
+    pub projection_hash_profile: String,
+    pub bundle_id: String,
+    pub record_count: u64,
+    pub head_sequence: u64,
+    pub head_projection_hash: String,
+    pub descriptor_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedRecord {
+    pub schema_version: String,
+    pub projection_hash_profile: String,
+    pub bundle_id: String,
+    pub sequence: u64,
+    pub previous_projection_hash: Option<String>,
+    pub projected_event: Value,
+    pub projection_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionVerificationResult {
+    pub schema_version: String,
+    pub scope: String,
+    pub valid: bool,
+    pub original_chain_verified_offline: bool,
+    pub original_chain_linkage_proven: bool,
+    pub bundle_id: String,
+    pub from_sequence: u64,
+    pub to_sequence: u64,
+    pub computed_projection_head_hash: Option<String>,
+    pub diagnostics: Vec<VerificationDiagnostic>,
+    pub verified_at: String,
 }
 
 /// Derives the deterministic opaque stream identity for a validated Task ID.
@@ -637,7 +687,7 @@ pub fn verify_records(
     }
 }
 
-/// Produces a privacy-screened JSONL copy and verification manifest.
+/// Produces a separately hashed privacy-redacted projection and manifest.
 ///
 /// # Errors
 /// Returns an error when the stream is invalid, unsafe to export, or cannot be read.
@@ -645,8 +695,10 @@ pub fn export_jsonl(
     connection: &Connection,
     stream_id: &str,
     verified_at: &str,
-) -> Result<PortableExport> {
-    let verification = verify_stream(connection, stream_id, None, None, verified_at)?;
+) -> Result<ProjectionPortableExport> {
+    validate_timestamp(verified_at)?;
+    let transaction = connection.unchecked_transaction()?;
+    let verification = verify_stream(&transaction, stream_id, None, None, verified_at)?;
     if !verification.valid {
         return Err(Error::InvalidRecord(
             "cannot export an invalid provenance stream".to_owned(),
@@ -655,7 +707,7 @@ pub fn export_jsonl(
     let mut records = Vec::new();
     let mut cursor = None;
     loop {
-        let page = list_events(connection, stream_id, cursor, MAX_PAGE_SIZE)?;
+        let page = list_events(&transaction, stream_id, cursor, MAX_PAGE_SIZE)?;
         for record in page.records {
             validate_stored_event(&record.event)?;
             records.push(record);
@@ -663,30 +715,81 @@ pub fn export_jsonl(
         let Some(next) = page.next_cursor else { break };
         cursor = Some(next);
     }
-    let head = records.last().ok_or_else(|| {
+    records.last().ok_or_else(|| {
         Error::InvalidRecord("cannot export an empty provenance stream".to_owned())
     })?;
-    let manifest = ExportManifest {
-        schema_version: SCHEMA_VERSION.to_owned(),
-        export_profile: "privacy-safe-original-chain".to_owned(),
-        hash_profile: HASH_PROFILE.to_owned(),
-        stream_id: stream_id.to_owned(),
-        record_count: records.len() as u64,
-        head_sequence: head.sequence,
-        head_event_hash: head.event_hash.clone(),
-    };
-    let mut records_jsonl = String::new();
+    let alias_key =
+        transaction.query_row("SELECT randomblob(32)", [], |row| row.get::<_, Vec<u8>>(0))?;
+    if alias_key.len() != 32 {
+        return Err(Error::InvalidRecord(
+            "projection alias key generation failed".to_owned(),
+        ));
+    }
+    let bundle_random = transaction.query_row("SELECT hex(randomblob(32))", [], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let bundle_id = format!("bundle:v1:{}", bundle_random.to_ascii_lowercase());
+    let mut projected_records = Vec::with_capacity(records.len());
+    let mut previous = None;
     for record in records {
+        let projected_event = project_event(&record.event, &alias_key)?;
+        let projection_hash = hash_projected_record(
+            &bundle_id,
+            record.sequence,
+            previous.as_deref(),
+            &projected_event,
+        )?;
+        projected_records.push(ProjectedRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            projection_hash_profile: PROJECTION_HASH_PROFILE.to_owned(),
+            bundle_id: bundle_id.clone(),
+            sequence: record.sequence,
+            previous_projection_hash: previous,
+            projected_event,
+            projection_hash: projection_hash.clone(),
+        });
+        previous = Some(projection_hash);
+    }
+    let head = projected_records.last().ok_or_else(|| {
+        Error::InvalidRecord("cannot export an empty projected stream".to_owned())
+    })?;
+    let mut manifest = ProjectionManifest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        export_profile: "privacy-redacted-projection-v1".to_owned(),
+        projection_hash_profile: PROJECTION_HASH_PROFILE.to_owned(),
+        bundle_id,
+        record_count: projected_records.len() as u64,
+        head_sequence: head.sequence,
+        head_projection_hash: head.projection_hash.clone(),
+        descriptor_hash: String::new(),
+    };
+    manifest.descriptor_hash = hash_projection_descriptor(&manifest)?;
+    let manifest_value = serde_json::to_value(&manifest)?;
+    if !projection_manifest_validator()?.is_valid(&manifest_value) {
+        return Err(Error::InvalidRecord(
+            "generated projection manifest is invalid".to_owned(),
+        ));
+    }
+    let mut records_jsonl = String::new();
+    for record in projected_records {
+        if !projected_record_validator()?.is_valid(&serde_json::to_value(&record)?) {
+            return Err(Error::InvalidRecord(
+                "generated projected record is invalid".to_owned(),
+            ));
+        }
         records_jsonl.push_str(&serde_json::to_string(&record)?);
         records_jsonl.push('\n');
     }
-    Ok(PortableExport {
-        manifest_json: serde_json::to_string_pretty(&manifest)?,
+    transaction.commit()?;
+    Ok(ProjectionPortableExport {
+        manifest_json: serde_json::to_string_pretty(&manifest_value)?,
         records_jsonl,
     })
 }
 
-/// Re-verifies a portable export without a database or network access.
+/// Verifies only the exported projection without a database or network access.
+///
+/// This does not verify or prove linkage to the original journal chain.
 ///
 /// # Errors
 /// Returns an error for malformed, unsupported, unsafe, or over-bound export input.
@@ -694,7 +797,7 @@ pub fn verify_jsonl_export(
     manifest_json: &str,
     records_jsonl: &str,
     verified_at: &str,
-) -> Result<VerificationResult> {
+) -> Result<ProjectionVerificationResult> {
     if manifest_json.len() > MAX_EVENT_BYTES
         || records_jsonl.len() > MAX_EVENT_BYTES.saturating_mul(10_000)
     {
@@ -703,16 +806,23 @@ pub fn verify_jsonl_export(
         ));
     }
     validate_timestamp(verified_at)?;
-    let manifest: ExportManifest = serde_json::from_str(manifest_json)?;
+    let manifest_value: Value = serde_json::from_str(manifest_json)?;
+    if !projection_manifest_validator()?.is_valid(&manifest_value) {
+        return Err(Error::InvalidRecord(
+            "unsupported portable provenance export manifest".to_owned(),
+        ));
+    }
+    let manifest: ProjectionManifest = serde_json::from_value(manifest_value)?;
     if manifest.schema_version != SCHEMA_VERSION
-        || manifest.hash_profile != HASH_PROFILE
-        || manifest.export_profile != "privacy-safe-original-chain"
+        || manifest.projection_hash_profile != PROJECTION_HASH_PROFILE
+        || manifest.export_profile != "privacy-redacted-projection-v1"
+        || !valid_bundle_id(&manifest.bundle_id)
+        || hash_projection_descriptor(&manifest)? != manifest.descriptor_hash
     {
         return Err(Error::InvalidRecord(
             "unsupported portable provenance export manifest".to_owned(),
         ));
     }
-    validate_stream_id(&manifest.stream_id)?;
     let mut records = Vec::new();
     for line in records_jsonl.lines() {
         if line.is_empty() || line.len() > MAX_EVENT_BYTES.saturating_mul(2) {
@@ -720,38 +830,659 @@ pub fn verify_jsonl_export(
                 "malformed portable provenance JSONL".to_owned(),
             ));
         }
-        let record: JournalRecord = serde_json::from_str(line)?;
+        let record_value: Value = serde_json::from_str(line)?;
+        if !projected_record_validator()?.is_valid(&record_value) {
+            return Err(Error::InvalidRecord(
+                "malformed projected provenance record".to_owned(),
+            ));
+        }
+        let record: ProjectedRecord = serde_json::from_value(record_value)?;
         records.push(record);
     }
+    Ok(verify_projected_records(&manifest, &records, verified_at))
+}
+
+fn projection_failure(
+    manifest: &ProjectionManifest,
+    verified_at: &str,
+    code: &str,
+    message: &str,
+    sequence: Option<u64>,
+    head: Option<String>,
+) -> ProjectionVerificationResult {
+    ProjectionVerificationResult {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        scope: "exported-projection".to_owned(),
+        valid: false,
+        original_chain_verified_offline: false,
+        original_chain_linkage_proven: false,
+        bundle_id: manifest.bundle_id.clone(),
+        from_sequence: 1,
+        to_sequence: sequence.unwrap_or(0),
+        computed_projection_head_hash: head,
+        diagnostics: vec![VerificationDiagnostic {
+            severity: Severity::Error,
+            code: code.to_owned(),
+            message: message.to_owned(),
+            sequence,
+            event_id: None,
+            related: Vec::new(),
+        }],
+        verified_at: verified_at.to_owned(),
+    }
+}
+
+fn verify_projected_records(
+    manifest: &ProjectionManifest,
+    records: &[ProjectedRecord],
+    verified_at: &str,
+) -> ProjectionVerificationResult {
+    let mut previous = None;
+    for (index, record) in records.iter().enumerate() {
+        let expected_sequence = index as u64 + 1;
+        if record.schema_version != SCHEMA_VERSION
+            || record.projection_hash_profile != PROJECTION_HASH_PROFILE
+            || record.bundle_id != manifest.bundle_id
+            || record.sequence != expected_sequence
+            || record.previous_projection_hash != previous
+            || validate_projected_event(&record.projected_event).is_err()
+        {
+            return projection_failure(
+                manifest,
+                verified_at,
+                "PROJECTION_RECORD_INVALID",
+                "projected record shape, order, or predecessor is invalid",
+                Some(record.sequence),
+                previous,
+            );
+        }
+        let Ok(computed) = hash_projected_record(
+            &manifest.bundle_id,
+            record.sequence,
+            previous.as_deref(),
+            &record.projected_event,
+        ) else {
+            return projection_failure(
+                manifest,
+                verified_at,
+                "PROJECTION_RECORD_INVALID",
+                "projected record cannot be canonicalized",
+                Some(record.sequence),
+                previous,
+            );
+        };
+        if computed != record.projection_hash {
+            return projection_failure(
+                manifest,
+                verified_at,
+                "PROJECTION_HASH_MISMATCH",
+                "projected record hash does not match its contents",
+                Some(record.sequence),
+                Some(computed),
+            );
+        }
+        previous = Some(computed);
+    }
     if records.len() as u64 != manifest.record_count
-        || records
-            .last()
-            .map(|value| (value.sequence, value.event_hash.as_str()))
-            != Some((manifest.head_sequence, manifest.head_event_hash.as_str()))
+        || records.last().map(|record| record.sequence) != Some(manifest.head_sequence)
+        || previous.as_deref() != Some(manifest.head_projection_hash.as_str())
     {
-        return Ok(failure(
-            &manifest.stream_id,
+        return projection_failure(
+            manifest,
             verified_at,
-            "PROVENANCE_CHECKPOINT_HEAD_MISMATCH",
-            "portable export manifest does not match its JSONL records",
-            records.last().map(|value| value.sequence),
-            None,
-            records.last().map(|value| value.event_hash.clone()),
-            Some(&CheckpointExpectation {
-                checkpoint_id: "export-manifest".to_owned(),
-                event_hash: manifest.head_event_hash,
-            }),
+            "PROJECTION_MANIFEST_MISMATCH",
+            "projection manifest does not match its records",
+            records.last().map(|record| record.sequence),
+            previous,
+        );
+    }
+    ProjectionVerificationResult {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        scope: "exported-projection".to_owned(),
+        valid: true,
+        original_chain_verified_offline: false,
+        original_chain_linkage_proven: false,
+        bundle_id: manifest.bundle_id.clone(),
+        from_sequence: 1,
+        to_sequence: manifest.head_sequence,
+        computed_projection_head_hash: Some(manifest.head_projection_hash.clone()),
+        diagnostics: Vec::new(),
+        verified_at: verified_at.to_owned(),
+    }
+}
+
+fn project_event(event: &Value, alias_key: &[u8]) -> Result<Value> {
+    validate_stored_event(event)?;
+    project_value(event, &mut Vec::new(), alias_key)
+}
+
+fn project_value(value: &Value, path: &mut Vec<String>, alias_key: &[u8]) -> Result<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+        Value::String(text) => {
+            let key = path.last().map(String::as_str).unwrap_or_default();
+            if retained_projection_string(path, key, text) {
+                Ok(value.clone())
+            } else {
+                Ok(alias_value(alias_key, alias_namespace(path, key), text))
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|value| project_value(value, path, alias_key))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(object) => {
+            if is_private_commitment(object) {
+                return Ok(value.clone());
+            }
+            let mut projected = serde_json::Map::new();
+            for (key, value) in object {
+                path.push(key.clone());
+                projected.insert(key.clone(), project_value(value, path, alias_key)?);
+                path.pop();
+            }
+            Ok(Value::Object(projected))
+        }
+    }
+}
+
+fn alias_value(alias_key: &[u8], namespace: &str, value: &str) -> Value {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECTION_ALIAS_DOMAIN);
+    hasher.update(alias_key);
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    let digest = hex_digest(hasher.finalize().as_slice());
+    json!({
+        "kind":"bundle-local-alias",
+        "version":"v1",
+        "namespace":namespace,
+        "alias":format!("sha256:{digest}")
+    })
+}
+
+fn alias_namespace(path: &[String], key: &str) -> &'static str {
+    match key {
+        "task_id" => "task",
+        "event_id" | "admission_event_id" | "provenance_event_ids" => "event",
+        "workspace_id" => "workspace",
+        "plan_id" => "plan",
+        "step_id" | "node_id" | "active_step_ids" => "step",
+        "related_ids" => "related",
+        "input_artifacts" | "output_artifacts" | "data_refs" => "artifact",
+        "id" if path
+            .iter()
+            .any(|part| part == "actor" || part == "principal") =>
+        {
+            "principal"
+        }
+        "id" if path.iter().any(|part| part == "waiting_on") => "waiting",
+        "id" if path.iter().any(|part| part == "skill") => "skill",
+        "id" => "identifier",
+        "transition_id" => "transition",
+        "provider_id" | "validator_id" => "provider",
+        "execution_binding_id" | "binding_id" => "binding",
+        "operation_id" | "unknown_operation_ids" => "operation",
+        "allocation_id" => "allocation",
+        "publication_id" => "publication",
+        "import_id" => "import",
+        "registry_snapshot_id" => "registry-snapshot",
+        "validation_result_id" => "validation-result",
+        "authority_token_id" => "authority-token",
+        "policy_decision_id" => "policy-decision",
+        "approval_id" => "approval",
+        _ => "opaque-value",
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the reviewed literal-string projection vocabulary in one audit table"
+)]
+fn retained_projection_string(path: &[String], key: &str, value: &str) -> bool {
+    match key {
+        "schema_version" => value == SCHEMA_VERSION,
+        "timestamp" | "created_at" | "validated_at" | "observed_at" | "resulted_at" => {
+            validate_timestamp(value).is_ok()
+        }
+        "event_type" => matches!(
+            value,
+            "task.created"
+                | "task.transitioned"
+                | "task.paused"
+                | "task.resumed"
+                | "task.cancelled"
+                | "task.completed"
+                | "task.failed"
+                | "intent.normalized"
+                | "plan.created"
+                | "plan.revised"
+                | "ir.validation.started"
+                | "ir.validation.completed"
+                | "ir.validation.failed"
+                | "registry.snapshot.selected"
+                | "capability.resolved"
+                | "authorization.requested"
+                | "authorization.granted"
+                | "authorization.denied"
+                | "approval.requested"
+                | "approval.granted"
+                | "approval.denied"
+                | "provider.selected"
+                | "placement.selected"
+                | "execution.bound"
+                | "execution.started"
+                | "execution.completed"
+                | "execution.failed"
+                | "model.invoked"
+                | "model.completed"
+                | "egress.started"
+                | "egress.completed"
+                | "artifact.imported"
+                | "artifact.created"
+                | "artifact.exported"
+                | "artifact.verified"
+                | "artifact.integrity-failed"
+                | "verification.started"
+                | "verification.completed"
+                | "verification.failed"
+                | "rollback.started"
+                | "rollback.completed"
+                | "skill.proposed"
+                | "skill.created"
+                | "skill.validated"
+                | "skill.compiled"
+                | "skill.executed"
+                | "skill.invalidated"
+        ),
+        "kind" if path.iter().any(|part| part == "waiting_on") => matches!(
+            value,
+            "input" | "approval" | "resource" | "provider" | "validation"
+        ),
+        "kind"
+            if path
+                .iter()
+                .any(|part| part == "actor" || part == "principal") =>
+        {
+            matches!(
+                value,
+                "user"
+                    | "agent"
+                    | "provider"
+                    | "model-provider"
+                    | "system-service"
+                    | "legacy-app"
+                    | "policy-engine"
+                    | "validator"
+                    | "peer-node"
+            )
+        }
+        "status" => matches!(
+            value,
+            "success" | "failure" | "denied" | "partial" | "pending" | "cancelled"
+        ),
+        "previous_state" | "new_state" => matches!(
+            value,
+            "CREATED"
+                | "PLANNING"
+                | "WAITING_FOR_INPUT"
+                | "WAITING_FOR_AUTH"
+                | "RUNNABLE"
+                | "RUNNING"
+                | "VERIFYING"
+                | "PAUSED"
+                | "RECOVERING"
+                | "ROLLING_BACK"
+                | "COMPLETED"
+                | "FAILED"
+                | "CANCELLED"
+                | "ROLLED_BACK"
+        ),
+        "locality" => matches!(value, "local" | "remote" | "peer" | "cloud"),
+        "isolation_class" => matches!(value, "P0" | "P1" | "P2" | "P3"),
+        "phase" => matches!(
+            value,
+            "admitted" | "delivered" | "pre-destination-admission" | "effect-boundary-armed"
+        ),
+        "outcome_certainty" | "certainty" => matches!(
+            value,
+            "NOT_STARTED"
+                | "STARTED_NO_EFFECT"
+                | "COMPLETED"
+                | "FAILED_NO_EFFECT"
+                | "FAILED_PARTIAL_EFFECT"
+                | "OUTCOME_UNKNOWN"
+        ),
+        "effect_boundary" => value == "destination-not-invoked",
+        "safe_action" => matches!(
+            value,
+            "CREATE_NEW_ATTEMPT"
+                | "RECONCILE_STATE"
+                | "MARK_ATTEMPT_FAILED"
+                | "REQUIRE_EXTERNAL_RECONCILIATION"
+                | "FAIL_TASK"
+                | "NO_ACTION"
+                | "CLEAN_STAGING"
+        ),
+        "source" => value == "user-selected",
+        "previous_durability_state" | "durability_state" => matches!(
+            value,
+            "STAGED" | "DURABLE" | "ORPHANED" | "CORRUPT" | "MISSING"
+        ),
+        _ => false,
+    }
+}
+
+fn is_private_commitment(object: &serde_json::Map<String, Value>) -> bool {
+    object.len() == 5
+        && object.get("kind").and_then(Value::as_str) == Some("task-field-commitment")
+        && object.get("version").and_then(Value::as_str) == Some("v1")
+        && object.get("algorithm").and_then(Value::as_str) == Some("sha256-keyed-prefix")
+        && object
+            .get("field")
+            .and_then(Value::as_str)
+            .is_some_and(|field| {
+                matches!(
+                    field,
+                    "original_intent"
+                        | "normalized_intent"
+                        | "reason_message"
+                        | "waiting_message"
+                        | "failure_summary"
+                )
+            })
+        && object
+            .get("commitment")
+            .and_then(Value::as_str)
+            .is_some_and(valid_hash)
+}
+
+fn validate_projected_event(event: &Value) -> Result<()> {
+    if serde_json::to_vec(event)?.len() > MAX_EVENT_BYTES || json_depth(event) > MAX_JSON_DEPTH {
+        return Err(Error::InvalidRecord(
+            "projected event exceeds bounds".to_owned(),
         ));
     }
-    Ok(verify_records(
-        &records,
-        &manifest.stream_id,
-        Some(&CheckpointExpectation {
-            checkpoint_id: "export-manifest".to_owned(),
-            event_hash: manifest.head_event_hash,
-        }),
-        verified_at,
+    let object = event
+        .as_object()
+        .ok_or_else(|| Error::InvalidRecord("projected event must be an object".to_owned()))?;
+    for key in [
+        "schema_version",
+        "event_id",
+        "task_id",
+        "event_type",
+        "timestamp",
+        "actor",
+    ] {
+        if !object.contains_key(key) {
+            return Err(Error::InvalidRecord(
+                "projected event is incomplete".to_owned(),
+            ));
+        }
+    }
+    validate_projected_value(event, event, &mut Vec::new())
+}
+
+fn validate_projected_value(root: &Value, value: &Value, path: &mut Vec<String>) -> Result<()> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        Value::String(text) => {
+            let key = path.last().map(String::as_str).unwrap_or_default();
+            if retained_projection_string(path, key, text) {
+                Ok(())
+            } else {
+                Err(Error::InvalidRecord(
+                    "raw string in projected event".to_owned(),
+                ))
+            }
+        }
+        Value::Array(values) => {
+            if values.len() > MAX_ARRAY_ITEMS {
+                return Err(Error::InvalidRecord(
+                    "projected array exceeds bounds".to_owned(),
+                ));
+            }
+            for value in values {
+                validate_projected_value(root, value, path)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            if is_private_commitment(object) {
+                return Ok(());
+            }
+            if object.get("kind").and_then(Value::as_str) == Some("bundle-local-alias") {
+                return validate_alias(object);
+            }
+            if object.len() > MAX_OBJECT_FIELDS
+                || object.keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "stream_id" | "event_hash" | "previous_event_hash" | "head_event_hash"
+                    )
+                })
+            {
+                return Err(Error::InvalidRecord(
+                    "projected object is invalid".to_owned(),
+                ));
+            }
+            for (key, value) in object {
+                if !projection_key_allowed(root, path, key) {
+                    return Err(Error::InvalidRecord(
+                        "projected object has an unsupported field".to_owned(),
+                    ));
+                }
+                path.push(key.clone());
+                validate_projected_value(root, value, path)?;
+                path.pop();
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the closed projected-object field vocabulary in one audit table"
+)]
+fn projection_key_allowed(root: &Value, path: &[String], key: &str) -> bool {
+    match path.last().map(String::as_str) {
+        None => matches!(
+            key,
+            "schema_version"
+                | "event_id"
+                | "task_id"
+                | "step_id"
+                | "event_type"
+                | "timestamp"
+                | "actor"
+                | "task_transition"
+                | "committed_mutation"
+                | "semantic_program_hash"
+                | "ir_version"
+                | "registry_snapshot_id"
+                | "validation_result_id"
+                | "execution_binding_id"
+                | "provider_id"
+                | "provider_version"
+                | "capability"
+                | "capability_contract_hash"
+                | "authority_token_id"
+                | "policy_decision_id"
+                | "approval_id"
+                | "skill"
+                | "input_artifacts"
+                | "output_artifacts"
+                | "external_transfer"
+                | "status"
+                | "details"
+        ),
+        Some("actor" | "principal") => matches!(key, "kind" | "id"),
+        Some("task_transition") => matches!(
+            key,
+            "transition_id"
+                | "previous_state"
+                | "new_state"
+                | "previous_revision"
+                | "new_revision"
+                | "reason_code"
+        ),
+        Some("committed_mutation") => matches!(
+            key,
+            "active_plan" | "active_step_ids" | "waiting_on" | "failure" | "recovery"
+        ),
+        Some("active_plan") => matches!(key, "plan_id" | "revision"),
+        Some("waiting_on") => matches!(key, "kind" | "id" | "message_ref"),
+        Some("failure") => matches!(
+            key,
+            "code"
+                | "step_id"
+                | "provider_id"
+                | "execution_binding_id"
+                | "retryable"
+                | "safe_to_replan"
+                | "unknown_side_effects"
+                | "rollback_available"
+                | "provenance_event_ids"
+        ),
+        Some("recovery") => matches!(
+            key,
+            "unknown_operation_ids" | "unknown_operations_ref" | "last_known_daemon_instance"
+        ),
+        Some("skill") => matches!(
+            key,
+            "id" | "version" | "manifest_hash" | "compiled_target_id"
+        ),
+        Some("external_transfer") => matches!(key, "destination" | "data_refs" | "purpose"),
+        Some("details") => root
+            .get("event_type")
+            .and_then(Value::as_str)
+            .is_some_and(|event_type| allowed_detail_key(event_type, key)),
+        Some("creation") => matches!(
+            key,
+            "principal"
+                | "workspace_id"
+                | "original_intent_ref"
+                | "normalized_intent_ref"
+                | "constraints"
+                | "created_at"
+        ),
+        Some("active_program") => matches!(
+            key,
+            "program_id"
+                | "ir_version"
+                | "semantic_hash"
+                | "registry_snapshot_id"
+                | "validation_result_id"
+                | "validated_at"
+                | "validator_id"
+                | "validator_version"
+                | "program_content_digest"
+        ),
+        Some("mutation_text_commitments") => matches!(key, "waiting_on" | "failure_summary"),
+        Some("export_reconciliation") => matches!(
+            key,
+            "verifier_id"
+                | "evidence_ref"
+                | "proof_hash"
+                | "challenge"
+                | "observed_at"
+                | "subject_hash"
+                | "recovery_ref"
+        ),
+        _ => false,
+    }
+}
+
+fn validate_alias(object: &serde_json::Map<String, Value>) -> Result<()> {
+    if object.len() != 4
+        || object.get("version").and_then(Value::as_str) != Some("v1")
+        || !object
+            .get("alias")
+            .and_then(Value::as_str)
+            .is_some_and(valid_hash)
+        || !object
+            .get("namespace")
+            .and_then(Value::as_str)
+            .is_some_and(|namespace| {
+                matches!(
+                    namespace,
+                    "task"
+                        | "event"
+                        | "workspace"
+                        | "plan"
+                        | "step"
+                        | "related"
+                        | "artifact"
+                        | "principal"
+                        | "waiting"
+                        | "skill"
+                        | "identifier"
+                        | "transition"
+                        | "provider"
+                        | "binding"
+                        | "operation"
+                        | "allocation"
+                        | "publication"
+                        | "import"
+                        | "registry-snapshot"
+                        | "validation-result"
+                        | "authority-token"
+                        | "policy-decision"
+                        | "opaque-value"
+                )
+            })
+    {
+        return Err(Error::InvalidRecord(
+            "projected alias is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_projected_record(
+    bundle_id: &str,
+    sequence: u64,
+    previous: Option<&str>,
+    event: &Value,
+) -> Result<String> {
+    let view = json!({"schema_version":SCHEMA_VERSION,"projection_hash_profile":PROJECTION_HASH_PROFILE,"bundle_id":bundle_id,"sequence":sequence,"previous_projection_hash":previous,"projected_event":event});
+    hash_canonical(PROJECTION_RECORD_DOMAIN, &view)
+}
+
+fn hash_projection_descriptor(manifest: &ProjectionManifest) -> Result<String> {
+    let view = json!({"schema_version":manifest.schema_version,"export_profile":manifest.export_profile,"projection_hash_profile":manifest.projection_hash_profile,"bundle_id":manifest.bundle_id,"record_count":manifest.record_count,"head_sequence":manifest.head_sequence,"head_projection_hash":manifest.head_projection_hash});
+    hash_canonical(PROJECTION_DESCRIPTOR_DOMAIN, &view)
+}
+
+fn hash_canonical(domain: &[u8], value: &Value) -> Result<String> {
+    let canonical = serde_json_canonicalizer::to_vec(value)
+        .map_err(|error| Error::Canonicalization(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(canonical);
+    Ok(format!(
+        "sha256:{}",
+        hex_digest(hasher.finalize().as_slice())
     ))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn valid_bundle_id(value: &str) -> bool {
+    value.len() == 74
+        && value.starts_with("bundle:v1:")
+        && value[10..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Computes the v0.1 domain-separated canonical journal-record hash.
@@ -794,6 +1525,32 @@ fn event_validator() -> Result<&'static jsonschema::Validator> {
         })
         .as_ref()
         .map_err(|error| Error::InvalidRecord(format!("provenance schema unavailable: {error}")))
+}
+
+fn projection_manifest_validator() -> Result<&'static jsonschema::Validator> {
+    static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    VALIDATOR
+        .get_or_init(|| {
+            let schema: Value = serde_json::from_str(PROJECTION_MANIFEST_SCHEMA)
+                .map_err(|error| error.to_string())?;
+            jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| Error::InvalidRecord(format!("projection schema unavailable: {error}")))
+}
+
+fn projected_record_validator() -> Result<&'static jsonschema::Validator> {
+    static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    VALIDATOR
+        .get_or_init(|| {
+            let schema: Value =
+                serde_json::from_str(PROJECTED_RECORD_SCHEMA).map_err(|error| error.to_string())?;
+            jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| Error::InvalidRecord(format!("projection schema unavailable: {error}")))
 }
 
 fn validate_event(task_id: &str, event: &Value) -> Result<()> {
@@ -2015,7 +2772,7 @@ mod tests {
             event: nested,
             event_hash: event_hash.clone(),
         };
-        let manifest = ExportManifest {
+        let manifest = LegacyExportManifest {
             schema_version: SCHEMA_VERSION.to_owned(),
             export_profile: "privacy-safe-original-chain".to_owned(),
             hash_profile: HASH_PROFILE.to_owned(),
@@ -2024,16 +2781,13 @@ mod tests {
             head_sequence: 1,
             head_event_hash: event_hash,
         };
-        let verification = verify_jsonl_export(
-            &serde_json::to_string(&manifest).unwrap(),
-            &format!("{}\n", serde_json::to_string(&record).unwrap()),
-            NOW,
-        )
-        .unwrap();
-        assert!(!verification.valid);
-        assert_eq!(
-            verification.diagnostics[0].code,
-            "PROVENANCE_SCHEMA_INVALID"
+        assert!(
+            verify_jsonl_export(
+                &serde_json::to_string(&manifest).unwrap(),
+                &format!("{}\n", serde_json::to_string(&record).unwrap()),
+                NOW,
+            )
+            .is_err()
         );
     }
 
@@ -2215,7 +2969,7 @@ mod tests {
             event: invalid,
             event_hash: event_hash.clone(),
         };
-        let manifest = ExportManifest {
+        let manifest = LegacyExportManifest {
             schema_version: SCHEMA_VERSION.to_owned(),
             export_profile: "privacy-safe-original-chain".to_owned(),
             hash_profile: HASH_PROFILE.to_owned(),
@@ -2224,16 +2978,13 @@ mod tests {
             head_sequence: 1,
             head_event_hash: event_hash,
         };
-        let verification = verify_jsonl_export(
-            &serde_json::to_string(&manifest).unwrap(),
-            &format!("{}\n", serde_json::to_string(&record).unwrap()),
-            NOW,
-        )
-        .unwrap();
-        assert!(!verification.valid);
-        assert_eq!(
-            verification.diagnostics[0].code,
-            "PROVENANCE_SCHEMA_INVALID"
+        assert!(
+            verify_jsonl_export(
+                &serde_json::to_string(&manifest).unwrap(),
+                &format!("{}\n", serde_json::to_string(&record).unwrap()),
+                NOW,
+            )
+            .is_err()
         );
 
         let mut export_connection = Connection::open_in_memory().unwrap();
@@ -2307,7 +3058,7 @@ mod tests {
             event: invalid_event,
             event_hash: invalid_hash.clone(),
         };
-        let invalid_manifest = ExportManifest {
+        let invalid_manifest = LegacyExportManifest {
             schema_version: SCHEMA_VERSION.to_owned(),
             export_profile: "privacy-safe-original-chain".to_owned(),
             hash_profile: HASH_PROFILE.to_owned(),
@@ -2317,14 +3068,229 @@ mod tests {
             head_event_hash: invalid_hash,
         };
         let invalid_jsonl = format!("{}\n", serde_json::to_string(&invalid_record).unwrap());
-        let offline = verify_jsonl_export(
-            &serde_json::to_string(&invalid_manifest).unwrap(),
-            &invalid_jsonl,
+        assert!(
+            verify_jsonl_export(
+                &serde_json::to_string(&invalid_manifest).unwrap(),
+                &invalid_jsonl,
+                NOW,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "projection privacy and adversarial integrity vectors share one fixture"
+    )]
+    fn redacted_projection_hides_all_identifier_channels_and_has_bounded_claims() {
+        let secret = "api_key=sk-live/private text";
+        let task_id = format!("task/{secret}");
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        let mut created = typed_creation_event(&task_id, 1);
+        created["event_id"] = json!(format!("event/{secret}"));
+        created["actor"]["id"] = json!(secret);
+        created["details"]["creation"]["principal"]["id"] = json!(secret);
+        created["details"]["creation"]["workspace_id"] = json!(secret);
+        created["details"]["active_step_ids"] = json!([secret, "Cafe\u{301}", "Café", "plan = 🧭"]);
+        let first = append_in_tx(&transaction, &task_id, &created, &ExpectedHead::Empty).unwrap();
+        let mut transitioned = typed_transition_event(&task_id);
+        transitioned["event_id"] = json!(format!("transition-event/{secret}"));
+        transitioned["step_id"] = json!(secret);
+        transitioned["actor"]["id"] = json!(secret);
+        transitioned["task_transition"]["transition_id"] = json!(secret);
+        transitioned["committed_mutation"]["active_plan"] = json!({"plan_id":secret,"revision":1});
+        transitioned["committed_mutation"]["active_step_ids"] = json!([secret]);
+        transitioned["committed_mutation"]["waiting_on"] = json!([{"kind":"input","id":secret}]);
+        transitioned["details"]["related_ids"] = json!([secret]);
+        transitioned["details"]["mutation_text_commitments"]["waiting_on"] =
+            json!([{"kind":"input","id":secret,"message_ref":null}]);
+        append_in_tx(&transaction, &task_id, &transitioned, &ExpectedHead::Any).unwrap();
+        transaction.commit().unwrap();
+
+        let stream = stream_id(&task_id).unwrap();
+        let source_before = list_events(&connection, &stream, None, 10).unwrap().records;
+        let export = export_jsonl(&connection, &stream, NOW).unwrap();
+        let source_after = list_events(&connection, &stream, None, 10).unwrap().records;
+        assert_eq!(source_before, source_after);
+        assert_eq!(source_before[0].event_hash, first.event_hash);
+        assert!(!export.manifest_json.contains(&stream));
+        assert!(!export.records_jsonl.contains(secret));
+        assert!(!export.records_jsonl.contains(&task_id));
+        for record in &source_before {
+            assert!(!export.manifest_json.contains(&record.event_hash));
+            assert!(!export.records_jsonl.contains(&record.event_hash));
+        }
+
+        let result =
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW).unwrap();
+        assert!(result.valid, "{result:?}");
+        assert_eq!(result.scope, "exported-projection");
+        assert!(!result.original_chain_verified_offline);
+        assert!(!result.original_chain_linkage_proven);
+
+        let projected = export
+            .records_jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<ProjectedRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected[0].projected_event.pointer("/actor/id"),
+            projected[0]
+                .projected_event
+                .pointer("/details/creation/principal/id")
+        );
+        assert_ne!(
+            projected[0]
+                .projected_event
+                .pointer("/details/active_step_ids/1"),
+            projected[0]
+                .projected_event
+                .pointer("/details/active_step_ids/2")
+        );
+        assert_ne!(
+            projected[1].projected_event.pointer("/step_id"),
+            projected[1]
+                .projected_event
+                .pointer("/details/related_ids/0")
+        );
+        assert!(
+            projected[1]
+                .projected_event
+                .pointer("/committed_mutation/active_plan/plan_id/alias")
+                .is_some()
+        );
+
+        let tampered = export
+            .records_jsonl
+            .replacen("\"success\"", "\"failure\"", 1);
+        assert!(
+            !verify_jsonl_export(&export.manifest_json, &tampered, NOW)
+                .unwrap()
+                .valid
+        );
+        let lines = export.records_jsonl.lines().collect::<Vec<_>>();
+        assert!(
+            !verify_jsonl_export(&export.manifest_json, &format!("{}\n", lines[0]), NOW)
+                .unwrap()
+                .valid
+        );
+        let reordered = format!("{}\n{}\n", lines[1], lines[0]);
+        assert!(
+            !verify_jsonl_export(&export.manifest_json, &reordered, NOW)
+                .unwrap()
+                .valid
+        );
+        let other = export_jsonl(&connection, &stream, NOW).unwrap();
+        let splice = format!(
+            "{}\n{}\n",
+            lines[0],
+            other.records_jsonl.lines().nth(1).unwrap()
+        );
+        assert!(
+            !verify_jsonl_export(&export.manifest_json, &splice, NOW)
+                .unwrap()
+                .valid
+        );
+        let mut injected: Value = serde_json::from_str(&export.manifest_json).unwrap();
+        injected["projection_hash_profile"] = json!("attacker-profile");
+        assert!(verify_jsonl_export(&injected.to_string(), &export.records_jsonl, NOW).is_err());
+
+        let mut legacy = Connection::open_in_memory().unwrap();
+        initialize(&legacy);
+        let transaction = legacy.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            "legacy/private task",
+            &typed_creation_event("legacy/private task", 99),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let legacy_stream = stream_id("legacy/private task").unwrap();
+        let legacy_export = export_jsonl(&legacy, &legacy_stream, NOW).unwrap();
+        assert_eq!(legacy_export.records_jsonl.lines().count(), 1);
+        assert!(!legacy_export.manifest_json.contains(&legacy_stream));
+        assert!(!legacy_export.records_jsonl.contains("legacy/private task"));
+        assert!(!legacy_export.records_jsonl.contains("\"event_hash\""));
+        assert!(!legacy_export.records_jsonl.contains("\"stream_id\""));
+        let mut unsupported_record: ProjectedRecord =
+            serde_json::from_str(legacy_export.records_jsonl.trim()).unwrap();
+        unsupported_record.projected_event["debug"] = json!(false);
+        unsupported_record.projection_hash = hash_projected_record(
+            &unsupported_record.bundle_id,
+            1,
+            None,
+            &unsupported_record.projected_event,
+        )
+        .unwrap();
+        let mut unsupported_manifest: ProjectionManifest =
+            serde_json::from_str(&legacy_export.manifest_json).unwrap();
+        unsupported_manifest.head_projection_hash = unsupported_record.projection_hash.clone();
+        unsupported_manifest.descriptor_hash =
+            hash_projection_descriptor(&unsupported_manifest).unwrap();
+        let unsupported = verify_jsonl_export(
+            &serde_json::to_string(&unsupported_manifest).unwrap(),
+            &format!("{}\n", serde_json::to_string(&unsupported_record).unwrap()),
             NOW,
         )
         .unwrap();
-        assert!(!offline.valid);
-        assert_eq!(offline.diagnostics[0].code, "PROVENANCE_SCHEMA_INVALID");
+        assert!(!unsupported.valid);
+        assert_eq!(unsupported.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+    }
+
+    #[test]
+    fn projection_export_uses_one_snapshot_during_concurrent_append() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("projection-snapshot.sqlite3");
+        let mut setup = Connection::open(&path).unwrap();
+        initialize(&setup);
+        setup.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let transaction = setup.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            "T-snapshot",
+            &event("T-snapshot", 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let export_path = path.clone();
+        let export_barrier = Arc::clone(&barrier);
+        let exporter = thread::spawn(move || {
+            let connection = Connection::open(export_path).unwrap();
+            export_barrier.wait();
+            export_jsonl(&connection, &stream_id("T-snapshot").unwrap(), NOW).unwrap()
+        });
+        let append_path = path.clone();
+        let append_barrier = Arc::clone(&barrier);
+        let appender = thread::spawn(move || {
+            let mut connection = Connection::open(append_path).unwrap();
+            append_barrier.wait();
+            let transaction = connection.transaction().unwrap();
+            append_in_tx(
+                &transaction,
+                "T-snapshot",
+                &event("T-snapshot", 2),
+                &ExpectedHead::Any,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        });
+        barrier.wait();
+        let export = exporter.join().unwrap();
+        appender.join().unwrap();
+        let verification =
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW).unwrap();
+        assert!(verification.valid, "{verification:?}");
+        assert!(matches!(export.records_jsonl.lines().count(), 1 | 2));
     }
 
     #[test]

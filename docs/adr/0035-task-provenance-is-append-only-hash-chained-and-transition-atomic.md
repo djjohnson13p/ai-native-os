@@ -114,6 +114,17 @@ contract's nonempty/nullable and Unicode-scalar length rules, including spaces,
 punctuation, emoji, and canonically distinct Unicode. Provenance does not
 normalize those values because that would change the event and chain identity.
 
+Normal portable export uses the separately typed
+`privacy-redacted-projection-v1` profile. The exporter validates the original
+chain and projects one consistent database snapshot, but exports neither its
+stream identity nor original hashes. All arbitrary string channels become
+secret-keyed bundle-local aliases with path namespaces and no exported mapping;
+only reviewed fixed enums, timestamps, numeric/boolean/null values, and validated
+private commitments remain literal. Projection descriptor and record hashes use
+domains separate from the journal hash. Offline verification is explicitly
+limited to `scope=exported-projection` and proves neither original-chain validity
+nor linkage to the authoritative journal.
+
 ## Compatibility impact
 
 The existing `provenance-event.schema.json` remains the event payload contract. v0.1 journal ordering/integrity is represented by a separate envelope schema so the change is additive at the architecture level.

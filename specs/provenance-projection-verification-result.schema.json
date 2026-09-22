@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-native-os.example/specs/provenance-projection-verification-result.schema.json",
+  "title": "Provenance Projection Verification Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "valid", "original_chain_verified_offline", "original_chain_linkage_proven", "bundle_id", "from_sequence", "to_sequence", "computed_projection_head_hash", "diagnostics", "verified_at"],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "scope": {"const": "exported-projection"},
+    "valid": {"type": "boolean"},
+    "original_chain_verified_offline": {"const": false},
+    "original_chain_linkage_proven": {"const": false},
+    "bundle_id": {"type": "string", "pattern": "^bundle:v1:[0-9a-f]{64}$"},
+    "from_sequence": {"type": "integer", "minimum": 1},
+    "to_sequence": {"type": "integer", "minimum": 0},
+    "computed_projection_head_hash": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}]},
+    "diagnostics": {"type": "array", "maxItems": 16, "items": {"type": "object"}},
+    "verified_at": {"type": "string", "format": "date-time"}
+  }
+}
