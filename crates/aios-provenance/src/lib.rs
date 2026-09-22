@@ -310,10 +310,15 @@ pub fn get_head(connection: &Connection, stream_id: &str) -> Result<Option<Strea
         .query_row(
             "SELECT sequence, event_hash FROM provenance_events WHERE stream_id=?1 ORDER BY sequence DESC LIMIT 1",
             [stream_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((row.get::<_, i64>(0)?, bounded_row_text(row, 1)?)),
         )
         .optional()?
         .map(|(sequence, event_hash)| {
+            if !valid_hash(&event_hash) {
+                return Err(Error::InvalidRecord(
+                    "stored provenance head hash is invalid".to_owned(),
+                ));
+            }
             Ok(StreamHead {
                 stream_id: stream_id.to_owned(),
                 sequence: u64::try_from(sequence).map_err(|_| {
@@ -2829,8 +2834,30 @@ mod tests {
                         .to_string()
                         .contains("stored provenance text column exceeds its byte bound")
                 );
+                assert!(get_head(&connection, &stream).is_err());
+                let transaction = connection.transaction().unwrap();
+                assert!(
+                    append_in_tx(
+                        &transaction,
+                        "T-provenance",
+                        &event("T-provenance", 2),
+                        &ExpectedHead::Any,
+                    )
+                    .is_err()
+                );
             }
         }
+
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_hash='invalid' WHERE stream_id=?1",
+                [&stream],
+            )
+            .unwrap();
+        assert!(get_head(&connection, &stream).is_err());
     }
 
     #[test]
