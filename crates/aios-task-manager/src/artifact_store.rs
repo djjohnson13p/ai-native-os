@@ -6542,6 +6542,15 @@ impl TaskManager {
             &request.task_id,
             &request.publication_id,
         )? {
+            if let Some(content_hash) = stored_hash
+                && committed_publication_sticky_damage_authenticates(
+                    &self.connection,
+                    &request.task_id,
+                    &request.publication_id,
+                )?
+            {
+                self.handoff_content_hash_damage(content_hash)?;
+            }
             return Ok(failed());
         }
         let Ok(result) = serde_json::from_str::<ArtifactPublicationResult>(result_json) else {
@@ -9258,6 +9267,37 @@ pub(crate) fn committed_publication_receipt_authenticates(
     task_id: &str,
     publication_id: &str,
 ) -> Result<bool> {
+    committed_publication_receipt_authenticates_with_integrity(
+        connection,
+        task_id,
+        publication_id,
+        false,
+    )
+}
+
+fn committed_publication_sticky_damage_authenticates(
+    connection: &Connection,
+    task_id: &str,
+    publication_id: &str,
+) -> Result<bool> {
+    committed_publication_receipt_authenticates_with_integrity(
+        connection,
+        task_id,
+        publication_id,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the durable publication, Artifact, lineage, provenance, and integrity proof is one security boundary"
+)]
+fn committed_publication_receipt_authenticates_with_integrity(
+    connection: &Connection,
+    task_id: &str,
+    publication_id: &str,
+    allow_sticky_damage: bool,
+) -> Result<bool> {
     let row = connection
         .query_row(
             "SELECT p.request_json,p.result_json,p.artifact_id,p.content_hash,p.committed_at,
@@ -9271,7 +9311,8 @@ pub(crate) fn committed_publication_receipt_authenticates(
                     b.size_bytes,b.durability_state,t.role,t.node_id,
                     e.event_hash,e.task_id,e.event_type,e.semantic_program_hash,e.node_id,
                     e.execution_binding_id,e.provider_id,e.status,e.event_json,
-                    r.expires_at,r.integrity_verified_at,r.integrity_verifier,r.created_at
+                    r.expires_at,r.integrity_verified_at,r.integrity_verifier,r.created_at,
+                    b.verified_at
              FROM artifact_publications p
              JOIN artifact_output_allocations a ON a.allocation_id=p.allocation_id
              JOIN artifacts r ON r.artifact_id=p.artifact_id
@@ -9333,6 +9374,7 @@ pub(crate) fn committed_publication_receipt_authenticates(
                     row.get::<_, Option<String>>(46)?,
                     row.get::<_, Option<String>>(47)?,
                     row.get::<_, String>(48)?,
+                    row.get::<_, Option<String>>(49)?,
                 ))
             },
         )
@@ -9500,6 +9542,29 @@ pub(crate) fn committed_publication_receipt_authenticates(
         && result.provenance_event_hash == row.36
         && result.provenance_event_id.as_deref()
             == Some(event_id("artifact-created", artifact_id_value).as_str());
+    let sticky_damage_evidence = allow_sticky_damage
+        && row.30 == "failed"
+        && matches!(row.33.as_str(), "MISSING" | "CORRUPT")
+        && row.46.is_some()
+        && row.46 == row.49
+        && row.47.as_deref() == Some("artifact-store:startup")
+        && connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM provenance_events
+                 WHERE task_id=?1 AND event_type='artifact.integrity-failed'
+                   AND timestamp=?2 AND status='failure'
+                   AND json_extract(event_json,'$.details.content_hash')=?3
+                   AND json_extract(event_json,'$.details.durability_state')=?4
+                   AND json_extract(event_json,'$.input_artifacts[0]')=?5
+             )",
+            params![task_id, row.46, content_hash, row.33, artifact_id_value],
+            |damage| damage.get::<_, bool>(0),
+        )?;
+    let integrity_exact = (row.30 == "verified"
+        && row.33 == "DURABLE"
+        && row.46.as_deref() == Some(committed_at)
+        && row.47.as_deref() == Some("artifact-store:sha256"))
+        || sticky_damage_evidence;
     let materialized_exact = row.6 == "PUBLISHED"
         && row.7.as_deref() == Some(publication_id)
         && row.8.as_deref() == Some(artifact_id_value)
@@ -9516,14 +9581,11 @@ pub(crate) fn committed_publication_receipt_authenticates(
         && row.27.as_deref() == Some(row.11.as_str())
         && row.28 == row.12
         && row.29 == origin_provider_id
-        && row.30 == "verified"
         && row.31.as_deref() == Some(serde_json::to_string(&request.labels)?.as_str())
         && row.45.is_none()
-        && row.46.as_deref() == Some(committed_at)
-        && row.47.as_deref() == Some("artifact-store:sha256")
         && row.48 == committed_at
         && blob_size == size
-        && row.33 == "DURABLE"
+        && integrity_exact
         && row.34 == "output"
         && row.35.as_deref() == Some(row.11.as_str());
     let envelope_exact = row.37.as_deref() == Some(task_id)
@@ -9637,8 +9699,12 @@ pub(crate) fn failed_expired_publication_receipt_authenticates(
 ) -> Result<bool> {
     let row = connection
         .query_row(
-            "SELECT allocation_id,request_json,state,result_json,committed_at
-             FROM artifact_publications WHERE task_id=?1 AND publication_id=?2",
+            "SELECT p.allocation_id,p.request_json,p.state,p.result_json,p.committed_at,
+                    a.state,a.publication_id,p.artifact_id,p.content_hash,a.published_artifact_id
+             FROM artifact_publications p
+             LEFT JOIN artifact_output_allocations a
+               ON a.allocation_id=p.allocation_id AND a.task_id=p.task_id
+             WHERE p.task_id=?1 AND p.publication_id=?2",
             params![task_id, publication_id],
             |row| {
                 Ok((
@@ -9647,17 +9713,39 @@ pub(crate) fn failed_expired_publication_receipt_authenticates(
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
         .optional()?;
-    let Some((allocation_id, request_json, state, result_json, committed_at)) = row else {
+    let Some((
+        allocation_id,
+        request_json,
+        state,
+        result_json,
+        committed_at,
+        allocation_state,
+        allocation_publication_id,
+        artifact_id,
+        content_hash,
+        published_artifact_id,
+    )) = row
+    else {
         return Ok(false);
     };
     let Ok(request) = serde_json::from_str::<ArtifactPublicationRequest>(&request_json) else {
         return Ok(false);
     };
     if state != "FAILED"
+        || !matches!(allocation_state.as_deref(), Some("FAILED" | "EXPIRED"))
+        || allocation_publication_id.as_deref() != Some(publication_id)
+        || artifact_id.is_some()
+        || content_hash.is_some()
+        || published_artifact_id.is_some()
         || request.task_id != task_id
         || request.publication_id != publication_id
         || request.allocation_id != allocation_id
@@ -16445,6 +16533,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers immutable expiry receipts and every contradictory allocation field"
+    )]
     fn expired_publication_receipts_reject_paired_cross_publication_substitution() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -16500,6 +16592,73 @@ mod tests {
             );
             transaction.rollback().unwrap();
         }
+
+        for (mutation, restore) in [
+            (
+                "UPDATE artifact_output_allocations SET state='WRITING' WHERE allocation_id='alloc-expired-a'",
+                "UPDATE artifact_output_allocations SET state='EXPIRED' WHERE allocation_id='alloc-expired-a'",
+            ),
+            (
+                "UPDATE artifact_output_allocations SET publication_id='pub-expired-b' WHERE allocation_id='alloc-expired-a'",
+                "UPDATE artifact_output_allocations SET publication_id='pub-expired-a' WHERE allocation_id='alloc-expired-a'",
+            ),
+        ] {
+            manager.connection.execute(mutation, []).unwrap();
+            assert!(
+                !failed_expired_publication_receipt_authenticates(
+                    &manager.connection,
+                    &requests[0].task_id,
+                    &requests[0].publication_id,
+                )
+                .unwrap()
+            );
+            let transaction = manager.connection.transaction().unwrap();
+            assert!(
+                crate::resolved_publication_recovery_subject(
+                    &transaction,
+                    &requests[0].task_id,
+                    &requests[0].publication_id,
+                )
+                .unwrap()
+                .is_none()
+            );
+            transaction.rollback().unwrap();
+            manager.connection.execute(restore, []).unwrap();
+        }
+
+        let materialized = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    import_id: Some("import-expired-contradiction".to_owned()),
+                    ..import_request()
+                },
+                &mut Cursor::new(b"materialized contradiction"),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET published_artifact_id=?2
+             WHERE allocation_id=?1",
+                params![requests[0].allocation_id, materialized.artifact_id],
+            )
+            .unwrap();
+        assert!(
+            !failed_expired_publication_receipt_authenticates(
+                &manager.connection,
+                &requests[0].task_id,
+                &requests[0].publication_id,
+            )
+            .unwrap()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_output_allocations SET published_artifact_id=NULL
+             WHERE allocation_id=?1",
+                [&requests[0].allocation_id],
+            )
+            .unwrap();
 
         let copied_evidence = manager
             .connection
@@ -18386,6 +18545,10 @@ mod tests {
         );
         empty_publication.semantic_type = Some(String::new());
         validate_publication_request(&empty_publication).unwrap();
+        empty_publication.semantic_type = Some(format!("{}@0", "a".repeat(254)));
+        validate_publication_request(&empty_publication).unwrap();
+        empty_publication.semantic_type = Some(format!("{}@0", "a".repeat(255)));
+        assert!(validate_publication_request(&empty_publication).is_err());
 
         let mut oversized_format = import_request();
         oversized_format.format = Some("x".repeat(161));
@@ -23460,9 +23623,79 @@ mod tests {
             .artifact_store_dir
             .remove_file(&storage_ref)
             .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
+                [],
+            )
+            .unwrap();
+        CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "injected committed publication damage handoff failure",
+                )))
+            }));
+        });
+        assert!(matches!(
+            manager.publish_artifact_output(&request),
+            Err(TaskManagerError::Io(_))
+        ));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RUNNING"
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications
+                 SET result_json=json_set(result_json,'$.message','forged sticky damage')
+                 WHERE publication_id=?1",
+                [&request.publication_id],
+            )
+            .unwrap();
+        let forged_damage = manager.publish_artifact_output(&request).unwrap();
+        assert_eq!(forged_damage.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RUNNING",
+            "a forged committed receipt must not trigger a recovery handoff"
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                params![request.publication_id, canonical_json(&original).unwrap()],
+            )
+            .unwrap();
         let missing = manager.publish_artifact_output(&request).unwrap();
         assert!(!missing.published);
         assert_eq!(missing.reason_code, "ARTIFACT_INTEGRITY_FAILED");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id='T-artifact'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RECOVERING"
+        );
     }
 
     #[test]

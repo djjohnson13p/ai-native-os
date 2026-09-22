@@ -156,6 +156,11 @@ fn artifact_contracts_enforce_exact_type_lineage_and_value_bounds() {
     request["semantic_type"] = Value::String("artifact.report@1@2".to_owned());
     assert!(!request_validator.is_valid(&request));
     request["semantic_type"] = Value::String("artifact.report@1".to_owned());
+    request["semantic_type"] = Value::String(format!("{}@0", "a".repeat(254)));
+    assert!(request_validator.is_valid(&request));
+    request["semantic_type"] = Value::String(format!("{}@0", "a".repeat(255)));
+    assert!(!request_validator.is_valid(&request));
+    request["semantic_type"] = Value::String("artifact.report@1".to_owned());
     request["lineage"]["input_artifact_ids"] = Value::Array(vec![Value::String("a".repeat(513))]);
     assert!(!request_validator.is_valid(&request));
     request["lineage"]["input_artifact_ids"] = Value::Array(Vec::new());

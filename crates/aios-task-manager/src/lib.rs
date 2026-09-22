@@ -2703,6 +2703,27 @@ pub(crate) fn reconcile_recovery_subject_in_transaction(
             )?;
         }
     }
+    if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
+        let terminal_state = match resolution.certainty.as_str() {
+            "COMPLETED" => Some("SUCCEEDED"),
+            "NOT_STARTED" | "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
+            _ => None,
+        };
+        if let Some(terminal_state) = terminal_state {
+            let changed = transaction.execute(
+                "UPDATE step_executions
+                 SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5),updated_at=?5
+                 WHERE task_id=?1 AND attempt_id=?2
+                   AND (outcome_certainty IS NULL OR outcome_certainty='OUTCOME_UNKNOWN' OR outcome_certainty=?4)",
+                params![task_id, attempt_id, terminal_state, resolution.certainty, event_timestamp],
+            )?;
+            if changed != 1 {
+                return Err(TaskManagerError::InvalidRecord(
+                    "attempt recovery evidence conflicts with durable step certainty",
+                ));
+            }
+        }
+    }
     let new_binding_required = resolution.safe_action == "CREATE_NEW_ATTEMPT";
     let assessment = canonical_json(&json!({
         "schema_version": SCHEMA_VERSION,
@@ -6718,33 +6739,42 @@ fn resolved_recovery_subject(
     inventory_id: &str,
 ) -> Result<Option<RecoveryResolution>> {
     if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
-        let mut attempts = Vec::new();
-        for record in stored_provider_invocations(transaction, task_id)?
-            .into_iter()
-            .filter(|record| record.attempt_id == attempt_id)
-        {
-            if let Some(resolution) =
-                authenticated_provider_invocation_resolution(task_id, &record)?
-            {
-                attempts.push(resolution);
-            }
-        }
-        if attempts.len() != 1 {
-            return Ok(None);
-        }
-        let resolution = attempts.into_iter().next().expect("length checked");
-        let stored_certainty = transaction
+        let step = transaction
             .query_row(
-                "SELECT outcome_certainty FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
+                "SELECT invocation_id,binding_id,node_id,outcome_certainty
+                 FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
                 params![task_id, attempt_id],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
-        return Ok(
-            (stored_certainty.as_deref() == Some(resolution.certainty.as_str()))
-                .then_some(resolution),
-        );
+            .optional()?;
+        let Some((Some(invocation_id), Some(binding_id), node_id, stored_certainty)) = step else {
+            return Ok(None);
+        };
+        let records = stored_provider_invocations(transaction, task_id)?;
+        let Some(record) = records.iter().find(|record| {
+            record.invocation_id == invocation_id
+                && record.attempt_id == attempt_id
+                && record.binding_id == binding_id
+                && record.node_id.as_deref() == Some(node_id.as_str())
+        }) else {
+            return Ok(None);
+        };
+        let Some(resolution) = authenticated_provider_invocation_resolution(task_id, record)?
+        else {
+            return Ok(None);
+        };
+        return Ok(match stored_certainty.as_deref() {
+            None | Some("OUTCOME_UNKNOWN") => Some(resolution),
+            Some(certainty) if certainty == resolution.certainty => Some(resolution),
+            _ => None,
+        });
     }
     if let Some(publication_id) = inventory_id.strip_prefix("publication:") {
         return resolved_publication_recovery_subject(transaction, task_id, publication_id);

@@ -4025,19 +4025,21 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
             [TEST_TIME],
         )
         .unwrap();
-    let inventory = unresolved_execution_ids(&manager.connection, "T-completion").unwrap();
-    assert_eq!(inventory, vec!["provider-invocation:invocation-terminal"]);
-    let recovery_ref = recovery_operations_ref("T-completion", 2, &inventory).unwrap();
-    manager
-        .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
-        .unwrap();
     manager
         .connection
         .execute(
-            "UPDATE step_executions SET outcome_certainty='COMPLETED'
+            "UPDATE step_executions
+             SET invocation_id='invocation-terminal',outcome_certainty='OUTCOME_UNKNOWN'
              WHERE task_id='T-completion' AND attempt_id='attempt-completion'",
             [],
         )
+        .unwrap();
+    let inventory = unresolved_execution_ids(&manager.connection, "T-completion").unwrap();
+    assert!(inventory.contains(&"attempt:attempt-completion".to_owned()));
+    assert!(inventory.contains(&"provider-invocation:invocation-terminal".to_owned()));
+    let recovery_ref = recovery_operations_ref("T-completion", 2, &inventory).unwrap();
+    manager
+        .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
         .unwrap();
     {
         let transaction = manager.connection.transaction().unwrap();
@@ -4063,6 +4065,41 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
         "completed_at":TEST_TIME
     }))
     .unwrap();
+    let sibling_result = canonical_json(&serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "result_id":"provider-result-sibling",
+        "invocation_id":"invocation-sibling",
+        "task_id":"T-completion",
+        "execution_binding_id":"binding-completion",
+        "node_id":"node-completion",
+        "provider":{"id":"provider:test","version":"0.1.0","package_or_build_hash":"sha256:build"},
+        "status":"SUCCEEDED",
+        "reason_codes":["PROVIDER_SUCCEEDED"],
+        "outputs":{},
+        "started_at":TEST_TIME,
+        "completed_at":TEST_TIME
+    }))
+    .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_invocations(
+            invocation_id,attempt_id,binding_id,task_id,provider_id,provider_version,
+            status,request_json,result_json,started_at,completed_at
+         ) VALUES ('invocation-sibling','attempt-completion','binding-completion',
+            'T-completion','provider:test','0.1.0','SUCCEEDED','{}',?1,?2,?2)",
+            rusqlite::params![sibling_result, TEST_TIME],
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_none(),
+            "a terminal sibling must not resolve the step's recorded pending invocation"
+        );
+    }
     manager
         .connection
         .execute(
@@ -4080,6 +4117,17 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
             "the exact authenticated provider result resolves its attempt"
         );
     }
+    manager
+        .reconcile_recovery_subject(&recovery_ref, "attempt:attempt-completion")
+        .unwrap();
+    assert_eq!(
+        manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap()
+            .outcome_certainty,
+        Some(OutcomeCertainty::Completed)
+    );
     for (field, forged) in [
         ("id", "provider:forged"),
         ("package_or_build_hash", "sha256:forged-build"),
