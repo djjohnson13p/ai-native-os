@@ -31,6 +31,7 @@ pub const MAX_PROJECTED_EVENT_BYTES: usize = 262_144;
 const MAX_PROJECTED_RECORD_BYTES: usize = MAX_PROJECTED_EVENT_BYTES + 4_096;
 const MAX_PROJECTION_EXPORT_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_PROJECTION_RECORDS: u64 = 10_000;
+const MAX_PROJECTION_SOURCE_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_STRING_CHARS: usize = 4096;
 const MAX_ARRAY_ITEMS: usize = 512;
 const MAX_OBJECT_FIELDS: usize = 256;
@@ -383,107 +384,75 @@ pub fn verify_stream(
             Error::InvalidRecord("verification sequence exceeds SQLite range".to_owned())
         })?;
     let mut statement = connection.prepare(
-        "SELECT schema_version, hash_profile, stream_id, sequence, previous_event_hash, event_json, event_hash FROM provenance_events WHERE stream_id=?1 AND (?2 IS NULL OR sequence<=?2) ORDER BY sequence",
+        "SELECT schema_version,hash_profile,stream_id,sequence,previous_event_hash,event_json,event_hash,event_id,task_id,timestamp,event_type,semantic_program_hash,ir_version,registry_snapshot_id,node_id,execution_binding_id,provider_id,status FROM provenance_events WHERE stream_id=?1 AND (?2 IS NULL OR sequence<=?2) ORDER BY sequence",
     )?;
-    let rows = statement.query_map(params![stream_id, upper], row_to_record)?;
-    let mut records = Vec::new();
+    let rows = statement.query_map(params![stream_id, upper], |row| {
+        Ok((
+            row_to_record(row)?,
+            JournalIndex {
+                event_id: row.get(7)?,
+                task_id: row.get(8)?,
+                timestamp: row.get(9)?,
+                event_type: row.get(10)?,
+                semantic_program_hash: row.get(11)?,
+                ir_version: row.get(12)?,
+                registry_snapshot_id: row.get(13)?,
+                node_id: row.get(14)?,
+                execution_binding_id: row.get(15)?,
+                provider_id: row.get(16)?,
+                status: row.get(17)?,
+            },
+        ))
+    })?;
+    let mut previous: Option<String> = None;
+    let mut expected_sequence = 1_u64;
     for row in rows {
-        match row {
-            Ok(record) => records.push(record),
-            Err(_) => {
-                return Ok(failure(
-                    stream_id,
-                    verified_at,
-                    "PROVENANCE_SCHEMA_INVALID",
-                    "stored journal record is malformed",
-                    None,
-                    None,
-                    None,
-                    checkpoint,
-                ));
-            }
+        let Ok((record, index)) = row else {
+            return Ok(failure(
+                stream_id,
+                verified_at,
+                "PROVENANCE_SCHEMA_INVALID",
+                "stored journal record is malformed",
+                None,
+                None,
+                previous,
+                checkpoint,
+            ));
+        };
+        let computed = match verify_one_record(
+            &record,
+            stream_id,
+            expected_sequence,
+            previous.as_deref(),
+            false,
+            checkpoint,
+            verified_at,
+        ) {
+            Ok(computed) => computed,
+            Err(result) => return Ok(*result),
+        };
+        if !index.matches(&record.event) {
+            return Ok(failure(
+                stream_id,
+                verified_at,
+                "PROVENANCE_SCHEMA_INVALID",
+                "journal index columns conflict with the hashed event",
+                Some(record.sequence),
+                Some(index.event_id),
+                Some(computed),
+                checkpoint,
+            ));
         }
+        previous = Some(computed);
+        expected_sequence = expected_sequence.saturating_add(1);
     }
-    let mut result = verify_records(&records, stream_id, checkpoint, verified_at);
-    if result.valid {
-        let mut statement = connection.prepare(
-            "SELECT sequence,event_id,task_id,stream_id,timestamp,event_type,semantic_program_hash,ir_version,registry_snapshot_id,node_id,execution_binding_id,provider_id,status,event_json FROM provenance_events WHERE stream_id=?1 AND (?2 IS NULL OR sequence<=?2) ORDER BY sequence",
-        )?;
-        let rows = statement.query_map(params![stream_id, upper], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, String>(13)?,
-            ))
-        })?;
-        for row in rows {
-            let (
-                sequence,
-                event_id,
-                task_id,
-                stored_stream,
-                timestamp,
-                event_type,
-                semantic_program_hash,
-                ir_version,
-                registry_snapshot_id,
-                node_id,
-                execution_binding_id,
-                provider_id,
-                status,
-                event_json,
-            ) = row?;
-            let sequence = u64::try_from(sequence).unwrap_or(0);
-            let Ok(event) = serde_json::from_str::<Value>(&event_json) else {
-                return Ok(failure(
-                    stream_id,
-                    verified_at,
-                    "PROVENANCE_SCHEMA_INVALID",
-                    "stored event JSON is malformed",
-                    Some(sequence),
-                    Some(event_id),
-                    result.computed_head_hash,
-                    checkpoint,
-                ));
-            };
-            let coherent = event_id == string_field(&event, "event_id").unwrap_or_default()
-                && task_id == string_field(&event, "task_id").unwrap_or_default()
-                && stored_stream == stream_id
-                && timestamp == string_field(&event, "timestamp").unwrap_or_default()
-                && event_type == string_field(&event, "event_type").unwrap_or_default()
-                && semantic_program_hash.as_deref()
-                    == string_field(&event, "semantic_program_hash")
-                && ir_version.as_deref() == string_field(&event, "ir_version")
-                && registry_snapshot_id.as_deref() == string_field(&event, "registry_snapshot_id")
-                && node_id.as_deref() == string_field(&event, "step_id")
-                && execution_binding_id.as_deref() == string_field(&event, "execution_binding_id")
-                && provider_id.as_deref() == string_field(&event, "provider_id")
-                && status.as_deref() == string_field(&event, "status");
-            if !coherent {
-                return Ok(failure(
-                    stream_id,
-                    verified_at,
-                    "PROVENANCE_SCHEMA_INVALID",
-                    "journal index columns conflict with the hashed event",
-                    Some(sequence),
-                    Some(event_id),
-                    result.computed_head_hash,
-                    checkpoint,
-                ));
-            }
-        }
-    }
+    let mut result = finish_verification(
+        stream_id,
+        expected_sequence,
+        previous,
+        checkpoint,
+        verified_at,
+    );
     if result.valid {
         if let Some(through) = through_sequence {
             if result.to_sequence != through {
@@ -503,159 +472,147 @@ pub fn verify_stream(
     Ok(result)
 }
 
-/// Verifies journal records already loaded in their presented order.
-#[allow(clippy::too_many_lines)]
-pub fn verify_records(
-    records: &[JournalRecord],
+struct JournalIndex {
+    event_id: String,
+    task_id: String,
+    timestamp: String,
+    event_type: String,
+    semantic_program_hash: Option<String>,
+    ir_version: Option<String>,
+    registry_snapshot_id: Option<String>,
+    node_id: Option<String>,
+    execution_binding_id: Option<String>,
+    provider_id: Option<String>,
+    status: Option<String>,
+}
+
+impl JournalIndex {
+    fn matches(&self, event: &Value) -> bool {
+        self.event_id == string_field(event, "event_id").unwrap_or_default()
+            && self.task_id == string_field(event, "task_id").unwrap_or_default()
+            && self.timestamp == string_field(event, "timestamp").unwrap_or_default()
+            && self.event_type == string_field(event, "event_type").unwrap_or_default()
+            && self.semantic_program_hash.as_deref() == string_field(event, "semantic_program_hash")
+            && self.ir_version.as_deref() == string_field(event, "ir_version")
+            && self.registry_snapshot_id.as_deref() == string_field(event, "registry_snapshot_id")
+            && self.node_id.as_deref() == string_field(event, "step_id")
+            && self.execution_binding_id.as_deref() == string_field(event, "execution_binding_id")
+            && self.provider_id.as_deref() == string_field(event, "provider_id")
+            && self.status.as_deref() == string_field(event, "status")
+    }
+}
+fn verify_one_record(
+    record: &JournalRecord,
     stream_id: &str,
+    expected_sequence: u64,
+    previous: Option<&str>,
+    expected_sequence_appears_later: bool,
+    checkpoint: Option<&CheckpointExpectation>,
+    verified_at: &str,
+) -> std::result::Result<String, Box<VerificationResult>> {
+    let event_id = string_field(&record.event, "event_id").map(str::to_owned);
+    let invalid = |code: &str, message: &str, head: Option<String>| {
+        Box::new(failure(
+            stream_id,
+            verified_at,
+            code,
+            message,
+            Some(record.sequence),
+            event_id.clone(),
+            head,
+            checkpoint,
+        ))
+    };
+    if record.sequence < expected_sequence || expected_sequence_appears_later {
+        return Err(invalid(
+            "PROVENANCE_SEQUENCE_ORDER_INVALID",
+            "records are not in strictly increasing sequence",
+            previous.map(str::to_owned),
+        ));
+    }
+    if record.sequence > expected_sequence {
+        return Err(invalid(
+            "PROVENANCE_SEQUENCE_GAP",
+            "provenance stream contains a sequence gap",
+            previous.map(str::to_owned),
+        ));
+    }
+    if record.schema_version != SCHEMA_VERSION {
+        return Err(invalid(
+            "PROVENANCE_SCHEMA_INVALID",
+            "journal record schema version is unsupported",
+            previous.map(str::to_owned),
+        ));
+    }
+    if record.hash_profile != HASH_PROFILE {
+        return Err(invalid(
+            "PROVENANCE_HASH_PROFILE_UNSUPPORTED",
+            "journal record hash profile is unsupported",
+            previous.map(str::to_owned),
+        ));
+    }
+    if record.stream_id != stream_id
+        || string_field(&record.event, "task_id").and_then(|id| self::stream_id(id).ok())
+            != Some(stream_id.to_owned())
+    {
+        return Err(invalid(
+            "PROVENANCE_STREAM_ID_MISMATCH",
+            "journal record identity does not match the verified stream",
+            previous.map(str::to_owned),
+        ));
+    }
+    if record.previous_event_hash.as_deref() != previous {
+        return Err(invalid(
+            "PROVENANCE_PREVIOUS_HASH_MISMATCH",
+            "previous_event_hash does not match the prior computed head",
+            previous.map(str::to_owned),
+        ));
+    }
+    let task_id = string_field(&record.event, "task_id").unwrap_or_default();
+    if validate_event(task_id, &record.event).is_err()
+        || validate_sequence_event_invariant(record.sequence, &record.event).is_err()
+        || !valid_hash(&record.event_hash)
+        || record
+            .previous_event_hash
+            .as_deref()
+            .is_some_and(|hash| !valid_hash(hash))
+    {
+        return Err(invalid(
+            "PROVENANCE_SCHEMA_INVALID",
+            "journal record or event is structurally invalid",
+            previous.map(str::to_owned),
+        ));
+    }
+    let computed = hash_record(
+        stream_id,
+        record.sequence,
+        record.previous_event_hash.as_deref(),
+        &record.event,
+    )
+    .map_err(|_| {
+        invalid(
+            "PROVENANCE_SCHEMA_INVALID",
+            "journal record cannot be canonicalized",
+            previous.map(str::to_owned),
+        )
+    })?;
+    if computed != record.event_hash {
+        return Err(invalid(
+            "PROVENANCE_EVENT_HASH_MISMATCH",
+            "recomputed journal-record hash does not match event_hash",
+            Some(computed),
+        ));
+    }
+    Ok(computed)
+}
+
+fn finish_verification(
+    stream_id: &str,
+    expected_sequence: u64,
+    previous: Option<String>,
     checkpoint: Option<&CheckpointExpectation>,
     verified_at: &str,
 ) -> VerificationResult {
-    let mut previous: Option<String> = None;
-    let mut expected_sequence = 1_u64;
-    for (index, record) in records.iter().enumerate() {
-        let event_id = string_field(&record.event, "event_id").map(str::to_owned);
-        if record.sequence < expected_sequence {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_SEQUENCE_ORDER_INVALID",
-                "records are not in strictly increasing sequence",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        if record.sequence > expected_sequence {
-            let (code, message) = if records[index..]
-                .iter()
-                .any(|candidate| candidate.sequence == expected_sequence)
-            {
-                (
-                    "PROVENANCE_SEQUENCE_ORDER_INVALID",
-                    "records are not in strictly increasing sequence",
-                )
-            } else {
-                (
-                    "PROVENANCE_SEQUENCE_GAP",
-                    "provenance stream contains a sequence gap",
-                )
-            };
-            return failure(
-                stream_id,
-                verified_at,
-                code,
-                message,
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        if record.schema_version != SCHEMA_VERSION {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_SCHEMA_INVALID",
-                "journal record schema version is unsupported",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        if record.hash_profile != HASH_PROFILE {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_HASH_PROFILE_UNSUPPORTED",
-                "journal record hash profile is unsupported",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        if record.stream_id != stream_id
-            || string_field(&record.event, "task_id").and_then(|id| self::stream_id(id).ok())
-                != Some(stream_id.to_owned())
-        {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_STREAM_ID_MISMATCH",
-                "journal record identity does not match the verified stream",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        if record.previous_event_hash != previous {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_PREVIOUS_HASH_MISMATCH",
-                "previous_event_hash does not match the prior computed head",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        let task_id = string_field(&record.event, "task_id").unwrap_or_default();
-        if validate_event(task_id, &record.event).is_err()
-            || validate_sequence_event_invariant(record.sequence, &record.event).is_err()
-            || !valid_hash(&record.event_hash)
-            || record
-                .previous_event_hash
-                .as_deref()
-                .is_some_and(|hash| !valid_hash(hash))
-        {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_SCHEMA_INVALID",
-                "journal record or event is structurally invalid",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        }
-        let Ok(computed) = hash_record(
-            stream_id,
-            record.sequence,
-            record.previous_event_hash.as_deref(),
-            &record.event,
-        ) else {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_SCHEMA_INVALID",
-                "journal record cannot be canonicalized",
-                Some(record.sequence),
-                event_id,
-                previous,
-                checkpoint,
-            );
-        };
-        if computed != record.event_hash {
-            return failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_EVENT_HASH_MISMATCH",
-                "recomputed journal-record hash does not match event_hash",
-                Some(record.sequence),
-                event_id,
-                Some(computed),
-                checkpoint,
-            );
-        }
-        previous = Some(computed);
-        expected_sequence = expected_sequence.saturating_add(1);
-    }
     let Some(computed_head_hash) = previous else {
         return failure(
             stream_id,
@@ -698,6 +655,43 @@ pub fn verify_records(
     }
 }
 
+/// Verifies journal records already loaded in their presented order.
+#[allow(clippy::too_many_lines)]
+pub fn verify_records(
+    records: &[JournalRecord],
+    stream_id: &str,
+    checkpoint: Option<&CheckpointExpectation>,
+    verified_at: &str,
+) -> VerificationResult {
+    let mut previous: Option<String> = None;
+    let mut expected_sequence = 1_u64;
+    for (index, record) in records.iter().enumerate() {
+        let expected_later = record.sequence > expected_sequence
+            && records[index..]
+                .iter()
+                .any(|candidate| candidate.sequence == expected_sequence);
+        match verify_one_record(
+            record,
+            stream_id,
+            expected_sequence,
+            previous.as_deref(),
+            expected_later,
+            checkpoint,
+            verified_at,
+        ) {
+            Ok(computed) => previous = Some(computed),
+            Err(failure) => return *failure,
+        }
+        expected_sequence = expected_sequence.saturating_add(1);
+    }
+    finish_verification(
+        stream_id,
+        expected_sequence,
+        previous,
+        checkpoint,
+        verified_at,
+    )
+}
 /// Produces a separately hashed privacy-redacted projection and manifest.
 ///
 /// # Errors
@@ -731,17 +725,22 @@ where
     validate_timestamp(verified_at)?;
     validate_stream_id(stream_id)?;
     let transaction = connection.unchecked_transaction()?;
-    validate(&transaction)?;
-    let record_count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+    let (record_count, source_bytes): (i64, i64) = transaction.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(event_json AS BLOB))),0) FROM provenance_events WHERE stream_id=?1",
         [stream_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if u64::try_from(record_count).map_or(true, |count| count > MAX_PROJECTION_RECORDS) {
         return Err(Error::InvalidRecord(
             "portable provenance export exceeds record-count bound".to_owned(),
         ));
     }
+    if u64::try_from(source_bytes).map_or(true, |bytes| bytes > MAX_PROJECTION_SOURCE_BYTES) {
+        return Err(Error::InvalidRecord(
+            "portable provenance export exceeds source-byte bound".to_owned(),
+        ));
+    }
+    validate(&transaction)?;
     let verification = verify_stream(&transaction, stream_id, None, None, verified_at)?;
     if !verification.valid {
         return Err(Error::InvalidRecord(
@@ -2702,6 +2701,40 @@ mod tests {
     }
 
     #[test]
+    fn streaming_verification_preserves_sequence_hash_and_index_diagnostics() {
+        for (sql, expected_code) in [
+            (
+                "DELETE FROM provenance_events WHERE sequence=2",
+                "PROVENANCE_SEQUENCE_GAP",
+            ),
+            (
+                "UPDATE provenance_events SET previous_event_hash='sha256:bad' WHERE sequence=2",
+                "PROVENANCE_PREVIOUS_HASH_MISMATCH",
+            ),
+            (
+                "UPDATE provenance_events SET event_hash='sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' WHERE sequence=2",
+                "PROVENANCE_EVENT_HASH_MISMATCH",
+            ),
+            (
+                "UPDATE provenance_events SET status='failure' WHERE sequence=2",
+                "PROVENANCE_SCHEMA_INVALID",
+            ),
+            (
+                "UPDATE provenance_events SET sequence=5 WHERE sequence=2",
+                "PROVENANCE_SEQUENCE_GAP",
+            ),
+        ] {
+            let mut connection = connection();
+            append_many(&mut connection, 4);
+            connection.execute_batch(sql).unwrap();
+            let stream = stream_id("T-provenance").unwrap();
+            let result = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+            assert!(!result.valid, "{sql}");
+            assert_eq!(result.diagnostics[0].code, expected_code, "{sql}");
+        }
+    }
+
+    #[test]
     fn append_rejects_payload_hash_fields_bounds_and_stale_heads() {
         let mut invalid_genesis_connection = connection();
         let invalid_genesis_tx = invalid_genesis_connection.transaction().unwrap();
@@ -3652,6 +3685,57 @@ mod tests {
         ).unwrap();
         let error = export_jsonl(&connection, &stream, NOW).unwrap_err();
         assert!(error.to_string().contains("record-count bound"));
+    }
+
+    #[test]
+    fn export_rejects_overbound_source_before_private_validation() {
+        let task_id = "T-large-source";
+        let stream = stream_id(task_id).unwrap();
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        let genesis = append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        let mut event = event(task_id, 2);
+        let artifacts = (0..500)
+            .map(|index| format!("artifact:{index:03}:{}", "x".repeat(100)))
+            .collect::<Vec<_>>();
+        event["input_artifacts"] = json!(artifacts);
+        assert!(validate_event(task_id, &event).is_ok());
+        let event_bytes = serde_json::to_vec(&event).unwrap().len() as u64;
+        assert!(event_bytes < MAX_EVENT_BYTES as u64);
+        let event_count = MAX_PROJECTION_SOURCE_BYTES / event_bytes + 2;
+        assert!(event_count < MAX_PROJECTION_RECORDS);
+        let mut previous = genesis.event_hash;
+        for sequence in 2..=event_count {
+            let event_id = format!("event-large-{sequence}");
+            event["event_id"] = json!(event_id);
+            event["details"]["index"] = json!(sequence);
+            let hash = hash_record(&stream, sequence, Some(&previous), &event).unwrap();
+            transaction.execute(
+                "INSERT INTO provenance_events (schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,event_type,status,previous_event_hash,event_hash,event_json) VALUES (?1,?2,?3,?4,?5,?6,?7,'verification.started','success',?8,?9,?10)",
+                params![SCHEMA_VERSION,HASH_PROFILE,event_id,task_id,stream,i64::try_from(sequence).unwrap(),NOW,previous,hash,serde_json::to_string(&event).unwrap()],
+            ).unwrap();
+            previous = hash;
+        }
+        transaction.commit().unwrap();
+        assert!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+        let mut callback_ran = false;
+        let error = export_jsonl_with_validation(&connection, &stream, NOW, |_| {
+            callback_ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!callback_ran);
+        assert!(error.to_string().contains("source-byte bound"));
     }
 
     #[test]
