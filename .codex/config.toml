@@ -2,12 +2,12 @@
 # Codex loads this file only when the repository is trusted.
 #
 # Root coordinator:
-# - GPT-5.6 Sol
-# - xhigh is the highest reasoning effort currently persistable in config.toml.
+# - GPT-6 Sol
+# - ultra is the GPT-6 Sol coordinator profile: maximum reasoning with automatic task delegation.
 # - The project owner should not manually route ordinary work among model-specific chats.
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
-plan_mode_reasoning_effort = "xhigh"
+model = "gpt-6-sol"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
 model_reasoning_summary = "concise"
 
 developer_instructions = """
@@ -37,12 +37,16 @@ bounded issue -> explorer as needed -> implementer -> tests -> reviewer/test_aud
 Do not stop merely because one subagent responded. Integrate the result and continue the loop automatically. Stop only at a defined gate, a tool/runtime limitation, or a genuine architecture/product/permission decision that requires the owner.
 
 Never silently weaken architecture/security contracts, bypass required reviews, or begin a later roadmap stage before the current gate passes.
+
+Model compatibility guard:
+- GPT-6 Sol and GPT-6 Luna require Codex client 0.155.0 or newer in the current catalog; GPT-6 Astra requires 0.153.0 or newer.
+- If a configured GPT-6 model is unavailable, do not silently fall back to a GPT-5.6 model. Report the unavailable model and client/runtime version in the GitHub handoff, then update the client/runtime before resuming unless the owner explicitly authorizes a temporary fallback.
 """
 
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 6
-default_subagent_model = "gpt-5.6-terra"
+default_subagent_model = "gpt-6-sol"
 default_subagent_reasoning_effort = "medium"
 interrupt_message = true
 
