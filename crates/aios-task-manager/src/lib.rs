@@ -7536,6 +7536,9 @@ mod tests {
             .unwrap();
         assert!(applied.applied);
         assert_eq!(applied.current_revision, Some(2));
+        let before_stale = manager.get_task("T-1").unwrap().unwrap();
+        let count_before_stale = manager.provenance_count("T-1").unwrap();
+        let head_before_stale = manager.provenance_head("T-1").unwrap();
         let stale = manager
             .transition(&request(
                 "tr-stale",
@@ -7546,6 +7549,22 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(stale.reason_code, "TASK_REVISION_CONFLICT");
+        assert!(!stale.applied);
+        assert!(stale.provenance_event_id.is_none());
+        assert!(stale.provenance_event_hash.is_none());
+        let after_stale = manager.get_task("T-1").unwrap().unwrap();
+        assert_eq!(after_stale.state, before_stale.state);
+        assert_eq!(after_stale.revision, before_stale.revision);
+        assert_eq!(manager.provenance_count("T-1").unwrap(), count_before_stale);
+        assert_eq!(manager.provenance_head("T-1").unwrap(), head_before_stale);
+        assert_eq!(
+            manager.connection.query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE json_extract(event_json,'$.task_transition.transition_id')='tr-stale'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            0
+        );
         let cancel = manager
             .transition(&request(
                 "tr-cancel",

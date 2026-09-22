@@ -218,6 +218,7 @@ pub fn append_in_tx(
             "provenance sequence overflow".to_owned(),
         ));
     }
+    validate_sequence_event_invariant(sequence, event)?;
     let previous_event_hash = head.map(|value| value.event_hash);
     let event_hash = hash_record(&stream_id, sequence, previous_event_hash.as_deref(), event)?;
     let event_id = string_field(event, "event_id")
@@ -407,8 +408,7 @@ pub fn verify_stream(
                 && node_id.as_deref() == string_field(&event, "step_id")
                 && execution_binding_id.as_deref() == string_field(&event, "execution_binding_id")
                 && provider_id.as_deref() == string_field(&event, "provider_id")
-                && status.as_deref() == string_field(&event, "status")
-                && (sequence != 1 || event_type == "task.created");
+                && status.as_deref() == string_field(&event, "status");
             if !coherent {
                 return Ok(failure(
                     stream_id,
@@ -545,6 +545,7 @@ pub fn verify_records(
         }
         let task_id = string_field(&record.event, "task_id").unwrap_or_default();
         if validate_event(task_id, &record.event).is_err()
+            || validate_sequence_event_invariant(record.sequence, &record.event).is_err()
             || !valid_hash(&record.event_hash)
             || record
                 .previous_event_hash
@@ -656,7 +657,7 @@ pub fn export_jsonl(
     loop {
         let page = list_events(connection, stream_id, cursor, MAX_PAGE_SIZE)?;
         for record in page.records {
-            ensure_export_safe(&record.event)?;
+            validate_stored_event(&record.event)?;
             records.push(record);
         }
         let Some(next) = page.next_cursor else { break };
@@ -720,7 +721,6 @@ pub fn verify_jsonl_export(
             ));
         }
         let record: JournalRecord = serde_json::from_str(line)?;
-        ensure_export_safe(&record.event)?;
         records.push(record);
     }
     if records.len() as u64 != manifest.record_count
@@ -857,32 +857,59 @@ fn validate_event(task_id: &str, event: &Value) -> Result<()> {
             ));
         }
     }
-    ensure_export_safe(event)
+    validate_details_vocabulary(event)
+}
+
+fn validate_stored_event(event: &Value) -> Result<()> {
+    let task_id = string_field(event, "task_id").ok_or_else(|| {
+        Error::InvalidRecord("provenance event has no typed Task identity".to_owned())
+    })?;
+    validate_event(task_id, event)
 }
 
 fn validate_task_id(task_id: &str) -> Result<()> {
-    let mut chars = task_id.chars();
-    let Some(first) = chars.next() else {
+    let count = task_id.chars().count();
+    if count == 0 {
         return Err(Error::InvalidRecord("Task ID is empty".to_owned()));
-    };
-    if !first.is_ascii_alphanumeric()
-        || task_id.len() > 256
-        || !chars.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-')
-        })
-    {
+    }
+    if count > 256 {
         return Err(Error::InvalidRecord(
-            "Task ID cannot form a valid provenance stream ID".to_owned(),
+            "Task ID exceeds 256 Unicode scalars".to_owned(),
         ));
     }
     Ok(())
 }
 
 fn validate_stream_id(value: &str) -> Result<()> {
-    let task_id = value
+    let key = value
         .strip_prefix("task:")
         .ok_or_else(|| Error::InvalidRecord("invalid provenance stream ID".to_owned()))?;
-    validate_task_id(task_id)
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(Error::InvalidRecord(
+            "invalid provenance stream ID".to_owned(),
+        ));
+    };
+    if value.len() > 256
+        || !first.is_ascii_alphanumeric()
+        || !chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-')
+        })
+    {
+        return Err(Error::InvalidRecord(
+            "invalid provenance stream ID".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sequence_event_invariant(sequence: u64, event: &Value) -> Result<()> {
+    if sequence == 1 && string_field(event, "event_type") != Some("task.created") {
+        return Err(Error::InvalidRecord(
+            "provenance genesis event must be task.created".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_timestamp(value: &str) -> Result<()> {
@@ -899,34 +926,242 @@ fn valid_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn ensure_export_safe(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if matches!(
-                    key.as_str(),
-                    "original_intent"
-                        | "normalized_intent"
-                        | "intent_commitment_nonce"
-                        | "raw_secret"
-                        | "password"
-                        | "authorization_header"
-                ) {
-                    return Err(Error::InvalidRecord(
-                        "provenance contains a private-content field".to_owned(),
-                    ));
-                }
-                ensure_export_safe(value)?;
-            }
+fn validate_details_vocabulary(event: &Value) -> Result<()> {
+    let Some(details) = event.get("details") else {
+        return Ok(());
+    };
+    let details = details
+        .as_object()
+        .ok_or_else(|| Error::InvalidRecord("provenance details must be an object".to_owned()))?;
+    let event_type = string_field(event, "event_type").unwrap_or_default();
+    for (key, value) in details {
+        if !allowed_detail_key(event_type, key) {
+            return Err(Error::InvalidRecord(format!(
+                "provenance details field `{key}` is not in the privacy-safe vocabulary"
+            )));
         }
-        Value::Array(values) => {
-            for value in values {
-                ensure_export_safe(value)?;
-            }
-        }
-        _ => {}
+        validate_detail_value(key, value)?;
     }
     Ok(())
+}
+
+fn allowed_detail_key(event_type: &str, key: &str) -> bool {
+    match event_type {
+        "task.created" => matches!(
+            key,
+            "revision"
+                | "creation"
+                | "active_plan"
+                | "active_step_ids"
+                | "waiting_on"
+                | "failure"
+                | "recovery"
+                | "fixture"
+        ),
+        "task.transitioned" => matches!(
+            key,
+            "related_ids" | "reason_message_ref" | "active_program" | "mutation_text_commitments"
+        ),
+        "authorization.granted" => matches!(key, "actions" | "resource" | "resources"),
+        "plan.created" | "plan.revised" => matches!(key, "plan_id" | "revision"),
+        "provider.selected" | "placement.selected" => {
+            matches!(key, "locality" | "isolation_class")
+        }
+        "execution.started" => matches!(
+            key,
+            "attempt_id"
+                | "binding_id"
+                | "node_id"
+                | "operation_id"
+                | "phase"
+                | "intent_hash"
+                | "admission_event_id"
+                | "admission_event_hash"
+                | "execution_profile"
+        ),
+        "execution.completed" | "execution.failed" => matches!(
+            key,
+            "operation_id"
+                | "outcome_certainty"
+                | "effect_boundary"
+                | "certainty"
+                | "export_reconciliation"
+                | "recovery_ref"
+                | "inventory_id"
+                | "safe_action"
+                | "reason_code"
+                | "phase"
+                | "admission_event_id"
+                | "admission_event_hash"
+                | "attempt"
+                | "duration_ms"
+        ),
+        "artifact.imported" => matches!(
+            key,
+            "content_hash"
+                | "size_bytes"
+                | "blob_reused"
+                | "import_id"
+                | "request_digest"
+                | "source"
+        ),
+        "artifact.created" => matches!(
+            key,
+            "allocation_id"
+                | "publication_id"
+                | "content_hash"
+                | "size_bytes"
+                | "blob_reused"
+                | "type"
+        ),
+        "artifact.exported" => matches!(key, "operation_id" | "size_bytes"),
+        "artifact.integrity-failed" => matches!(
+            key,
+            "content_hash"
+                | "observation_ordinal"
+                | "previous_durability_state"
+                | "durability_state"
+                | "publication_id"
+                | "allocation_id"
+                | "request_digest"
+                | "reason_code"
+                | "resulted_at"
+        ),
+        "verification.started" | "verification.completed" | "verification.failed" => {
+            matches!(key, "index" | "verified_claims" | "failed_claims")
+        }
+        "task.completed" => matches!(key, "revision" | "external_egress" | "verified"),
+        _ => false,
+    }
+}
+
+fn validate_detail_value(key: &str, value: &Value) -> Result<()> {
+    match key {
+        "creation" => validate_object_keys(
+            value,
+            &[
+                "principal",
+                "workspace_id",
+                "original_intent_ref",
+                "normalized_intent_ref",
+                "constraints",
+                "created_at",
+            ],
+        ),
+        "principal" => validate_object_keys(value, &["kind", "id"]),
+        "original_intent_ref"
+        | "normalized_intent_ref"
+        | "reason_message_ref"
+        | "failure_summary"
+        | "message_ref" => validate_commitment(value),
+        "active_plan" => validate_object_keys(value, &["plan_id", "revision"]),
+        "waiting_on" => validate_array_objects(value, &["kind", "id", "message_ref"]),
+        "failure" => validate_object_keys(
+            value,
+            &[
+                "code",
+                "step_id",
+                "provider_id",
+                "execution_binding_id",
+                "provenance_event_ids",
+                "retryable",
+                "safe_to_replan",
+                "unknown_side_effects",
+                "rollback_available",
+            ],
+        ),
+        "recovery" => validate_object_keys(
+            value,
+            &[
+                "unknown_operation_ids",
+                "unknown_operations_ref",
+                "last_known_daemon_instance",
+            ],
+        ),
+        "active_program" => validate_object_keys(
+            value,
+            &[
+                "program_id",
+                "ir_version",
+                "semantic_hash",
+                "registry_snapshot_id",
+                "validation_result_id",
+                "validated_at",
+                "validator_id",
+                "validator_version",
+                "program_content_digest",
+            ],
+        ),
+        "mutation_text_commitments" => {
+            validate_object_keys(value, &["waiting_on", "failure_summary"])
+        }
+        "export_reconciliation" => validate_object_keys(
+            value,
+            &[
+                "verifier_id",
+                "evidence_ref",
+                "proof_hash",
+                "challenge",
+                "observed_at",
+                "subject_hash",
+                "recovery_ref",
+            ],
+        ),
+        _ => reject_nested_objects(value),
+    }
+}
+
+fn validate_commitment(value: &Value) -> Result<()> {
+    validate_object_keys(
+        value,
+        &["kind", "version", "algorithm", "field", "commitment"],
+    )
+}
+
+fn validate_array_objects(value: &Value, allowed: &[&str]) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let values = value.as_array().ok_or_else(|| {
+        Error::InvalidRecord("provenance details field has an invalid shape".to_owned())
+    })?;
+    for value in values {
+        validate_object_keys(value, allowed)?;
+    }
+    Ok(())
+}
+
+fn validate_object_keys(value: &Value, allowed: &[&str]) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        Error::InvalidRecord("provenance details field has an invalid shape".to_owned())
+    })?;
+    for (key, value) in object {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Error::InvalidRecord(format!(
+                "nested provenance details field `{key}` is not in the privacy-safe vocabulary"
+            )));
+        }
+        validate_detail_value(key, value)?;
+    }
+    Ok(())
+}
+
+fn reject_nested_objects(value: &Value) -> Result<()> {
+    match value {
+        Value::Object(object) if !object.is_empty() => Err(Error::InvalidRecord(
+            "provenance details contain an untyped nested object".to_owned(),
+        )),
+        Value::Array(values) => {
+            for value in values {
+                reject_nested_objects(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn json_depth(value: &Value) -> usize {
@@ -1034,6 +1269,11 @@ mod tests {
 
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection);
+        connection
+    }
+
+    fn initialize(connection: &Connection) {
         connection
             .execute_batch(
                 "CREATE TABLE provenance_events (
@@ -1059,7 +1299,6 @@ mod tests {
             );",
             )
             .unwrap();
-        connection
     }
 
     fn event(task_id: &str, index: u64) -> Value {
@@ -1076,7 +1315,11 @@ mod tests {
             "timestamp":NOW,
             "actor":{"kind":"system-service","id":"service:test"},
             "status":"success",
-            "details":{"index":index}
+            "details": if index == 1 {
+                json!({"revision":1,"fixture":true})
+            } else {
+                json!({"index":index})
+            }
         })
     }
 
@@ -1167,6 +1410,18 @@ mod tests {
 
     #[test]
     fn append_rejects_payload_hash_fields_bounds_and_stale_heads() {
+        let mut invalid_genesis_connection = connection();
+        let invalid_genesis_tx = invalid_genesis_connection.transaction().unwrap();
+        assert!(
+            append_in_tx(
+                &invalid_genesis_tx,
+                "T-provenance",
+                &event("T-provenance", 2),
+                &ExpectedHead::Empty,
+            )
+            .is_err()
+        );
+
         let mut connection = connection();
         let transaction = connection.transaction().unwrap();
         let first = append_in_tx(
@@ -1229,6 +1484,80 @@ mod tests {
     }
 
     #[test]
+    fn details_vocabulary_rejects_private_aliases_and_unknown_nested_keys() {
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            "T-provenance",
+            &event("T-provenance", 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        for (index, key) in [
+            "model_prompt",
+            "apiKey",
+            "prompt",
+            "body",
+            "content",
+            "debug_dump",
+            "credential",
+            "api_key",
+            "accessToken",
+            "authorizationHeader",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut candidate = event("T-provenance", index as u64 + 2);
+            candidate["details"] = json!({(key):"private"});
+            assert!(
+                append_in_tx(&transaction, "T-provenance", &candidate, &ExpectedHead::Any).is_err(),
+                "unexpectedly accepted private detail alias {key}"
+            );
+        }
+
+        let mut nested = event("T-nested", 1);
+        nested["details"] = json!({
+            "revision":1,
+            "creation":{"original_intent_ref":null,"apiKey":"private"}
+        });
+        assert!(append_in_tx(&transaction, "T-nested", &nested, &ExpectedHead::Empty).is_err());
+
+        let stream = stream_id("T-nested").unwrap();
+        let event_hash = hash_record(&stream, 1, None, &nested).unwrap();
+        let record = JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 1,
+            previous_event_hash: None,
+            event: nested,
+            event_hash: event_hash.clone(),
+        };
+        let manifest = ExportManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            export_profile: "privacy-safe-original-chain".to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream,
+            record_count: 1,
+            head_sequence: 1,
+            head_event_hash: event_hash,
+        };
+        let verification = verify_jsonl_export(
+            &serde_json::to_string(&manifest).unwrap(),
+            &format!("{}\n", serde_json::to_string(&record).unwrap()),
+            NOW,
+        )
+        .unwrap();
+        assert!(!verification.valid);
+        assert_eq!(
+            verification.diagnostics[0].code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+    }
+
+    #[test]
     fn portable_export_reverifies_offline_and_fails_closed() {
         let mut connection = connection();
         append_many(&mut connection, 4);
@@ -1259,6 +1588,36 @@ mod tests {
             result.diagnostics[0].code,
             "PROVENANCE_CHECKPOINT_HEAD_MISMATCH"
         );
+
+        let invalid_event = event("T-provenance", 2);
+        let invalid_hash = hash_record(&stream, 1, None, &invalid_event).unwrap();
+        let invalid_record = JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 1,
+            previous_event_hash: None,
+            event: invalid_event,
+            event_hash: invalid_hash.clone(),
+        };
+        let invalid_manifest = ExportManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            export_profile: "privacy-safe-original-chain".to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            record_count: 1,
+            head_sequence: 1,
+            head_event_hash: invalid_hash,
+        };
+        let invalid_jsonl = format!("{}\n", serde_json::to_string(&invalid_record).unwrap());
+        let offline = verify_jsonl_export(
+            &serde_json::to_string(&invalid_manifest).unwrap(),
+            &invalid_jsonl,
+            NOW,
+        )
+        .unwrap();
+        assert!(!offline.valid);
+        assert_eq!(offline.diagnostics[0].code, "PROVENANCE_SCHEMA_INVALID");
     }
 
     #[test]
@@ -1279,5 +1638,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn concurrent_exact_head_append_has_one_winner_and_valid_chain() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provenance.sqlite3");
+        let mut setup = Connection::open(&path).unwrap();
+        initialize(&setup);
+        let transaction = setup.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            "T-concurrent",
+            &event("T-concurrent", 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let stream = stream_id("T-concurrent").unwrap();
+        let observed = get_head(&setup, &stream).unwrap().unwrap();
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for worker in 0..2_u64 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let expected = ExpectedHead::Exact {
+                sequence: observed.sequence,
+                event_hash: observed.event_hash.clone(),
+            };
+            workers.push(thread::spawn(move || {
+                let mut connection = Connection::open(path).unwrap();
+                connection.busy_timeout(Duration::from_secs(5)).unwrap();
+                barrier.wait();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                let mut candidate = event("T-concurrent", worker + 2);
+                candidate["event_id"] = json!(format!("event-concurrent-{worker}"));
+                match append_in_tx(&transaction, "T-concurrent", &candidate, &expected) {
+                    Ok(_) => {
+                        transaction.commit().unwrap();
+                        true
+                    }
+                    Err(error) => {
+                        assert!(error.to_string().contains("stale provenance stream head"));
+                        false
+                    }
+                }
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|won| **won).count(), 1);
+
+        let connection = Connection::open(path).unwrap();
+        let verification = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+        assert!(verification.valid, "{verification:?}");
+        assert_eq!(verification.to_sequence, 2);
     }
 }

@@ -475,39 +475,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
     );
 }
 
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "keeps the legacy table shape and survival assertions together"
-)]
-fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("provenance-migration.sqlite3");
-    let original_hash = {
-        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        manager
-            .create_task(&create("T-provenance-migration"))
-            .unwrap();
-        manager.connection.execute(
-            "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,sensitivity,retention_class,origin_kind,origin_task_id,integrity_state,created_at)
-             VALUES (?1,?2,'artifact.test@1','application/octet-stream','local','task','task','T-provenance-migration','unknown',?3)",
-            rusqlite::params![
-                format!("artifact:v1:sha256:{}", "a".repeat(64)),
-                format!("artifact://artifact:v1:sha256:{}", "a".repeat(64)),
-                TEST_TIME,
-            ],
-        ).unwrap();
-        manager
-            .connection
-            .query_row(
-                "SELECT event_hash FROM provenance_events WHERE task_id='T-provenance-migration'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-    };
-
-    let connection = Connection::open(&path).unwrap();
+fn downgrade_provenance_before_0011(connection: &Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -551,43 +519,184 @@ fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() 
          DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';",
         )
         .unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the legacy table shape and survival assertions together"
+)]
+fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("provenance-migration.sqlite3");
+    let task_id = "任务-迁移-é";
+    let original_records = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create(task_id)).unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        for index in 2..=3 {
+            append_event(
+                &transaction,
+                task_id,
+                &serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "event_id": format!("event:legacy-unicode:{index}"),
+                    "task_id": task_id,
+                    "event_type": "verification.started",
+                    "timestamp": TEST_TIME,
+                    "actor": {"kind":"system-service","id":"service:test"},
+                    "status": "success",
+                    "details": {"index": index}
+                }),
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        manager.connection.execute(
+            "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,sensitivity,retention_class,origin_kind,origin_task_id,integrity_state,created_at)
+             VALUES (?1,?2,'artifact.test@1','application/octet-stream','local','task','task',?3,'unknown',?4)",
+            rusqlite::params![
+                format!("artifact:v1:sha256:{}", "a".repeat(64)),
+                format!("artifact://artifact:v1:sha256:{}", "a".repeat(64)),
+                task_id,
+                TEST_TIME,
+            ],
+        ).unwrap();
+        let mut statement = manager
+            .connection
+            .prepare(
+                "SELECT sequence,previous_event_hash,event_hash,event_json
+                 FROM provenance_events WHERE task_id=?1 ORDER BY sequence",
+            )
+            .unwrap();
+        statement
+            .query_map([task_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    downgrade_provenance_before_0011(&connection);
     drop(connection);
 
     let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-    assert!(
-        manager
-            .get_task("T-provenance-migration")
-            .unwrap()
-            .is_some()
-    );
+    assert!(manager.get_task(task_id).unwrap().is_some());
     assert_eq!(
         manager
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM artifacts WHERE origin_task_id='T-provenance-migration'",
-                [],
+                "SELECT COUNT(*) FROM artifacts WHERE origin_task_id=?1",
+                [task_id],
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
         1
     );
+    let mut statement = manager
+        .connection
+        .prepare(
+            "SELECT sequence,previous_event_hash,event_hash,event_json
+             FROM provenance_events WHERE task_id=?1 ORDER BY sequence",
+        )
+        .unwrap();
+    let migrated_records = statement
+        .query_map([task_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(migrated_records.len(), 3);
+    assert_eq!(migrated_records, original_records);
+    assert!(manager.verify_provenance(task_id).unwrap());
     assert_eq!(
-        manager
-            .connection
-            .query_row(
-                "SELECT event_hash FROM provenance_events WHERE task_id='T-provenance-migration'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        original_hash
-    );
-    assert!(manager.verify_provenance("T-provenance-migration").unwrap());
-    assert_eq!(
-        manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id='T-provenance-migration'", [], |row| row.get::<_, String>(0)).unwrap(),
+        manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id=?1", [task_id], |row| row.get::<_, String>(0)).unwrap(),
         "0.1:aios-provenance-event-v0.1"
     );
     assert!(!provenance_task_fk_cascades(&manager.connection).unwrap());
+}
+
+#[test]
+fn provenance_migration_rolls_back_when_legacy_details_are_not_privacy_safe() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("provenance-invalid-migration.sqlite3");
+    let task_id = "T-invalid-legacy-details";
+    let (mut event, stream_id) = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create(task_id)).unwrap();
+        let event_json = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        (
+            serde_json::from_str::<serde_json::Value>(&event_json).unwrap(),
+            aios_provenance::stream_id(task_id).unwrap(),
+        )
+    };
+    event["details"]["apiKey"] = serde_json::json!("private-legacy-value");
+    let forged_hash = aios_provenance::hash_record(&stream_id, 1, None, &event).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    downgrade_provenance_before_0011(&connection);
+    connection
+        .execute_batch("DROP TRIGGER provenance_events_no_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE provenance_events SET event_json=?2,event_hash=?3 WHERE task_id=?1",
+            rusqlite::params![task_id, event.to_string(), forged_hash],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+             BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let connection = Connection::open(&path).unwrap();
+    assert!(!table_has_column(&connection, "provenance_events", "schema_version").unwrap());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations
+                 WHERE migration_id='0011_provenance_service_boundary'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        event.to_string()
+    );
 }
 
 #[test]
@@ -6044,13 +6153,12 @@ fn completion_authenticates_verification_event_row_and_chain() {
 }
 
 #[test]
-fn task_stream_ids_require_ascii_grammar_while_other_ids_count_scalars() {
+fn unicode_identifier_limits_count_scalars_instead_of_utf8_bytes() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    let max_id = "T".repeat(256);
-    let too_long = "T".repeat(257);
+    let max_id = "é".repeat(256);
+    let too_long = "é".repeat(257);
     manager.create_task(&create(&max_id)).unwrap();
     assert!(manager.create_task(&create(&too_long)).is_err());
-    assert!(manager.create_task(&create(&"é".repeat(256))).is_err());
     let transition = request(
         &"界".repeat(256),
         &max_id,
