@@ -940,7 +940,24 @@ fn validate_details_vocabulary(event: &Value) -> Result<()> {
                 "provenance details field `{key}` is not in the privacy-safe vocabulary"
             )));
         }
-        validate_detail_value(key, value)?;
+        validate_detail_value(event_type, key, value)?;
+    }
+    if event_type == "task.created"
+        && [
+            "revision",
+            "creation",
+            "active_plan",
+            "active_step_ids",
+            "waiting_on",
+            "failure",
+            "recovery",
+        ]
+        .iter()
+        .any(|key| !details.contains_key(*key))
+    {
+        return Err(invalid_details(
+            "task.created is missing its typed creation projection",
+        ));
     }
     Ok(())
 }
@@ -1035,133 +1052,479 @@ fn allowed_detail_key(event_type: &str, key: &str) -> bool {
     }
 }
 
-fn validate_detail_value(key: &str, value: &Value) -> Result<()> {
-    match key {
-        "creation" => validate_object_keys(
-            value,
-            &[
-                "principal",
-                "workspace_id",
-                "original_intent_ref",
-                "normalized_intent_ref",
-                "constraints",
-                "created_at",
-            ],
-        ),
-        "principal" => validate_object_keys(value, &["kind", "id"]),
-        "original_intent_ref"
-        | "normalized_intent_ref"
-        | "reason_message_ref"
-        | "failure_summary"
-        | "message_ref" => validate_commitment(value),
-        "active_plan" => validate_object_keys(value, &["plan_id", "revision"]),
-        "waiting_on" => validate_array_objects(value, &["kind", "id", "message_ref"]),
-        "failure" => validate_object_keys(
-            value,
-            &[
-                "code",
-                "step_id",
-                "provider_id",
-                "execution_binding_id",
-                "provenance_event_ids",
-                "retryable",
-                "safe_to_replan",
-                "unknown_side_effects",
-                "rollback_available",
-            ],
-        ),
-        "recovery" => validate_object_keys(
-            value,
-            &[
-                "unknown_operation_ids",
-                "unknown_operations_ref",
-                "last_known_daemon_instance",
-            ],
-        ),
-        "active_program" => validate_object_keys(
-            value,
-            &[
-                "program_id",
-                "ir_version",
-                "semantic_hash",
-                "registry_snapshot_id",
-                "validation_result_id",
-                "validated_at",
-                "validator_id",
-                "validator_version",
-                "program_content_digest",
-            ],
-        ),
-        "mutation_text_commitments" => {
-            validate_object_keys(value, &["waiting_on", "failure_summary"])
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_same_arms,
+    reason = "keeps the closed event-type and detail-key value contract auditable as one dispatch table"
+)]
+fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<()> {
+    match (event_type, key) {
+        ("task.created", "revision") => expect_integer(value, 1, Some(1)),
+        ("task.created", "creation") => validate_creation_details(value),
+        ("task.created", "active_plan") => expect_null(value),
+        ("task.created", "active_step_ids") => expect_identifier_array(value, 512, 128),
+        ("task.created", "waiting_on") => validate_waiting_on(value, false),
+        ("task.created", "failure" | "recovery") => expect_null(value),
+        ("task.created", "fixture") => expect_bool(value),
+        ("task.transitioned", "related_ids") => expect_identifier_array(value, 128, 256),
+        ("task.transitioned", "reason_message_ref") => {
+            validate_commitment(value, "reason_message", true)
         }
-        "export_reconciliation" => validate_object_keys(
+        ("task.transitioned", "active_program") => validate_active_program(value),
+        ("task.transitioned", "mutation_text_commitments") => validate_mutation_commitments(value),
+        ("authorization.granted", "actions") => expect_token_array(value, 64, 128),
+        ("authorization.granted", "resource") => expect_identifier(value, 256),
+        ("authorization.granted", "resources") => expect_identifier_array(value, 64, 256),
+        ("plan.created" | "plan.revised", "plan_id") => expect_identifier(value, 256),
+        ("plan.created" | "plan.revised", "revision") => expect_integer(value, 1, None),
+        ("provider.selected" | "placement.selected", "locality") => {
+            expect_one_of(value, &["local", "remote", "peer", "cloud"])
+        }
+        ("provider.selected" | "placement.selected", "isolation_class") => {
+            expect_one_of(value, &["P0", "P1", "P2", "P3"])
+        }
+        ("execution.started", "attempt_id") => expect_identifier(value, 256),
+        ("execution.started", "binding_id") => expect_identifier(value, 256),
+        ("execution.started", "node_id") => expect_identifier(value, 128),
+        ("execution.started" | "execution.completed" | "execution.failed", "operation_id") => {
+            expect_identifier(value, 256)
+        }
+        ("execution.started" | "execution.completed" | "execution.failed", "phase") => {
+            expect_one_of(
+                value,
+                &[
+                    "admitted",
+                    "delivered",
+                    "pre-destination-admission",
+                    "effect-boundary-armed",
+                ],
+            )
+        }
+        ("execution.started", "intent_hash") => expect_digest(value),
+        (
+            "execution.started" | "execution.completed" | "execution.failed",
+            "admission_event_id",
+        ) => expect_nullable_identifier(value, 256),
+        (
+            "execution.started" | "execution.completed" | "execution.failed",
+            "admission_event_hash",
+        ) => expect_nullable_digest(value),
+        ("execution.started", "execution_profile") => expect_identifier(value, 256),
+        ("execution.completed" | "execution.failed", "outcome_certainty") => {
+            expect_certainty(value)
+        }
+        ("execution.completed" | "execution.failed", "effect_boundary") => {
+            expect_one_of(value, &["destination-not-invoked"])
+        }
+        ("execution.completed" | "execution.failed", "certainty") => expect_certainty(value),
+        ("execution.completed" | "execution.failed", "export_reconciliation") => {
+            validate_export_reconciliation(value)
+        }
+        ("execution.completed" | "execution.failed", "recovery_ref") => {
+            expect_identifier(value, 256)
+        }
+        ("execution.completed" | "execution.failed", "inventory_id") => {
+            expect_identifier(value, 256)
+        }
+        ("execution.completed" | "execution.failed", "safe_action") => expect_one_of(
             value,
             &[
-                "verifier_id",
-                "evidence_ref",
-                "proof_hash",
-                "challenge",
-                "observed_at",
-                "subject_hash",
-                "recovery_ref",
+                "CREATE_NEW_ATTEMPT",
+                "RECONCILE_STATE",
+                "MARK_ATTEMPT_FAILED",
+                "REQUIRE_EXTERNAL_RECONCILIATION",
+                "FAIL_TASK",
+                "NO_ACTION",
+                "CLEAN_STAGING",
             ],
         ),
-        _ => reject_nested_objects(value),
+        ("execution.completed" | "execution.failed", "reason_code") => expect_reason_code(value),
+        ("execution.completed" | "execution.failed", "attempt") => expect_integer(value, 1, None),
+        ("execution.completed" | "execution.failed", "duration_ms") => {
+            expect_integer(value, 0, None)
+        }
+        (
+            "artifact.imported" | "artifact.created" | "artifact.integrity-failed",
+            "content_hash",
+        ) => expect_digest(value),
+        ("artifact.imported" | "artifact.created" | "artifact.exported", "size_bytes") => {
+            expect_integer(value, 0, None)
+        }
+        ("artifact.imported" | "artifact.created", "blob_reused") => expect_bool(value),
+        ("artifact.imported", "import_id") => expect_nullable_identifier(value, 256),
+        ("artifact.imported" | "artifact.integrity-failed", "request_digest") => {
+            expect_digest(value)
+        }
+        ("artifact.imported", "source") => expect_one_of(value, &["user-selected"]),
+        ("artifact.created" | "artifact.integrity-failed", "allocation_id") => {
+            expect_identifier(value, 256)
+        }
+        ("artifact.created" | "artifact.integrity-failed", "publication_id") => {
+            expect_identifier(value, 256)
+        }
+        ("artifact.created", "type") => expect_token(value, 256),
+        ("artifact.exported", "operation_id") => expect_identifier(value, 256),
+        ("artifact.integrity-failed", "observation_ordinal") => expect_integer(value, 1, None),
+        ("artifact.integrity-failed", "previous_durability_state") => {
+            expect_nullable_durability_state(value)
+        }
+        ("artifact.integrity-failed", "durability_state") => expect_durability_state(value),
+        ("artifact.integrity-failed", "reason_code") => expect_reason_code(value),
+        ("artifact.integrity-failed", "resulted_at") => expect_timestamp(value),
+        ("verification.started" | "verification.completed" | "verification.failed", "index") => {
+            expect_integer(value, 1, None)
+        }
+        (
+            "verification.started" | "verification.completed" | "verification.failed",
+            "verified_claims" | "failed_claims",
+        ) => expect_integer(value, 0, None),
+        ("task.completed", "revision") => expect_integer(value, 1, None),
+        ("task.completed", "external_egress" | "verified") => expect_bool(value),
+        _ => Err(invalid_details("detail field has no typed value contract")),
     }
 }
 
-fn validate_commitment(value: &Value) -> Result<()> {
-    validate_object_keys(
+fn validate_creation_details(value: &Value) -> Result<()> {
+    let object = expect_exact_object(
+        value,
+        &[
+            "principal",
+            "workspace_id",
+            "original_intent_ref",
+            "normalized_intent_ref",
+            "constraints",
+            "created_at",
+        ],
+    )?;
+    for (key, value) in object {
+        match key.as_str() {
+            "principal" => validate_principal(value)?,
+            "workspace_id" => expect_nullable_identifier(value, 256)?,
+            "original_intent_ref" => validate_commitment(value, "original_intent", false)?,
+            "normalized_intent_ref" => {
+                validate_commitment(value, "normalized_intent", true)?;
+            }
+            "constraints" => expect_null(value)?,
+            "created_at" => expect_timestamp(value)?,
+            _ => unreachable!("object keys were checked"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_principal(value: &Value) -> Result<()> {
+    let object = expect_exact_object(value, &["kind", "id"])?;
+    expect_one_of(&object["kind"], &["user", "system-service"])?;
+    expect_identifier(&object["id"], 256)
+}
+
+fn validate_active_program(value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let object = expect_exact_object(
+        value,
+        &[
+            "program_id",
+            "ir_version",
+            "semantic_hash",
+            "registry_snapshot_id",
+            "validation_result_id",
+            "validated_at",
+            "validator_id",
+            "validator_version",
+            "program_content_digest",
+        ],
+    )?;
+    expect_identifier(&object["program_id"], 256)?;
+    expect_token(&object["ir_version"], 64)?;
+    expect_digest(&object["semantic_hash"])?;
+    expect_identifier(&object["registry_snapshot_id"], 256)?;
+    expect_nullable_identifier(&object["validation_result_id"], 256)?;
+    expect_nullable_timestamp(&object["validated_at"])?;
+    expect_nullable_identifier(&object["validator_id"], 256)?;
+    expect_nullable_token(&object["validator_version"], 128)?;
+    expect_digest(&object["program_content_digest"])
+}
+
+fn validate_mutation_commitments(value: &Value) -> Result<()> {
+    let object = expect_exact_object(value, &["waiting_on", "failure_summary"])?;
+    validate_waiting_on(&object["waiting_on"], true)?;
+    validate_commitment(&object["failure_summary"], "failure_summary", true)
+}
+
+fn validate_waiting_on(value: &Value, with_commitments: bool) -> Result<()> {
+    if value.is_null() && with_commitments {
+        return Ok(());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_details("waiting_on must be an array"))?;
+    if values.len() > 64 {
+        return Err(invalid_details("waiting_on exceeds its item bound"));
+    }
+    for value in values {
+        let keys: &[&str] = if with_commitments {
+            &["kind", "id", "message_ref"]
+        } else {
+            &["kind", "id"]
+        };
+        let object = expect_exact_object(value, keys)?;
+        expect_one_of(
+            &object["kind"],
+            &["input", "approval", "resource", "provider", "validation"],
+        )?;
+        expect_identifier(&object["id"], 256)?;
+        if with_commitments {
+            validate_commitment(&object["message_ref"], "waiting_message", true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_export_reconciliation(value: &Value) -> Result<()> {
+    let object = expect_exact_object(
+        value,
+        &[
+            "verifier_id",
+            "evidence_ref",
+            "proof_hash",
+            "challenge",
+            "observed_at",
+            "subject_hash",
+            "recovery_ref",
+        ],
+    )?;
+    expect_identifier(&object["verifier_id"], 256)?;
+    expect_identifier(&object["evidence_ref"], 256)?;
+    expect_digest(&object["proof_hash"])?;
+    expect_identifier(&object["challenge"], 128)?;
+    expect_timestamp(&object["observed_at"])?;
+    expect_digest(&object["subject_hash"])?;
+    expect_identifier(&object["recovery_ref"], 256)
+}
+
+fn validate_commitment(value: &Value, expected_field: &str, nullable: bool) -> Result<()> {
+    if value.is_null() {
+        return if nullable {
+            Ok(())
+        } else {
+            Err(invalid_details("required commitment is null"))
+        };
+    }
+    let object = expect_exact_object(
         value,
         &["kind", "version", "algorithm", "field", "commitment"],
+    )?;
+    if object.get("kind").and_then(Value::as_str) != Some("task-field-commitment")
+        || object.get("version").and_then(Value::as_str) != Some("v1")
+        || object.get("algorithm").and_then(Value::as_str) != Some("sha256-keyed-prefix")
+        || object.get("field").and_then(Value::as_str) != Some(expected_field)
+    {
+        return Err(invalid_details("commitment profile or field is invalid"));
+    }
+    expect_digest(&object["commitment"])
+}
+
+fn expect_exact_object<'a>(
+    value: &'a Value,
+    keys: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = expect_object_keys(value, keys)?;
+    if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+        return Err(invalid_details("typed detail object has missing fields"));
+    }
+    Ok(object)
+}
+
+fn expect_object_keys<'a>(
+    value: &'a Value,
+    keys: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid_details("typed detail value must be an object"))?;
+    if object.keys().any(|key| !keys.contains(&key.as_str())) {
+        return Err(invalid_details("typed detail object has an unknown field"));
+    }
+    Ok(object)
+}
+
+fn expect_integer(value: &Value, minimum: u64, maximum: Option<u64>) -> Result<()> {
+    if value
+        .as_u64()
+        .is_some_and(|value| value >= minimum && maximum.is_none_or(|maximum| value <= maximum))
+    {
+        Ok(())
+    } else {
+        Err(invalid_details(
+            "detail value must be a bounded unsigned integer",
+        ))
+    }
+}
+
+fn expect_bool(value: &Value) -> Result<()> {
+    if value.is_boolean() {
+        Ok(())
+    } else {
+        Err(invalid_details("detail value must be a boolean"))
+    }
+}
+
+fn expect_null(value: &Value) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        Err(invalid_details("detail value must be null"))
+    }
+}
+
+fn expect_identifier(value: &Value, maximum: usize) -> Result<()> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid_details("identifier detail must be a string"))?;
+    let length = value.chars().count();
+    if length == 0
+        || length > maximum
+        || !value.chars().all(|character| {
+            character.is_alphanumeric()
+                || matches!(character, '.' | '_' | ':' | '/' | '@' | '+' | '-')
+        })
+    {
+        return Err(invalid_details("identifier detail has invalid syntax"));
+    }
+    Ok(())
+}
+
+fn expect_nullable_identifier(value: &Value, maximum: usize) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        expect_identifier(value, maximum)
+    }
+}
+
+fn expect_token(value: &Value, maximum: usize) -> Result<()> {
+    expect_identifier(value, maximum)
+}
+
+fn expect_nullable_token(value: &Value, maximum: usize) -> Result<()> {
+    expect_nullable_identifier(value, maximum)
+}
+
+fn expect_identifier_array(
+    value: &Value,
+    maximum_items: usize,
+    maximum_chars: usize,
+) -> Result<()> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_details("identifier collection must be an array"))?;
+    if values.len() > maximum_items {
+        return Err(invalid_details(
+            "identifier collection exceeds its item bound",
+        ));
+    }
+    for value in values {
+        expect_identifier(value, maximum_chars)?;
+    }
+    Ok(())
+}
+
+fn expect_token_array(value: &Value, maximum_items: usize, maximum_chars: usize) -> Result<()> {
+    expect_identifier_array(value, maximum_items, maximum_chars)
+}
+
+fn expect_one_of(value: &Value, allowed: &[&str]) -> Result<()> {
+    if value.as_str().is_some_and(|value| allowed.contains(&value)) {
+        Ok(())
+    } else {
+        Err(invalid_details(
+            "detail value is not an allowed enum member",
+        ))
+    }
+}
+
+fn expect_reason_code(value: &Value) -> Result<()> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid_details("reason code must be a string"))?;
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            (index != 0 || byte.is_ascii_uppercase())
+                && (byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return Err(invalid_details("reason code has invalid syntax"));
+    }
+    Ok(())
+}
+
+fn expect_digest(value: &Value) -> Result<()> {
+    if value.as_str().is_some_and(valid_hash) {
+        Ok(())
+    } else {
+        Err(invalid_details("digest detail must be lowercase sha256"))
+    }
+}
+
+fn expect_nullable_digest(value: &Value) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        expect_digest(value)
+    }
+}
+
+fn expect_timestamp(value: &Value) -> Result<()> {
+    value
+        .as_str()
+        .ok_or_else(|| invalid_details("timestamp detail must be a string"))
+        .and_then(validate_timestamp)
+}
+
+fn expect_nullable_timestamp(value: &Value) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        expect_timestamp(value)
+    }
+}
+
+fn expect_certainty(value: &Value) -> Result<()> {
+    expect_one_of(
+        value,
+        &[
+            "NOT_STARTED",
+            "STARTED_NO_EFFECT",
+            "COMPLETED",
+            "FAILED_NO_EFFECT",
+            "FAILED_PARTIAL_EFFECT",
+            "OUTCOME_UNKNOWN",
+        ],
     )
 }
 
-fn validate_array_objects(value: &Value, allowed: &[&str]) -> Result<()> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let values = value.as_array().ok_or_else(|| {
-        Error::InvalidRecord("provenance details field has an invalid shape".to_owned())
-    })?;
-    for value in values {
-        validate_object_keys(value, allowed)?;
-    }
-    Ok(())
+fn expect_durability_state(value: &Value) -> Result<()> {
+    expect_one_of(
+        value,
+        &["STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"],
+    )
 }
 
-fn validate_object_keys(value: &Value, allowed: &[&str]) -> Result<()> {
+fn expect_nullable_durability_state(value: &Value) -> Result<()> {
     if value.is_null() {
-        return Ok(());
+        Ok(())
+    } else {
+        expect_durability_state(value)
     }
-    let object = value.as_object().ok_or_else(|| {
-        Error::InvalidRecord("provenance details field has an invalid shape".to_owned())
-    })?;
-    for (key, value) in object {
-        if !allowed.contains(&key.as_str()) {
-            return Err(Error::InvalidRecord(format!(
-                "nested provenance details field `{key}` is not in the privacy-safe vocabulary"
-            )));
-        }
-        validate_detail_value(key, value)?;
-    }
-    Ok(())
 }
 
-fn reject_nested_objects(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(object) if !object.is_empty() => Err(Error::InvalidRecord(
-            "provenance details contain an untyped nested object".to_owned(),
-        )),
-        Value::Array(values) => {
-            for value in values {
-                reject_nested_objects(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+fn invalid_details(message: &str) -> Error {
+    Error::InvalidRecord(format!(
+        "invalid privacy-safe provenance details: {message}"
+    ))
 }
 
 fn json_depth(value: &Value) -> usize {
@@ -1302,23 +1665,90 @@ mod tests {
     }
 
     fn event(task_id: &str, index: u64) -> Value {
-        let event_type = if index == 1 {
-            "task.created"
-        } else {
-            "verification.started"
-        };
+        if index == 1 {
+            let mut event = typed_creation_event(task_id, 1);
+            event["event_id"] = json!("event-1");
+            return event;
+        }
         json!({
             "schema_version":"0.1",
             "event_id":format!("event-{index}"),
             "task_id":task_id,
-            "event_type":event_type,
+            "event_type":"verification.started",
             "timestamp":NOW,
             "actor":{"kind":"system-service","id":"service:test"},
             "status":"success",
-            "details": if index == 1 {
-                json!({"revision":1,"fixture":true})
-            } else {
-                json!({"index":index})
+            "details":{"index":index}
+        })
+    }
+
+    fn commitment(field: &str) -> Value {
+        json!({
+            "kind":"task-field-commitment",
+            "version":"v1",
+            "algorithm":"sha256-keyed-prefix",
+            "field":field,
+            "commitment":format!("sha256:{}", "a".repeat(64))
+        })
+    }
+
+    fn typed_creation_event(task_id: &str, suffix: usize) -> Value {
+        json!({
+            "schema_version":"0.1",
+            "event_id":format!("event-typed-{suffix}"),
+            "task_id":task_id,
+            "event_type":"task.created",
+            "timestamp":NOW,
+            "actor":{"kind":"system-service","id":"service:test"},
+            "status":"success",
+            "details":{
+                "revision":1,
+                "creation":{
+                    "principal":{"kind":"user","id":"user:test"},
+                    "workspace_id":"workspace:test",
+                    "original_intent_ref":commitment("original_intent"),
+                    "normalized_intent_ref":null,
+                    "constraints":null,
+                    "created_at":NOW
+                },
+                "active_plan":null,
+                "active_step_ids":["step:test"],
+                "waiting_on":[],
+                "failure":null,
+                "recovery":null
+            }
+        })
+    }
+
+    fn typed_transition_event(task_id: &str) -> Value {
+        json!({
+            "schema_version":"0.1",
+            "event_id":"event-typed-transition",
+            "task_id":task_id,
+            "event_type":"task.transitioned",
+            "timestamp":NOW,
+            "actor":{"kind":"system-service","id":"service:test"},
+            "status":"success",
+            "task_transition":{
+                "transition_id":"transition:test",
+                "previous_state":"CREATED",
+                "new_state":"PLANNING",
+                "previous_revision":1,
+                "new_revision":2,
+                "reason_code":"PLANNING_REQUESTED"
+            },
+            "committed_mutation":{
+                "active_plan":null,
+                "active_step_ids":null,
+                "waiting_on":null,
+                "failure":null,
+                "recovery":null
+            },
+            "details":{
+                "related_ids":[],
+                "reason_message_ref":commitment("reason_message"),
+                "active_program":null,
+                "mutation_text_commitments":{"waiting_on":null,"failure_summary":null}
             }
         })
     }
@@ -1555,6 +1985,214 @@ mod tests {
             verification.diagnostics[0].code,
             "PROVENANCE_SCHEMA_INVALID"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers append, offline verification, and export with one shared adversarial vector set"
+    )]
+    fn typed_details_reject_private_scalars_and_malformed_commitments_everywhere() {
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        let mut cases = Vec::new();
+
+        let mut wrong_revision = typed_creation_event("T-typed-revision", 1);
+        wrong_revision["details"]["revision"] = json!("raw private text");
+        cases.push(wrong_revision);
+
+        let mut private_workspace = typed_creation_event("T-typed-workspace", 2);
+        private_workspace["details"]["creation"]["workspace_id"] = json!("private workspace notes");
+        cases.push(private_workspace);
+
+        let mut wrong_number = typed_creation_event("T-typed-number", 3);
+        wrong_number["details"]["revision"] = json!(1.5);
+        cases.push(wrong_number);
+
+        let mut null_required = typed_creation_event("T-typed-null-commitment", 4);
+        null_required["details"]["creation"]["original_intent_ref"] = Value::Null;
+        cases.push(null_required);
+
+        let mut missing_field = typed_creation_event("T-typed-missing-commitment", 5);
+        missing_field["details"]["creation"]["original_intent_ref"]
+            .as_object_mut()
+            .unwrap()
+            .remove("algorithm");
+        cases.push(missing_field);
+
+        for (suffix, path, value) in [
+            (
+                6,
+                "/details/creation/original_intent_ref/kind",
+                json!("other"),
+            ),
+            (
+                7,
+                "/details/creation/original_intent_ref/version",
+                json!("v2"),
+            ),
+            (
+                8,
+                "/details/creation/original_intent_ref/algorithm",
+                json!("sha256"),
+            ),
+            (
+                9,
+                "/details/creation/original_intent_ref/field",
+                json!("normalized_intent"),
+            ),
+            (
+                10,
+                "/details/creation/original_intent_ref/commitment",
+                json!(format!("sha256:{}", "A".repeat(64))),
+            ),
+        ] {
+            let task_id = format!("T-typed-commitment-{suffix}");
+            let mut candidate = typed_creation_event(&task_id, suffix);
+            *candidate.pointer_mut(path).unwrap() = value;
+            cases.push(candidate);
+        }
+
+        let mut wrong_normalized = typed_creation_event("T-typed-normalized-field", 11);
+        wrong_normalized["details"]["creation"]["normalized_intent_ref"] =
+            commitment("original_intent");
+        cases.push(wrong_normalized);
+
+        for candidate in cases {
+            let task_id = candidate["task_id"].as_str().unwrap();
+            assert!(
+                append_in_tx(&transaction, task_id, &candidate, &ExpectedHead::Empty).is_err(),
+                "unexpectedly accepted typed private or malformed detail: {candidate}"
+            );
+        }
+
+        append_in_tx(
+            &transaction,
+            "T-typed-transition",
+            &typed_creation_event("T-typed-transition", 12),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        let mut bad_reason = typed_transition_event("T-typed-transition");
+        bad_reason["details"]["reason_message_ref"]["field"] = json!("original_intent");
+        assert!(
+            append_in_tx(
+                &transaction,
+                "T-typed-transition",
+                &bad_reason,
+                &ExpectedHead::Any
+            )
+            .is_err()
+        );
+        let bad_size = json!({
+            "schema_version":"0.1",
+            "event_id":"event-typed-size",
+            "task_id":"T-typed-transition",
+            "event_type":"artifact.exported",
+            "timestamp":NOW,
+            "actor":{"kind":"system-service","id":"service:test"},
+            "input_artifacts":["artifact:test"],
+            "output_artifacts":[],
+            "external_transfer":{"destination":"local","data_refs":["artifact:test"]},
+            "status":"success",
+            "details":{"operation_id":"operation:test","size_bytes":"raw secret"}
+        });
+        assert!(
+            append_in_tx(
+                &transaction,
+                "T-typed-transition",
+                &bad_size,
+                &ExpectedHead::Any
+            )
+            .is_err()
+        );
+        let bad_content_hash = json!({
+            "schema_version":"0.1",
+            "event_id":"event-typed-content-hash",
+            "task_id":"T-typed-transition",
+            "event_type":"artifact.created",
+            "timestamp":NOW,
+            "actor":{"kind":"system-service","id":"service:test"},
+            "status":"success",
+            "details":{
+                "allocation_id":"allocation:test",
+                "publication_id":"publication:test",
+                "content_hash":"raw secret",
+                "size_bytes":1,
+                "blob_reused":false
+            }
+        });
+        assert!(
+            append_in_tx(
+                &transaction,
+                "T-typed-transition",
+                &bad_content_hash,
+                &ExpectedHead::Any
+            )
+            .is_err()
+        );
+        transaction.commit().unwrap();
+
+        let mut invalid = typed_creation_event("T-offline-private", 13);
+        invalid["details"]["creation"]["workspace_id"] = json!("raw private workspace text");
+        let stream = stream_id("T-offline-private").unwrap();
+        let event_hash = hash_record(&stream, 1, None, &invalid).unwrap();
+        let record = JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 1,
+            previous_event_hash: None,
+            event: invalid,
+            event_hash: event_hash.clone(),
+        };
+        let manifest = ExportManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            export_profile: "privacy-safe-original-chain".to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream,
+            record_count: 1,
+            head_sequence: 1,
+            head_event_hash: event_hash,
+        };
+        let verification = verify_jsonl_export(
+            &serde_json::to_string(&manifest).unwrap(),
+            &format!("{}\n", serde_json::to_string(&record).unwrap()),
+            NOW,
+        )
+        .unwrap();
+        assert!(!verification.valid);
+        assert_eq!(
+            verification.diagnostics[0].code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+
+        let mut export_connection = Connection::open_in_memory().unwrap();
+        initialize(&export_connection);
+        let transaction = export_connection.transaction().unwrap();
+        let appended = append_in_tx(
+            &transaction,
+            "T-export-private",
+            &event("T-export-private", 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let mut forged = event("T-export-private", 1);
+        forged["details"]["revision"] = json!("raw secret");
+        let stream = stream_id("T-export-private").unwrap();
+        let forged_hash = hash_record(&stream, 1, None, &forged).unwrap();
+        export_connection
+            .execute(
+                "UPDATE provenance_events SET event_json=?2,event_hash=?3 WHERE event_id=?1",
+                params![
+                    appended.event["event_id"].as_str().unwrap(),
+                    forged.to_string(),
+                    forged_hash
+                ],
+            )
+            .unwrap();
+        assert!(export_jsonl(&export_connection, &stream, NOW).is_err());
     }
 
     #[test]

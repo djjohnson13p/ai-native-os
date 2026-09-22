@@ -19,6 +19,8 @@
           "details": {
             "revision": 1,
             "creation": {
+              "principal": {"kind": "user", "id": "user:fixture"},
+              "workspace_id": null,
               "original_intent_ref": {
                 "kind": "task-field-commitment",
                 "version": "v1",
@@ -26,8 +28,15 @@
                 "field": "original_intent",
                 "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               },
-              "normalized_intent_ref": null
+              "normalized_intent_ref": null,
+              "constraints": null,
+              "created_at": "2026-09-15T22:00:00Z"
             },
+            "active_plan": null,
+            "active_step_ids": [],
+            "waiting_on": [],
+            "failure": null,
+            "recovery": null,
             "fixture": true
           }
         }

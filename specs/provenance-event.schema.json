@@ -239,12 +239,116 @@
           "index", "verified_claims", "failed_claims", "external_egress", "verified"
         ]
       },
+      "properties": {
+        "revision": {"type": "integer", "minimum": 1},
+        "fixture": {"type": "boolean"},
+        "creation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["principal", "workspace_id", "original_intent_ref", "normalized_intent_ref", "constraints", "created_at"],
+          "properties": {
+            "principal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "id"],
+              "properties": {
+                "kind": {"enum": ["user", "system-service"]},
+                "id": {"$ref": "#/$defs/safeIdentifier"}
+              }
+            },
+            "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+            "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
+            "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
+            "constraints": {"type": "null"},
+            "created_at": {"type": "string", "format": "date-time"}
+          }
+        },
+        "active_plan": {"type": "null"},
+        "active_step_ids": {"type": "array", "maxItems": 512, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "waiting_on": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id"],
+            "properties": {
+              "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"$ref": "#/$defs/safeIdentifier"}
+            }
+          }
+        },
+        "failure": {"type": "null"},
+        "recovery": {"type": "null"},
+        "related_ids": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "reason_message_ref": {"$ref": "#/$defs/reasonMessageRef"},
+        "active_program": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/activeProgramDetails"}]},
+        "mutation_text_commitments": {"$ref": "#/$defs/mutationTextCommitments"},
+        "actions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "resource": {"$ref": "#/$defs/safeIdentifier"},
+        "resources": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "plan_id": {"$ref": "#/$defs/safeIdentifier"},
+        "locality": {"enum": ["local", "remote", "peer", "cloud"]},
+        "isolation_class": {"enum": ["P0", "P1", "P2", "P3"]},
+        "attempt_id": {"$ref": "#/$defs/safeIdentifier"},
+        "binding_id": {"$ref": "#/$defs/safeIdentifier"},
+        "node_id": {"$ref": "#/$defs/safeIdentifier"},
+        "operation_id": {"$ref": "#/$defs/safeIdentifier"},
+        "phase": {"enum": ["admitted", "delivered", "pre-destination-admission", "effect-boundary-armed"]},
+        "intent_hash": {"$ref": "#/$defs/sha256Digest"},
+        "admission_event_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "admission_event_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256Digest"}]},
+        "execution_profile": {"$ref": "#/$defs/safeIdentifier"},
+        "outcome_certainty": {"$ref": "#/$defs/outcomeCertainty"},
+        "effect_boundary": {"const": "destination-not-invoked"},
+        "certainty": {"$ref": "#/$defs/outcomeCertainty"},
+        "export_reconciliation": {"$ref": "#/$defs/exportReconciliationDetails"},
+        "recovery_ref": {"$ref": "#/$defs/safeIdentifier"},
+        "inventory_id": {"$ref": "#/$defs/safeIdentifier"},
+        "safe_action": {"enum": ["CREATE_NEW_ATTEMPT", "RECONCILE_STATE", "MARK_ATTEMPT_FAILED", "REQUIRE_EXTERNAL_RECONCILIATION", "FAIL_TASK", "NO_ACTION", "CLEAN_STAGING"]},
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "content_hash": {"$ref": "#/$defs/sha256Digest"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "blob_reused": {"type": "boolean"},
+        "import_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "request_digest": {"$ref": "#/$defs/sha256Digest"},
+        "source": {"const": "user-selected"},
+        "allocation_id": {"$ref": "#/$defs/safeIdentifier"},
+        "publication_id": {"$ref": "#/$defs/safeIdentifier"},
+        "type": {"$ref": "#/$defs/safeIdentifier"},
+        "observation_ordinal": {"type": "integer", "minimum": 1},
+        "previous_durability_state": {"enum": [null, "STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
+        "durability_state": {"enum": ["STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
+        "resulted_at": {"type": "string", "format": "date-time"},
+        "index": {"type": "integer", "minimum": 1},
+        "verified_claims": {"type": "integer", "minimum": 0},
+        "failed_claims": {"type": "integer", "minimum": 0},
+        "external_egress": {"type": "boolean"},
+        "verified": {"type": "boolean"}
+      },
       "additionalProperties": true
     },
     "previous_event_hash": {"type": ["string", "null"]},
     "event_hash": {"type": ["string", "null"]}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"event_type": {"const": "task.created"}},
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["details"],
+        "properties": {
+          "details": {
+            "required": ["revision", "creation", "active_plan", "active_step_ids", "waiting_on", "failure", "recovery"],
+            "properties": {"revision": {"const": 1}}
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {"event_type": {"const": "task.transitioned"}},
@@ -281,6 +385,117 @@
     }
   ],
   "$defs": {
+    "safeIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\s]+$"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "outcomeCertainty": {
+      "enum": ["NOT_STARTED", "STARTED_NO_EFFECT", "COMPLETED", "FAILED_NO_EFFECT", "FAILED_PARTIAL_EFFECT", "OUTCOME_UNKNOWN"]
+    },
+    "fieldCommitment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "algorithm", "field", "commitment"],
+      "properties": {
+        "kind": {"const": "task-field-commitment"},
+        "version": {"const": "v1"},
+        "algorithm": {"const": "sha256-keyed-prefix"},
+        "field": {"enum": ["original_intent", "normalized_intent", "reason_message", "waiting_message", "failure_summary"]},
+        "commitment": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "originalIntentCommitment": {
+      "allOf": [
+        {"$ref": "#/$defs/fieldCommitment"},
+        {"properties": {"field": {"const": "original_intent"}}}
+      ]
+    },
+    "normalizedIntentCommitment": {
+      "allOf": [
+        {"$ref": "#/$defs/fieldCommitment"},
+        {"properties": {"field": {"const": "normalized_intent"}}}
+      ]
+    },
+    "waitingMessageRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "waiting_message"}}}
+          ]
+        }
+      ]
+    },
+    "failureSummaryRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "failure_summary"}}}
+          ]
+        }
+      ]
+    },
+    "activeProgramDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program_id", "ir_version", "semantic_hash", "registry_snapshot_id", "validation_result_id", "validated_at", "validator_id", "validator_version", "program_content_digest"],
+      "properties": {
+        "program_id": {"$ref": "#/$defs/safeIdentifier"},
+        "ir_version": {"$ref": "#/$defs/safeIdentifier"},
+        "semantic_hash": {"$ref": "#/$defs/sha256Digest"},
+        "registry_snapshot_id": {"$ref": "#/$defs/safeIdentifier"},
+        "validation_result_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "validated_at": {"type": ["string", "null"], "format": "date-time"},
+        "validator_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "validator_version": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "program_content_digest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "mutationTextCommitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["waiting_on", "failure_summary"],
+      "properties": {
+        "waiting_on": {
+          "type": ["array", "null"],
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id", "message_ref"],
+            "properties": {
+              "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"$ref": "#/$defs/safeIdentifier"},
+              "message_ref": {"$ref": "#/$defs/waitingMessageRef"}
+            }
+          }
+        },
+        "failure_summary": {"$ref": "#/$defs/failureSummaryRef"}
+      }
+    },
+    "exportReconciliationDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifier_id", "evidence_ref", "proof_hash", "challenge", "observed_at", "subject_hash", "recovery_ref"],
+      "properties": {
+        "verifier_id": {"$ref": "#/$defs/safeIdentifier"},
+        "evidence_ref": {"$ref": "#/$defs/safeIdentifier"},
+        "proof_hash": {"$ref": "#/$defs/sha256Digest"},
+        "challenge": {"$ref": "#/$defs/safeIdentifier"},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "subject_hash": {"$ref": "#/$defs/sha256Digest"},
+        "recovery_ref": {"$ref": "#/$defs/safeIdentifier"}
+      }
+    },
     "taskState": {
       "type": "string",
       "enum": [
@@ -293,16 +508,10 @@
       "oneOf": [
         {"type": "null"},
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "version", "algorithm", "field", "commitment"],
-          "properties": {
-            "kind": {"const": "task-field-commitment"},
-            "version": {"const": "v1"},
-            "algorithm": {"const": "sha256-keyed-prefix"},
-            "field": {"const": "reason_message"},
-            "commitment": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-          }
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "reason_message"}}}
+          ]
         }
       ]
     }

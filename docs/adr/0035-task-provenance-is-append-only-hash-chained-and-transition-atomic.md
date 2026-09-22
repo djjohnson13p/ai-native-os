@@ -100,9 +100,12 @@ The provenance subsystem is part of correctness for consequential effects. It is
 
 `details` uses a closed event-specific vocabulary. Append, verification,
 migration, and export reject unknown top-level or nested detail fields; extending
-the vocabulary requires a deliberate schema and validator revision. This keeps
-secret/private payloads and unreviewed diagnostic dumps out of portable
-provenance rather than relying on a denylist of known secret names.
+the vocabulary or a field's bounded type requires a deliberate schema and
+validator revision. Allowed fields accept only their path-specific integer,
+boolean, enum, identifier, timestamp, digest, collection, or exact commitment
+shape. Commitment references bind their exact field discriminator and v1
+profile. This keeps secret/private payloads and unreviewed diagnostic dumps out
+of portable provenance rather than relying on names alone.
 
 ## Compatibility impact
 
