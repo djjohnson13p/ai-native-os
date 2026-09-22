@@ -4069,12 +4069,9 @@ fn migrate_task_manager_schema(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0009_artifact_writer_session_fencing', 'artifact-writer-session-fencing-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
-            [],
-        )?;
         let foreign_key_failures = connection.query_row(
-            "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+            "SELECT (SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events'))
+                  + (SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges'))",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -4083,6 +4080,10 @@ fn migrate_task_manager_schema(
                 "persistence migration produced invalid foreign-key references",
             ));
         }
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
+            [],
+        )?;
         Ok(())
     })();
     let result = match migration {

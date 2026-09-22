@@ -15,7 +15,34 @@
     "from_sequence": {"type": "integer", "minimum": 1},
     "to_sequence": {"type": "integer", "minimum": 0},
     "computed_projection_head_hash": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}]},
-    "diagnostics": {"type": "array", "maxItems": 16, "items": {"type": "object"}},
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "code", "message"],
+        "properties": {
+          "severity": {"const": "error"},
+          "code": {"enum": ["PROJECTION_RECORD_INVALID", "PROJECTION_HASH_MISMATCH", "PROJECTION_MANIFEST_MISMATCH"]},
+          "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "sequence": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
     "verified_at": {"type": "string", "format": "date-time"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"valid": {"const": true}}, "required": ["valid"]},
+      "then": {
+        "properties": {
+          "computed_projection_head_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "diagnostics": {"maxItems": 0},
+          "to_sequence": {"minimum": 1}
+        }
+      },
+      "else": {"properties": {"diagnostics": {"minItems": 1}}}
+    }
+  ]
 }

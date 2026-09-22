@@ -815,6 +815,123 @@ fn provenance_migration_rolls_back_when_legacy_details_are_not_privacy_safe() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "checks each legacy provenance reference and its rollback invariants"
+)]
+fn provenance_migration_rejects_orphaned_legacy_references_without_changing_hashes() {
+    for (name, orphan_id) in [
+        ("task", "T-missing-parent"),
+        ("snapshot", "snapshot:missing-parent"),
+        ("binding", "binding:missing-parent"),
+    ] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(format!("orphan-{name}.sqlite3"));
+        let original_task_id = format!("T-legacy-{name}");
+        {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(&original_task_id)).unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_provenance_before_0011(&connection);
+        let mut event: serde_json::Value = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE sequence=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|json| serde_json::from_str(&json).unwrap())
+            .unwrap();
+        let task_id = if name == "task" {
+            event["task_id"] = serde_json::json!(orphan_id);
+            orphan_id
+        } else {
+            original_task_id.as_str()
+        };
+        let snapshot_id = (name == "snapshot").then_some(orphan_id);
+        let binding_id = (name == "binding").then_some(orphan_id);
+        if let Some(snapshot_id) = snapshot_id {
+            event["registry_snapshot_id"] = serde_json::json!(snapshot_id);
+        }
+        if let Some(binding_id) = binding_id {
+            event["execution_binding_id"] = serde_json::json!(binding_id);
+        }
+        let stream_id = aios_provenance::stream_id(task_id).unwrap();
+        let event_hash = aios_provenance::hash_record(&stream_id, 1, None, &event).unwrap();
+        let event_json = event.to_string();
+        connection
+            .execute_batch("DROP TRIGGER provenance_events_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_events SET task_id=?1,stream_id=?2,registry_snapshot_id=?3,
+                 execution_binding_id=?4,event_hash=?5,event_json=?6 WHERE sequence=1",
+                rusqlite::params![
+                    task_id,
+                    stream_id,
+                    snapshot_id,
+                    binding_id,
+                    event_hash,
+                    event_json
+                ],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "{name}"
+        );
+        drop(connection);
+
+        let result = TaskManager::open_with_clock(&path, Box::new(FixedClock));
+        assert!(
+            matches!(
+                result,
+                Err(TaskManagerError::InvalidRecord(
+                    "persistence migration produced invalid foreign-key references"
+                ))
+            ),
+            "{name}"
+        );
+        let connection = Connection::open(&path).unwrap();
+        assert!(!table_has_column(&connection, "provenance_events", "schema_version").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations
+                     WHERE migration_id='0011_provenance_service_boundary'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "{name}"
+        );
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT event_hash,event_json FROM provenance_events WHERE sequence=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (event_hash, event_json), "{name}");
+    }
+}
+
+#[test]
 fn portable_provenance_export_is_private_and_reverifies_without_task_storage() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     let create_request = create("T-portable-provenance");

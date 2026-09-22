@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1",
+  "scope": "exported-projection",
+  "valid": true,
+  "original_chain_verified_offline": false,
+  "original_chain_linkage_proven": false,
+  "bundle_id": "bundle:v1:9bb3d3c4d617a706ac55b43a8a89af4d80ecc3b08119f17903177204aa271ed2",
+  "from_sequence": 1,
+  "to_sequence": 2,
+  "computed_projection_head_hash": "sha256:808ebd6acca05f206eb9e0aca64c5f6c07993d2cb991ff269e45738952f89bdb",
+  "diagnostics": [],
+  "verified_at": "2026-09-22T00:00:00Z"
+}

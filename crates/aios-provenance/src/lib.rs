@@ -10,7 +10,8 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -18,8 +19,8 @@ use time::format_description::well_known::Rfc3339;
 
 pub const SCHEMA_VERSION: &str = "0.1";
 pub const HASH_PROFILE: &str = "aios-provenance-event-v0.1";
-pub const MAX_EVENT_BYTES: usize = 65_536;
-pub const MAX_DETAILS_BYTES: usize = 32_768;
+pub const MAX_EVENT_BYTES: usize = 524_288;
+pub const MAX_DETAILS_BYTES: usize = 458_752;
 pub const MAX_JSON_DEPTH: usize = 32;
 pub const MAX_PAGE_SIZE: u32 = 256;
 /// Maximum canonical JSON size of one privacy-redacted projected event.
@@ -314,9 +315,9 @@ pub fn get_head(connection: &Connection, stream_id: &str) -> Result<Option<Strea
         )
         .optional()?
         .map(|(sequence, event_hash)| {
-            if !valid_hash(&event_hash) {
+            if sequence <= 0 || !valid_hash(&event_hash) {
                 return Err(Error::InvalidRecord(
-                    "stored provenance head hash is invalid".to_owned(),
+                    "stored provenance head is invalid".to_owned(),
                 ));
             }
             Ok(StreamHead {
@@ -382,6 +383,7 @@ pub fn verify_stream(
 ) -> Result<VerificationResult> {
     validate_stream_id(stream_id)?;
     validate_timestamp(verified_at)?;
+    validate_checkpoint(checkpoint)?;
     let upper = through_sequence
         .map(i64::try_from)
         .transpose()
@@ -412,17 +414,21 @@ pub fn verify_stream(
     let mut previous: Option<String> = None;
     let mut expected_sequence = 1_u64;
     for row in rows {
-        let Ok((record, index)) = row else {
-            return Ok(failure(
-                stream_id,
-                verified_at,
-                "PROVENANCE_SCHEMA_INVALID",
-                "stored journal record is malformed",
-                None,
-                None,
-                previous,
-                checkpoint,
-            ));
+        let (record, index) = match row {
+            Ok(value) => value,
+            Err(error) if malformed_row_error(&error) => {
+                return Ok(failure(
+                    stream_id,
+                    verified_at,
+                    "PROVENANCE_SCHEMA_INVALID",
+                    "stored journal record is malformed",
+                    None,
+                    None,
+                    previous,
+                    checkpoint,
+                ));
+            }
+            Err(error) => return Err(Error::Storage(error)),
         };
         let computed = match verify_one_record(
             &record,
@@ -668,9 +674,39 @@ pub fn verify_records(
     checkpoint: Option<&CheckpointExpectation>,
     verified_at: &str,
 ) -> VerificationResult {
+    if validate_stream_id(stream_id).is_err()
+        || validate_timestamp(verified_at).is_err()
+        || validate_checkpoint(checkpoint).is_err()
+    {
+        return failure(
+            stream_id,
+            verified_at,
+            "PROVENANCE_SCHEMA_INVALID",
+            "verification request is invalid",
+            None,
+            None,
+            None,
+            None,
+        );
+    }
     let mut previous: Option<String> = None;
     let mut expected_sequence = 1_u64;
+    let mut event_ids = std::collections::HashSet::new();
     for (index, record) in records.iter().enumerate() {
+        if let Some(event_id) = string_field(&record.event, "event_id") {
+            if !event_ids.insert(event_id) {
+                return failure(
+                    stream_id,
+                    verified_at,
+                    "PROVENANCE_SCHEMA_INVALID",
+                    "duplicate provenance event ID",
+                    Some(record.sequence),
+                    Some(event_id.to_owned()),
+                    previous,
+                    checkpoint,
+                );
+            }
+        }
         let expected_later = record.sequence > expected_sequence
             && records[index..]
                 .iter()
@@ -853,7 +889,12 @@ pub fn verify_jsonl_export(
         ));
     }
     validate_timestamp(verified_at)?;
-    let manifest_value: Value = serde_json::from_str(manifest_json)?;
+    let manifest_value = parse_unique_json(manifest_json)?;
+    if !within_shape_bounds(&manifest_value) {
+        return Err(Error::InvalidRecord(
+            "portable provenance manifest exceeds shape bounds".to_owned(),
+        ));
+    }
     if !projection_manifest_validator()?.is_valid(&manifest_value) {
         return Err(Error::InvalidRecord(
             "unsupported portable provenance export manifest".to_owned(),
@@ -877,7 +918,12 @@ pub fn verify_jsonl_export(
                 "malformed portable provenance JSONL".to_owned(),
             ));
         }
-        let record_value: Value = serde_json::from_str(line)?;
+        let record_value = parse_unique_json(line)?;
+        if !within_shape_bounds(&record_value) {
+            return Err(Error::InvalidRecord(
+                "projected provenance record exceeds shape bounds".to_owned(),
+            ));
+        }
         if !projected_record_validator()?.is_valid(&record_value) {
             return Err(Error::InvalidRecord(
                 "malformed projected provenance record".to_owned(),
@@ -925,6 +971,10 @@ fn projection_failure(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "checks one projected chain and its identities"
+)]
 fn verify_projected_records(
     manifest: &ProjectionManifest,
     records: &[ProjectedRecord],
@@ -933,6 +983,7 @@ fn verify_projected_records(
     let mut previous = None;
     let mut task_alias: Option<&str> = None;
     let mut event_aliases = std::collections::BTreeSet::new();
+    let mut alias_namespaces = std::collections::HashMap::<String, String>::new();
     for (index, record) in records.iter().enumerate() {
         let expected_sequence = index as u64 + 1;
         if record.schema_version != SCHEMA_VERSION
@@ -941,6 +992,7 @@ fn verify_projected_records(
             || record.sequence != expected_sequence
             || record.previous_projection_hash != previous
             || validate_projected_event(&record.projected_event).is_err()
+            || !collect_alias_namespaces(&record.projected_event, &mut alias_namespaces)
         {
             return projection_failure(
                 manifest,
@@ -959,8 +1011,8 @@ fn verify_projected_records(
             .projected_event
             .pointer("/event_id/alias")
             .and_then(Value::as_str);
-        if (index == 0
-            && string_field(&record.projected_event, "event_type") != Some("task.created"))
+        if ((index == 0)
+            != (string_field(&record.projected_event, "event_type") == Some("task.created")))
             || projected_task_alias.is_none()
             || projected_event_alias.is_none()
             || task_alias.is_some_and(|first| Some(first) != projected_task_alias)
@@ -1029,6 +1081,123 @@ fn verify_projected_records(
         diagnostics: Vec::new(),
         verified_at: verified_at.to_owned(),
     }
+}
+
+fn collect_alias_namespaces(
+    event: &Value,
+    seen: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    let mut pending = vec![event];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(object)
+                if object.get("kind").and_then(Value::as_str) == Some("bundle-local-alias") =>
+            {
+                let Some(digest) = object.get("alias").and_then(Value::as_str) else {
+                    return false;
+                };
+                let Some(namespace) = object.get("namespace").and_then(Value::as_str) else {
+                    return false;
+                };
+                if seen
+                    .insert(digest.to_owned(), namespace.to_owned())
+                    .is_some_and(|prior| prior != namespace)
+                {
+                    return false;
+                }
+            }
+            Value::Object(object) => pending.extend(object.values()),
+            Value::Array(values) => pending.extend(values),
+            _ => {}
+        }
+    }
+    true
+}
+
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct UniqueVisitor;
+        impl<'de> Visitor<'de> for UniqueVisitor {
+            type Value = UniqueJson;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("JSON without duplicate object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Bool(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(Value::Number(number)))
+                    .ok_or_else(|| E::custom("invalid JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value.to_owned())))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, UniqueJson(value))) = map.next_entry::<String, UniqueJson>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                    values.insert(key, value);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+fn parse_unique_json(input: &str) -> Result<Value> {
+    Ok(serde_json::from_str::<UniqueJson>(input)?.0)
 }
 
 fn project_event(event: &Value, alias_key: &[u8]) -> Result<Value> {
@@ -1280,10 +1449,7 @@ fn is_private_commitment(object: &serde_json::Map<String, Value>) -> bool {
 }
 
 fn validate_projected_event(event: &Value) -> Result<()> {
-    if serde_json::to_vec(event)?.len() > MAX_PROJECTED_EVENT_BYTES
-        || json_depth(event) > MAX_JSON_DEPTH
-        || !within_shape_bounds(event)
-    {
+    if !within_shape_bounds(event) || serde_json::to_vec(event)?.len() > MAX_PROJECTED_EVENT_BYTES {
         return Err(Error::InvalidRecord(
             "projected event exceeds bounds".to_owned(),
         ));
@@ -1443,6 +1609,11 @@ fn hash_projected_record(
     previous: Option<&str>,
     event: &Value,
 ) -> Result<String> {
+    if !within_shape_bounds(event) {
+        return Err(Error::InvalidRecord(
+            "projected event exceeds shape bounds".to_owned(),
+        ));
+    }
     let view = json!({"schema_version":SCHEMA_VERSION,"projection_hash_profile":PROJECTION_HASH_PROFILE,"bundle_id":bundle_id,"sequence":sequence,"previous_projection_hash":previous,"projected_event":event});
     hash_canonical(PROJECTION_RECORD_DOMAIN, &view)
 }
@@ -1453,6 +1624,11 @@ fn hash_projection_descriptor(manifest: &ProjectionManifest) -> Result<String> {
 }
 
 fn hash_canonical(domain: &[u8], value: &Value) -> Result<String> {
+    if !within_shape_bounds(value) {
+        return Err(Error::InvalidRecord(
+            "provenance JSON exceeds shape bounds".to_owned(),
+        ));
+    }
     let canonical = serde_json_canonicalizer::to_vec(value)
         .map_err(|error| Error::Canonicalization(error.to_string()))?;
     let mut hasher = Sha256::new();
@@ -1490,6 +1666,11 @@ pub fn hash_record(
     previous: Option<&str>,
     event: &Value,
 ) -> Result<String> {
+    if !within_shape_bounds(event) {
+        return Err(Error::InvalidRecord(
+            "provenance event exceeds shape bounds".to_owned(),
+        ));
+    }
     let mut event = event.clone();
     let object = event
         .as_object_mut()
@@ -1567,11 +1748,13 @@ fn validate_event(task_id: &str, event: &Value) -> Result<()> {
 
 fn validate_event_contract(task_id: &str, event: &Value, source_size_bounds: bool) -> Result<()> {
     validate_task_id(task_id)?;
+    if !within_shape_bounds(event) {
+        return Err(Error::InvalidRecord(
+            "provenance event exceeds size or depth bounds".to_owned(),
+        ));
+    }
     let bytes = serde_json::to_vec(event)?;
-    if (source_size_bounds && bytes.len() > MAX_EVENT_BYTES)
-        || json_depth(event) > MAX_JSON_DEPTH
-        || !within_shape_bounds(event)
-    {
+    if source_size_bounds && bytes.len() > MAX_EVENT_BYTES {
         return Err(Error::InvalidRecord(
             "provenance event exceeds size or depth bounds".to_owned(),
         ));
@@ -1675,9 +1858,9 @@ fn validate_stream_id(value: &str) -> Result<()> {
 }
 
 fn validate_sequence_event_invariant(sequence: u64, event: &Value) -> Result<()> {
-    if sequence == 1 && string_field(event, "event_type") != Some("task.created") {
+    if (sequence == 1) != (string_field(event, "event_type") == Some("task.created")) {
         return Err(Error::InvalidRecord(
-            "provenance genesis event must be task.created".to_owned(),
+            "task.created must occur exactly at provenance genesis".to_owned(),
         ));
     }
     Ok(())
@@ -1695,6 +1878,29 @@ fn valid_hash(value: &str) -> bool {
         && value[7..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_checkpoint(checkpoint: Option<&CheckpointExpectation>) -> Result<()> {
+    if let Some(checkpoint) = checkpoint {
+        if checkpoint.checkpoint_id.is_empty()
+            || checkpoint.checkpoint_id.chars().count() > 256
+            || !valid_hash(&checkpoint.event_hash)
+        {
+            return Err(Error::InvalidRecord(
+                "invalid provenance checkpoint expectation".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn malformed_row_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+    )
 }
 
 fn validate_details_vocabulary(event: &Value) -> Result<()> {
@@ -1843,7 +2049,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         }
         ("task.transitioned", "active_program") => validate_active_program(value),
         ("task.transitioned", "mutation_text_commitments") => validate_mutation_commitments(value),
-        ("authorization.granted", "actions") => expect_token_array(value, 64, 128),
+        ("authorization.granted", "actions") => expect_safe_identifier_array(value, 64),
         ("authorization.granted", "resource") => expect_identifier(value, 256),
         ("authorization.granted", "resources") => expect_identifier_array(value, 64, 256),
         ("plan.created" | "plan.revised", "plan_id") => expect_task_string(value, 256, true),
@@ -2252,8 +2458,25 @@ fn expect_identifier_array(
     Ok(())
 }
 
-fn expect_token_array(value: &Value, maximum_items: usize, maximum_chars: usize) -> Result<()> {
-    expect_identifier_array(value, maximum_items, maximum_chars)
+fn expect_safe_identifier_array(value: &Value, maximum_items: usize) -> Result<()> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_details("action collection must be an array"))?;
+    if values.len() > maximum_items {
+        return Err(invalid_details("action collection exceeds its item bound"));
+    }
+    for value in values {
+        let action = value
+            .as_str()
+            .ok_or_else(|| invalid_details("action must be a string"))?;
+        if action.is_empty()
+            || action.chars().count() > 256
+            || action.chars().any(char::is_whitespace)
+        {
+            return Err(invalid_details("action has invalid syntax"));
+        }
+    }
+    Ok(())
 }
 
 fn expect_one_of(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -2348,28 +2571,32 @@ fn invalid_details(message: &str) -> Error {
     ))
 }
 
-fn json_depth(value: &Value) -> usize {
-    match value {
-        Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
-        Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
-        _ => 1,
-    }
-}
-
 fn within_shape_bounds(value: &Value) -> bool {
-    match value {
-        Value::String(value) => value.chars().count() <= MAX_STRING_CHARS,
-        Value::Array(values) => {
-            values.len() <= MAX_ARRAY_ITEMS && values.iter().all(within_shape_bounds)
+    let mut pending = vec![(value, 1_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_JSON_DEPTH {
+            return false;
         }
-        Value::Object(values) => {
-            values.len() <= MAX_OBJECT_FIELDS
-                && values
-                    .iter()
-                    .all(|(key, value)| key.chars().count() <= 256 && within_shape_bounds(value))
+        match value {
+            Value::String(value) if value.chars().count() > MAX_STRING_CHARS => return false,
+            Value::Array(values) => {
+                if values.len() > MAX_ARRAY_ITEMS {
+                    return false;
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                if values.len() > MAX_OBJECT_FIELDS
+                    || values.keys().any(|key| key.chars().count() > 256)
+                {
+                    return false;
+                }
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
         }
-        _ => true,
     }
+    true
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRecord> {
@@ -2654,7 +2881,7 @@ mod tests {
                 record.previous_projection_hash.as_deref(),
                 &record.projected_event,
             )
-            .unwrap();
+            .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
             previous = Some(record.projection_hash.clone());
         }
         let mut manifest: ProjectionManifest = serde_json::from_str(&export.manifest_json).unwrap();
@@ -3571,7 +3798,7 @@ mod tests {
         transaction.commit().unwrap();
         let export =
             export_jsonl(&connection, &stream_id("T-max-projection").unwrap(), NOW).unwrap();
-        assert!(export.records_jsonl.len() > MAX_EVENT_BYTES);
+        assert!(export.records_jsonl.len() > 65_536);
         assert!(export.records_jsonl.len() <= MAX_PROJECTED_RECORD_BYTES);
         assert!(
             verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW)
@@ -3782,6 +4009,220 @@ mod tests {
             records.remove(0);
         });
         assert!(projection_rejected(&wrong_genesis));
+    }
+
+    #[test]
+    fn deeply_nested_values_are_bounded_before_serialization_or_hashing() {
+        let mut nested = Value::Null;
+        for _ in 0..=MAX_JSON_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        let mut source = event("T-deep", 1);
+        source["details"]["active_step_ids"] = nested.clone();
+        let stream = stream_id("T-deep").unwrap();
+        assert!(validate_event("T-deep", &source).is_err());
+        assert!(hash_record(&stream, 1, None, &source).is_err());
+        assert!(validate_projected_event(&nested).is_err());
+        assert!(hash_canonical(PROJECTION_RECORD_DOMAIN, &nested).is_err());
+    }
+
+    #[test]
+    fn portable_json_rejects_duplicate_keys_before_hashing() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let export = export_jsonl(&connection, &stream_id("T-provenance").unwrap(), NOW).unwrap();
+        let duplicate_manifest = format!(
+            "{{\"schema_version\":\"0.1\",{}",
+            &export.manifest_json[1..]
+        );
+        assert!(verify_jsonl_export(&duplicate_manifest, &export.records_jsonl, NOW).is_err());
+        let line = export.records_jsonl.lines().next().unwrap();
+        let duplicate_record = format!("{{\"sequence\":1,{}\n", &line[1..]);
+        assert!(verify_jsonl_export(&export.manifest_json, &duplicate_record, NOW).is_err());
+        let nested_duplicate = export.records_jsonl.replacen(
+            "\"event_id\":{",
+            "\"event_id\":{\"kind\":\"bundle-local-alias\",",
+            1,
+        );
+        assert!(verify_jsonl_export(&export.manifest_json, &nested_duplicate, NOW).is_err());
+    }
+
+    #[test]
+    fn checkpoint_and_head_request_bounds_are_enforced() {
+        let mut connection = connection();
+        let records = append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        for checkpoint in [
+            CheckpointExpectation {
+                checkpoint_id: String::new(),
+                event_hash: records[0].event_hash.clone(),
+            },
+            CheckpointExpectation {
+                checkpoint_id: "x".repeat(257),
+                event_hash: records[0].event_hash.clone(),
+            },
+            CheckpointExpectation {
+                checkpoint_id: "checkpoint:test".to_owned(),
+                event_hash: "sha256:invalid".to_owned(),
+            },
+        ] {
+            assert!(verify_stream(&connection, &stream, None, Some(&checkpoint), NOW).is_err());
+            assert_eq!(
+                verify_records(&records, &stream, Some(&checkpoint), NOW).diagnostics[0].code,
+                "PROVENANCE_SCHEMA_INVALID"
+            );
+        }
+        connection
+            .execute(
+                "UPDATE provenance_events SET sequence=0 WHERE stream_id=?1",
+                [&stream],
+            )
+            .unwrap();
+        assert!(get_head(&connection, &stream).is_err());
+    }
+
+    #[test]
+    fn task_created_only_at_genesis_and_detached_event_ids_are_unique() {
+        let mut connection = connection();
+        let mut records = append_many(&mut connection, 2);
+        let stream = stream_id("T-provenance").unwrap();
+        let second_created = typed_creation_event("T-provenance", 2);
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            append_in_tx(
+                &transaction,
+                "T-provenance",
+                &second_created,
+                &ExpectedHead::Any
+            )
+            .is_err()
+        );
+        records[1].event = second_created;
+        records[1].event_hash = hash_record(
+            &stream,
+            2,
+            records[1].previous_event_hash.as_deref(),
+            &records[1].event,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_records(&records, &stream, None, NOW).diagnostics[0].code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+        drop(transaction);
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_id=?1,event_type='task.created',event_json=?2,event_hash=?3 WHERE stream_id=?4 AND sequence=2",
+                params![
+                    string_field(&records[1].event, "event_id"),
+                    serde_json::to_string(&records[1].event).unwrap(),
+                    records[1].event_hash,
+                    stream,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+
+        records[1].event = event("T-provenance", 2);
+        records[1].event["event_id"] = records[0].event["event_id"].clone();
+        records[1].event_hash = hash_record(
+            &stream,
+            2,
+            records[1].previous_event_hash.as_deref(),
+            &records[1].event,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_records(&records, &stream, None, NOW).diagnostics[0].code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+    }
+
+    #[test]
+    fn projected_identity_rejects_later_genesis_and_cross_namespace_digest() {
+        let mut connection = connection();
+        append_many(&mut connection, 2);
+        let export = export_jsonl(&connection, &stream_id("T-provenance").unwrap(), NOW).unwrap();
+        let later_created = rehash_projection(&export, |records| {
+            records[1].projected_event = records[0].projected_event.clone();
+            records[1].projected_event["event_id"]["alias"] =
+                json!(format!("sha256:{}", "f".repeat(64)));
+        });
+        assert!(projection_rejected(&later_created));
+        let cross_namespace = rehash_projection(&export, |records| {
+            records[1].projected_event["event_id"]["alias"] =
+                records[0].projected_event["task_id"]["alias"].clone();
+        });
+        assert!(projection_rejected(&cross_namespace));
+    }
+
+    #[test]
+    fn maximum_step_set_and_action_identifier_bounds_are_accepted() {
+        let mut connection = connection();
+        let mut maximum = typed_creation_event("T-large-step-set", 1);
+        let steps = (0..512)
+            .map(|index| format!("{index:03}{}", "\u{0001}".repeat(125)))
+            .collect::<Vec<_>>();
+        maximum["details"]["active_step_ids"] = json!(steps);
+        assert!(serde_json::to_vec(&maximum).unwrap().len() > 65_536);
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            "T-large-step-set",
+            &maximum,
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let stream = stream_id("T-large-step-set").unwrap();
+        assert_eq!(
+            list_events(&connection, &stream, None, 1)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        assert!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+        let export = export_jsonl(&connection, &stream, NOW).unwrap();
+        assert!(
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
+
+        let mut authorized = event("T-action", 2);
+        authorized["event_type"] = json!("authorization.granted");
+        authorized["details"] = json!({"actions":["!".repeat(256)]});
+        assert!(validate_event("T-action", &authorized).is_ok());
+        authorized["details"]["actions"] = json!(["!".repeat(257)]);
+        assert!(validate_event("T-action", &authorized).is_err());
+        authorized["details"]["actions"] = json!(["has space"]);
+        assert!(validate_event("T-action", &authorized).is_err());
+    }
+
+    #[test]
+    fn sqlite_step_errors_are_not_classified_as_malformed_rows() {
+        assert!(!malformed_row_error(&rusqlite::Error::QueryReturnedNoRows));
+        assert!(malformed_row_error(
+            &rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad row"
+                )),
+            )
+        ));
     }
 
     #[test]
