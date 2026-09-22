@@ -15,7 +15,11 @@ A plain mutable event table also makes accidental/history-tampering harder to de
 
 For v0.1:
 
-1. Each Task has an append-oriented provenance stream identified by `task:<task_id>`.
+1. Each Task has an append-oriented provenance stream identified by
+   `task:<task-stream-key>`, where the v0.1 key is the lowercase SHA-256 digest
+   of `"AIOS-TASK-PROVENANCE-STREAM-ID\0v1\0" || task_id UTF-8`, prefixed with
+   `v1:sha256:`. This deterministic opaque identity preserves already committed
+   Stage-1 chain hashes; the typed event payload continues to carry `task_id`.
 2. Journal records carry a monotonically increasing per-stream sequence beginning at 1.
 3. Each journal record links to the previous record hash; the first record uses a null previous hash.
 4. Record hashes use a canonical, domain-separated profile over the typed record content excluding the record's own hash and detached signatures.

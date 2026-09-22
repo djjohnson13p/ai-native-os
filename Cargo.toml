@@ -3,6 +3,7 @@ members = [
     "crates/aios-contracts",
     "crates/aios-registry",
     "crates/aios-ir",
+    "crates/aios-provenance",
     "crates/aios-task-manager",
     "cmd/aios-ir",
 ]
@@ -15,6 +16,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 aios-contracts = { path = "crates/aios-contracts" }
 aios-ir = { path = "crates/aios-ir" }
+aios-provenance = { path = "crates/aios-provenance" }
 aios-registry = { path = "crates/aios-registry" }
 cap-std = "=4.0.3"
 fs2 = "0.4.3"

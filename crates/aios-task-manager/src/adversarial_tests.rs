@@ -471,8 +471,154 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        9
+        10
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the legacy table shape and survival assertions together"
+)]
+fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("provenance-migration.sqlite3");
+    let original_hash = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager
+            .create_task(&create("T-provenance-migration"))
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,sensitivity,retention_class,origin_kind,origin_task_id,integrity_state,created_at)
+             VALUES (?1,?2,'artifact.test@1','application/octet-stream','local','task','task','T-provenance-migration','unknown',?3)",
+            rusqlite::params![
+                format!("artifact:v1:sha256:{}", "a".repeat(64)),
+                format!("artifact://artifact:v1:sha256:{}", "a".repeat(64)),
+                TEST_TIME,
+            ],
+        ).unwrap();
+        manager
+            .connection
+            .query_row(
+                "SELECT event_hash FROM provenance_events WHERE task_id='T-provenance-migration'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         DROP INDEX IF EXISTS ix_provenance_task_sequence;
+         DROP TRIGGER IF EXISTS provenance_events_no_update;
+         DROP TRIGGER IF EXISTS provenance_events_no_delete;
+         ALTER TABLE provenance_events RENAME TO provenance_events_modern;
+         CREATE TABLE provenance_events (
+             event_id TEXT PRIMARY KEY,
+             task_id TEXT NOT NULL,
+             stream_id TEXT NOT NULL,
+             sequence INTEGER NOT NULL CHECK(sequence>=1),
+             timestamp TEXT NOT NULL,
+             event_type TEXT NOT NULL,
+             semantic_program_hash TEXT,
+             ir_version TEXT,
+             registry_snapshot_id TEXT,
+             node_id TEXT,
+             execution_binding_id TEXT,
+             provider_id TEXT,
+             status TEXT,
+             previous_event_hash TEXT,
+             event_hash TEXT NOT NULL,
+             event_json TEXT NOT NULL,
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+             FOREIGN KEY(registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),
+             FOREIGN KEY(execution_binding_id) REFERENCES execution_bindings(binding_id),
+             UNIQUE(task_id,sequence), UNIQUE(stream_id,sequence)
+         );
+         INSERT INTO provenance_events
+         SELECT event_id,task_id,stream_id,sequence,timestamp,event_type,semantic_program_hash,
+                ir_version,registry_snapshot_id,node_id,execution_binding_id,provider_id,status,
+                previous_event_hash,event_hash,event_json
+         FROM provenance_events_modern;
+         DROP TABLE provenance_events_modern;
+         CREATE INDEX ix_provenance_task_sequence ON provenance_events(task_id,sequence);
+         CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+         BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;
+         CREATE TRIGGER provenance_events_no_delete BEFORE DELETE ON provenance_events
+         BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;
+         DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(
+        manager
+            .get_task("T-provenance-migration")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE origin_task_id='T-provenance-migration'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT event_hash FROM provenance_events WHERE task_id='T-provenance-migration'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        original_hash
+    );
+    assert!(manager.verify_provenance("T-provenance-migration").unwrap());
+    assert_eq!(
+        manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id='T-provenance-migration'", [], |row| row.get::<_, String>(0)).unwrap(),
+        "0.1:aios-provenance-event-v0.1"
+    );
+    assert!(!provenance_task_fk_cascades(&manager.connection).unwrap());
+}
+
+#[test]
+fn portable_provenance_export_is_private_and_reverifies_without_task_storage() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let create_request = create("T-portable-provenance");
+    let private_intent = create_request.original_intent.clone();
+    manager.create_task(&create_request).unwrap();
+    assert!(
+        manager
+            .transition(&request(
+                "tr-portable-provenance",
+                "T-portable-provenance",
+                1,
+                TaskState::Created,
+                TaskState::Planning,
+            ))
+            .unwrap()
+            .applied
+    );
+    let export = manager.export_provenance("T-portable-provenance").unwrap();
+    assert!(!export.records_jsonl.contains(&private_intent));
+    assert!(!export.records_jsonl.contains("intent_commitment_nonce"));
+    assert!(export.records_jsonl.contains("original_intent_ref"));
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
 }
 
 #[test]
@@ -5898,12 +6044,13 @@ fn completion_authenticates_verification_event_row_and_chain() {
 }
 
 #[test]
-fn unicode_identifier_limits_count_scalars_instead_of_utf8_bytes() {
+fn task_stream_ids_require_ascii_grammar_while_other_ids_count_scalars() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    let max_id = "é".repeat(256);
-    let too_long = "é".repeat(257);
+    let max_id = "T".repeat(256);
+    let too_long = "T".repeat(257);
     manager.create_task(&create(&max_id)).unwrap();
     assert!(manager.create_task(&create(&too_long)).is_err());
+    assert!(manager.create_task(&create(&"é".repeat(256))).is_err());
     let transition = request(
         &"界".repeat(256),
         &max_id,
@@ -6161,7 +6308,7 @@ fn completion_checks_semantic_types_and_the_current_provenance_head() {
     let transaction = corrupt_suffix.connection.transaction().unwrap();
     append_event(&transaction, "T-completion", &serde_json::json!({
         "schema_version":SCHEMA_VERSION,"event_id":"event:suffix","task_id":"T-completion",
-        "event_type":"artifact.published","timestamp":TEST_TIME,"actor":{"kind":"system-service","id":"service:test"},"status":"success"
+        "event_type":"artifact.created","timestamp":TEST_TIME,"actor":{"kind":"system-service","id":"service:test"},"status":"success"
     })).unwrap();
     transaction.commit().unwrap();
     corrupt_suffix.connection.execute_batch("DROP TRIGGER provenance_events_no_update; UPDATE provenance_events SET event_hash='sha256:corrupt' WHERE event_id='event:suffix';").unwrap();
