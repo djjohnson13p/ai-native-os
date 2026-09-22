@@ -7,9 +7,9 @@
   "required": ["schema_version", "event_id", "task_id", "event_type", "timestamp", "actor"],
   "properties": {
     "schema_version": {"type": "string", "const": "0.1"},
-    "event_id": {"type": "string", "minLength": 1},
-    "task_id": {"type": "string", "minLength": 1},
-    "step_id": {"type": ["string", "null"]},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "step_id": {"type": ["string", "null"], "maxLength": 4096},
     "event_type": {
       "type": "string",
       "enum": [
@@ -62,7 +62,7 @@
         "skill.invalidated"
       ]
     },
-    "timestamp": {"type": "string", "format": "date-time"},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 4096},
     "actor": {
       "type": "object",
       "additionalProperties": false,
@@ -72,7 +72,7 @@
           "type": "string",
           "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]
         },
-        "id": {"type": "string", "minLength": 1}
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
       }
     },
     "task_transition": {
@@ -168,41 +168,45 @@
     },
     "semantic_program_hash": {
       "type": ["string", "null"],
+      "maxLength": 4096,
       "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
     },
-    "ir_version": {"type": ["string", "null"]},
-    "registry_snapshot_id": {"type": ["string", "null"]},
-    "validation_result_id": {"type": ["string", "null"]},
-    "execution_binding_id": {"type": ["string", "null"]},
-    "provider_id": {"type": ["string", "null"]},
-    "provider_version": {"type": ["string", "null"]},
-    "capability": {"type": ["string", "null"]},
+    "ir_version": {"type": ["string", "null"], "maxLength": 4096},
+    "registry_snapshot_id": {"type": ["string", "null"], "maxLength": 4096},
+    "validation_result_id": {"type": ["string", "null"], "maxLength": 4096},
+    "execution_binding_id": {"type": ["string", "null"], "maxLength": 4096},
+    "provider_id": {"type": ["string", "null"], "maxLength": 4096},
+    "provider_version": {"type": ["string", "null"], "maxLength": 4096},
+    "capability": {"type": ["string", "null"], "maxLength": 4096},
     "capability_contract_hash": {
       "type": ["string", "null"],
+      "maxLength": 4096,
       "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
     },
-    "authority_token_id": {"type": ["string", "null"]},
-    "policy_decision_id": {"type": ["string", "null"]},
-    "approval_id": {"type": ["string", "null"]},
+    "authority_token_id": {"type": ["string", "null"], "maxLength": 4096},
+    "policy_decision_id": {"type": ["string", "null"], "maxLength": 4096},
+    "approval_id": {"type": ["string", "null"], "maxLength": 4096},
     "skill": {
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["id", "version"],
       "properties": {
-        "id": {"type": "string", "minLength": 1},
-        "version": {"type": "string", "minLength": 1},
-        "manifest_hash": {"type": ["string", "null"]},
-        "compiled_target_id": {"type": ["string", "null"]}
+        "id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "version": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "manifest_hash": {"type": ["string", "null"], "maxLength": 4096},
+        "compiled_target_id": {"type": ["string", "null"], "maxLength": 4096}
       }
     },
     "input_artifacts": {
       "type": "array",
-      "items": {"type": "string"},
+      "maxItems": 512,
+      "items": {"type": "string", "maxLength": 4096},
       "uniqueItems": true
     },
     "output_artifacts": {
       "type": "array",
-      "items": {"type": "string"},
+      "maxItems": 512,
+      "items": {"type": "string", "maxLength": 4096},
       "uniqueItems": true
     },
     "external_transfer": {
@@ -210,14 +214,15 @@
       "additionalProperties": false,
       "required": ["destination", "data_refs"],
       "properties": {
-        "destination": {"type": "string", "minLength": 1},
+        "destination": {"type": "string", "minLength": 1, "maxLength": 4096},
         "data_refs": {
           "type": "array",
-          "items": {"type": "string"},
+          "maxItems": 512,
+          "items": {"type": "string", "maxLength": 4096},
           "minItems": 1,
           "uniqueItems": true
         },
-        "purpose": {"type": ["string", "null"]}
+        "purpose": {"type": ["string", "null"], "maxLength": 4096}
       }
     },
     "status": {
@@ -226,7 +231,7 @@
     },
     "details": {
       "type": "object",
-      "description": "Privacy-safe typed projection only. Detail names are a closed v0.1 vocabulary; implementations further restrict them by event_type and reject unknown nested object fields.",
+      "description": "Privacy-safe typed projection only. Detail names are a closed v0.1 vocabulary and are further restricted by event_type below; implementations reject unknown nested object fields.",
       "propertyNames": {
         "enum": [
           "revision", "creation", "active_plan", "active_step_ids", "waiting_on", "failure", "recovery", "fixture",
@@ -260,7 +265,7 @@
             "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
             "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
             "constraints": {"type": "null"},
-            "created_at": {"type": "string", "format": "date-time"}
+            "created_at": {"type": "string", "format": "date-time", "maxLength": 4096}
           }
         },
         "active_plan": {"type": "null"},
@@ -321,7 +326,7 @@
         "observation_ordinal": {"type": "integer", "minimum": 1},
         "previous_durability_state": {"enum": [null, "STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
         "durability_state": {"enum": ["STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
-        "resulted_at": {"type": "string", "format": "date-time"},
+        "resulted_at": {"type": "string", "format": "date-time", "maxLength": 4096},
         "index": {"type": "integer", "minimum": 1},
         "verified_claims": {"type": "integer", "minimum": 0},
         "failed_claims": {"type": "integer", "minimum": 0},
@@ -329,11 +334,65 @@
         "verified": {"type": "boolean"}
       },
       "additionalProperties": true
-    },
-    "previous_event_hash": {"type": ["string", "null"]},
-    "event_hash": {"type": ["string", "null"]}
+    }
   },
   "allOf": [
+    {
+      "if": {"properties": {"event_type": {"const":"task.created"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["revision","creation","active_plan","active_step_ids","waiting_on","failure","recovery","fixture"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"task.transitioned"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["related_ids","reason_message_ref","active_program","mutation_text_commitments"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"authorization.granted"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["actions","resource","resources"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["plan.created","plan.revised"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["plan_id","revision"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["provider.selected","placement.selected"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["locality","isolation_class"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"execution.started"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["attempt_id","binding_id","node_id","operation_id","phase","intent_hash","admission_event_id","admission_event_hash","execution_profile"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["execution.completed","execution.failed"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","outcome_certainty","effect_boundary","certainty","export_reconciliation","recovery_ref","inventory_id","safe_action","reason_code","phase","admission_event_id","admission_event_hash","attempt","duration_ms"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.imported"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["content_hash","size_bytes","blob_reused","import_id","request_digest","source"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.created"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["allocation_id","publication_id","content_hash","size_bytes","blob_reused","type"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.exported"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","size_bytes"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.integrity-failed"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["content_hash","observation_ordinal","previous_durability_state","durability_state","publication_id","allocation_id","request_digest","reason_code","resulted_at"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["verification.started","verification.completed","verification.failed"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["index","verified_claims","failed_claims"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"task.completed"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["revision","external_egress","verified"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum": ["task.created","task.transitioned","authorization.granted","plan.created","plan.revised","provider.selected","placement.selected","execution.started","execution.completed","execution.failed","artifact.imported","artifact.created","artifact.exported","artifact.integrity-failed","verification.started","verification.completed","verification.failed","task.completed"]}}},
+      "else": {"properties": {"details": {"maxProperties": 0}}}
+    },
     {
       "if": {
         "properties": {"event_type": {"const": "task.created"}},
@@ -471,7 +530,7 @@
         "semantic_hash": {"$ref": "#/$defs/sha256Digest"},
         "registry_snapshot_id": {"$ref": "#/$defs/safeIdentifier"},
         "validation_result_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
-        "validated_at": {"type": ["string", "null"], "format": "date-time"},
+        "validated_at": {"type": ["string", "null"], "format": "date-time", "maxLength": 4096},
         "validator_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
         "validator_version": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
         "program_content_digest": {"$ref": "#/$defs/sha256Digest"}
@@ -508,7 +567,7 @@
         "evidence_ref": {"$ref": "#/$defs/safeIdentifier"},
         "proof_hash": {"$ref": "#/$defs/sha256Digest"},
         "challenge": {"$ref": "#/$defs/safeIdentifier"},
-        "observed_at": {"type": "string", "format": "date-time"},
+        "observed_at": {"type": "string", "format": "date-time", "maxLength": 4096},
         "subject_hash": {"$ref": "#/$defs/sha256Digest"},
         "recovery_ref": {"$ref": "#/$defs/safeIdentifier"}
       }

@@ -26,9 +26,9 @@ pub const MAX_PAGE_SIZE: u32 = 256;
 /// Maximum canonical JSON size of one privacy-redacted projected event.
 ///
 /// Aliases are deliberately larger than the source strings they replace. This
-/// cap covers the maximum 512-item Task step set while keeping offline input
-/// independently bounded.
-pub const MAX_PROJECTED_EVENT_BYTES: usize = 262_144;
+/// cap covers the concurrent Task step and artifact collections (up to four
+/// 512-item arrays), plus the other bounded event fields.
+pub const MAX_PROJECTED_EVENT_BYTES: usize = 524_288;
 const MAX_PROJECTED_RECORD_BYTES: usize = MAX_PROJECTED_EVENT_BYTES + 4_096;
 const MAX_PROJECTION_EXPORT_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_PROJECTION_RECORDS: u64 = 10_000;
@@ -3852,6 +3852,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn concurrent_maximum_task_and_artifact_collections_export_and_verify() {
+        let task_id = "T-combined-projection-bound";
+        let mut connection = connection();
+        let mut source = typed_creation_event(task_id, 1);
+        source["details"]["active_step_ids"] = json!(
+            (0..512)
+                .map(|index| format!("step:{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        source["input_artifacts"] = json!(
+            (0..512)
+                .map(|index| format!("input:{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        source["output_artifacts"] = json!(
+            (0..512)
+                .map(|index| format!("output:{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        source["external_transfer"] = json!({
+            "destination":"local",
+            "data_refs":(0..512).map(|index| format!("ref:{index:03}")).collect::<Vec<_>>()
+        });
+        let source_bytes = serde_json::to_vec(&source).unwrap().len();
+        assert!(source_bytes <= MAX_EVENT_BYTES);
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(&transaction, task_id, &source, &ExpectedHead::Empty).unwrap();
+        transaction.commit().unwrap();
+        let stream = stream_id(task_id).unwrap();
+        let export = export_jsonl(&connection, &stream, NOW).unwrap();
+        let record: ProjectedRecord =
+            serde_json::from_str(export.records_jsonl.lines().next().unwrap()).unwrap();
+        let projected_bytes = serde_json::to_vec(&record.projected_event).unwrap().len();
+        assert!(
+            projected_bytes > 262_144,
+            "expected old bound to reject {projected_bytes} bytes"
+        );
+        assert!(projected_bytes <= MAX_PROJECTED_EVENT_BYTES);
+        assert!(export.records_jsonl.lines().next().unwrap().len() <= MAX_PROJECTED_RECORD_BYTES);
+        assert!(export.records_jsonl.len() <= MAX_PROJECTION_EXPORT_BYTES);
+        let verification =
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW).unwrap();
+        assert!(verification.valid, "{verification:?}");
     }
 
     #[test]

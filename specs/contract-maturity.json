@@ -45,7 +45,7 @@
       "controlling_adrs": ["ADR-0035", "ADR-0042"],
       "fixture_paths": ["examples/provenance/"],
       "blocking_questions": [],
-      "notes": "Tamper-evident local journal, not tamper-proof against a privileged full-store rewrite. Portable export is a separately hashed privacy-redacted projection with bundle-local aliases; offline verification proves only the exported projection and neither original-chain validity nor linkage."
+      "notes": "Tamper-evident local journal, not tamper-proof against a privileged full-store rewrite. The event payload schema encodes event-specific detail keys and 512-item Artifact/reference bounds while journal-envelope hashes remain outside the payload. Portable export is a separately hashed privacy-redacted projection with bundle-local aliases; offline verification proves only the exported projection and neither original-chain validity nor linkage."
     },
     {
       "id": "semantic-provider-registry-v0.1",

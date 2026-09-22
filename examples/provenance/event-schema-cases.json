@@ -1,0 +1,230 @@
+{
+  "description": "Draft 2020-12 provenance event payload schema cases. Journal envelope hashes are outside event payloads.",
+  "cases": [
+    {
+      "name": "authorization-details-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:1",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "actions": [
+            "read"
+          ],
+          "resource": "artifact:one",
+          "resources": [
+            "artifact:one"
+          ]
+        }
+      }
+    },
+    {
+      "name": "authorization-plan-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:2",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "plan_id": "plan:one"
+        }
+      }
+    },
+    {
+      "name": "plan-details-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:3",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "plan_id": "plan:one",
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "plan-resource-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:4",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "resource": "artifact:one"
+        }
+      }
+    },
+    {
+      "name": "event-without-detail-vocabulary-accepts-empty",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:5",
+        "task_id": "task:fixture",
+        "event_type": "task.paused",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {}
+      }
+    },
+    {
+      "name": "event-without-detail-vocabulary-rejects-known-key",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:6",
+        "task_id": "task:fixture",
+        "event_type": "task.paused",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "journal-hash-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:7",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "event_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "journal-previous-hash-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:8",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "previous_event_hash": null
+      }
+    },
+    {
+      "name": "artifact-array-bound-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:9",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [
+          "artifact:two"
+        ]
+      }
+    },
+    {
+      "name": "export-data-refs-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:10",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "op:one",
+          "size_bytes": 1
+        }
+      }
+    },
+    {
+      "name": "export-plan-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:11",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "plan_id": "plan:one"
+        }
+      }
+    }
+  ]
+}

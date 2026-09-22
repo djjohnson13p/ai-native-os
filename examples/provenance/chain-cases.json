@@ -3,7 +3,7 @@
   "hashes": "GENERATE_AT_TEST_TIME",
   "description": "Synthetic provenance journal cases. The implementation must generate canonical event hashes; these cases specify relationships and expected verification outcomes rather than trusted precomputed digests.",
   "base_stream": {
-    "stream_id": "task:T-provenance-fixture-1",
+    "stream_id": "task:v1:sha256:d5aa05557f9a91d49506656e869269d74c3d1e945a5853765a2243605176540b",
     "events": [
       {
         "sequence": 1,

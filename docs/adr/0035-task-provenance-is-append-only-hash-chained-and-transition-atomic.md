@@ -128,14 +128,24 @@ nor linkage to the authoritative journal.
 The projection validator is path- and event-specific: it checks required
 non-null fields, exact nested keys, fixed enums and scalar types, commitment
 field discriminators, and the namespace of every alias, including approval
-attribution. A projected event has a 262,144-byte cap so every valid 512-step
-Task creation can expand into aliases; the record envelope and complete JSONL
+attribution. A projected event has a 524,288-byte cap so a valid Task creation
+can expand its simultaneous 512-step and three 512-item Artifact/reference
+collections into aliases; the record envelope and complete JSONL
 bundle remain separately bounded, and the exporter validates each generated
 record before release.
 
 ## Compatibility impact
 
-The existing `provenance-event.schema.json` remains the event payload contract. v0.1 journal ordering/integrity is represented by a separate envelope schema so the change is additive at the architecture level.
+`provenance-event.schema.json` remains the event payload contract, and v0.1
+journal ordering/integrity uses a separate envelope schema. The payload schema
+now states the already enforced 512-item collection bounds and event-specific
+detail-key mapping, and forbids journal-envelope hash fields inside the event.
+This tightens schema-only validation to match the trusted runtime: previously
+conforming stored events and their canonical hashes do not change, while a
+producer relying on the former permissive schema must correct any event the
+runtime already rejected. The positive chain fixture uses the opaque derived
+stream ID required by the existing runtime; its Task ID and semantic payload
+remain unchanged.
 
 ## Related
 
