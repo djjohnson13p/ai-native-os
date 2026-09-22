@@ -125,6 +125,14 @@ domains separate from the journal hash. Offline verification is explicitly
 limited to `scope=exported-projection` and proves neither original-chain validity
 nor linkage to the authoritative journal.
 
+The projection validator is path- and event-specific: it checks required
+non-null fields, exact nested keys, fixed enums and scalar types, commitment
+field discriminators, and the namespace of every alias, including approval
+attribution. A projected event has a 262,144-byte cap so every valid 512-step
+Task creation can expand into aliases; the record envelope and complete JSONL
+bundle remain separately bounded, and the exporter validates each generated
+record before release.
+
 ## Compatibility impact
 
 The existing `provenance-event.schema.json` remains the event payload contract. v0.1 journal ordering/integrity is represented by a separate envelope schema so the change is additive at the architecture level.

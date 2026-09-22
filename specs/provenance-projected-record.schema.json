@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ai-native-os.example/specs/provenance-projected-record.schema.json",
   "title": "Privacy-Redacted Provenance Projected Record v1",
-  "description": "The implementation applies the provenance event contract's closed path-specific projection: all non-fixed strings are bundle-local aliases; only fixed enums, timestamps, numbers, booleans, nulls, and validated private commitments remain literal.",
+  "description": "A bounded one-for-one projection. This schema fixes the envelope and required projected event structure; the verifier additionally checks every optional event-specific path and alias namespace against the source event contract.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "projection_hash_profile", "bundle_id", "sequence", "previous_projection_hash", "projected_event", "projection_hash"],
@@ -12,8 +12,46 @@
     "bundle_id": {"type": "string", "pattern": "^bundle:v1:[0-9a-f]{64}$"},
     "sequence": {"type": "integer", "minimum": 1},
     "previous_projection_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
-    "projected_event": {"type": "object"},
+    "projected_event": {"$ref": "#/$defs/projectedEvent"},
     "projection_hash": {"$ref": "#/$defs/hash"}
   },
-  "$defs": {"hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "alias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "namespace", "alias"],
+      "properties": {
+        "kind": {"const": "bundle-local-alias"},
+        "version": {"const": "v1"},
+        "namespace": {"enum": ["task", "event", "workspace", "plan", "step", "related", "artifact", "principal", "waiting", "skill", "identifier", "transition", "provider", "binding", "operation", "allocation", "publication", "import", "registry-snapshot", "validation-result", "authority-token", "policy-decision", "approval", "opaque-value"]},
+        "alias": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "eventAlias": {"allOf": [{"$ref": "#/$defs/alias"}, {"properties": {"namespace": {"const": "event"}}}]},
+    "taskAlias": {"allOf": [{"$ref": "#/$defs/alias"}, {"properties": {"namespace": {"const": "task"}}}]},
+    "principalAlias": {"allOf": [{"$ref": "#/$defs/alias"}, {"properties": {"namespace": {"const": "principal"}}}]},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]},
+        "id": {"$ref": "#/$defs/principalAlias"}
+      }
+    },
+    "projectedEvent": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["schema_version", "event_id", "task_id", "event_type", "timestamp", "actor"],
+      "properties": {
+        "schema_version": {"const": "0.1"},
+        "event_id": {"$ref": "#/$defs/eventAlias"},
+        "task_id": {"$ref": "#/$defs/taskAlias"},
+        "event_type": {"enum": ["task.created", "task.transitioned", "task.paused", "task.resumed", "task.cancelled", "task.completed", "task.failed", "intent.normalized", "plan.created", "plan.revised", "ir.validation.started", "ir.validation.completed", "ir.validation.failed", "registry.snapshot.selected", "capability.resolved", "authorization.requested", "authorization.granted", "authorization.denied", "approval.requested", "approval.granted", "approval.denied", "provider.selected", "placement.selected", "execution.bound", "execution.started", "execution.completed", "execution.failed", "model.invoked", "model.completed", "egress.started", "egress.completed", "artifact.imported", "artifact.created", "artifact.exported", "artifact.verified", "artifact.integrity-failed", "verification.started", "verification.completed", "verification.failed", "rollback.started", "rollback.completed", "skill.proposed", "skill.created", "skill.validated", "skill.compiled", "skill.executed", "skill.invalidated"]},
+        "timestamp": {"type": "string", "format": "date-time"},
+        "actor": {"$ref": "#/$defs/actor"}
+      }
+    }
+  }
 }
