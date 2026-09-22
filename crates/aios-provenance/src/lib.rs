@@ -390,17 +390,17 @@ pub fn verify_stream(
         Ok((
             row_to_record(row)?,
             JournalIndex {
-                event_id: row.get(7)?,
-                task_id: row.get(8)?,
-                timestamp: row.get(9)?,
-                event_type: row.get(10)?,
-                semantic_program_hash: row.get(11)?,
-                ir_version: row.get(12)?,
-                registry_snapshot_id: row.get(13)?,
-                node_id: row.get(14)?,
-                execution_binding_id: row.get(15)?,
-                provider_id: row.get(16)?,
-                status: row.get(17)?,
+                event_id: bounded_row_text(row, 7)?,
+                task_id: bounded_row_text(row, 8)?,
+                timestamp: bounded_row_text(row, 9)?,
+                event_type: bounded_row_text(row, 10)?,
+                semantic_program_hash: bounded_nullable_row_text(row, 11)?,
+                ir_version: bounded_nullable_row_text(row, 12)?,
+                registry_snapshot_id: bounded_nullable_row_text(row, 13)?,
+                node_id: bounded_nullable_row_text(row, 14)?,
+                execution_binding_id: bounded_nullable_row_text(row, 15)?,
+                provider_id: bounded_nullable_row_text(row, 16)?,
+                status: bounded_nullable_row_text(row, 17)?,
             },
         ))
     })?;
@@ -2369,18 +2369,33 @@ fn within_shape_bounds(value: &Value) -> bool {
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRecord> {
     let sequence = row.get::<_, i64>(3)?;
-    let event_json = row.get::<_, String>(5)?;
-    let event = serde_json::from_str(&event_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            event_json.len(),
+    let event_bytes = match row.get_ref(5)? {
+        rusqlite::types::ValueRef::Text(bytes) => bytes,
+        value => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                5,
+                "event_json".to_owned(),
+                value.data_type(),
+            ));
+        }
+    };
+    if event_bytes.len() > MAX_EVENT_BYTES {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            5,
             rusqlite::types::Type::Text,
-            Box::new(error),
-        )
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stored provenance event exceeds its byte bound",
+            )),
+        ));
+    }
+    let event = serde_json::from_slice(event_bytes).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(JournalRecord {
-        schema_version: row.get(0)?,
-        hash_profile: row.get(1)?,
-        stream_id: row.get(2)?,
+        schema_version: bounded_row_text(row, 0)?,
+        hash_profile: bounded_row_text(row, 1)?,
+        stream_id: bounded_row_text(row, 2)?,
         sequence: u64::try_from(sequence).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,
@@ -2388,10 +2403,37 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRecord> {
                 Box::new(error),
             )
         })?,
-        previous_event_hash: row.get(4)?,
+        previous_event_hash: bounded_nullable_row_text(row, 4)?,
         event,
-        event_hash: row.get(6)?,
+        event_hash: bounded_row_text(row, 6)?,
     })
+}
+
+fn bounded_row_text(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<String> {
+    if let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(column)? {
+        if bytes.len() > MAX_EVENT_BYTES {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stored provenance text column exceeds its byte bound",
+                )),
+            ));
+        }
+    }
+    row.get(column)
+}
+
+fn bounded_nullable_row_text(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<String>> {
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Text(_) => bounded_row_text(row, column).map(Some),
+        _ => row.get(column),
+    }
 }
 
 fn string_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
@@ -2731,6 +2773,63 @@ mod tests {
             let result = verify_stream(&connection, &stream, None, None, NOW).unwrap();
             assert!(!result.valid, "{sql}");
             assert_eq!(result.diagnostics[0].code, expected_code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn oversized_stored_event_is_rejected_before_json_parse_by_all_row_readers() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        let event_json: String = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let oversized = format!("{event_json}{}", " ".repeat(1_048_576));
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_json=?2 WHERE stream_id=?1",
+                params![stream, oversized],
+            )
+            .unwrap();
+        let result = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+        assert!(!result.valid);
+        assert_eq!(result.diagnostics[0].code, "PROVENANCE_SCHEMA_INVALID");
+        assert!(
+            list_events(&connection, &stream, None, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("stored provenance event exceeds its byte bound")
+        );
+    }
+
+    #[test]
+    fn oversized_stored_index_columns_fail_before_owned_text_materialization() {
+        for column in ["event_id", "event_hash"] {
+            let mut connection = connection();
+            append_many(&mut connection, 1);
+            let stream = stream_id("T-provenance").unwrap();
+            let oversized = "x".repeat(1_048_576);
+            connection
+                .execute(
+                    &format!("UPDATE provenance_events SET {column}=?1 WHERE stream_id=?2"),
+                    params![oversized, stream],
+                )
+                .unwrap();
+            let result = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+            assert!(!result.valid, "{column}");
+            assert_eq!(result.diagnostics[0].code, "PROVENANCE_SCHEMA_INVALID");
+            if column == "event_hash" {
+                assert!(
+                    list_events(&connection, &stream, None, 1)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("stored provenance text column exceeds its byte bound")
+                );
+            }
         }
     }
 
