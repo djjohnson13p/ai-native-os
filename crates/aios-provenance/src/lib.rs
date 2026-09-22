@@ -1196,8 +1196,16 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 
-fn parse_unique_json(input: &str) -> Result<Value> {
-    Ok(serde_json::from_str::<UniqueJson>(input)?.0)
+/// Parses JSON while rejecting duplicate object keys at every depth.
+///
+/// # Errors
+/// Returns an error for malformed JSON or a duplicate object key.
+pub fn parse_unique_json(input: &str) -> Result<Value> {
+    parse_unique_json_bytes(input.as_bytes())
+}
+
+fn parse_unique_json_bytes(input: &[u8]) -> Result<Value> {
+    Ok(serde_json::from_slice::<UniqueJson>(input)?.0)
 }
 
 fn project_event(event: &Value, alias_key: &[u8]) -> Result<Value> {
@@ -2621,7 +2629,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRecord> {
             )),
         ));
     }
-    let event = serde_json::from_slice(event_bytes).map_err(|error| {
+    let event = parse_unique_json_bytes(event_bytes).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(JournalRecord {
@@ -3036,6 +3044,52 @@ mod tests {
                 .to_string()
                 .contains("stored provenance event exceeds its byte bound")
         );
+    }
+
+    #[test]
+    fn stored_row_rejects_duplicate_json_keys_even_with_matching_hash_and_index() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        let event_json: String = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_hash: String = connection
+            .query_row(
+                "SELECT event_hash FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for raw in [
+            format!("{{\"event_id\":\"attacker:first\",{}", &event_json[1..]),
+            event_json.replacen("\"actor\":{", "\"actor\":{\"id\":\"attacker:first\",", 1),
+        ] {
+            // Last-wins parsing would recover the original event and its valid hash.
+            let collapsed: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                hash_record(&stream, 1, None, &collapsed).unwrap(),
+                original_hash
+            );
+            connection
+                .execute(
+                    "UPDATE provenance_events SET event_json=?1 WHERE stream_id=?2",
+                    params![raw, stream],
+                )
+                .unwrap();
+            let verification = verify_stream(&connection, &stream, None, None, NOW).unwrap();
+            assert!(!verification.valid);
+            assert_eq!(
+                verification.diagnostics[0].code,
+                "PROVENANCE_SCHEMA_INVALID"
+            );
+            assert!(list_events(&connection, &stream, None, 1).is_err());
+            assert!(export_jsonl(&connection, &stream, NOW).is_err());
+        }
     }
 
     #[test]

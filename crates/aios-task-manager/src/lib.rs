@@ -2030,7 +2030,7 @@ impl TaskManager {
         let mut material_reason_message_ref: Option<Value> = None;
         let mut material_updated_at: Option<String> = None;
         for row in rows {
-            let event: Value = serde_json::from_str(&row?)?;
+            let event = aios_provenance::parse_unique_json(&row?)?;
             if event.get("event_type").and_then(Value::as_str) == Some("task.created") {
                 let creation = event.pointer("/details/creation").cloned().ok_or(
                     TaskManagerError::InvalidRecord("Task provenance creation payload is missing"),
@@ -2770,7 +2770,7 @@ pub(crate) fn reconcile_recovery_subject_in_transaction(
         }
     });
     let resolution_event_id = if let Some((stored, _)) = existing_event {
-        let stored: Value = serde_json::from_str(&stored)?;
+        let stored = aios_provenance::parse_unique_json(&stored)?;
         if stored != event || !verify_provenance_through(transaction, &task_id, None)? {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery resolution event identity conflicts with durable provenance",
@@ -4243,7 +4243,7 @@ fn reconstruct_committed_transition(
         .ok_or(TaskManagerError::InvalidRecord(
             "committed transition result cannot be reconstructed from provenance",
         ))?;
-    let event: Value = serde_json::from_str(&event_row.3)?;
+    let event = aios_provenance::parse_unique_json(&event_row.3)?;
     let request_json = connection.query_row(
         "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
         [transition_id],
@@ -5191,7 +5191,7 @@ fn authenticated_transition_result(
                 ))?;
             let sequence = u64::try_from(event_row.0)
                 .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance sequence"))?;
-            let event: Value = serde_json::from_str(&event_row.3)?;
+            let event = aios_provenance::parse_unique_json(&event_row.3)?;
             if !result.applied
                 || result.reason_code != "TASK_TRANSITION_APPLIED"
                 || result.previous_revision != Some(expected_revision)
@@ -6485,7 +6485,7 @@ fn has_current_verification(
         let Ok(sequence) = u64::try_from(sequence) else {
             return Ok(false);
         };
-        let event: Value = serde_json::from_str(&event_json)?;
+        let event = aios_provenance::parse_unique_json(&event_json)?;
         if status != "success"
             || event_string(&event, "event_id") != Some(event_id.as_str())
             || event_string(&event, "task_id") != Some(task_id)
@@ -6989,7 +6989,7 @@ fn authenticated_recovery_resolution(
     let Some(event_json) = event_json else {
         return Ok(false);
     };
-    let event: Value = serde_json::from_str(&event_json)?;
+    let event = aios_provenance::parse_unique_json(&event_json)?;
     Ok(event
         .pointer("/details/recovery_ref")
         .and_then(Value::as_str)

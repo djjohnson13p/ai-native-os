@@ -6678,6 +6678,47 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
 }
 
 #[test]
+fn recovery_resolution_reader_rejects_duplicate_stored_event_keys() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-duplicate-recovery-event";
+    manager.create_task(&create(task_id)).unwrap();
+    let (event_id, event_json): (String, String) = manager
+        .connection
+        .query_row(
+            "SELECT event_id,event_json FROM provenance_events WHERE task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let duplicate_json = event_json.replacen('{', "{\"task_id\":\"T-shadow\",", 1);
+    assert!(serde_json::from_str::<Value>(&duplicate_json).is_ok());
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER provenance_events_no_update")
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE provenance_events SET event_type='execution.completed',event_json=?1 WHERE event_id=?2",
+            rusqlite::params![duplicate_json, event_id],
+        )
+        .unwrap();
+
+    let transaction = manager.connection.transaction().unwrap();
+    let assessment = serde_json::json!({"evidence":[{"ref":event_id}]});
+    let error = authenticated_recovery_resolution(
+        &transaction,
+        task_id,
+        "recovery:test",
+        "operation:test",
+        &assessment,
+    )
+    .unwrap_err();
+    assert!(matches!(&error, TaskManagerError::Provenance(_)));
+    assert!(error.to_string().contains("duplicate"));
+}
+
+#[test]
 fn completion_checks_semantic_types_and_the_current_provenance_head() {
     let mut wrong_type = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut wrong_type, HASH, &["artifact-output"], "COMMITTED");
