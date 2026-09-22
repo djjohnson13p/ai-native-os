@@ -2,12 +2,12 @@
 # Codex loads this file only when the repository is trusted.
 #
 # Root coordinator:
-# - GPT-5.6 Sol
-# - xhigh is the highest reasoning effort currently persistable in config.toml.
+# - GPT-6 Sol
+# - ultra is the GPT-6 Sol coordinator profile: maximum reasoning with automatic task delegation.
 # - The project owner should not manually route ordinary work among model-specific chats.
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
-plan_mode_reasoning_effort = "xhigh"
+model = "gpt-6-sol"
+model_reasoning_effort = "ultra"
+plan_mode_reasoning_effort = "ultra"
 model_reasoning_summary = "concise"
 
 developer_instructions = """
@@ -42,7 +42,7 @@ Never silently weaken architecture/security contracts, bypass required reviews, 
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 6
-default_subagent_model = "gpt-5.6-terra"
+default_subagent_model = "gpt-6-sol"
 default_subagent_reasoning_effort = "medium"
 interrupt_message = true
 

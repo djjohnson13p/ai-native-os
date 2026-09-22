@@ -128,14 +128,14 @@ Project-scoped Codex routing is defined in `.codex/config.toml` and `.codex/agen
 
 The root coordinator should keep one implementation thread and delegate work through subagents:
 
-- `explorer` — GPT-5.6 Luna / medium / read-only for codebase mapping and evidence gathering;
-- `implementer` — GPT-5.6 Sol / high / workspace-write for bounded implementation and fixes;
-- `reviewer` — GPT-5.6 Terra / high / read-only for ordinary correctness review;
-- `test_auditor` — GPT-5.6 Terra / high / read-only for adversarial test/evidence review;
+- `explorer` — GPT-6 Luna / medium / read-only for codebase mapping and evidence gathering;
+- `implementer` — GPT-6 Sol / high / workspace-write for bounded implementation and fixes;
+- `reviewer` — GPT-6 Sol / high / read-only for ordinary correctness review;
+- `test_auditor` — GPT-6 Sol / high / read-only for adversarial test/evidence review;
 - `astra_reviewer` — GPT-6 Astra / medium / read-only for trusted-boundary architecture/security gates;
 - `astra_deep_review` — GPT-6 Astra / high / read-only only when a normal review leaves a genuinely difficult architecture/security question unresolved.
 
-The project-level root fallback is GPT-5.6 Sol with xhigh reasoning because `config.toml` currently persists reasoning only through `xhigh`. If the user explicitly selects Sol/Max in the Codex UI, keep that setting; explicit session configuration takes precedence.
+The project-level root coordinator is GPT-6 Sol with `ultra` reasoning. In the current Codex model catalog, `ultra` is the maximum GPT-6 Sol reasoning profile with automatic task delegation, which matches this repository's coordinator role. GPT-6 Astra remains the independent review model. The current GPT-6 catalog has no Terra model; former Terra review/test roles migrate to GPT-6 Sol.
 
 ### Delegation policy
 

@@ -56,11 +56,11 @@ Codex loads project-scoped configuration only when the repository is trusted.
 Fallback project configuration:
 
 ```text
-GPT-5.6 Sol
-xhigh reasoning
+GPT-6 Sol
+ultra reasoning
 ```
 
-The current Codex config format persists reasoning only through `xhigh`. If the user explicitly selected **Sol / Max** in the interactive Codex UI, that explicit setting takes precedence and should remain.
+The current GPT-6 Codex catalog supports `ultra` for GPT-6 Sol; this repository uses it for the root coordinator because `ultra` is the maximum reasoning profile with automatic task delegation. GPT-6 Luna is used for fast repository exploration, GPT-6 Sol for implementation and ordinary review/test-audit work, and GPT-6 Astra for independent trusted-boundary review. The current GPT-6 catalog has no Terra model; former Terra roles migrate to GPT-6 Sol.
 
 The root coordinator plans, delegates, integrates, commits, and writes the final handoff. It should not waste its highest reasoning budget on file inventory or mechanical test inspection when a lower-cost subagent can do that safely.
 
@@ -68,10 +68,10 @@ The root coordinator plans, delegates, integrates, commits, and writes the final
 
 | Work | Agent | Model | Reasoning | Sandbox |
 | --- | --- | --- | --- | --- |
-| codebase mapping / evidence | `explorer` | GPT-5.6 Luna | medium | read-only |
-| implementation / repairs | `implementer` | GPT-5.6 Sol | high | workspace-write |
-| ordinary correctness review | `reviewer` | GPT-5.6 Terra | high | read-only |
-| test/adversarial evidence audit | `test_auditor` | GPT-5.6 Terra | high | read-only |
+| codebase mapping / evidence | `explorer` | GPT-6 Luna | medium | read-only |
+| implementation / repairs | `implementer` | GPT-6 Sol | high | workspace-write |
+| ordinary correctness review | `reviewer` | GPT-6 Sol | high | read-only |
+| test/adversarial evidence audit | `test_auditor` | GPT-6 Sol | high | read-only |
 | trusted-boundary/security review | `astra_reviewer` | GPT-6 Astra | medium | read-only |
 | unresolved hard escalation | `astra_deep_review` | GPT-6 Astra | high | read-only |
 
