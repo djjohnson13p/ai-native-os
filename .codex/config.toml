@@ -37,6 +37,10 @@ bounded issue -> explorer as needed -> implementer -> tests -> reviewer/test_aud
 Do not stop merely because one subagent responded. Integrate the result and continue the loop automatically. Stop only at a defined gate, a tool/runtime limitation, or a genuine architecture/product/permission decision that requires the owner.
 
 Never silently weaken architecture/security contracts, bypass required reviews, or begin a later roadmap stage before the current gate passes.
+
+Model compatibility guard:
+- GPT-6 Sol and GPT-6 Luna require Codex client 0.155.0 or newer in the current catalog; GPT-6 Astra requires 0.153.0 or newer.
+- If a configured GPT-6 model is unavailable, do not silently fall back to a GPT-5.6 model. Report the unavailable model and client/runtime version in the GitHub handoff, then update the client/runtime before resuming unless the owner explicitly authorizes a temporary fallback.
 """
 
 [agents]

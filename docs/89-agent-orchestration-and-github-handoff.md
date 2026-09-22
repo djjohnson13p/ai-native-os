@@ -62,6 +62,8 @@ ultra reasoning
 
 The current GPT-6 Codex catalog supports `ultra` for GPT-6 Sol; this repository uses it for the root coordinator because `ultra` is the maximum reasoning profile with automatic task delegation. GPT-6 Luna is used for fast repository exploration, GPT-6 Sol for implementation and ordinary review/test-audit work, and GPT-6 Astra for independent trusted-boundary review. The current GPT-6 catalog has no Terra model; former Terra roles migrate to GPT-6 Sol.
 
+Compatibility guard: the current Codex catalog lists GPT-6 Sol and GPT-6 Luna as requiring Codex 0.155.0 or newer, while GPT-6 Astra requires 0.153.0 or newer. A missing configured GPT-6 model is treated as an environment/version blocker, not permission to silently fall back to an older model family.
+
 The root coordinator plans, delegates, integrates, commits, and writes the final handoff. It should not waste its highest reasoning budget on file inventory or mechanical test inspection when a lower-cost subagent can do that safely.
 
 ## Agent routing

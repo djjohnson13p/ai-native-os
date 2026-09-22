@@ -137,6 +137,8 @@ The root coordinator should keep one implementation thread and delegate work thr
 
 The project-level root coordinator is GPT-6 Sol with `ultra` reasoning. In the current Codex model catalog, `ultra` is the maximum GPT-6 Sol reasoning profile with automatic task delegation, which matches this repository's coordinator role. GPT-6 Astra remains the independent review model. The current GPT-6 catalog has no Terra model; former Terra review/test roles migrate to GPT-6 Sol.
 
+**GPT-6 runtime compatibility:** GPT-6 Sol/Luna require Codex 0.155.0+ in the current catalog; GPT-6 Astra requires 0.153.0+. If a configured GPT-6 model is unavailable, do not silently substitute a 5.6 model. Record the runtime/client mismatch in the GitHub handoff and update the Codex runtime before continuing unless the owner explicitly authorizes a temporary fallback.
+
 ### Delegation policy
 
 Use subagents proactively when work can be separated without weakening evidence:
