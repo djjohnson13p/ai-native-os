@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS provider_conformance_evidence (
 -- Artifact content identity / output publication
 -- ---------------------------------------------------------------------------
 
+CREATE TABLE IF NOT EXISTS artifact_store_binding (
+    singleton_id           INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    database_identity      TEXT NOT NULL,
+    canonical_root         TEXT NOT NULL,
+    root_identity          TEXT NOT NULL,
+    bound_at               TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifact_blobs (
     content_hash           TEXT PRIMARY KEY,
     size_bytes             INTEGER NOT NULL CHECK (size_bytes >= 0),
@@ -257,6 +265,12 @@ CREATE TABLE IF NOT EXISTS artifact_output_allocations (
     state                   TEXT NOT NULL CHECK (state IN (
         'ALLOCATED', 'WRITING', 'FINALIZING', 'PUBLISHED', 'ABORTED', 'EXPIRED', 'FAILED'
     )),
+    writer_grant_id         TEXT,
+    writer_grant_one_shot_consumed INTEGER CHECK (
+        writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1)
+    ),
+    writer_session_id       TEXT,
+    writer_generation       INTEGER NOT NULL DEFAULT 0 CHECK (writer_generation >= 0),
     publication_id          TEXT,
     published_artifact_id   TEXT,
     staging_ref             TEXT,
@@ -579,8 +593,8 @@ CREATE TABLE IF NOT EXISTS provider_invocations (
 CREATE TABLE IF NOT EXISTS operations (
     operation_id             TEXT PRIMARY KEY,
     task_id                  TEXT NOT NULL,
-    semantic_program_hash    TEXT NOT NULL,
-    node_id                  TEXT NOT NULL,
+    semantic_program_hash    TEXT,
+    node_id                  TEXT,
     binding_id               TEXT,
     attempt_id               TEXT,
     transaction_class        TEXT,
@@ -679,6 +693,16 @@ CREATE TABLE IF NOT EXISTS recovery_unknown_operations (
     PRIMARY KEY (assessment_id, ordinal),
     UNIQUE (assessment_id, operation_id),
     FOREIGN KEY (assessment_id) REFERENCES recovery_assessments(assessment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS artifact_export_reconciliation_challenges (
+    operation_id              TEXT PRIMARY KEY,
+    recovery_assessment_id    TEXT NOT NULL,
+    subject_hash              TEXT NOT NULL,
+    challenge                 TEXT NOT NULL UNIQUE,
+    issued_at                 TEXT NOT NULL,
+    FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
 );
 
 -- ---------------------------------------------------------------------------

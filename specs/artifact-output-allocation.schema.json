@@ -27,6 +27,7 @@
     "output_port": {"type": ["string", "null"], "maxLength": 128},
     "expected_semantic_type": {
       "type": ["string", "null"],
+      "maxLength": 256,
       "pattern": "^(?:[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*))?$"
     },
     "allowed_media_types": {
@@ -49,7 +50,7 @@
       "enum": ["ALLOCATED", "WRITING", "FINALIZING", "PUBLISHED", "ABORTED", "EXPIRED", "FAILED"]
     },
     "publication_id": {"type": ["string", "null"], "maxLength": 256},
-    "published_artifact_id": {"type": ["string", "null"], "maxLength": 256},
+    "published_artifact_id": {"type": ["string", "null"], "maxLength": 512},
     "created_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"},
     "updated_at": {"type": ["string", "null"], "format": "date-time"}

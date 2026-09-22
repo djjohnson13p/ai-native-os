@@ -10,6 +10,8 @@ const CONTRACT_HASH: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 const SUITE_HASH: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 const TEST_TIME: &str = "2026-09-19T00:00:00Z";
+const COMPLETION_ARTIFACT_ID: &str =
+    "artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe";
 
 struct FixedClock;
 
@@ -469,7 +471,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        9
     );
 }
 
@@ -931,7 +933,7 @@ fn seed_completion_fixture_with_identity(
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'snapshot-completion', 'node-completion',
                  'binding-completion', 'provider:test', '0.1.0', 1, 3,
-                 'SUCCEEDED', 'COMPLETED', '[]', '[\"artifact-output\"]',
+                 'SUCCEEDED', 'COMPLETED', '[]', '[\"artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe\"]',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );
@@ -939,21 +941,22 @@ fn seed_completion_fixture_with_identity(
                  content_hash, size_bytes, storage_ref, durability_state,
                  created_at, verified_at
              ) VALUES (
-                 'sha256:artifact-output', 42, 'blob://completion/output',
+                 'sha256:4444444444444444444444444444444444444444444444444444444444444444', 42, 'blob://completion/output',
                  'DURABLE', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifacts (
                  artifact_id, uri, semantic_type, media_type, sensitivity, retention_class, origin_kind,
                  origin_task_id, origin_program_hash, origin_node_id,
                  origin_binding_id, origin_provider_id, size_bytes, content_hash,
-                 integrity_state, integrity_verified_at, created_at
+                 integrity_state, integrity_verified_at, integrity_verifier, labels_json, created_at
              ) VALUES (
-                 'artifact-output', 'artifact://completion/output', 'artifact.report@1',
-                 'application/json', 'local', 'task', 'provider', 'T-completion',
+                 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe',
+                 'artifact://artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'artifact.report@1',
+                 'application/json', 'local', 'task', 'task', 'T-completion',
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'provider:test',
-                 42, 'sha256:artifact-output', 'verified',
-                 '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
+                 42, 'sha256:4444444444444444444444444444444444444444444444444444444444444444', 'verified',
+                 '2026-09-19T00:00:00Z', 'artifact-store:sha256', '[]', '2026-09-19T00:00:00Z'
              );
              INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
@@ -965,13 +968,13 @@ fn seed_completion_fixture_with_identity(
                  'node-completion', 'binding-completion',
                  'attempt-completion', 'report', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
                  'publication-completion',
-                 'artifact-output', '2026-09-19T00:00:00Z',
+                 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', '2026-09-19T00:00:00Z',
                  '2026-09-20T00:00:00Z'
              );
              INSERT INTO task_artifacts (
                  task_id, artifact_id, role, node_id, added_at
              ) VALUES (
-                 'T-completion', 'artifact-output', 'output',
+                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'output',
                  'node-completion', '2026-09-19T00:00:00Z'
              );
              UPDATE tasks SET
@@ -984,6 +987,18 @@ fn seed_completion_fixture_with_identity(
              WHERE task_id = 'T-completion';",
         )
         .unwrap();
+    let publication_request = ArtifactPublicationRequest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        publication_id: "publication-completion".to_owned(),
+        allocation_id: "allocation-completion".to_owned(),
+        task_id: "T-completion".to_owned(),
+        expected_allocation_state: ArtifactExpectedState::Writing,
+        semantic_type: Some("artifact.report@1".to_owned()),
+        media_type: "application/json".to_owned(),
+        format: None,
+        lineage: ArtifactLineage::default(),
+        labels: Vec::new(),
+    };
     manager
         .connection
         .execute(
@@ -992,13 +1007,68 @@ fn seed_completion_fixture_with_identity(
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-completion', 'allocation-completion',
-                 'T-completion', 'artifact-output', 'sha256:artifact-output', '{}', ?1,
+                 'T-completion', 'artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe', 'sha256:4444444444444444444444444444444444444444444444444444444444444444', ?2, ?1,
                  '2026-09-19T00:00:00Z',
                  CASE WHEN ?1 = 'COMMITTED' THEN '2026-09-19T00:00:00Z' END
              )",
-            [publication_state],
+            rusqlite::params![
+                publication_state,
+                canonical_json(&publication_request).unwrap()
+            ],
         )
         .unwrap();
+    if publication_state == "COMMITTED" {
+        let transaction = manager.connection.transaction().unwrap();
+        let publication_event = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "event_id": artifact_store::event_id("artifact-created", COMPLETION_ARTIFACT_ID),
+            "task_id": "T-completion",
+            "event_type": "artifact.created",
+            "timestamp": TEST_TIME,
+            "actor": {"kind":"system-service","id":"service:artifact-store"},
+            "semantic_program_hash": HASH,
+            "step_id": "node-completion",
+            "execution_binding_id": "binding-completion",
+            "provider_id": "provider:test",
+            "input_artifacts": [],
+            "output_artifacts": [COMPLETION_ARTIFACT_ID],
+            "status": "success",
+            "details": {
+                "publication_id": "publication-completion",
+                "allocation_id": "allocation-completion",
+                "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                "size_bytes": 42,
+                "blob_reused": false
+            }
+        });
+        let appended = append_event(&transaction, "T-completion", &publication_event).unwrap();
+        let result = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "publication_id": "publication-completion",
+            "allocation_id": "allocation-completion",
+            "task_id": "T-completion",
+            "published": true,
+            "reason_code": "ARTIFACT_PUBLICATION_APPLIED",
+            "message": null,
+            "artifact_id": COMPLETION_ARTIFACT_ID,
+            "artifact_uri": format!("artifact://{COMPLETION_ARTIFACT_ID}"),
+            "semantic_type": "artifact.report@1",
+            "media_type": "application/json",
+            "size_bytes": 42,
+            "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "blob_reused": false,
+            "provenance_event_id": appended.event_id,
+            "provenance_event_hash": appended.event_hash,
+            "resulted_at": TEST_TIME
+        });
+        transaction
+            .execute(
+                "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                rusqlite::params!["publication-completion", canonical_json(&result).unwrap()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
     manager
         .connection
         .execute(
@@ -1006,6 +1076,16 @@ fn seed_completion_fixture_with_identity(
             [verification_snapshot],
         )
         .unwrap();
+    let verification_artifacts = verification_artifacts
+        .iter()
+        .map(|artifact_id| {
+            if *artifact_id == "artifact-output" {
+                COMPLETION_ARTIFACT_ID
+            } else {
+                *artifact_id
+            }
+        })
+        .collect::<Vec<_>>();
     let transaction = manager.connection.transaction().unwrap();
     let verification = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -1103,14 +1183,233 @@ fn completion_request(id: &str) -> TransitionRequest {
 fn verifying_completes_with_current_program_exact_step_publication_and_coverage() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    assert!(
+        committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap(),
+        "stored result: {}",
+        manager
+            .connection
+            .query_row(
+                "SELECT result_json FROM artifact_publications WHERE publication_id='publication-completion'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+    );
 
     let result = manager
         .transition(&completion_request("tr-completion-valid"))
         .unwrap();
-    assert!(result.applied);
+    assert!(result.applied, "{}", result.reason_code);
     assert_eq!(result.current_state, Some(TaskState::Completed));
     assert_eq!(result.current_revision, Some(3));
     assert!(manager.verify_provenance("T-completion").unwrap());
+}
+
+#[test]
+fn forged_committed_publication_receipt_enters_inventory_and_blocks_completion() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    let raw = manager
+        .connection
+        .query_row(
+            "SELECT result_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let mut forged: Value = serde_json::from_str(&raw).unwrap();
+    forged["size_bytes"] = serde_json::json!(43);
+    manager
+        .connection
+        .execute(
+            "UPDATE artifact_publications SET result_json=?1
+             WHERE publication_id='publication-completion'",
+            [canonical_json(&forged).unwrap()],
+        )
+        .unwrap();
+
+    assert!(
+        !committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap()
+    );
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-completion".to_owned())
+    );
+    let result = manager
+        .transition(&completion_request("tr-completion-forged-publication"))
+        .unwrap();
+    assert!(!result.applied);
+    let task = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(task.state, TaskState::Verifying);
+    assert_eq!(task.revision, 2);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "constructs a fully coherent but nondeterministically identified publication to exercise the shared replay/recovery proof"
+)]
+fn coherent_mislinked_publication_is_rejected_by_replay_inventory_and_completion() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    let rogue_id =
+        "artifact:v1:sha256:9999999999999999999999999999999999999999999999999999999999999999";
+    let rogue_uri = format!("artifact://{rogue_id}");
+    manager
+        .connection
+        .execute_batch(
+            "DROP TRIGGER provenance_events_no_delete;
+             DELETE FROM provenance_events
+              WHERE task_id='T-completion'
+                AND sequence >= (SELECT sequence FROM provenance_events
+                                  WHERE task_id='T-completion'
+                                    AND event_type='artifact.created');",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO artifacts(
+                 artifact_id,uri,semantic_type,media_type,format,size_bytes,content_hash,
+                 sensitivity,retention_class,expires_at,origin_kind,origin_task_id,
+                 origin_program_hash,origin_node_id,origin_binding_id,origin_provider_id,
+                 integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at)
+             SELECT ?1,?2,semantic_type,media_type,format,size_bytes,content_hash,
+                    sensitivity,retention_class,expires_at,origin_kind,origin_task_id,
+                    origin_program_hash,origin_node_id,origin_binding_id,origin_provider_id,
+                    integrity_state,integrity_verified_at,integrity_verifier,labels_json,created_at
+               FROM artifacts WHERE artifact_id=?3",
+            rusqlite::params![rogue_id, rogue_uri, COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO task_artifacts(task_id,artifact_id,role,node_id,added_at)
+             SELECT task_id,?1,role,node_id,added_at FROM task_artifacts
+              WHERE task_id='T-completion' AND artifact_id=?2",
+            rusqlite::params![rogue_id, COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute_batch(&format!(
+            "UPDATE artifact_output_allocations SET published_artifact_id='{rogue_id}'
+              WHERE allocation_id='allocation-completion';
+             UPDATE artifact_publications SET artifact_id='{rogue_id}'
+              WHERE publication_id='publication-completion';
+             UPDATE step_executions SET output_artifacts_json='[\"{rogue_id}\"]'
+              WHERE attempt_id='attempt-completion';"
+        ))
+        .unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    let publication_event = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": artifact_store::event_id("artifact-created", rogue_id),
+        "task_id": "T-completion",
+        "event_type": "artifact.created",
+        "timestamp": TEST_TIME,
+        "actor": {"kind":"system-service","id":"service:artifact-store"},
+        "semantic_program_hash": HASH,
+        "step_id": "node-completion",
+        "execution_binding_id": "binding-completion",
+        "provider_id": "provider:test",
+        "input_artifacts": [],
+        "output_artifacts": [rogue_id],
+        "status": "success",
+        "details": {
+            "publication_id": "publication-completion",
+            "allocation_id": "allocation-completion",
+            "content_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "size_bytes": 42,
+            "blob_reused": false
+        }
+    });
+    let appended = append_event(&transaction, "T-completion", &publication_event).unwrap();
+    let raw_result = transaction
+        .query_row(
+            "SELECT result_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let mut result: Value = serde_json::from_str(&raw_result).unwrap();
+    result["artifact_id"] = serde_json::json!(rogue_id);
+    result["artifact_uri"] = serde_json::json!(rogue_uri);
+    result["provenance_event_id"] = serde_json::json!(appended.event_id);
+    result["provenance_event_hash"] = serde_json::json!(appended.event_hash);
+    transaction
+        .execute(
+            "UPDATE artifact_publications SET result_json=?1
+             WHERE publication_id='publication-completion'",
+            [canonical_json(&result).unwrap()],
+        )
+        .unwrap();
+    let verification = serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":"event:verification:completion",
+        "task_id":"T-completion",
+        "event_type":"verification.completed",
+        "timestamp":TEST_TIME,
+        "actor":{"kind":"system-service","id":"service:verifier"},
+        "semantic_program_hash":HASH,
+        "registry_snapshot_id":"snapshot-completion",
+        "validation_result_id":"validation-completion",
+        "input_artifacts":[rogue_id],
+        "output_artifacts":[],
+        "status":"success"
+    });
+    append_event(&transaction, "T-completion", &verification).unwrap();
+    transaction.commit().unwrap();
+
+    assert!(
+        !committed_publication_structurally_valid(
+            &manager.connection,
+            "T-completion",
+            "publication-completion"
+        )
+        .unwrap()
+    );
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-completion".to_owned())
+    );
+    let request_json = manager
+        .connection
+        .query_row(
+            "SELECT request_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let request: ArtifactPublicationRequest = serde_json::from_str(&request_json).unwrap();
+    assert_eq!(
+        manager
+            .publish_artifact_output(&request)
+            .unwrap()
+            .reason_code,
+        "ARTIFACT_INTEGRITY_FAILED"
+    );
+    let completion = manager
+        .transition(&completion_request("tr-completion-mislinked-publication"))
+        .unwrap();
+    assert!(!completion.applied);
+    assert_eq!(completion.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
 }
 
 #[test]
@@ -1146,10 +1445,82 @@ fn completion_rejects_stale_verification_missing_or_mismatched_coverage_and_unpu
         let result = manager
             .transition(&completion_request(&format!("tr-completion-{name}")))
             .unwrap();
-        assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED", "{name}");
+        assert_eq!(
+            result.reason_code,
+            if name == "unpublished-output" {
+                "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+            } else {
+                "TASK_COMPLETION_GATE_FAILED"
+            },
+            "{name}"
+        );
         let task = manager.get_task("T-completion").unwrap().unwrap();
         assert_eq!((task.state, task.revision), (TaskState::Verifying, 2));
     }
+}
+
+#[test]
+fn distinct_pending_publication_blocks_otherwise_valid_completion_until_aborted() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute(
+            "INSERT INTO artifact_output_allocations (
+                 allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,
+                 output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,
+                 sensitivity,retention,state,writer_generation,created_at,updated_at,expires_at
+             )
+             SELECT 'allocation-pending-extra',task_id,semantic_program_hash,node_id,NULL,NULL,
+                    'auxiliary',expected_semantic_type,allowed_media_types_json,max_size_bytes,
+                    sensitivity,retention,'WRITING',0,created_at,updated_at,expires_at
+             FROM artifact_output_allocations WHERE allocation_id='allocation-completion'",
+            [],
+        )
+        .unwrap();
+    let pending = ArtifactPublicationRequest {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        publication_id: "publication-pending-extra".to_owned(),
+        allocation_id: "allocation-pending-extra".to_owned(),
+        task_id: "T-completion".to_owned(),
+        expected_allocation_state: ArtifactExpectedState::Writing,
+        semantic_type: Some("artifact.report@1".to_owned()),
+        media_type: "application/json".to_owned(),
+        format: None,
+        lineage: ArtifactLineage::default(),
+        labels: Vec::new(),
+    };
+    let pending_json = canonical_json(&pending).unwrap();
+    manager
+        .reserve_publication(&pending, &pending_json)
+        .unwrap();
+    assert!(
+        unresolved_execution_ids(&manager.connection, "T-completion")
+            .unwrap()
+            .contains(&"publication:publication-pending-extra".to_owned())
+    );
+    assert!(matches!(
+        manager.scope_owned_artifact_reads("T-completion", &[COMPLETION_ARTIFACT_ID.to_owned()]),
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+    ));
+
+    let blocked = manager
+        .transition(&completion_request("tr-completion-pending-extra"))
+        .unwrap();
+    assert!(!blocked.applied);
+    assert_eq!(blocked.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
+    let unchanged = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(
+        (unchanged.state, unchanged.revision),
+        (TaskState::Verifying, 2)
+    );
+
+    manager.abort_pending_publication(&pending).unwrap();
+    let completed = manager
+        .transition(&completion_request("tr-completion-after-pending-abort"))
+        .unwrap();
+    assert!(completed.applied);
+    assert_eq!(completed.current_state, Some(TaskState::Completed));
 }
 
 #[test]
@@ -1459,7 +1830,7 @@ fn completion_rejects_unknown_attempt_wrong_allocation_identity_and_verification
             .transition(&completion_request("tr-wrong-allocation"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 
     let mut stale_identity = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -2335,17 +2706,20 @@ fn completion_uses_program_ports_and_rejects_self_report_or_artifact_aliasing() 
 
     let mut alias = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut alias, HASH, &["artifact-output"], "COMMITTED");
-    alias.connection.execute_batch(
-        "UPDATE semantic_program_revisions SET program_json = '{\"nodes\":[{\"id\":\"node-completion\",\"outputs\":{\"report\":\"artifact.report@1\",\"receipt\":\"artifact.report@1\"}}]}' WHERE task_id = 'T-completion' AND program_revision = 1;
-         INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', 'artifact-output', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
-         INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at, committed_at) VALUES ('publication-alias', 'allocation-alias', 'T-completion', 'artifact-output', '{}', 'COMMITTED', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');",
-    ).unwrap();
+    alias
+        .connection
+        .execute_batch(&format!(
+            "UPDATE semantic_program_revisions SET program_json = '{{\"nodes\":[{{\"id\":\"node-completion\",\"outputs\":{{\"report\":\"artifact.report@1\",\"receipt\":\"artifact.report@1\"}}}}]}}' WHERE task_id = 'T-completion' AND program_revision = 1;
+             INSERT INTO artifact_output_allocations (allocation_id, task_id, semantic_program_hash, node_id, binding_id, attempt_id, output_port, sensitivity, retention, state, publication_id, published_artifact_id, created_at, expires_at) VALUES ('allocation-alias', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'node-completion', 'binding-completion', 'attempt-completion', 'receipt', 'local', 'task', 'PUBLISHED', 'publication-alias', '{COMPLETION_ARTIFACT_ID}', '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z');
+             INSERT INTO artifact_publications (publication_id, allocation_id, task_id, artifact_id, request_json, state, requested_at, committed_at) VALUES ('publication-alias', 'allocation-alias', 'T-completion', '{COMPLETION_ARTIFACT_ID}', '{{}}', 'COMMITTED', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');"
+        ))
+        .unwrap();
     assert_eq!(
         alias
             .transition(&completion_request("tr-output-alias"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 }
 
@@ -3143,7 +3517,7 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager.connection.execute(
-        "UPDATE artifact_blobs SET durability_state = 'CORRUPT' WHERE content_hash = 'sha256:artifact-output'",
+        "UPDATE artifact_blobs SET durability_state = 'CORRUPT' WHERE content_hash = 'sha256:4444444444444444444444444444444444444444444444444444444444444444'",
         [],
     ).unwrap();
     assert_eq!(
@@ -3151,7 +3525,31 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
             .transition(&completion_request("tr-corrupt-blob"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
+    );
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET state='PAUSED' WHERE task_id='T-completion'",
+            [],
+        )
+        .unwrap();
+    let paused = manager.get_task("T-completion").unwrap().unwrap();
+    let blocked = manager
+        .transition(&request(
+            "tr-corrupt-publication-live",
+            "T-completion",
+            paused.revision,
+            TaskState::Paused,
+            TaskState::Runnable,
+        ))
+        .unwrap();
+    assert!(!blocked.applied);
+    assert_eq!(blocked.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
+    let still_paused = manager.get_task("T-completion").unwrap().unwrap();
+    assert_eq!(
+        (still_paused.state, still_paused.revision),
+        (TaskState::Paused, paused.revision)
     );
 
     manager.connection.execute_batch(
@@ -3195,13 +3593,286 @@ fn provider_allocation_blob_and_live_recovery_evidence_are_revalidated() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers refresh immutability, stale-reference rebasing, and successful recovery exit"
+)]
+fn refreshed_recovery_inventory_becomes_active_without_rewriting_history() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("refresh-recovery.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-recovery", TaskState::Running);
+    manager
+        .connection
+        .execute(
+            "INSERT INTO operations (
+                operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+                outcome_certainty,prepared_at
+             ) VALUES (
+                'operation-r1','T-refresh-recovery',?1,'node-1','NETWORK','UNKNOWN',
+                'OUTCOME_UNKNOWN',?2
+             )",
+            rusqlite::params![HASH, TEST_TIME],
+        )
+        .unwrap();
+    let recovered = manager
+        .reconcile_live_execution("T-refresh-recovery")
+        .unwrap();
+    assert!(recovered.applied);
+    let first = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    assert_eq!(first.state, TaskState::Recovering);
+    let first_ref = first
+        .recovery
+        .as_ref()
+        .and_then(|value| value["unknown_operations_ref"].as_str())
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&first_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1"]
+    );
+
+    manager
+        .connection
+        .execute(
+            "INSERT INTO operations (
+                operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+                outcome_certainty,prepared_at
+             ) VALUES (
+                'operation-r2','T-refresh-recovery',?1,'node-1','NETWORK','UNKNOWN',
+                'OUTCOME_UNKNOWN',?2
+             )",
+            rusqlite::params![HASH, TEST_TIME],
+        )
+        .unwrap();
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let refreshed = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.state, TaskState::Recovering);
+    assert_eq!(refreshed.revision, first.revision);
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        refreshed
+            .recovery
+            .as_ref()
+            .and_then(|value| value["unknown_operations_ref"].as_str()),
+        Some(first_ref.as_str())
+    );
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&first_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1"]
+    );
+    manager
+        .connection
+        .execute(
+            "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1
+             WHERE operation_id IN ('operation-r1','operation-r2')",
+            [TEST_TIME],
+        )
+        .unwrap();
+    let first_assessment_id =
+        recovery_subject_assessment_id(&first_ref, "external-operation", "operation:operation-r1");
+    let first_assessment_before: String = manager
+        .connection
+        .query_row(
+            "SELECT assessment_json FROM recovery_assessments WHERE assessment_id=?1",
+            [&first_assessment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    manager
+        .reconcile_recovery_subject(&first_ref, "operation:operation-r1")
+        .unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT assessment_json FROM recovery_assessments WHERE assessment_id=?1",
+                [&first_assessment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        first_assessment_before,
+        "refresh reconciliation must not rewrite historical evidence"
+    );
+    let current = manager.get_task("T-refresh-recovery").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-refreshed-recovery-resolved",
+            "T-refresh-recovery",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
+}
+
+#[test]
+fn refreshed_recovery_inventory_carries_forward_already_resolved_subjects() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("refresh-resolved-recovery.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-resolved", TaskState::Running);
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r1','T-refresh-resolved',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_live_execution("T-refresh-resolved")
+        .unwrap();
+    let first_ref = manager
+        .active_recovery_inventory_ref("T-refresh-resolved")
+        .unwrap()
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r1'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&first_ref, "operation:operation-r1")
+        .unwrap();
+
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r2','T-refresh-resolved',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-resolved")
+        .unwrap()
+        .unwrap();
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r2'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
+    let current = manager.get_task("T-refresh-resolved").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-carried-forward-recovery-resolved",
+            "T-refresh-resolved",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
+}
+
+#[test]
+fn recovery_refresh_materializes_terminal_evidence_that_arrived_before_reconciliation() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("refresh-terminal-before-reconcile.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, "T-refresh-terminal", TaskState::Running);
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r1','T-refresh-terminal',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_live_execution("T-refresh-terminal")
+        .unwrap();
+    let first_ref = manager
+        .active_recovery_inventory_ref("T-refresh-terminal")
+        .unwrap()
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r1'",
+        [TEST_TIME],
+    ).unwrap();
+    manager.connection.execute(
+        "INSERT INTO operations (
+            operation_id,task_id,semantic_program_hash,node_id,effect_class,state,
+            outcome_certainty,prepared_at
+         ) VALUES ('operation-r2','T-refresh-terminal',?1,'node-1','NETWORK','UNKNOWN','OUTCOME_UNKNOWN',?2)",
+        rusqlite::params![HASH, TEST_TIME],
+    ).unwrap();
+
+    drop(manager);
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let second_ref = manager
+        .active_recovery_inventory_ref("T-refresh-terminal")
+        .unwrap()
+        .unwrap();
+    assert_ne!(second_ref, first_ref);
+    assert_eq!(
+        manager
+            .recovery_unknown_operation_ids(&second_ref)
+            .unwrap()
+            .unwrap(),
+        vec!["operation:operation-r1", "operation:operation-r2"]
+    );
+    manager.connection.execute(
+        "UPDATE operations SET state='SUCCEEDED',outcome_certainty='COMPLETED',finished_at=?1 WHERE operation_id='operation-r2'",
+        [TEST_TIME],
+    ).unwrap();
+    manager
+        .reconcile_recovery_subject(&second_ref, "operation:operation-r2")
+        .unwrap();
+    let current = manager.get_task("T-refresh-terminal").unwrap().unwrap();
+    let exited = manager
+        .transition(&request(
+            "tr-terminal-before-reconcile-resolved",
+            "T-refresh-terminal",
+            current.revision,
+            TaskState::Recovering,
+            TaskState::Planning,
+        ))
+        .unwrap();
+    assert!(exited.applied, "{exited:?}");
+}
+
+#[test]
 fn unknown_newer_migration_and_recovery_inventory_tamper_fail_closed() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("future.sqlite3");
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch(
         "CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
-         INSERT INTO schema_migrations VALUES ('0005_future', 'future', '2026-09-19T00:00:00Z');",
+         INSERT INTO schema_migrations VALUES ('0010_future', 'future', '2026-09-19T00:00:00Z');",
     ).unwrap();
     drop(connection);
     assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
@@ -3354,12 +4025,31 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
             [TEST_TIME],
         )
         .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE step_executions
+             SET invocation_id='invocation-terminal',outcome_certainty='OUTCOME_UNKNOWN'
+             WHERE task_id='T-completion' AND attempt_id='attempt-completion'",
+            [],
+        )
+        .unwrap();
     let inventory = unresolved_execution_ids(&manager.connection, "T-completion").unwrap();
-    assert_eq!(inventory, vec!["provider-invocation:invocation-terminal"]);
+    assert!(inventory.contains(&"attempt:attempt-completion".to_owned()));
+    assert!(inventory.contains(&"provider-invocation:invocation-terminal".to_owned()));
     let recovery_ref = recovery_operations_ref("T-completion", 2, &inventory).unwrap();
     manager
         .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
         .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_none(),
+            "a mutable attempt certainty cannot resolve without authenticated provider evidence"
+        );
+    }
     let result = canonical_json(&serde_json::json!({
         "schema_version":SCHEMA_VERSION,
         "result_id":"provider-result-terminal",
@@ -3375,6 +4065,41 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
         "completed_at":TEST_TIME
     }))
     .unwrap();
+    let sibling_result = canonical_json(&serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "result_id":"provider-result-sibling",
+        "invocation_id":"invocation-sibling",
+        "task_id":"T-completion",
+        "execution_binding_id":"binding-completion",
+        "node_id":"node-completion",
+        "provider":{"id":"provider:test","version":"0.1.0","package_or_build_hash":"sha256:build"},
+        "status":"SUCCEEDED",
+        "reason_codes":["PROVIDER_SUCCEEDED"],
+        "outputs":{},
+        "started_at":TEST_TIME,
+        "completed_at":TEST_TIME
+    }))
+    .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_invocations(
+            invocation_id,attempt_id,binding_id,task_id,provider_id,provider_version,
+            status,request_json,result_json,started_at,completed_at
+         ) VALUES ('invocation-sibling','attempt-completion','binding-completion',
+            'T-completion','provider:test','0.1.0','SUCCEEDED','{}',?1,?2,?2)",
+            rusqlite::params![sibling_result, TEST_TIME],
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_none(),
+            "a terminal sibling must not resolve the step's recorded pending invocation"
+        );
+    }
     manager
         .connection
         .execute(
@@ -3383,6 +4108,26 @@ fn authenticated_terminal_provider_receipt_resolves_historical_inventory() {
             rusqlite::params![result, TEST_TIME],
         )
         .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            resolved_recovery_subject(&transaction, "T-completion", "attempt:attempt-completion")
+                .unwrap()
+                .is_some(),
+            "the exact authenticated provider result resolves its attempt"
+        );
+    }
+    manager
+        .reconcile_recovery_subject(&recovery_ref, "attempt:attempt-completion")
+        .unwrap();
+    assert_eq!(
+        manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap()
+            .outcome_certainty,
+        Some(OutcomeCertainty::Completed)
+    );
     for (field, forged) in [
         ("id", "provider:forged"),
         ("package_or_build_hash", "sha256:forged-build"),
@@ -3879,7 +4624,8 @@ fn actual_running_admission_requires_complete_current_output_allocations() {
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
-             UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';",
+             UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         ).unwrap();
         seed_resolved_empty_recovery(&mut manager, "T-completion", 2);
         manager.connection.execute(mutation, []).unwrap();
@@ -3943,6 +4689,10 @@ fn persisted_step_timestamp_and_migration_chain_are_strict() {
         "0002_task_manager_contract_reconciliation",
         "0003_task_manager_recovery_fencing_privacy",
         "0004_task_manager_review_hardening",
+        "0005_artifact_store_root_binding",
+        "0006_artifact_writer_admission",
+        "0007_artifact_owner_export_context",
+        "0008_artifact_export_reconciliation_challenge",
     ] {
         assert_eq!(
             manager
@@ -4076,7 +4826,8 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         ).unwrap();
         seed_resolved_empty_recovery(&mut manager, "T-completion", 2);
         manager.connection.execute(mutation, []).unwrap();
@@ -4104,18 +4855,21 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
 
 #[test]
 fn completion_requires_present_durable_hash_matching_verified_blob() {
-    for (name, mutation) in [
+    for (name, mutation, expected_reason) in [
         (
             "blob-missing",
-            "UPDATE artifact_blobs SET durability_state='MISSING' WHERE content_hash='sha256:artifact-output'",
+            "UPDATE artifact_blobs SET durability_state='MISSING' WHERE content_hash='sha256:4444444444444444444444444444444444444444444444444444444444444444'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "integrity-failed",
             "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id='artifact-output'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "hash-mismatch",
             "UPDATE artifact_publications SET content_hash='sha256:mismatch' WHERE publication_id='publication-completion'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -4126,13 +4880,23 @@ fn completion_requires_present_durable_hash_matching_verified_blob() {
                 [TEST_TIME],
             ).unwrap();
         }
-        manager.connection.execute(mutation, []).unwrap();
+        if name == "integrity-failed" {
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute(mutation, []).unwrap();
+        }
         assert_eq!(
             manager
                 .transition(&completion_request(&format!("tr-blob-{name}")))
                 .unwrap()
                 .reason_code,
-            "TASK_COMPLETION_GATE_FAILED",
+            expected_reason,
             "{name}"
         );
     }
@@ -4433,6 +5197,7 @@ fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
         r"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
            UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
            UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+           DELETE FROM artifact_publications WHERE publication_id='publication-completion';
            INSERT INTO step_executions(attempt_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,attempt_number,revision,state,outcome_certainty,input_artifacts_json,output_artifacts_json,created_at,updated_at) VALUES ('attempt-later','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-later',1,1,'PENDING','NOT_STARTED','[]','[]','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
     ).unwrap();
     let result = manager
@@ -4574,7 +5339,17 @@ fn verifying_requires_exact_durable_candidate_outputs_for_every_active_port() {
                 [],
             )
             .unwrap();
-        manager.connection.execute_batch(mutation).unwrap();
+        if name == "missing-artifact" {
+            manager
+                .connection
+                .execute(
+                    "DELETE FROM task_artifacts WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute_batch(mutation).unwrap();
+        }
         let result = manager
             .transition(&request(
                 &format!("tr-verifying-output-{name}"),
@@ -4659,7 +5434,7 @@ fn locked_store_identity_rejects_path_retarget_before_connection_use() {
     let path = directory.path().join("identity.sqlite3");
     let original = directory.path().join("original.sqlite3");
     assert!(
-        open_locked_store(&path, Box::new(FixedClock), |locked_path| {
+        open_locked_store(&path, Box::new(FixedClock), Vec::new(), |locked_path| {
             std::fs::rename(locked_path, &original).unwrap();
             OpenOptions::new()
                 .create(true)
@@ -4697,6 +5472,52 @@ fn locked_store_identity_checks_sqlite_main_after_path_swap_back() {
     std::fs::remove_file(&path).unwrap();
     symlink(&original, &path).unwrap();
     assert!(verify_locked_store_identity(&connection, &lock).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_store_identity_rejects_replacement_with_preserved_creation_time() {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.sqlite3");
+    let displaced = directory.path().join("identity-original.sqlite3");
+    std::fs::write(&path, b"original").unwrap();
+    let original_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let original_creation_time = original_file.metadata().unwrap().creation_time();
+    let original_identity = store_identity(&path, &original_file).unwrap();
+    drop(original_file);
+
+    std::fs::rename(&path, &displaced).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let creation_time_argument = original_creation_time.to_string();
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($path,$ticks) [System.IO.File]::SetCreationTimeUtc($path,[DateTime]::FromFileTimeUtc([Int64]$ticks)) }",
+            path.to_str().unwrap(),
+            &creation_time_argument,
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let replacement_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        replacement_file.metadata().unwrap().creation_time(),
+        original_creation_time
+    );
+    let replacement_identity = store_identity(&path, &replacement_file).unwrap();
+    assert_ne!(original_identity, replacement_identity);
 }
 
 #[test]
@@ -4840,6 +5661,203 @@ fn upgraded_recovery_basis_is_backfilled_and_trigger_enforced() {
 }
 
 #[test]
+fn artifact_writer_admission_columns_are_added_by_the_ordered_migration() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("writer-admission-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE artifact_output_allocations DROP COLUMN writer_grant_one_shot_consumed;
+             ALTER TABLE artifact_output_allocations DROP COLUMN writer_grant_id;
+             DELETE FROM schema_migrations WHERE migration_id='0006_artifact_writer_admission';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_grant_id"
+        )
+        .unwrap()
+    );
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_grant_one_shot_consumed"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE migration_id='0006_artifact_writer_admission'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "artifact-writer-admission-v0.1"
+    );
+}
+
+#[test]
+fn artifact_writer_session_fencing_columns_are_added_by_the_ordered_migration() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("writer-session-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE artifact_output_allocations DROP COLUMN writer_session_id;
+             ALTER TABLE artifact_output_allocations DROP COLUMN writer_generation;
+             DELETE FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_session_id"
+        )
+        .unwrap()
+    );
+    assert!(
+        table_has_column(
+            &manager.connection,
+            "artifact_output_allocations",
+            "writer_generation"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "artifact-writer-session-fencing-v0.1"
+    );
+}
+
+#[test]
+fn export_reconciliation_challenge_migration_is_ordered_and_fail_closed() {
+    let directory = tempdir().unwrap();
+    let upgrade = directory.path().join("challenge-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&upgrade, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&upgrade).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE artifact_export_reconciliation_challenges;
+             DELETE FROM schema_migrations
+             WHERE migration_id='0008_artifact_export_reconciliation_challenge';",
+        )
+        .unwrap();
+    drop(connection);
+    let manager = TaskManager::open_with_clock(&upgrade, Box::new(FixedClock)).unwrap();
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='artifact_export_reconciliation_challenges') || ':' ||
+                        (SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0008_artifact_export_reconciliation_challenge' AND checksum='artifact-export-reconciliation-challenge-v0.1')",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1:1"
+    );
+    drop(manager);
+
+    let stamped = directory.path().join("challenge-stamped-missing.sqlite3");
+    drop(TaskManager::open_with_clock(&stamped, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&stamped).unwrap();
+    connection
+        .execute_batch("DROP TABLE artifact_export_reconciliation_challenges;")
+        .unwrap();
+    drop(connection);
+    assert!(TaskManager::open_with_clock(&stamped, Box::new(FixedClock)).is_err());
+
+    let base_upgrade = directory.path().join("challenge-base-upgrade.sqlite3");
+    drop(TaskManager::open_with_clock(&base_upgrade, Box::new(FixedClock)).unwrap());
+    let connection = Connection::open(&base_upgrade).unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         DROP TABLE artifact_export_reconciliation_challenges;
+         DROP TABLE operations;
+         CREATE TABLE operations (
+             operation_id TEXT PRIMARY KEY,
+             task_id TEXT NOT NULL,
+             semantic_program_hash TEXT NOT NULL,
+             node_id TEXT NOT NULL,
+             binding_id TEXT,
+             attempt_id TEXT,
+             transaction_class TEXT,
+             effect_class TEXT NOT NULL,
+             idempotency_key TEXT,
+             state TEXT NOT NULL,
+             outcome_certainty TEXT,
+             external_receipt TEXT,
+             details_json TEXT,
+             prepared_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT
+         );
+         CREATE TABLE artifact_export_reconciliation_challenges (
+             operation_id TEXT PRIMARY KEY,
+             recovery_assessment_id TEXT NOT NULL,
+             subject_hash TEXT NOT NULL,
+             challenge TEXT NOT NULL UNIQUE,
+             issued_at TEXT NOT NULL,
+             FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+             FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+         );
+         DELETE FROM schema_migrations
+          WHERE migration_id IN ('0007_artifact_owner_export_context','0008_artifact_export_reconciliation_challenge');",
+    ).unwrap();
+    drop(connection);
+
+    let upgraded = TaskManager::open_with_clock(&base_upgrade, Box::new(FixedClock)).unwrap();
+    let foreign_targets = {
+        let mut statement = upgraded
+            .connection
+            .prepare("PRAGMA foreign_key_list(artifact_export_reconciliation_challenges)")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap();
+        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+    };
+    assert!(foreign_targets.iter().any(|target| target == "operations"));
+    assert!(
+        !foreign_targets
+            .iter()
+            .any(|target| target == "operations_legacy")
+    );
+    assert_eq!(
+        upgraded
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn proposed_active_steps_scope_initial_waiting_for_auth_lookup() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
@@ -4876,7 +5894,7 @@ fn completion_authenticates_verification_event_row_and_chain() {
         .transition(&completion_request("tr-verification-row-forged"))
         .unwrap();
     assert!(!result.applied);
-    assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED");
+    assert_eq!(result.reason_code, "TASK_UNKNOWN_EXTERNAL_OUTCOME");
 }
 
 #[test]
@@ -5123,13 +6141,19 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
 fn completion_checks_semantic_types_and_the_current_provenance_head() {
     let mut wrong_type = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut wrong_type, HASH, &["artifact-output"], "COMMITTED");
-    wrong_type.connection.execute("UPDATE artifacts SET semantic_type='artifact.wrong@1' WHERE artifact_id='artifact-output'", []).unwrap();
+    wrong_type
+        .connection
+        .execute(
+            "UPDATE artifacts SET semantic_type='artifact.wrong@1' WHERE artifact_id=?1",
+            [COMPLETION_ARTIFACT_ID],
+        )
+        .unwrap();
     assert_eq!(
         wrong_type
             .transition(&completion_request("tr-wrong-semantic-type"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 
     let mut corrupt_suffix = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -5146,7 +6170,7 @@ fn completion_checks_semantic_types_and_the_current_provenance_head() {
             .transition(&completion_request("tr-corrupt-suffix"))
             .unwrap()
             .reason_code,
-        "TASK_COMPLETION_GATE_FAILED"
+        "TASK_UNKNOWN_EXTERNAL_OUTCOME"
     );
 }
 
@@ -5430,7 +6454,8 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
                 "DROP TRIGGER execution_bindings_no_update;
                  UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
                  UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-                 UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+                 UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+                 DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
             )
             .unwrap();
         match tamper {
@@ -5528,7 +6553,8 @@ fn prepare_completion_for_admission(manager: &TaskManager) {
         .execute_batch(
             "UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
-             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';",
+             UPDATE artifact_output_allocations SET state='ALLOCATED', publication_id=NULL, published_artifact_id=NULL WHERE allocation_id='allocation-completion';
+             DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         )
         .unwrap();
 }
@@ -5862,26 +6888,31 @@ fn failure_code_must_match_machine_reason_code_pattern() {
 
 #[test]
 fn completion_enforces_every_output_allocation_constraint() {
-    for (name, mutation) in [
+    for (name, mutation, expected_reason) in [
         (
             "max-size",
             "UPDATE artifact_output_allocations SET max_size_bytes=41 WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "media-type",
             "UPDATE artifact_output_allocations SET allowed_media_types_json='[\"text/plain\"]' WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "malformed-media-types",
             "UPDATE artifact_output_allocations SET allowed_media_types_json='{}' WHERE allocation_id='allocation-completion'",
+            "TASK_COMPLETION_GATE_FAILED",
         ),
         (
             "sensitivity",
             "UPDATE artifact_output_allocations SET sensitivity='secret' WHERE allocation_id='allocation-completion'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
         (
             "retention",
             "UPDATE artifact_output_allocations SET retention='persistent' WHERE allocation_id='allocation-completion'",
+            "TASK_UNKNOWN_EXTERNAL_OUTCOME",
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -5890,7 +6921,7 @@ fn completion_enforces_every_output_allocation_constraint() {
         let result = manager
             .transition(&completion_request(&format!("tr-allocation-{name}")))
             .unwrap();
-        assert_eq!(result.reason_code, "TASK_COMPLETION_GATE_FAILED", "{name}");
+        assert_eq!(result.reason_code, expected_reason, "{name}");
         assert_eq!(
             manager.get_task("T-completion").unwrap().unwrap().state,
             TaskState::Verifying
@@ -6155,9 +7186,32 @@ fn reconciled_aborted_revoked_and_denied_subjects_keep_failure_dispositions() {
     manager
         .persist_recovery_inventory(&recovery_ref, "T-completion", 2, &inventory, TEST_TIME)
         .unwrap();
+    let publication_request: crate::artifact_store::ArtifactPublicationRequest = manager
+        .connection
+        .query_row(
+            "SELECT request_json FROM artifact_publications
+             WHERE publication_id='publication-completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    manager
+        .connection
+        .execute_batch(
+            "UPDATE artifact_output_allocations
+             SET state='WRITING',published_artifact_id=NULL
+             WHERE allocation_id='allocation-completion';
+             UPDATE artifact_publications
+             SET artifact_id=NULL,content_hash=NULL
+             WHERE publication_id='publication-completion';",
+        )
+        .unwrap();
+    manager
+        .abort_pending_publication(&publication_request)
+        .unwrap();
     manager.connection.execute_batch(
-        "UPDATE artifact_publications SET state='ABORTED' WHERE publication_id='publication-completion';
-         UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T00:00:00Z' WHERE grant_id='grant-recovery';",
+        "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T00:00:00Z' WHERE grant_id='grant-recovery';",
     ).unwrap();
     let denied_result = canonical_json(&serde_json::json!({
         "schema_version":SCHEMA_VERSION,
@@ -6230,7 +7284,7 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
         (
             "missing-blob",
             "UPDATE artifact_blobs SET durability_state='MISSING'
-             WHERE content_hash='sha256:artifact-output'",
+             WHERE content_hash='sha256:4444444444444444444444444444444444444444444444444444444444444444'",
         ),
         (
             "unverified-artifact",
@@ -6263,7 +7317,17 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                 "valid:{name}"
             );
         }
-        manager.connection.execute(mutation, []).unwrap();
+        if name == "unverified-artifact" {
+            manager
+                .connection
+                .execute(
+                    "UPDATE artifacts SET integrity_state='failed' WHERE artifact_id=?1",
+                    [COMPLETION_ARTIFACT_ID],
+                )
+                .unwrap();
+        } else {
+            manager.connection.execute(mutation, []).unwrap();
+        }
         let transaction = manager.connection.transaction().unwrap();
         assert!(
             resolved_recovery_subject(
@@ -6276,12 +7340,15 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
             "{name}"
         );
     }
+}
 
+#[test]
+fn committed_publication_recovery_rejects_rogue_allocation_alias() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     manager
         .connection
-        .execute_batch(
+        .execute_batch(&format!(
             "INSERT INTO artifact_output_allocations (
                  allocation_id, task_id, semantic_program_hash, node_id,
                  binding_id, attempt_id, output_port, expected_semantic_type,
@@ -6292,7 +7359,7 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                  'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50',
                  'node-completion', 'binding-completion', 'attempt-completion',
                  'rogue', 'artifact.report@1', 'local', 'task', 'PUBLISHED',
-                 'publication-rogue', 'artifact-output',
+                 'publication-rogue', '{COMPLETION_ARTIFACT_ID}',
                  '2026-09-19T00:00:00Z', '2026-09-20T00:00:00Z'
              );
              INSERT INTO artifact_publications (
@@ -6300,10 +7367,10 @@ fn committed_publication_recovery_requires_full_allocation_artifact_and_blob_pro
                  request_json, state, requested_at, committed_at
              ) VALUES (
                  'publication-rogue', 'allocation-rogue', 'T-completion',
-                 'artifact-output', 'sha256:artifact-output', '{}', 'COMMITTED',
+                 '{COMPLETION_ARTIFACT_ID}', 'sha256:4444444444444444444444444444444444444444444444444444444444444444', '{{}}', 'COMMITTED',
                  '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z'
-             );",
-        )
+             );"
+        ))
         .unwrap();
     let transaction = manager.connection.transaction().unwrap();
     assert!(

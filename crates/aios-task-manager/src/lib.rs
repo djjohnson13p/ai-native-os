@@ -12,11 +12,26 @@
     )
 )]
 
+mod artifact_store;
+
+pub use artifact_store::{
+    ArtifactAllocationState, ArtifactExpectedState, ArtifactExportDestination,
+    ArtifactExportOutcomeVerifier, ArtifactExportReconciliationSubject, ArtifactExportWriter,
+    ArtifactHandle, ArtifactIntegrity, ArtifactIntegrityState, ArtifactLineage, ArtifactOrigin,
+    ArtifactOriginKind, ArtifactOutputAllocation, ArtifactPublicationRequest,
+    ArtifactPublicationResult, ArtifactReadScope, ArtifactReader, ArtifactReconciliationFinding,
+    ArtifactReconciliationKind, ArtifactReconciliationReport, ArtifactRetention,
+    ArtifactStagingWriter, ArtifactUri, ContentHash, ImportArtifactRequest,
+    OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
+    VerifiedArtifactExportNoEffect,
+};
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -44,7 +59,7 @@ impl fmt::Display for TaskManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => write!(formatter, "task storage failure: {error}"),
-            Self::Io(error) => write!(formatter, "task store ownership failure: {error}"),
+            Self::Io(error) => write!(formatter, "task store I/O failure: {error}"),
             Self::Serialization(error) => write!(formatter, "task serialization failure: {error}"),
             Self::Canonicalization(error) => {
                 write!(formatter, "provenance canonicalization failure: {error}")
@@ -432,10 +447,21 @@ pub struct StepExecutionRecord {
 
 pub struct TaskManager {
     connection: Connection,
-    clock: Box<dyn Clock>,
+    clock: Arc<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
-    _store_lock: Option<StoreLock>,
+    artifact_scope_issuer: String,
+    database_locator: DatabaseLocator,
+    artifact_store_root: PathBuf,
+    artifact_store_dir: cap_std::fs::Dir,
+    store_lock: Option<StoreLock>,
+    artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
+    artifact_export_verifiers:
+        BTreeMap<String, Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
+    /// Reader admissions returned by this live process but not yet durably marked delivered.
+    /// Persisted pending admissions can be rehydrated after process loss without allowing two
+    /// simultaneous handles in one manager lifetime.
+    delivered_reader_admissions: Arc<Mutex<BTreeSet<String>>>,
 }
 
 pub trait Clock: Send + Sync {
@@ -453,12 +479,13 @@ impl Clock for SystemClock {
 }
 
 struct StoreLock {
-    _database_file: File,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    database_file: File,
     _lock_file: File,
     identity: StoreIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct StoreIdentity {
     canonical_path: PathBuf,
     #[cfg(unix)]
@@ -466,10 +493,50 @@ struct StoreIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    creation_time: u64,
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl PartialEq for StoreIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number == other.volume_serial_number
+                && self.file_index == other.file_index
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.canonical_path == other.canonical_path
+        }
+    }
+}
+
+impl Eq for StoreIdentity {}
+
+impl StoreIdentity {
+    fn persistent_key(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("unix:{}:{}", self.device, self.inode)
+        }
+        #[cfg(windows)]
+        {
+            format!("windows:{}:{}", self.volume_serial_number, self.file_index)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("path:{}", self.canonical_path.display())
+        }
+    }
 }
 
 fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
+    #[cfg(not(windows))]
     let metadata = file.metadata()?;
     #[cfg(unix)]
     {
@@ -482,10 +549,11 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        let information = winx::winapi_util::file::information(file)?;
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
-            creation_time: metadata.creation_time(),
+            volume_serial_number: information.volume_serial_number(),
+            file_index: information.file_index(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -494,6 +562,26 @@ fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
         Ok(StoreIdentity {
             canonical_path: path.canonicalize()?,
         })
+    }
+}
+
+#[derive(Clone)]
+enum DatabaseLocator {
+    File(PathBuf),
+    SharedMemory(String),
+}
+
+impl DatabaseLocator {
+    fn open(&self) -> rusqlite::Result<Connection> {
+        match self {
+            Self::File(path) => Connection::open(path),
+            Self::SharedMemory(uri) => Connection::open_with_flags(
+                uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            ),
+        }
     }
 }
 
@@ -525,7 +613,7 @@ fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
         .open(lock_path)?;
     file.try_lock_exclusive()?;
     Ok(StoreLock {
-        _database_file: database_file,
+        database_file,
         _lock_file: file,
         identity,
     })
@@ -552,7 +640,12 @@ fn verify_locked_store_identity(connection: &Connection, lock: &StoreLock) -> Re
     Ok(())
 }
 
-fn open_locked_store<F>(path: &Path, clock: Box<dyn Clock>, after_lock: F) -> Result<TaskManager>
+fn open_locked_store<F>(
+    path: &Path,
+    clock: Box<dyn Clock>,
+    export_verifiers: Vec<Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
+    after_lock: F,
+) -> Result<TaskManager>
 where
     F: FnOnce(&Path),
 {
@@ -560,7 +653,25 @@ where
     after_lock(path);
     let connection = Connection::open(path)?;
     verify_locked_store_identity(&connection, &lock)?;
-    TaskManager::initialize(connection, clock, Some(lock))
+    TaskManager::initialize(
+        connection,
+        clock,
+        Some(lock),
+        DatabaseLocator::File(path.to_path_buf()),
+        export_verifiers,
+    )
+}
+
+/// Explicit trusted offline upgrade for the historical Windows creation-time Artifact-store
+/// binding. Ordinary open deliberately refuses that spoofable identity format.
+#[cfg(windows)]
+pub(crate) fn rebind_legacy_windows_artifact_store(path: &Path) -> Result<()> {
+    let lock = acquire_store_lock(path)?;
+    let mut connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    verify_locked_store_identity(&connection, &lock)?;
+    preflight_migration_state(&connection)?;
+    artifact_store::rebind_legacy_windows_root(&lock, &mut connection)
 }
 
 fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {
@@ -617,7 +728,7 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        open_locked_store(path, Box::new(SystemClock), |_| {})
+        open_locked_store(path, Box::new(SystemClock), Vec::new(), |_| {})
     }
 
     /// Opens an isolated in-memory store with the production clock.
@@ -625,7 +736,7 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when `SQLite` cannot initialize the schema.
     pub fn open_in_memory() -> Result<Self> {
-        Self::initialize(Connection::open_in_memory()?, Box::new(SystemClock), None)
+        Self::open_shared_memory(Box::new(SystemClock))
     }
 
     /// Opens a store with an injected trusted clock.
@@ -634,7 +745,36 @@ impl TaskManager {
     /// Returns an error when `SQLite` cannot open or initialize the schema.
     pub fn open_with_clock(path: impl AsRef<Path>, clock: Box<dyn Clock>) -> Result<Self> {
         let path = path.as_ref();
-        open_locked_store(path, clock, |_| {})
+        open_locked_store(path, clock, Vec::new(), |_| {})
+    }
+
+    /// Opens a store with an immutable set of trusted destination-status adapters.
+    ///
+    /// The adapters are fixed for the manager lifetime. Provider-facing methods cannot add,
+    /// replace, or select them when resolving an unknown export.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot open, an adapter identity is invalid, or two
+    /// adapters claim the same destination class.
+    pub fn open_with_export_verifiers(
+        path: impl AsRef<Path>,
+        verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        open_locked_store(path, Box::new(SystemClock), verifiers, |_| {})
+    }
+
+    /// Opens a store with an injected trusted clock and immutable export verifiers.
+    ///
+    /// # Errors
+    /// Returns an error when the store or verifier registry is invalid.
+    pub fn open_with_clock_and_export_verifiers(
+        path: impl AsRef<Path>,
+        clock: Box<dyn Clock>,
+        verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        open_locked_store(path, clock, verifiers, |_| {})
     }
 
     /// Opens an in-memory store with an injected trusted clock.
@@ -642,13 +782,24 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when `SQLite` cannot initialize the schema.
     pub fn open_in_memory_with_clock(clock: Box<dyn Clock>) -> Result<Self> {
-        Self::initialize(Connection::open_in_memory()?, clock, None)
+        Self::open_shared_memory(clock)
+    }
+
+    fn open_shared_memory(clock: Box<dyn Clock>) -> Result<Self> {
+        static NEXT_MEMORY_STORE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let sequence = NEXT_MEMORY_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let uri = format!("file:aios-task-manager-{sequence}?mode=memory&cache=shared");
+        let locator = DatabaseLocator::SharedMemory(uri.clone());
+        Self::initialize(locator.open()?, clock, None, locator, Vec::new())
     }
 
     fn initialize(
-        connection: Connection,
+        mut connection: Connection,
         clock: Box<dyn Clock>,
         store_lock: Option<StoreLock>,
+        database_locator: DatabaseLocator,
+        export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_migration_state(&connection)?;
@@ -660,17 +811,54 @@ impl TaskManager {
                 acquired_at TEXT NOT NULL
             );",
         )?;
+        let clock: Arc<dyn Clock> = Arc::from(clock);
         let acquired_at = clock.now();
         let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
+        let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
+            artifact_store::initialize_root(store_lock.as_ref(), &mut connection)?;
+        let artifact_scope_issuer =
+            connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
+        let mut artifact_export_verifiers = BTreeMap::new();
+        for verifier in export_verifiers {
+            artifact_store::validate_id(
+                verifier.verifier_id(),
+                256,
+                "invalid Artifact export reconciliation verifier",
+            )?;
+            artifact_store::validate_id(
+                verifier.destination_class(),
+                256,
+                "invalid Artifact export reconciliation destination class",
+            )?;
+            if artifact_export_verifiers
+                .insert(verifier.destination_class().to_owned(), verifier)
+                .is_some()
+            {
+                return Err(TaskManagerError::InvalidRecord(
+                    "duplicate Artifact export reconciliation destination adapter",
+                ));
+            }
+        }
         let mut manager = Self {
             connection,
             clock,
             lease_owner,
             lease_epoch,
-            _store_lock: store_lock,
+            artifact_scope_issuer,
+            database_locator,
+            artifact_store_root,
+            artifact_store_dir,
+            store_lock,
+            artifact_store_cleanup,
+            artifact_export_verifiers,
+            delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
         };
+        manager.verify_all_provenance_chains()?;
+        manager.migrate_legacy_keyed_import_receipts()?;
+        manager.reconcile_export_operations_startup()?;
+        manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
         Ok(manager)
     }
@@ -1132,6 +1320,10 @@ impl TaskManager {
     /// # Errors
     /// Returns an error when durable state cannot be read or a recovery
     /// transition cannot be committed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps nonterminal recovery transitions and immutable terminal recovery reporting in one startup scan"
+    )]
     pub(crate) fn recover_startup(&mut self) -> Result<Vec<TransitionResult>> {
         self.verify_nonterminal_heads()?;
         let candidates = {
@@ -1148,6 +1340,7 @@ impl TaskManager {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut results = Vec::with_capacity(candidates.len());
+        let mut newly_recovered = std::collections::BTreeSet::new();
         for (task_id, revision, state) in candidates {
             let revision = u64::try_from(revision)
                 .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
@@ -1210,9 +1403,177 @@ impl TaskManager {
                     "startup recovery transition was not applied",
                 ));
             }
+            newly_recovered.insert(result.task_id.clone());
             results.push(result);
         }
+        // Terminal state is immutable, but new consequential evidence may be
+        // discovered during startup Artifact/export reconciliation. Persist a
+        // deterministic recovery inventory for reporting and subject-level
+        // reconciliation without fabricating a terminal -> RECOVERING edge.
+        let terminal_tasks = {
+            let mut statement = self.connection.prepare(
+                "SELECT task_id,revision FROM tasks
+                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','ROLLED_BACK')
+                 ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (task_id, revision) in terminal_tasks {
+            let revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let inventory = unresolved_execution_ids(&self.connection, &task_id)?;
+            if inventory.is_empty() {
+                continue;
+            }
+            let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
+            self.persist_recovery_inventory(
+                &recovery_ref,
+                &task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+            )?;
+        }
+        // Artifact reconciliation runs before this scan and can discover a
+        // consequential subject after a Task has already entered RECOVERING.
+        // Persist a fresh immutable monotonic inventory for the current recovery
+        // episode. The Task's recovery-entry transition remains the lifecycle
+        // authority; active_recovery_inventory resolves later supersets.
+        let recovering_tasks = {
+            let mut statement = self.connection.prepare(
+                "SELECT task_id,revision,json_extract(recovery_json,'$.unknown_operations_ref')
+                 FROM tasks WHERE state='RECOVERING' ORDER BY task_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (task_id, revision, _active_recovery_ref) in recovering_tasks {
+            if newly_recovered.contains(&task_id) {
+                continue;
+            }
+            let revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let current = unresolved_execution_ids(&self.connection, &task_id)?;
+            if current.is_empty() {
+                continue;
+            }
+            let Some(active) = active_recovery_inventory(&self.connection, &task_id)? else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "active recovery inventory does not exist",
+                ));
+            };
+            let mut inventory = active.operation_ids.clone();
+            inventory.extend(current);
+            inventory.sort();
+            inventory.dedup();
+            if inventory == active.operation_ids {
+                continue;
+            }
+            let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory)?;
+            self.persist_recovery_inventory_in_existing_episode(
+                &recovery_ref,
+                &task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+                &active.recovery_ref,
+            )?;
+        }
         Ok(results)
+    }
+
+    /// Persists immutable recovery reporting for newly discovered consequential evidence on a
+    /// terminal Task without changing its lifecycle state.
+    pub(crate) fn persist_terminal_recovery_inventory_for_task(
+        &mut self,
+        task_id: &str,
+    ) -> Result<String> {
+        let state = self.connection.query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [task_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if !matches!(
+            state.as_str(),
+            "COMPLETED" | "FAILED" | "CANCELLED" | "ROLLED_BACK"
+        ) {
+            return Err(TaskManagerError::InvalidRecord(
+                "terminal recovery inventory requires a terminal Task",
+            ));
+        }
+        self.persist_recovery_inventory_for_task(task_id)
+    }
+
+    pub(crate) fn persist_recovery_inventory_for_task(&mut self, task_id: &str) -> Result<String> {
+        let (revision, state, _active_recovery_ref) = self
+            .connection
+            .query_row(
+                "SELECT revision,state,json_extract(recovery_json,'$.unknown_operations_ref')
+                 FROM tasks WHERE task_id=?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "terminal recovery Task does not exist",
+            ))?;
+        let revision = u64::try_from(revision)
+            .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+        let current = unresolved_execution_ids(&self.connection, task_id)?;
+        if current.is_empty() {
+            return Err(TaskManagerError::InvalidRecord(
+                "recovery inventory requires consequential evidence",
+            ));
+        }
+        let mut inventory = current;
+        let mut episode_ref = None;
+        if state == "RECOVERING" {
+            let active = active_recovery_inventory(&self.connection, task_id)?.ok_or(
+                TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+            )?;
+            inventory.extend(active.operation_ids.iter().cloned());
+            inventory.sort();
+            inventory.dedup();
+            if inventory == active.operation_ids {
+                return Ok(active.recovery_ref);
+            }
+            episode_ref = Some(active.recovery_ref);
+        }
+        let recovery_ref = recovery_operations_ref(task_id, revision, &inventory)?;
+        if let Some(episode_ref) = episode_ref {
+            self.persist_recovery_inventory_in_existing_episode(
+                &recovery_ref,
+                task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+                &episode_ref,
+            )?;
+        } else {
+            self.persist_recovery_inventory(
+                &recovery_ref,
+                task_id,
+                revision,
+                &inventory,
+                &self.clock.now(),
+            )?;
+        }
+        Ok(recovery_ref)
     }
 
     /// Performs a trusted, evidence-derived live reconciliation handoff.
@@ -1303,29 +1664,13 @@ impl TaskManager {
         &self,
         recovery_ref: &str,
     ) -> Result<Option<Vec<String>>> {
-        let basis = self
-            .connection
-            .query_row(
-                "SELECT task_id, basis_revision FROM recovery_assessments WHERE assessment_id = ?1 AND subject_kind = 'task'",
-                [recovery_ref],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            ).optional()?;
-        let Some((task_id, basis_revision)) = basis else {
-            return Ok(None);
-        };
-        let operations = query_strings(
-            &self.connection,
-            "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
-            recovery_ref,
-        )?;
-        let basis_revision = u64::try_from(basis_revision)
-            .map_err(|_| TaskManagerError::InvalidRecord("recovery basis revision is invalid"))?;
-        if recovery_operations_ref(&task_id, basis_revision, &operations)? != recovery_ref {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery inventory digest does not match its durable contents",
-            ));
-        }
-        Ok(Some(operations))
+        Ok(exact_recovery_inventory(&self.connection, recovery_ref)?
+            .map(|inventory| inventory.operation_ids))
+    }
+
+    pub(crate) fn active_recovery_inventory_ref(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(active_recovery_inventory(&self.connection, task_id)?
+            .map(|inventory| inventory.recovery_ref))
     }
 
     /// Records a trusted recovery observation for one historically inventoried
@@ -1346,123 +1691,23 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let (task_id, epoch_id) = transaction
-            .query_row(
-                "SELECT task_id, recovery_epoch_id FROM recovery_assessments WHERE assessment_id=?1 AND subject_kind='task'",
-                [recovery_ref],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .ok_or(TaskManagerError::InvalidRecord(
-                "recovery reference does not exist",
-            ))?;
-        let inventoried = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
-            params![recovery_ref, inventory_id],
-            |row| row.get::<_, bool>(0),
+        let requested = exact_recovery_inventory(&transaction, recovery_ref)?.ok_or(
+            TaskManagerError::InvalidRecord("recovery inventory does not exist"),
         )?;
-        let resolution = resolved_recovery_subject(&transaction, &task_id, inventory_id)?;
-        let Some(resolution) = resolution.filter(|_| inventoried) else {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery subject lacks a safe durable outcome",
-            ));
-        };
-        let rows = {
-            let mut statement = transaction.prepare(
-                "SELECT assessment_id, subject_kind, subject_id, basis_revision, created_at FROM recovery_assessments WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'",
-            )?;
-            let rows = statement.query_map(params![task_id, epoch_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let Some((assessment_id, subject_kind, subject_id, basis_revision, created_at)) =
-            rows.into_iter().find(|(_, kind, id, _, _)| {
-                recovery_subject_inventory_id(kind, id).as_deref() == Some(inventory_id)
+        let recovery_ref = active_recovery_inventory(&transaction, &requested.task_id)?
+            .filter(|active| {
+                active.recovery_epoch_id == requested.recovery_epoch_id
+                    && requested
+                        .operation_ids
+                        .iter()
+                        .all(|id| active.operation_ids.contains(id))
             })
-        else {
-            return Err(TaskManagerError::InvalidRecord(
-                "recovery subject assessment is missing",
-            ));
-        };
-        let event_id = recovery_resolution_event_id(recovery_ref, inventory_id);
-        let existing_event = transaction
-            .query_row(
-                "SELECT event_json, timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
-                params![task_id, event_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let event_timestamp = existing_event
-            .as_ref()
-            .map_or(observed_at.as_str(), |(_, timestamp)| timestamp.as_str())
-            .to_owned();
-        let event = json!({
-            "schema_version": SCHEMA_VERSION,
-            "event_id": event_id,
-            "task_id": task_id,
-            "event_type": "execution.completed",
-            "timestamp": event_timestamp,
-            "actor": {"kind":"system-service","id":"service:recovery"},
-            "status": resolution.event_status,
-            "details": {
-                "recovery_ref":recovery_ref,
-                "inventory_id":inventory_id,
-                "certainty":resolution.certainty,
-                "safe_action":resolution.safe_action,
-                "reason_code":resolution.reason_code
-            }
-        });
-        let resolution_event_id = if let Some((stored, _)) = existing_event {
-            let stored: Value = serde_json::from_str(&stored)?;
-            if stored != event || !verify_provenance_through(&transaction, &task_id, None)? {
-                return Err(TaskManagerError::InvalidRecord(
-                    "recovery resolution event identity conflicts with durable provenance",
-                ));
-            }
-            event_id
-        } else {
-            append_event(&transaction, &task_id, &event)?.event_id
-        };
-        if let Some(operation_id) = inventory_id.strip_prefix("operation:") {
-            let terminal_state = match resolution.certainty.as_str() {
-                "NOT_STARTED" => Some("CANCELLED"),
-                "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
-                "COMPLETED" => Some("SUCCEEDED"),
-                _ => None,
-            };
-            if let Some(terminal_state) = terminal_state {
-                transaction.execute(
-                    "UPDATE operations SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5) WHERE task_id=?1 AND operation_id=?2",
-                    params![task_id, operation_id, terminal_state, resolution.certainty, event_timestamp],
-                )?;
-            }
-        }
-        let new_binding_required = resolution.safe_action == "CREATE_NEW_ATTEMPT";
-        let assessment = canonical_json(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "assessment_id": assessment_id,
-            "recovery_epoch_id": epoch_id,
-            "task_id": task_id,
-            "subject": {"kind":subject_kind,"id":subject_id},
-            "certainty":resolution.certainty,
-            "evidence":[{"kind":"provenance","ref":resolution_event_id,"observation":"trusted durable recovery observation"}],
-            "safe_action":resolution.safe_action,
-            "new_binding_required":new_binding_required,
-            "external_reconciliation_required":false,
-            "reason_codes":[resolution.reason_code],
-            "created_at":created_at
-        }))?;
-        let reason_codes_json = serde_json::to_string(&[resolution.reason_code])?;
-        transaction.execute(
-            "UPDATE recovery_assessments SET certainty=?2, safe_action=?3, reason_codes_json=?4, assessment_json=?5 WHERE assessment_id=?1 AND basis_revision=?6",
-            params![assessment_id, resolution.certainty, resolution.safe_action, reason_codes_json, assessment, basis_revision],
+            .map_or_else(|| recovery_ref.to_owned(), |active| active.recovery_ref);
+        reconcile_recovery_subject_in_transaction(
+            &transaction,
+            &recovery_ref,
+            inventory_id,
+            &observed_at,
         )?;
         transaction.commit()?;
         Ok(())
@@ -1485,7 +1730,79 @@ impl TaskManager {
                 "recovery reference does not authenticate its basis and inventory",
             ));
         }
-        let epoch_id = format!("epoch:{recovery_ref}");
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        Self::persist_recovery_inventory_in_transaction(
+            &transaction,
+            recovery_ref,
+            task_id,
+            basis_revision,
+            operation_ids,
+            created_at,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn persist_recovery_inventory_in_existing_episode(
+        &mut self,
+        recovery_ref: &str,
+        task_id: &str,
+        basis_revision: u64,
+        operation_ids: &[String],
+        created_at: &str,
+        episode_root_ref: &str,
+    ) -> Result<()> {
+        let epoch_id = self.connection.query_row(
+            "SELECT recovery_epoch_id FROM recovery_assessments
+             WHERE assessment_id=?1 AND task_id=?2 AND subject_kind='task'",
+            params![episode_root_ref, task_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        Self::persist_recovery_inventory_in_transaction(
+            &transaction,
+            recovery_ref,
+            task_id,
+            basis_revision,
+            operation_ids,
+            created_at,
+            Some(&epoch_id),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the recovery assessment and exact subject inventory in its caller's atomic transaction"
+    )]
+    fn persist_recovery_inventory_in_transaction(
+        transaction: &Transaction<'_>,
+        recovery_ref: &str,
+        task_id: &str,
+        basis_revision: u64,
+        operation_ids: &[String],
+        created_at: &str,
+        episode_epoch_id: Option<&str>,
+    ) -> Result<()> {
+        if recovery_operations_ref(task_id, basis_revision, operation_ids)? != recovery_ref {
+            return Err(TaskManagerError::InvalidRecord(
+                "recovery reference does not authenticate its basis and inventory",
+            ));
+        }
+        let default_epoch_id = format!("epoch:{recovery_ref}");
+        let epoch_id = episode_epoch_id.unwrap_or(&default_epoch_id);
         // An empty inventory is absence of evidence, not affirmative proof that
         // execution never started. The aggregate therefore remains conservative;
         // per-subject assessments below may record NOT_STARTED only from an
@@ -1498,26 +1815,48 @@ impl TaskManager {
         ];
         let external_reconciliation_required = true;
         let reason_codes_json = serde_json::to_string(&reason_codes)?;
-        let lease_owner = self.lease_owner.clone();
-        let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
         transaction.execute(
             "INSERT OR IGNORE INTO recovery_epochs (recovery_epoch_id, started_at) VALUES (?1, ?2)",
             params![epoch_id, created_at],
         )?;
-        for subject in load_recovery_subjects(&transaction, task_id)? {
+        let mut materialized_inventory = std::collections::BTreeSet::new();
+        for subject in load_recovery_subjects(transaction, task_id)? {
+            if let Some(inventory_id) = recovery_subject_inventory_id(subject.kind, &subject.id) {
+                materialized_inventory.insert(inventory_id);
+            }
             persist_recovery_subject_assessment(
-                &transaction,
+                transaction,
                 recovery_ref,
-                &epoch_id,
+                epoch_id,
                 task_id,
                 basis_revision,
                 &subject,
                 created_at,
             )?;
+        }
+        let mut carried_resolutions = Vec::new();
+        if episode_epoch_id.is_some() {
+            for inventory_id in operation_ids {
+                if !materialized_inventory.contains(inventory_id)
+                    && carry_forward_resolved_recovery_subject(
+                        transaction,
+                        recovery_ref,
+                        epoch_id,
+                        task_id,
+                        basis_revision,
+                        inventory_id,
+                        created_at,
+                    )?
+                {
+                    carried_resolutions.push(inventory_id.clone());
+                    materialized_inventory.insert(inventory_id.clone());
+                }
+            }
+            if materialized_inventory.len() != operation_ids.len() {
+                return Err(TaskManagerError::InvalidRecord(
+                    "recovery inventory lacks authenticated subject evidence",
+                ));
+            }
         }
         let existing = transaction
             .query_row(
@@ -1605,7 +1944,7 @@ impl TaskManager {
             ));
         }
         let stored_operations = query_strings(
-            &transaction,
+            transaction,
             "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
             recovery_ref,
         )?;
@@ -1614,7 +1953,14 @@ impl TaskManager {
                 "recovery reference resolves to a different operation inventory",
             ));
         }
-        transaction.commit()?;
+        for inventory_id in carried_resolutions {
+            reconcile_recovery_subject_in_transaction(
+                transaction,
+                recovery_ref,
+                &inventory_id,
+                created_at,
+            )?;
+        }
         Ok(())
     }
 
@@ -2198,6 +2544,24 @@ impl TaskManager {
         verify_provenance_through(&self.connection, task_id, None)
     }
 
+    fn verify_all_provenance_chains(&self) -> Result<()> {
+        let task_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT task_id FROM tasks ORDER BY task_id")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for task_id in task_ids {
+            if !verify_provenance_through(&self.connection, &task_id, None)? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Task provenance chain is missing or invalid before startup reconciliation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn transition_with_provenance_failure(
         &mut self,
@@ -2228,6 +2592,159 @@ struct ProvenanceRow {
     previous_event_hash: Option<String>,
     event_hash: String,
     event_json: String,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the authenticated resolution event, operation certainty, and subject assessment in one transaction"
+)]
+pub(crate) fn reconcile_recovery_subject_in_transaction(
+    transaction: &Transaction<'_>,
+    recovery_ref: &str,
+    inventory_id: &str,
+    observed_at: &str,
+) -> Result<()> {
+    let (task_id, epoch_id) = transaction
+        .query_row(
+            "SELECT task_id, recovery_epoch_id FROM recovery_assessments WHERE assessment_id=?1 AND subject_kind='task'",
+            [recovery_ref],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(TaskManagerError::InvalidRecord(
+            "recovery reference does not exist",
+        ))?;
+    let inventoried = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_unknown_operations WHERE assessment_id=?1 AND operation_id=?2)",
+        params![recovery_ref, inventory_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let resolution = resolved_recovery_subject(transaction, &task_id, inventory_id)?;
+    let Some(resolution) = resolution.filter(|_| inventoried) else {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery subject lacks a safe durable outcome",
+        ));
+    };
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT assessment_id, subject_kind, subject_id, basis_revision, created_at FROM recovery_assessments WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'",
+        )?;
+        let rows = statement.query_map(params![task_id, epoch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let Some((assessment_id, subject_kind, subject_id, basis_revision, created_at)) =
+        rows.into_iter().find(|(assessment_id, kind, id, _, _)| {
+            recovery_subject_inventory_id(kind, id).as_deref() == Some(inventory_id)
+                && recovery_subject_assessment_id(recovery_ref, kind, id) == *assessment_id
+        })
+    else {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery subject assessment is missing",
+        ));
+    };
+    let event_id = recovery_resolution_event_id(recovery_ref, inventory_id);
+    let existing_event = transaction
+        .query_row(
+            "SELECT event_json, timestamp FROM provenance_events WHERE task_id=?1 AND event_id=?2",
+            params![task_id, event_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let event_timestamp = existing_event
+        .as_ref()
+        .map_or(observed_at, |(_, timestamp)| timestamp.as_str())
+        .to_owned();
+    let event = json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": event_id,
+        "task_id": task_id,
+        "event_type": "execution.completed",
+        "timestamp": event_timestamp,
+        "actor": {"kind":"system-service","id":"service:recovery"},
+        "status": resolution.event_status,
+        "details": {
+            "recovery_ref":recovery_ref,
+            "inventory_id":inventory_id,
+            "certainty":resolution.certainty,
+            "safe_action":resolution.safe_action,
+            "reason_code":resolution.reason_code
+        }
+    });
+    let resolution_event_id = if let Some((stored, _)) = existing_event {
+        let stored: Value = serde_json::from_str(&stored)?;
+        if stored != event || !verify_provenance_through(transaction, &task_id, None)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "recovery resolution event identity conflicts with durable provenance",
+            ));
+        }
+        event_id
+    } else {
+        append_event(transaction, &task_id, &event)?.event_id
+    };
+    if let Some(operation_id) = inventory_id.strip_prefix("operation:") {
+        let terminal_state = match resolution.certainty.as_str() {
+            "NOT_STARTED" => Some("CANCELLED"),
+            "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
+            "COMPLETED" => Some("SUCCEEDED"),
+            _ => None,
+        };
+        if let Some(terminal_state) = terminal_state {
+            transaction.execute(
+                "UPDATE operations SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5) WHERE task_id=?1 AND operation_id=?2",
+                params![task_id, operation_id, terminal_state, resolution.certainty, event_timestamp],
+            )?;
+        }
+    }
+    if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
+        let terminal_state = match resolution.certainty.as_str() {
+            "COMPLETED" => Some("SUCCEEDED"),
+            "NOT_STARTED" | "STARTED_NO_EFFECT" | "FAILED_NO_EFFECT" => Some("FAILED"),
+            _ => None,
+        };
+        if let Some(terminal_state) = terminal_state {
+            let changed = transaction.execute(
+                "UPDATE step_executions
+                 SET state=?3,outcome_certainty=?4,finished_at=COALESCE(finished_at,?5),updated_at=?5
+                 WHERE task_id=?1 AND attempt_id=?2
+                   AND (outcome_certainty IS NULL OR outcome_certainty='OUTCOME_UNKNOWN' OR outcome_certainty=?4)",
+                params![task_id, attempt_id, terminal_state, resolution.certainty, event_timestamp],
+            )?;
+            if changed != 1 {
+                return Err(TaskManagerError::InvalidRecord(
+                    "attempt recovery evidence conflicts with durable step certainty",
+                ));
+            }
+        }
+    }
+    let new_binding_required = resolution.safe_action == "CREATE_NEW_ATTEMPT";
+    let assessment = canonical_json(&json!({
+        "schema_version": SCHEMA_VERSION,
+        "assessment_id": assessment_id,
+        "recovery_epoch_id": epoch_id,
+        "task_id": task_id,
+        "subject": {"kind":subject_kind,"id":subject_id},
+        "certainty":resolution.certainty,
+        "evidence":[{"kind":"provenance","ref":resolution_event_id,"observation":"trusted durable recovery observation"}],
+        "safe_action":resolution.safe_action,
+        "new_binding_required":new_binding_required,
+        "external_reconciliation_required":false,
+        "reason_codes":[resolution.reason_code],
+        "created_at":created_at
+    }))?;
+    let reason_codes_json = serde_json::to_string(&[resolution.reason_code])?;
+    transaction.execute(
+        "UPDATE recovery_assessments SET certainty=?2, safe_action=?3, reason_codes_json=?4, assessment_json=?5 WHERE assessment_id=?1 AND basis_revision=?6",
+        params![assessment_id, resolution.certainty, resolution.safe_action, reason_codes_json, assessment, basis_revision],
+    )?;
+    Ok(())
 }
 
 fn verify_provenance_through(
@@ -2659,6 +3176,116 @@ fn recovery_operations_ref(
     Ok(format!("recovery-operations:sha256:{hex}"))
 }
 
+#[derive(Debug, Clone)]
+struct RecoveryInventory {
+    recovery_ref: String,
+    recovery_epoch_id: String,
+    task_id: String,
+    operation_ids: Vec<String>,
+}
+
+fn exact_recovery_inventory(
+    connection: &Connection,
+    recovery_ref: &str,
+) -> Result<Option<RecoveryInventory>> {
+    let basis = connection
+        .query_row(
+            "SELECT recovery_epoch_id,task_id,basis_revision FROM recovery_assessments
+             WHERE assessment_id=?1 AND subject_kind='task'",
+            [recovery_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((recovery_epoch_id, task_id, basis_revision)) = basis else {
+        return Ok(None);
+    };
+    let basis_revision = u64::try_from(basis_revision)
+        .map_err(|_| TaskManagerError::InvalidRecord("recovery basis revision is invalid"))?;
+    let operation_ids = query_strings(
+        connection,
+        "SELECT operation_id FROM recovery_unknown_operations
+         WHERE assessment_id=?1 ORDER BY ordinal",
+        recovery_ref,
+    )?;
+    if recovery_operations_ref(&task_id, basis_revision, &operation_ids)? != recovery_ref {
+        return Err(TaskManagerError::InvalidRecord(
+            "recovery inventory digest does not match its durable contents",
+        ));
+    }
+    Ok(Some(RecoveryInventory {
+        recovery_ref: recovery_ref.to_owned(),
+        recovery_epoch_id,
+        task_id,
+        operation_ids,
+    }))
+}
+
+fn active_recovery_inventory(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<RecoveryInventory>> {
+    let root_ref = connection
+        .query_row(
+            "SELECT json_extract(recovery_json,'$.unknown_operations_ref')
+             FROM tasks WHERE task_id=?1 AND state='RECOVERING'",
+            [task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(root_ref) = root_ref else {
+        return Ok(None);
+    };
+    let mut selected = exact_recovery_inventory(connection, &root_ref)?.ok_or(
+        TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+    )?;
+    let root_set = selected
+        .operation_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT assessment_id FROM recovery_assessments
+             WHERE task_id=?1 AND subject_kind='task' AND recovery_epoch_id=?2
+             ORDER BY assessment_id",
+        )?;
+        let rows = statement.query_map(params![task_id, selected.recovery_epoch_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut selected_set = root_set.clone();
+    for candidate_ref in candidates {
+        let candidate = exact_recovery_inventory(connection, &candidate_ref)?.ok_or(
+            TaskManagerError::InvalidRecord("active recovery inventory does not exist"),
+        )?;
+        let candidate_set = candidate
+            .operation_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !root_set.is_subset(&candidate_set) {
+            continue;
+        }
+        if selected_set.is_subset(&candidate_set) {
+            selected = candidate;
+            selected_set = candidate_set;
+        } else if !candidate_set.is_subset(&selected_set) {
+            return Err(TaskManagerError::InvalidRecord(
+                "active recovery inventories are not monotonic",
+            ));
+        }
+    }
+    Ok(Some(selected))
+}
+
 fn startup_recovery_transition_id(task_id: &str, revision: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"AIOS-STARTUP-RECOVERY-TRANSITION\0v0.1\0");
@@ -2777,7 +3404,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -2805,6 +3432,36 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0004_task_manager_review_hardening",
         "task-manager-review-hardening-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0005_artifact_store_root_binding",
+        "artifact-store-root-binding-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0006_artifact_writer_admission",
+        "artifact-writer-admission-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0007_artifact_owner_export_context",
+        "artifact-owner-export-context-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0008_artifact_export_reconciliation_challenge",
+        "artifact-export-reconciliation-challenge-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0009_artifact_writer_session_fencing",
+        "artifact-writer-session-fencing-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0010_keyed_import_causal_receipts",
+        "keyed-import-causal-receipts-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -2882,6 +3539,72 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 ],
             )?;
         }
+        let has_v5 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0005_artifact_store_root_binding')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v5 {
+            require_migration_tables(connection, &["artifact_store_binding"])?;
+        }
+        let has_v6 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0006_artifact_writer_admission')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v6
+            && (!table_has_column(connection, "artifact_output_allocations", "writer_grant_id")?
+                || !table_has_column(
+                    connection,
+                    "artifact_output_allocations",
+                    "writer_grant_one_shot_consumed",
+                )?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "artifact writer admission migration is incomplete",
+            ));
+        }
+        let has_v7 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v7
+            && (table_column_not_null(connection, "operations", "semantic_program_hash")?
+                || table_column_not_null(connection, "operations", "node_id")?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact owner export context migration is incomplete",
+            ));
+        }
+        let has_v8 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0008_artifact_export_reconciliation_challenge')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v8 {
+            require_migration_tables(connection, &["artifact_export_reconciliation_challenges"])?;
+        }
+        let has_v9 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0009_artifact_writer_session_fencing')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v9
+            && (!table_has_column(
+                connection,
+                "artifact_output_allocations",
+                "writer_session_id",
+            )? || !table_has_column(
+                connection,
+                "artifact_output_allocations",
+                "writer_generation",
+            )?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "artifact writer session fencing migration is incomplete",
+            ));
+        }
     }
     let has_steps = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'step_executions')",
@@ -2942,13 +3665,57 @@ fn migrate_task_manager_schema(
         "0004_task_manager_review_hardening",
         "task-manager-review-hardening-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0005_artifact_store_root_binding",
+        "artifact-store-root-binding-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0006_artifact_writer_admission",
+        "artifact-writer-admission-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0007_artifact_owner_export_context",
+        "artifact-owner-export-context-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0008_artifact_export_reconciliation_challenge",
+        "artifact-export-reconciliation-challenge-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0009_artifact_writer_session_fencing",
+        "artifact-writer-session-fencing-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0010_keyed_import_causal_receipts",
+        "keyed-import-causal-receipts-v0.1",
+    )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
     };
+    let has_owner_export_context = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0007_artifact_owner_export_context')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let operations_require_rebuild = !has_owner_export_context
+        && (table_column_not_null(connection, "operations", "semantic_program_hash")?
+            || table_column_not_null(connection, "operations", "node_id")?);
+    let challenge_table_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_export_reconciliation_challenges')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let foreign_key_rebuild = transition_has_foreign_key || operations_require_rebuild;
     let foreign_keys_enabled =
         connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))?;
-    if transition_has_foreign_key {
+    if foreign_key_rebuild {
         connection.execute_batch("PRAGMA foreign_keys = OFF")?;
     }
     connection.execute_batch("BEGIN IMMEDIATE")?;
@@ -3039,6 +3806,96 @@ fn migrate_task_manager_schema(
             connection
                 .execute_batch("ALTER TABLE approval_decisions ADD COLUMN approved_until TEXT;")?;
         }
+        if !table_has_column(connection, "artifact_output_allocations", "writer_grant_id")? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_grant_id TEXT;",
+            )?;
+        }
+        if !table_has_column(
+            connection,
+            "artifact_output_allocations",
+            "writer_grant_one_shot_consumed",
+        )? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_grant_one_shot_consumed INTEGER CHECK (writer_grant_one_shot_consumed IS NULL OR writer_grant_one_shot_consumed IN (0, 1));",
+            )?;
+        }
+        if !table_has_column(
+            connection,
+            "artifact_output_allocations",
+            "writer_session_id",
+        )? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_session_id TEXT;",
+            )?;
+        }
+        if !table_has_column(
+            connection,
+            "artifact_output_allocations",
+            "writer_generation",
+        )? {
+            connection.execute_batch(
+                "ALTER TABLE artifact_output_allocations ADD COLUMN writer_generation INTEGER NOT NULL DEFAULT 0 CHECK (writer_generation >= 0);",
+            )?;
+        }
+        if operations_require_rebuild {
+            if challenge_table_exists {
+                connection.execute_batch(
+                    "ALTER TABLE artifact_export_reconciliation_challenges
+                     RENAME TO artifact_export_reconciliation_challenges_legacy;",
+                )?;
+            }
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS ix_operations_task_state;
+                 ALTER TABLE operations RENAME TO operations_legacy;
+                 CREATE TABLE operations (
+                     operation_id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     semantic_program_hash TEXT,
+                     node_id TEXT,
+                     binding_id TEXT,
+                     attempt_id TEXT,
+                     transaction_class TEXT,
+                     effect_class TEXT NOT NULL,
+                     idempotency_key TEXT,
+                     state TEXT NOT NULL CHECK (state IN (
+                         'PREPARED','STARTED','SUCCEEDED','FAILED','UNKNOWN','CANCELLED'
+                     )),
+                     outcome_certainty TEXT CHECK (outcome_certainty IS NULL OR outcome_certainty IN (
+                         'NOT_STARTED','STARTED_NO_EFFECT','COMPLETED',
+                         'FAILED_NO_EFFECT','FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'
+                     )),
+                     external_receipt TEXT,
+                     details_json TEXT,
+                     prepared_at TEXT NOT NULL,
+                     started_at TEXT,
+                     finished_at TEXT,
+                     FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+                     FOREIGN KEY (binding_id) REFERENCES execution_bindings(binding_id),
+                     FOREIGN KEY (attempt_id) REFERENCES step_executions(attempt_id)
+                 );
+                 INSERT INTO operations SELECT * FROM operations_legacy;
+                 DROP TABLE operations_legacy;
+                 CREATE INDEX ix_operations_task_state ON operations(task_id,state);",
+            )?;
+            if challenge_table_exists {
+                connection.execute_batch(
+                    "CREATE TABLE artifact_export_reconciliation_challenges (
+                         operation_id TEXT PRIMARY KEY,
+                         recovery_assessment_id TEXT NOT NULL,
+                         subject_hash TEXT NOT NULL,
+                         challenge TEXT NOT NULL UNIQUE,
+                         issued_at TEXT NOT NULL,
+                         FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+                         FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+                     );
+                     INSERT INTO artifact_export_reconciliation_challenges
+                     SELECT operation_id,recovery_assessment_id,subject_hash,challenge,issued_at
+                     FROM artifact_export_reconciliation_challenges_legacy;
+                     DROP TABLE artifact_export_reconciliation_challenges_legacy;",
+                )?;
+            }
+        }
         let duplicate_publications = connection.query_row(
             "SELECT COUNT(*) FROM (SELECT allocation_id FROM artifact_publications GROUP BY allocation_id HAVING COUNT(*) > 1)",
             [],
@@ -3071,13 +3928,54 @@ fn migrate_task_manager_schema(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0004_task_manager_review_hardening', 'task-manager-review-hardening-v0.1', '2026-09-20T00:00:00Z')",
             [],
         )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0005_artifact_store_root_binding', 'artifact-store-root-binding-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0006_artifact_writer_admission', 'artifact-writer-admission-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0007_artifact_owner_export_context', 'artifact-owner-export-context-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS artifact_export_reconciliation_challenges (
+                 operation_id TEXT PRIMARY KEY,
+                 recovery_assessment_id TEXT NOT NULL,
+                 subject_hash TEXT NOT NULL,
+                 challenge TEXT NOT NULL UNIQUE,
+                 issued_at TEXT NOT NULL,
+                 FOREIGN KEY (operation_id) REFERENCES operations(operation_id) ON DELETE CASCADE,
+                 FOREIGN KEY (recovery_assessment_id) REFERENCES recovery_assessments(assessment_id)
+             );",
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0008_artifact_export_reconciliation_challenge', 'artifact-export-reconciliation-challenge-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0009_artifact_writer_session_fencing', 'artifact-writer-session-fencing-v0.1', '2026-09-20T00:00:00Z')",
+            [],
+        )?;
+        let foreign_key_failures = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if foreign_key_failures != 0 {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration produced invalid foreign-key references",
+            ));
+        }
         Ok(())
     })();
     let result = match migration {
         Ok(()) => connection.execute_batch("COMMIT"),
         Err(error) => {
             connection.execute_batch("ROLLBACK")?;
-            return if transition_has_foreign_key && foreign_keys_enabled {
+            return if foreign_key_rebuild && foreign_keys_enabled {
                 connection.execute_batch("PRAGMA foreign_keys = ON")?;
                 Err(error)
             } else {
@@ -3085,7 +3983,7 @@ fn migrate_task_manager_schema(
             };
         }
     };
-    if transition_has_foreign_key && foreign_keys_enabled {
+    if foreign_key_rebuild && foreign_keys_enabled {
         connection.execute_batch("PRAGMA foreign_keys = ON")?;
     }
     result.map_err(Into::into)
@@ -3405,6 +4303,22 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
     Ok(false)
 }
 
+fn table_column_not_null(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+    })?;
+    for stored in columns {
+        let (name, not_null) = stored?;
+        if name == column {
+            return Ok(not_null);
+        }
+    }
+    Err(TaskManagerError::InvalidRecord(
+        "required persistence column is missing",
+    ))
+}
+
 fn require_migration_tables(connection: &Connection, tables: &[&str]) -> Result<()> {
     for table in tables {
         let present = connection.query_row(
@@ -3578,6 +4492,35 @@ fn unresolved_provider_invocation_ids(
         .collect())
 }
 
+fn committed_publication_structurally_valid(
+    connection: &Connection,
+    task_id: &str,
+    publication_id: &str,
+) -> Result<bool> {
+    artifact_store::committed_publication_receipt_authenticates(connection, task_id, publication_id)
+}
+
+fn unresolved_committed_publication_ids(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    let ids = query_strings(
+        connection,
+        "SELECT publication_id FROM artifact_publications
+         WHERE task_id=?1 AND state='COMMITTED' ORDER BY publication_id",
+        task_id,
+    )?;
+    ids.into_iter()
+        .filter_map(
+            |id| match committed_publication_structurally_valid(connection, task_id, &id) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(id)),
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
 fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Vec<String>> {
     let mut ids = query_strings(
         connection,
@@ -3596,6 +4539,11 @@ fn unresolved_execution_ids(connection: &Connection, task_id: &str) -> Result<Ve
         ) ORDER BY recovery_id",
         task_id,
     )?;
+    ids.extend(
+        unresolved_committed_publication_ids(connection, task_id)?
+            .into_iter()
+            .map(|id| format!("publication:{id}")),
+    );
     ids.extend(unresolved_provider_invocation_ids(connection, task_id)?);
     ids.extend(unresolved_credential_use_ids(connection, task_id)?);
     ids.sort();
@@ -3607,7 +4555,8 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM operations WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('PREPARED', 'STARTED', 'UNKNOWN') AND outcome_certainty IS NULL))) +
-               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL)))",
+               (SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND (outcome_certainty IN ('FAILED_PARTIAL_EFFECT', 'OUTCOME_UNKNOWN') OR (state IN ('STARTING', 'RUNNING', 'UNKNOWN') AND outcome_certainty IS NULL))) +
+               (SELECT COUNT(*) FROM artifact_publications WHERE task_id = ?1 AND state = 'PENDING')",
             [task_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -3621,7 +4570,14 @@ fn unresolved_execution_count(transaction: &Transaction<'_>, task_id: &str) -> R
     .map_err(|_| {
         TaskManagerError::InvalidRecord("provider-invocation count exceeds supported range")
     })?;
-    Ok(unresolved_without_receipts + unresolved_credentials + unresolved_invocations)
+    let unresolved_publications = i64::try_from(
+        unresolved_committed_publication_ids(transaction, task_id)?.len(),
+    )
+    .map_err(|_| TaskManagerError::InvalidRecord("publication count exceeds supported range"))?;
+    Ok(unresolved_without_receipts
+        + unresolved_credentials
+        + unresolved_invocations
+        + unresolved_publications)
 }
 
 struct RecoverySubject {
@@ -3795,6 +4751,18 @@ fn load_recovery_subjects(
             });
         }
     }
+    for id in unresolved_committed_publication_ids(transaction, task_id)? {
+        subjects.push(RecoverySubject {
+            kind: "artifact-publication",
+            id: format!("publication:{id}"),
+            evidence_kind: "blob-integrity",
+            certainty: "FAILED_PARTIAL_EFFECT".to_owned(),
+            safe_action: "FAIL_TASK",
+            reason_code: "RECOVERY_ARTIFACT_INTEGRITY_FAILED",
+            observation: "committed Artifact publication lacks complete authenticated structural or blob proof"
+                .to_owned(),
+        });
+    }
     subjects.sort_by(|left, right| (left.kind, &left.id).cmp(&(right.kind, &right.id)));
     Ok(subjects)
 }
@@ -3893,6 +4861,70 @@ fn persist_recovery_subject_assessment(
         }
     }
     Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "copies one authenticated subject into a new immutable recovery inventory"
+)]
+fn carry_forward_resolved_recovery_subject(
+    transaction: &Transaction<'_>,
+    recovery_ref: &str,
+    epoch_id: &str,
+    task_id: &str,
+    basis_revision: u64,
+    inventory_id: &str,
+    created_at: &str,
+) -> Result<bool> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT subject_kind,subject_id
+             FROM recovery_assessments
+             WHERE task_id=?1 AND recovery_epoch_id=?2 AND subject_kind<>'task'
+             ORDER BY assessment_id",
+        )?;
+        let rows = statement.query_map(params![task_id, epoch_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (kind, id) in rows {
+        if recovery_subject_inventory_id(&kind, &id).as_deref() != Some(inventory_id) {
+            continue;
+        }
+        let Some(resolution) = resolved_recovery_subject(transaction, task_id, inventory_id)?
+        else {
+            continue;
+        };
+        let kind = match kind.as_str() {
+            "attempt" => "attempt",
+            "external-operation" => "external-operation",
+            "artifact-publication" => "artifact-publication",
+            "authority-grant" => "authority-grant",
+            _ => continue,
+        };
+        persist_recovery_subject_assessment(
+            transaction,
+            recovery_ref,
+            epoch_id,
+            task_id,
+            basis_revision,
+            &RecoverySubject {
+                kind,
+                id,
+                evidence_kind: "recovery-subject",
+                certainty: resolution.certainty,
+                safe_action: resolution.safe_action,
+                reason_code: resolution.reason_code,
+                observation:
+                    "authenticated terminal evidence became durable before inventory refresh"
+                        .to_owned(),
+            },
+            created_at,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn all_unique(values: &[String]) -> bool {
@@ -5645,12 +6677,36 @@ fn resolved_publication_recovery_subject(
         )
         .optional()?;
     Ok(match publication {
-        Some((state, _, _)) if state == "ABORTED" => Some(RecoveryResolution {
-            certainty: "FAILED_NO_EFFECT".to_owned(),
-            safe_action: "CLEAN_STAGING",
-            reason_code: "RECOVERY_FAILED_NO_EFFECT",
-            event_status: "cancelled",
-        }),
+        Some((state, _, _))
+            if state == "ABORTED"
+                && artifact_store::aborted_publication_receipt_authenticates(
+                    transaction,
+                    task_id,
+                    publication_id,
+                )? =>
+        {
+            Some(RecoveryResolution {
+                certainty: "FAILED_NO_EFFECT".to_owned(),
+                safe_action: "CLEAN_STAGING",
+                reason_code: "RECOVERY_FAILED_NO_EFFECT",
+                event_status: "cancelled",
+            })
+        }
+        Some((state, _, _))
+            if state == "FAILED"
+                && artifact_store::failed_expired_publication_receipt_authenticates(
+                    transaction,
+                    task_id,
+                    publication_id,
+                )? =>
+        {
+            Some(RecoveryResolution {
+                certainty: "FAILED_NO_EFFECT".to_owned(),
+                safe_action: "CLEAN_STAGING",
+                reason_code: "RECOVERY_FAILED_NO_EFFECT",
+                event_status: "failure",
+            })
+        }
         Some((state, allocation_id, Some(artifact_id))) if state == "COMMITTED" => {
             let active_steps = transaction
                 .query_row(
@@ -5683,15 +6739,42 @@ fn resolved_recovery_subject(
     inventory_id: &str,
 ) -> Result<Option<RecoveryResolution>> {
     if let Some(attempt_id) = inventory_id.strip_prefix("attempt:") {
-        let certainty = transaction
+        let step = transaction
             .query_row(
-                "SELECT outcome_certainty FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
+                "SELECT invocation_id,binding_id,node_id,outcome_certainty
+                 FROM step_executions WHERE task_id=?1 AND attempt_id=?2",
                 params![task_id, attempt_id],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
-        return Ok(certainty.and_then(recovery_resolution));
+            .optional()?;
+        let Some((Some(invocation_id), Some(binding_id), node_id, stored_certainty)) = step else {
+            return Ok(None);
+        };
+        let records = stored_provider_invocations(transaction, task_id)?;
+        let Some(record) = records.iter().find(|record| {
+            record.invocation_id == invocation_id
+                && record.attempt_id == attempt_id
+                && record.binding_id == binding_id
+                && record.node_id.as_deref() == Some(node_id.as_str())
+        }) else {
+            return Ok(None);
+        };
+        let Some(resolution) = authenticated_provider_invocation_resolution(task_id, record)?
+        else {
+            return Ok(None);
+        };
+        return Ok(match stored_certainty.as_deref() {
+            None | Some("OUTCOME_UNKNOWN") => Some(resolution),
+            Some(certainty) if certainty == resolution.certainty => Some(resolution),
+            _ => None,
+        });
     }
     if let Some(publication_id) = inventory_id.strip_prefix("publication:") {
         return resolved_publication_recovery_subject(transaction, task_id, publication_id);
@@ -5807,30 +6890,16 @@ fn authenticated_recovery_resolution(
     reason = "keeps aggregate, inventory, and per-subject recovery authentication contiguous for audit"
 )]
 fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<bool> {
-    let recovery_json = transaction
-        .query_row(
-            "SELECT recovery_json FROM tasks WHERE task_id = ?1 AND state = 'RECOVERING'",
-            [task_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    let Some(recovery_json) = recovery_json else {
+    let Some(active_inventory) = active_recovery_inventory(transaction, task_id)? else {
         return Ok(false);
     };
-    let recovery: Value = serde_json::from_str(&recovery_json)?;
-    let Some(recovery_ref) = recovery
-        .get("unknown_operations_ref")
-        .and_then(Value::as_str)
-    else {
-        return Ok(false);
-    };
+    let recovery_ref = active_inventory.recovery_ref;
     let aggregate = transaction
         .query_row(
             "SELECT recovery_epoch_id, basis_revision, certainty, safe_action, assessment_json
          FROM recovery_assessments
          WHERE assessment_id = ?1 AND task_id = ?2 AND subject_kind = 'task' AND subject_id = ?2",
-            params![recovery_ref, task_id],
+            params![&recovery_ref, task_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -5851,7 +6920,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
     let inventory = query_strings(
         transaction,
         "SELECT operation_id FROM recovery_unknown_operations WHERE assessment_id = ?1 ORDER BY ordinal",
-        recovery_ref,
+        &recovery_ref,
     )?;
     if recovery_operations_ref(task_id, basis_revision, &inventory)? != recovery_ref {
         return Ok(false);
@@ -5868,7 +6937,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         return Ok(false);
     }
     let aggregate_json: Value = serde_json::from_str(&assessment_json)?;
-    if aggregate_json.get("assessment_id").and_then(Value::as_str) != Some(recovery_ref)
+    if aggregate_json.get("assessment_id").and_then(Value::as_str) != Some(recovery_ref.as_str())
         || aggregate_json
             .pointer("/subject/kind")
             .and_then(Value::as_str)
@@ -5904,9 +6973,6 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if subject_rows.len() != inventory.len() {
-        return Ok(false);
-    }
     let mut covered_inventory = std::collections::BTreeSet::new();
     let mut authenticated_resolved_inventory = std::collections::BTreeSet::new();
     for (
@@ -5918,12 +6984,16 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
         subject_json,
     ) in subject_rows
     {
+        if recovery_subject_assessment_id(&recovery_ref, &subject_kind, &subject_id)
+            != assessment_id
+        {
+            continue;
+        }
         let subject: Value = serde_json::from_str(&subject_json)?;
         let Some(inventory_id) = recovery_subject_inventory_id(&subject_kind, &subject_id) else {
             return Ok(false);
         };
-        if recovery_subject_assessment_id(recovery_ref, &subject_kind, &subject_id) != assessment_id
-            || !covered_inventory.insert(inventory_id.clone())
+        if !covered_inventory.insert(inventory_id.clone())
             || subject.get("assessment_id").and_then(Value::as_str) != Some(assessment_id.as_str())
             || subject.pointer("/subject/kind").and_then(Value::as_str)
                 != Some(subject_kind.as_str())
@@ -5944,7 +7014,7 @@ fn recovery_allows_exit(transaction: &Transaction<'_>, task_id: &str) -> Result<
             && authenticated_recovery_resolution(
                 transaction,
                 task_id,
-                recovery_ref,
+                &recovery_ref,
                 &inventory_id,
                 &subject,
             )?

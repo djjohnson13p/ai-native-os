@@ -21,7 +21,7 @@
     "published": {"type": "boolean"},
     "reason_code": {"type": "string", "pattern": "^ARTIFACT_[A-Z0-9_]+$"},
     "message": {"type": ["string", "null"], "maxLength": 4096},
-    "artifact_id": {"type": ["string", "null"], "maxLength": 256},
+    "artifact_id": {"type": ["string", "null"], "maxLength": 512},
     "artifact_uri": {"type": ["string", "null"], "pattern": "^(?:artifact://.+)?$"},
     "semantic_type": {
       "type": ["string", "null"],
