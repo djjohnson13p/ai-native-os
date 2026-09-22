@@ -1995,191 +1995,197 @@ impl TaskManager {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for (task_id, revision, state) in tasks {
-            if !self.verify_provenance(&task_id)? {
-                return Err(TaskManagerError::InvalidRecord(
-                    "nonterminal Task provenance chain is missing or invalid",
-                ));
-            }
-            let mut statement = self.connection.prepare(
+            self.verify_task_head(&task_id, revision, &state)?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps full provenance replay and materialized security-view comparison auditable"
+    )]
+    fn verify_task_head(&self, task_id: &str, revision: i64, state: &str) -> Result<()> {
+        if !self.verify_provenance(task_id)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task provenance chain is missing or invalid",
+            ));
+        }
+        let mut statement = self.connection.prepare(
                 "SELECT event_json FROM provenance_events WHERE task_id = ?1 AND event_type IN ('task.created', 'task.transitioned') ORDER BY sequence",
             )?;
-            let rows = statement.query_map([&task_id], |row| row.get::<_, String>(0))?;
-            let mut material_revision = 0_i64;
-            let mut material_state: Option<TaskState> = None;
-            let mut material_creation: Option<Value> = None;
-            let mut material_active_plan: Option<ActivePlan> = None;
-            let mut material_active_program: Option<Value> = None;
-            let mut material_active_program_digest: Option<String> = None;
-            let mut material_steps = Vec::<String>::new();
-            let mut material_waiting = json!([]);
-            let mut material_waiting_commitments = json!([]);
-            let mut material_failure: Option<Value> = None;
-            let mut material_failure_commitment: Option<Value> = None;
-            let mut material_recovery: Option<Value> = None;
-            let mut material_state_reason: Option<Value> = None;
-            let mut material_reason_message_ref: Option<Value> = None;
-            let mut material_updated_at: Option<String> = None;
-            for row in rows {
-                let event: Value = serde_json::from_str(&row?)?;
-                if event.get("event_type").and_then(Value::as_str) == Some("task.created") {
-                    let creation = event.pointer("/details/creation").cloned().ok_or(
-                        TaskManagerError::InvalidRecord(
-                            "Task provenance creation payload is missing",
-                        ),
-                    )?;
-                    if material_revision != 0
-                        || event.pointer("/details/revision").and_then(Value::as_i64) != Some(1)
-                        || event.get("actor") != creation.get("principal")
-                        || event.get("timestamp") != creation.get("created_at")
-                    {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "Task provenance has an invalid creation event",
-                        ));
-                    }
-                    material_revision = 1;
-                    material_state = Some(TaskState::Created);
-                    material_creation = Some(creation);
-                    material_updated_at = event
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    material_steps = serde_json::from_value(
-                        event
-                            .pointer("/details/active_step_ids")
-                            .cloned()
-                            .unwrap_or_else(|| json!([])),
-                    )?;
-                    material_state_reason = Some(json!({
-                        "code": "TASK_CREATED",
-                        "provenance_event_id": event_string(&event, "event_id")
-                    }));
-                    continue;
-                }
-                let previous_revision = event
-                    .pointer("/task_transition/previous_revision")
-                    .and_then(Value::as_i64);
-                let new_revision = event
-                    .pointer("/task_transition/new_revision")
-                    .and_then(Value::as_i64);
-                let previous_state = event
-                    .pointer("/task_transition/previous_state")
-                    .and_then(Value::as_str)
-                    .map(TaskState::parse)
-                    .transpose()?;
-                let new_state = event
-                    .pointer("/task_transition/new_state")
-                    .and_then(Value::as_str)
-                    .map(TaskState::parse)
-                    .transpose()?;
-                if previous_revision != Some(material_revision)
-                    || new_revision != material_revision.checked_add(1)
-                    || previous_state != material_state
-                    || !previous_state
-                        .zip(new_state)
-                        .is_some_and(|(from, to)| allowed_transition(from, to))
+        let rows = statement.query_map([&task_id], |row| row.get::<_, String>(0))?;
+        let mut material_revision = 0_i64;
+        let mut material_state: Option<TaskState> = None;
+        let mut material_creation: Option<Value> = None;
+        let mut material_active_plan: Option<ActivePlan> = None;
+        let mut material_active_program: Option<Value> = None;
+        let mut material_active_program_digest: Option<String> = None;
+        let mut material_steps = Vec::<String>::new();
+        let mut material_waiting = json!([]);
+        let mut material_waiting_commitments = json!([]);
+        let mut material_failure: Option<Value> = None;
+        let mut material_failure_commitment: Option<Value> = None;
+        let mut material_recovery: Option<Value> = None;
+        let mut material_state_reason: Option<Value> = None;
+        let mut material_reason_message_ref: Option<Value> = None;
+        let mut material_updated_at: Option<String> = None;
+        for row in rows {
+            let event: Value = serde_json::from_str(&row?)?;
+            if event.get("event_type").and_then(Value::as_str) == Some("task.created") {
+                let creation = event.pointer("/details/creation").cloned().ok_or(
+                    TaskManagerError::InvalidRecord("Task provenance creation payload is missing"),
+                )?;
+                if material_revision != 0
+                    || event.pointer("/details/revision").and_then(Value::as_i64) != Some(1)
+                    || event.get("actor") != creation.get("principal")
+                    || event.get("timestamp") != creation.get("created_at")
                 {
                     return Err(TaskManagerError::InvalidRecord(
-                        "Task provenance state history is discontinuous",
+                        "Task provenance has an invalid creation event",
                     ));
                 }
-                material_revision += 1;
-                material_state = new_state;
+                material_revision = 1;
+                material_state = Some(TaskState::Created);
+                material_creation = Some(creation);
                 material_updated_at = event
                     .get("timestamp")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let mutation =
+                material_steps = serde_json::from_value(
                     event
-                        .get("committed_mutation")
-                        .ok_or(TaskManagerError::InvalidRecord(
-                            "Task transition provenance has no committed mutation",
-                        ))?;
-                if let Some(value) = mutation.get("active_plan").filter(|value| !value.is_null()) {
-                    material_active_plan = Some(serde_json::from_value(value.clone())?);
-                }
-                if let Some(value) = mutation
-                    .get("active_step_ids")
-                    .filter(|value| !value.is_null())
-                {
-                    material_steps = serde_json::from_value(value.clone())?;
-                }
-                if let Some(value) = mutation.get("waiting_on").filter(|value| !value.is_null()) {
-                    material_waiting = value.clone();
-                    material_waiting_commitments = event
-                        .pointer("/details/mutation_text_commitments/waiting_on")
+                        .pointer("/details/active_step_ids")
                         .cloned()
-                        .ok_or(TaskManagerError::InvalidRecord(
-                            "waiting message commitments are missing",
-                        ))?;
-                }
-                if let Some(value) = mutation.get("failure").filter(|value| !value.is_null()) {
-                    material_failure = Some(value.clone());
-                    material_failure_commitment = event
-                        .pointer("/details/mutation_text_commitments/failure_summary")
-                        .cloned();
-                    if material_failure_commitment.is_none() {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "failure summary commitment is missing",
-                        ));
-                    }
-                }
-                if let Some(value) = mutation.get("recovery").filter(|value| !value.is_null()) {
-                    material_recovery = Some(value.clone());
-                }
+                        .unwrap_or_else(|| json!([])),
+                )?;
                 material_state_reason = Some(json!({
-                    "code": event.pointer("/task_transition/reason_code"),
+                    "code": "TASK_CREATED",
                     "provenance_event_id": event_string(&event, "event_id")
                 }));
-                material_reason_message_ref = event.pointer("/details/reason_message_ref").cloned();
-                if let Some(value) = event
-                    .pointer("/details/active_program")
-                    .filter(|value| !value.is_null())
-                {
-                    let mut identity = value.clone();
-                    material_active_program_digest = identity
-                        .get("program_content_digest")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    let Some(identity) = identity.as_object_mut() else {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "Task provenance active program is malformed",
-                        ));
-                    };
-                    identity.remove("program_content_digest");
-                    material_active_program = Some(Value::Object(identity.clone()));
-                }
+                continue;
             }
-            if material_revision != revision
-                || material_state.map(TaskState::as_str) != Some(state.as_str())
+            let previous_revision = event
+                .pointer("/task_transition/previous_revision")
+                .and_then(Value::as_i64);
+            let new_revision = event
+                .pointer("/task_transition/new_revision")
+                .and_then(Value::as_i64);
+            let previous_state = event
+                .pointer("/task_transition/previous_state")
+                .and_then(Value::as_str)
+                .map(TaskState::parse)
+                .transpose()?;
+            let new_state = event
+                .pointer("/task_transition/new_state")
+                .and_then(Value::as_str)
+                .map(TaskState::parse)
+                .transpose()?;
+            if previous_revision != Some(material_revision)
+                || new_revision != material_revision.checked_add(1)
+                || previous_state != material_state
+                || !previous_state
+                    .zip(new_state)
+                    .is_some_and(|(from, to)| allowed_transition(from, to))
             {
                 return Err(TaskManagerError::InvalidRecord(
-                    "nonterminal Task state does not match provenance head",
+                    "Task provenance state history is discontinuous",
                 ));
             }
-            let task = self
-                .get_task(&task_id)?
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "provenance-backed Task disappeared during startup verification",
-                ))?;
-            let intent_nonce = self.connection.query_row(
-                "SELECT intent_commitment_nonce FROM tasks WHERE task_id = ?1",
-                [&task_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            if intent_nonce.len() != 32 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "Task intent commitment nonce is invalid",
-                ));
+            material_revision += 1;
+            material_state = new_state;
+            material_updated_at = event
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let mutation =
+                event
+                    .get("committed_mutation")
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "Task transition provenance has no committed mutation",
+                    ))?;
+            if let Some(value) = mutation.get("active_plan").filter(|value| !value.is_null()) {
+                material_active_plan = Some(serde_json::from_value(value.clone())?);
             }
-            let expected_creation = json!({
-                "principal": task.principal,
-                "workspace_id": task.workspace_id,
-                "original_intent_ref": task_field_commitment(&intent_nonce, "original_intent", task.original_intent.as_bytes()),
-                "normalized_intent_ref": task.normalized_intent.as_ref().map(|value| canonical_json(value).map(|canonical| task_field_commitment(&intent_nonce, "normalized_intent", canonical.as_bytes()))).transpose()?,
-                "constraints": task.constraints,
-                "created_at": task.created_at,
-            });
-            let active_program_digest = self
+            if let Some(value) = mutation
+                .get("active_step_ids")
+                .filter(|value| !value.is_null())
+            {
+                material_steps = serde_json::from_value(value.clone())?;
+            }
+            if let Some(value) = mutation.get("waiting_on").filter(|value| !value.is_null()) {
+                material_waiting = value.clone();
+                material_waiting_commitments = event
+                    .pointer("/details/mutation_text_commitments/waiting_on")
+                    .cloned()
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "waiting message commitments are missing",
+                    ))?;
+            }
+            if let Some(value) = mutation.get("failure").filter(|value| !value.is_null()) {
+                material_failure = Some(value.clone());
+                material_failure_commitment = event
+                    .pointer("/details/mutation_text_commitments/failure_summary")
+                    .cloned();
+                if material_failure_commitment.is_none() {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "failure summary commitment is missing",
+                    ));
+                }
+            }
+            if let Some(value) = mutation.get("recovery").filter(|value| !value.is_null()) {
+                material_recovery = Some(value.clone());
+            }
+            material_state_reason = Some(json!({
+                "code": event.pointer("/task_transition/reason_code"),
+                "provenance_event_id": event_string(&event, "event_id")
+            }));
+            material_reason_message_ref = event.pointer("/details/reason_message_ref").cloned();
+            if let Some(value) = event
+                .pointer("/details/active_program")
+                .filter(|value| !value.is_null())
+            {
+                let mut identity = value.clone();
+                material_active_program_digest = identity
+                    .get("program_content_digest")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let Some(identity) = identity.as_object_mut() else {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "Task provenance active program is malformed",
+                    ));
+                };
+                identity.remove("program_content_digest");
+                material_active_program = Some(Value::Object(identity.clone()));
+            }
+        }
+        if material_revision != revision || material_state.map(TaskState::as_str) != Some(state) {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task state does not match provenance head",
+            ));
+        }
+        let task = self
+            .get_task(task_id)?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "provenance-backed Task disappeared during startup verification",
+            ))?;
+        let intent_nonce = self.connection.query_row(
+            "SELECT intent_commitment_nonce FROM tasks WHERE task_id = ?1",
+            [&task_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        if intent_nonce.len() != 32 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task intent commitment nonce is invalid",
+            ));
+        }
+        let expected_creation = json!({
+            "principal": task.principal,
+            "workspace_id": task.workspace_id,
+            "original_intent_ref": task_field_commitment(&intent_nonce, "original_intent", task.original_intent.as_bytes()),
+            "normalized_intent_ref": task.normalized_intent.as_ref().map(|value| canonical_json(value).map(|canonical| task_field_commitment(&intent_nonce, "normalized_intent", canonical.as_bytes()))).transpose()?,
+            "constraints": task.constraints,
+            "created_at": task.created_at,
+        });
+        let active_program_digest = self
                 .connection
                 .query_row(
                     "SELECT p.program_json FROM tasks t JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.status = 'active' WHERE t.task_id = ?1",
@@ -2189,45 +2195,44 @@ impl TaskManager {
                 .optional()?
                 .map(|program_json| program_content_digest(&program_json))
                 .transpose()?;
-            let expected_waiting = provenance_waiting_on(&task.waiting_on);
-            let expected_waiting_commitments =
-                provenance_waiting_commitments(&task.waiting_on, &intent_nonce);
-            let expected_failure = task.failure.as_ref().map(provenance_failure);
-            let expected_failure_commitment = task
-                .failure
-                .as_ref()
-                .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
-            let task_reason_without_message = task.state_reason.as_ref().map(|reason| {
-                json!({
-                    "code": reason.get("code"),
-                    "provenance_event_id": reason.get("provenance_event_id"),
+        let expected_waiting = provenance_waiting_on(&task.waiting_on);
+        let expected_waiting_commitments =
+            provenance_waiting_commitments(&task.waiting_on, &intent_nonce);
+        let expected_failure = task.failure.as_ref().map(provenance_failure);
+        let expected_failure_commitment = task
+            .failure
+            .as_ref()
+            .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
+        let task_reason_without_message = task.state_reason.as_ref().map(|reason| {
+            json!({
+                "code": reason.get("code"),
+                "provenance_event_id": reason.get("provenance_event_id"),
+            })
+        });
+        let expected_reason_message_ref = task.state_reason.as_ref().and_then(|reason| {
+            reason.get("message").map(|message| {
+                message.as_str().map_or(Value::Null, |message| {
+                    task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
                 })
-            });
-            let expected_reason_message_ref = task.state_reason.as_ref().and_then(|reason| {
-                reason.get("message").map(|message| {
-                    message.as_str().map_or(Value::Null, |message| {
-                        task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
-                    })
-                })
-            });
-            if material_creation.as_ref() != Some(&expected_creation)
-                || task.updated_at != material_updated_at.unwrap_or_default()
-                || task.active_plan != material_active_plan
-                || task.active_program != material_active_program
-                || active_program_digest != material_active_program_digest
-                || task.active_step_ids != material_steps
-                || expected_waiting != material_waiting
-                || expected_waiting_commitments != material_waiting_commitments
-                || expected_failure != material_failure
-                || expected_failure_commitment != material_failure_commitment
-                || task.recovery != material_recovery
-                || task_reason_without_message != material_state_reason
-                || expected_reason_message_ref != material_reason_message_ref
-            {
-                return Err(TaskManagerError::InvalidRecord(
-                    "Task security state does not match committed provenance",
-                ));
-            }
+            })
+        });
+        if material_creation.as_ref() != Some(&expected_creation)
+            || task.updated_at != material_updated_at.unwrap_or_default()
+            || task.active_plan != material_active_plan
+            || task.active_program != material_active_program
+            || active_program_digest != material_active_program_digest
+            || task.active_step_ids != material_steps
+            || expected_waiting != material_waiting
+            || expected_waiting_commitments != material_waiting_commitments
+            || expected_failure != material_failure
+            || expected_failure_commitment != material_failure_commitment
+            || task.recovery != material_recovery
+            || task_reason_without_message != material_state_reason
+            || expected_reason_message_ref != material_reason_message_ref
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task security state does not match committed provenance",
+            ));
         }
         Ok(())
     }
@@ -2622,16 +2627,29 @@ impl TaskManager {
         )?)
     }
 
-    /// Exports a privacy-safe original-chain JSONL stream plus verification manifest.
+    /// Exports a privacy-redacted projection after checking its Task record and journal.
     ///
     /// # Errors
     /// Returns an error when the stream is invalid, unsafe to export, or cannot be read.
     pub fn export_provenance(&self, task_id: &str) -> Result<ProvenancePortableExport> {
         let stream_id = aios_provenance::stream_id(task_id)?;
-        Ok(aios_provenance::export_jsonl(
+        Ok(aios_provenance::export_jsonl_with_validation(
             &self.connection,
             &stream_id,
             &self.clock.now(),
+            |connection| {
+                let (revision, state): (i64, String) = connection.query_row(
+                    "SELECT revision, state FROM tasks WHERE task_id = ?1",
+                    [task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                self.verify_task_head(task_id, revision, &state)
+                    .map_err(|_| {
+                        aios_provenance::Error::InvalidRecord(
+                            "Task security state does not match committed provenance".to_owned(),
+                        )
+                    })
+            },
         )?)
     }
 

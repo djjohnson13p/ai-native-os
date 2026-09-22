@@ -849,6 +849,56 @@ fn portable_provenance_export_is_private_and_reverifies_without_task_storage() {
 }
 
 #[test]
+fn portable_export_rejects_private_task_and_journal_disagreement() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    for (task_id, tamper) in [
+        (
+            "T-export-bad-nonce",
+            "UPDATE tasks SET intent_commitment_nonce = zeroblob(1) WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-intent",
+            "UPDATE tasks SET original_intent = 'changed' WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-normalized-intent",
+            "UPDATE tasks SET normalized_intent_json = '{}' WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-state",
+            "UPDATE tasks SET state = 'PLANNING' WHERE task_id = ?1",
+        ),
+    ] {
+        manager.create_task(&create(task_id)).unwrap();
+        assert!(manager.export_provenance(task_id).is_ok());
+        manager.connection.execute(tamper, [task_id]).unwrap();
+        assert!(manager.export_provenance(task_id).is_err(), "{task_id}");
+    }
+
+    let task_id = "T-export-terminal-bad-nonce";
+    manager.create_task(&create(task_id)).unwrap();
+    let cancelled = manager
+        .transition(&request(
+            "tr-export-terminal",
+            task_id,
+            1,
+            TaskState::Created,
+            TaskState::Cancelled,
+        ))
+        .unwrap();
+    assert!(cancelled.applied);
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET intent_commitment_nonce = zeroblob(1) WHERE task_id = ?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(task_id).is_err());
+}
+
+#[test]
 fn startup_fails_closed_for_missing_corrupt_or_head_mismatched_provenance() {
     let directory = tempdir().unwrap();
     for (name, mutate) in [

@@ -30,6 +30,7 @@ pub const MAX_PAGE_SIZE: u32 = 256;
 pub const MAX_PROJECTED_EVENT_BYTES: usize = 262_144;
 const MAX_PROJECTED_RECORD_BYTES: usize = MAX_PROJECTED_EVENT_BYTES + 4_096;
 const MAX_PROJECTION_EXPORT_BYTES: usize = 8 * 1_024 * 1_024;
+const MAX_PROJECTION_RECORDS: u64 = 10_000;
 const MAX_STRING_CHARS: usize = 4096;
 const MAX_ARRAY_ITEMS: usize = 512;
 const MAX_OBJECT_FIELDS: usize = 256;
@@ -706,28 +707,47 @@ pub fn export_jsonl(
     stream_id: &str,
     verified_at: &str,
 ) -> Result<ProjectionPortableExport> {
+    export_jsonl_with_validation(connection, stream_id, verified_at, |_| Ok(()))
+}
+
+/// Exports one snapshot after the caller validates its private Task state in
+/// that same transaction. The callback must not commit or mutate the journal.
+///
+/// # Errors
+/// Returns an error when validation, verification, projection, or storage fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps snapshot validation, projection, and bounded export in one transaction"
+)]
+pub fn export_jsonl_with_validation<F>(
+    connection: &Connection,
+    stream_id: &str,
+    verified_at: &str,
+    validate: F,
+) -> Result<ProjectionPortableExport>
+where
+    F: FnOnce(&Connection) -> Result<()>,
+{
     validate_timestamp(verified_at)?;
+    validate_stream_id(stream_id)?;
     let transaction = connection.unchecked_transaction()?;
+    validate(&transaction)?;
+    let record_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+        [stream_id],
+        |row| row.get(0),
+    )?;
+    if u64::try_from(record_count).map_or(true, |count| count > MAX_PROJECTION_RECORDS) {
+        return Err(Error::InvalidRecord(
+            "portable provenance export exceeds record-count bound".to_owned(),
+        ));
+    }
     let verification = verify_stream(&transaction, stream_id, None, None, verified_at)?;
     if !verification.valid {
         return Err(Error::InvalidRecord(
             "cannot export an invalid provenance stream".to_owned(),
         ));
     }
-    let mut records = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = list_events(&transaction, stream_id, cursor, MAX_PAGE_SIZE)?;
-        for record in page.records {
-            validate_stored_event(&record.event)?;
-            records.push(record);
-        }
-        let Some(next) = page.next_cursor else { break };
-        cursor = Some(next);
-    }
-    records.last().ok_or_else(|| {
-        Error::InvalidRecord("cannot export an empty provenance stream".to_owned())
-    })?;
     let alias_key =
         transaction.query_row("SELECT randomblob(32)", [], |row| row.get::<_, Vec<u8>>(0))?;
     if alias_key.len() != 32 {
@@ -739,29 +759,53 @@ pub fn export_jsonl(
         row.get::<_, String>(0)
     })?;
     let bundle_id = format!("bundle:v1:{}", bundle_random.to_ascii_lowercase());
-    let mut projected_records = Vec::with_capacity(records.len());
+    let mut records_jsonl = String::new();
+    let mut cursor = None;
     let mut previous = None;
-    for record in records {
-        let projected_event = project_event(&record.event, &alias_key)?;
-        validate_projected_event(&projected_event)?;
-        let projection_hash = hash_projected_record(
-            &bundle_id,
-            record.sequence,
-            previous.as_deref(),
-            &projected_event,
-        )?;
-        projected_records.push(ProjectedRecord {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            projection_hash_profile: PROJECTION_HASH_PROFILE.to_owned(),
-            bundle_id: bundle_id.clone(),
-            sequence: record.sequence,
-            previous_projection_hash: previous,
-            projected_event,
-            projection_hash: projection_hash.clone(),
-        });
-        previous = Some(projection_hash);
+    let mut head_sequence = 0;
+    let mut projected_count = 0_u64;
+    loop {
+        let page = list_events(&transaction, stream_id, cursor, MAX_PAGE_SIZE)?;
+        for record in page.records {
+            validate_stored_event(&record.event)?;
+            let projected_event = project_event(&record.event, &alias_key)?;
+            validate_projected_event(&projected_event)?;
+            let projection_hash = hash_projected_record(
+                &bundle_id,
+                record.sequence,
+                previous.as_deref(),
+                &projected_event,
+            )?;
+            let projected_record = ProjectedRecord {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                projection_hash_profile: PROJECTION_HASH_PROFILE.to_owned(),
+                bundle_id: bundle_id.clone(),
+                sequence: record.sequence,
+                previous_projection_hash: previous,
+                projected_event,
+                projection_hash: projection_hash.clone(),
+            };
+            if !projected_record_validator()?.is_valid(&serde_json::to_value(&projected_record)?) {
+                return Err(Error::InvalidRecord(
+                    "generated projected record is invalid".to_owned(),
+                ));
+            }
+            let line = serde_json::to_string(&projected_record)?;
+            if records_jsonl.len() + line.len() + 1 > MAX_PROJECTION_EXPORT_BYTES {
+                return Err(Error::InvalidRecord(
+                    "portable provenance export exceeds bounds".to_owned(),
+                ));
+            }
+            records_jsonl.push_str(&line);
+            records_jsonl.push('\n');
+            head_sequence = record.sequence;
+            projected_count += 1;
+            previous = Some(projection_hash);
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
     }
-    let head = projected_records.last().ok_or_else(|| {
+    let head_projection_hash = previous.ok_or_else(|| {
         Error::InvalidRecord("cannot export an empty projected stream".to_owned())
     })?;
     let mut manifest = ProjectionManifest {
@@ -769,9 +813,9 @@ pub fn export_jsonl(
         export_profile: "privacy-redacted-projection-v1".to_owned(),
         projection_hash_profile: PROJECTION_HASH_PROFILE.to_owned(),
         bundle_id,
-        record_count: projected_records.len() as u64,
-        head_sequence: head.sequence,
-        head_projection_hash: head.projection_hash.clone(),
+        record_count: projected_count,
+        head_sequence,
+        head_projection_hash,
         descriptor_hash: String::new(),
     };
     manifest.descriptor_hash = hash_projection_descriptor(&manifest)?;
@@ -780,21 +824,6 @@ pub fn export_jsonl(
         return Err(Error::InvalidRecord(
             "generated projection manifest is invalid".to_owned(),
         ));
-    }
-    let mut records_jsonl = String::new();
-    for record in projected_records {
-        if !projected_record_validator()?.is_valid(&serde_json::to_value(&record)?) {
-            return Err(Error::InvalidRecord(
-                "generated projected record is invalid".to_owned(),
-            ));
-        }
-        records_jsonl.push_str(&serde_json::to_string(&record)?);
-        records_jsonl.push('\n');
-        if records_jsonl.len() > MAX_PROJECTION_EXPORT_BYTES {
-            return Err(Error::InvalidRecord(
-                "portable provenance export exceeds bounds".to_owned(),
-            ));
-        }
     }
     transaction.commit()?;
     Ok(ProjectionPortableExport {
@@ -898,6 +927,8 @@ fn verify_projected_records(
     verified_at: &str,
 ) -> ProjectionVerificationResult {
     let mut previous = None;
+    let mut task_alias: Option<&str> = None;
+    let mut event_aliases = std::collections::BTreeSet::new();
     for (index, record) in records.iter().enumerate() {
         let expected_sequence = index as u64 + 1;
         if record.schema_version != SCHEMA_VERSION
@@ -916,6 +947,31 @@ fn verify_projected_records(
                 previous,
             );
         }
+        let projected_task_alias = record
+            .projected_event
+            .pointer("/task_id/alias")
+            .and_then(Value::as_str);
+        let projected_event_alias = record
+            .projected_event
+            .pointer("/event_id/alias")
+            .and_then(Value::as_str);
+        if (index == 0
+            && string_field(&record.projected_event, "event_type") != Some("task.created"))
+            || projected_task_alias.is_none()
+            || projected_event_alias.is_none()
+            || task_alias.is_some_and(|first| Some(first) != projected_task_alias)
+            || !event_aliases.insert(projected_event_alias.unwrap_or_default())
+        {
+            return projection_failure(
+                manifest,
+                verified_at,
+                "PROJECTION_RECORD_INVALID",
+                "projected stream genesis or event identity is invalid",
+                Some(record.sequence),
+                previous,
+            );
+        }
+        task_alias = projected_task_alias;
         let Ok(computed) = hash_projected_record(
             &manifest.bundle_id,
             record.sequence,
@@ -1323,6 +1379,9 @@ fn projected_placeholder(
     }
     if key == "reason_code" || (key == "code" && path.iter().any(|part| part == "failure")) {
         return format!("PROJECTED_{}", digest[7..].to_ascii_uppercase());
+    }
+    if key == "ir_version" && path.iter().any(|part| part == "active_program") {
+        return digest[7..].to_owned();
     }
     digest.to_owned()
 }
@@ -3503,6 +3562,96 @@ mod tests {
                     .valid
             );
         }
+    }
+
+    #[test]
+    fn active_program_ir_version_projects_with_its_source_bound() {
+        let task_id = "T-active-program-projection";
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        let mut transition = typed_transition_event(task_id);
+        transition["details"]["active_program"] = json!({
+            "program_id":"program:test",
+            "ir_version":"0.1",
+            "semantic_hash":format!("sha256:{}", "a".repeat(64)),
+            "registry_snapshot_id":"snapshot:test",
+            "validation_result_id":"validation:test",
+            "validated_at":NOW,
+            "validator_id":"validator:test",
+            "validator_version":"1.0",
+            "program_content_digest":format!("sha256:{}", "b".repeat(64))
+        });
+        append_in_tx(&transaction, task_id, &transition, &ExpectedHead::Any).unwrap();
+        transaction.commit().unwrap();
+
+        let export = export_jsonl(&connection, &stream_id(task_id).unwrap(), NOW).unwrap();
+        let result =
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW).unwrap();
+        assert!(result.valid, "{result:?}");
+        let projected: ProjectedRecord =
+            serde_json::from_str(export.records_jsonl.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            projected.projected_event["details"]["active_program"]["ir_version"]["kind"],
+            "bundle-local-alias"
+        );
+    }
+
+    #[test]
+    fn rehashed_projection_rejects_mixed_tasks_duplicate_events_and_wrong_genesis() {
+        let mut connection = connection();
+        append_many(&mut connection, 2);
+        let export = export_jsonl(&connection, &stream_id("T-provenance").unwrap(), NOW).unwrap();
+        let mixed_tasks = rehash_projection(&export, |records| {
+            records[1].projected_event["task_id"]["alias"] =
+                json!(format!("sha256:{}", "f".repeat(64)));
+        });
+        assert!(projection_rejected(&mixed_tasks));
+
+        let duplicate_events = rehash_projection(&export, |records| {
+            records[1].projected_event["event_id"] = records[0].projected_event["event_id"].clone();
+        });
+        assert!(projection_rejected(&duplicate_events));
+
+        let wrong_genesis = rehash_projection(&export, |records| {
+            records.remove(0);
+        });
+        assert!(projection_rejected(&wrong_genesis));
+    }
+
+    #[test]
+    fn export_runs_private_validation_and_rejects_overbound_record_count() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        let mut callback_ran = false;
+        let refused = export_jsonl_with_validation(&connection, &stream, NOW, |snapshot| {
+            callback_ran = true;
+            let count: i64 = snapshot.query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1);
+            Err(Error::InvalidRecord(
+                "private Task validation failed".to_owned(),
+            ))
+        });
+        assert!(callback_ran);
+        assert!(refused.is_err());
+
+        connection.execute(
+            "WITH RECURSIVE numbered(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM numbered WHERE value<10000) INSERT INTO provenance_events (schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,event_type,event_hash,event_json) SELECT '0.1','aios-provenance-event-v0.1','extra-' || value,'T-provenance',?1,value+1,?2,'verification.started',?3,'{}' FROM numbered",
+            params![stream, NOW, format!("sha256:{}", "a".repeat(64))],
+        ).unwrap();
+        let error = export_jsonl(&connection, &stream, NOW).unwrap_err();
+        assert!(error.to_string().contains("record-count bound"));
     }
 
     #[test]
