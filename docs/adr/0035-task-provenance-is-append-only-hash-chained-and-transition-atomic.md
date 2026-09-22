@@ -107,6 +107,13 @@ shape. Commitment references bind their exact field discriminator and v1
 profile. This keeps secret/private payloads and unreviewed diagnostic dumps out
 of portable provenance rather than relying on names alone.
 
+Identifier validation is field-specific. Machine-owned IDs retain their
+restricted grammar. Opaque Task-origin IDs (`principal.id`, `workspace_id`,
+step IDs, waiting IDs, plan IDs, and reason-related IDs) preserve the Task
+contract's nonempty/nullable and Unicode-scalar length rules, including spaces,
+punctuation, emoji, and canonically distinct Unicode. Provenance does not
+normalize those values because that would change the event and chain identity.
+
 ## Compatibility impact
 
 The existing `provenance-event.schema.json` remains the event payload contract. v0.1 journal ordering/integrity is represented by a separate envelope schema so the change is additive at the architecture level.

@@ -253,10 +253,10 @@
               "required": ["kind", "id"],
               "properties": {
                 "kind": {"enum": ["user", "system-service"]},
-                "id": {"$ref": "#/$defs/safeIdentifier"}
+                "id": {"$ref": "#/$defs/taskOpaqueIdentifier"}
               }
             },
-            "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+            "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskOpaqueIdentifier"}]},
             "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
             "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
             "constraints": {"type": "null"},
@@ -264,7 +264,7 @@
           }
         },
         "active_plan": {"type": "null"},
-        "active_step_ids": {"type": "array", "maxItems": 512, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "active_step_ids": {"type": "array", "maxItems": 512, "uniqueItems": true, "items": {"$ref": "#/$defs/taskOpaqueStepIdentifier"}},
         "waiting_on": {
           "type": "array",
           "maxItems": 64,
@@ -274,20 +274,20 @@
             "required": ["kind", "id"],
             "properties": {
               "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
-              "id": {"$ref": "#/$defs/safeIdentifier"}
+              "id": {"$ref": "#/$defs/taskOpaqueIdentifier"}
             }
           }
         },
         "failure": {"type": "null"},
         "recovery": {"type": "null"},
-        "related_ids": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "related_ids": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/taskOpaqueRelatedIdentifier"}},
         "reason_message_ref": {"$ref": "#/$defs/reasonMessageRef"},
         "active_program": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/activeProgramDetails"}]},
         "mutation_text_commitments": {"$ref": "#/$defs/mutationTextCommitments"},
         "actions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
         "resource": {"$ref": "#/$defs/safeIdentifier"},
         "resources": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
-        "plan_id": {"$ref": "#/$defs/safeIdentifier"},
+        "plan_id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
         "locality": {"enum": ["local", "remote", "peer", "cloud"]},
         "isolation_class": {"enum": ["P0", "P1", "P2", "P3"]},
         "attempt_id": {"$ref": "#/$defs/safeIdentifier"},
@@ -391,6 +391,23 @@
       "maxLength": 256,
       "pattern": "^[^\\s]+$"
     },
+    "taskOpaqueIdentifier": {
+      "description": "Opaque Task-origin identifier. Bounds count Unicode scalar values; punctuation and whitespace are preserved for compatibility with the Task contract.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "taskOpaqueStepIdentifier": {
+      "description": "Opaque Task step identifier copied without normalization.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "taskOpaqueRelatedIdentifier": {
+      "description": "Opaque transition reason reference copied without normalization; the Task transition contract permits an empty value.",
+      "type": "string",
+      "maxLength": 512
+    },
     "sha256Digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
@@ -474,7 +491,7 @@
             "required": ["kind", "id", "message_ref"],
             "properties": {
               "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
-              "id": {"$ref": "#/$defs/safeIdentifier"},
+              "id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
               "message_ref": {"$ref": "#/$defs/waitingMessageRef"}
             }
           }

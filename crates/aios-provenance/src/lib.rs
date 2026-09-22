@@ -1062,11 +1062,11 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         ("task.created", "revision") => expect_integer(value, 1, Some(1)),
         ("task.created", "creation") => validate_creation_details(value),
         ("task.created", "active_plan") => expect_null(value),
-        ("task.created", "active_step_ids") => expect_identifier_array(value, 512, 128),
+        ("task.created", "active_step_ids") => expect_task_string_array(value, 512, 128, true),
         ("task.created", "waiting_on") => validate_waiting_on(value, false),
         ("task.created", "failure" | "recovery") => expect_null(value),
         ("task.created", "fixture") => expect_bool(value),
-        ("task.transitioned", "related_ids") => expect_identifier_array(value, 128, 256),
+        ("task.transitioned", "related_ids") => expect_task_string_array(value, 32, 512, false),
         ("task.transitioned", "reason_message_ref") => {
             validate_commitment(value, "reason_message", true)
         }
@@ -1075,7 +1075,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         ("authorization.granted", "actions") => expect_token_array(value, 64, 128),
         ("authorization.granted", "resource") => expect_identifier(value, 256),
         ("authorization.granted", "resources") => expect_identifier_array(value, 64, 256),
-        ("plan.created" | "plan.revised", "plan_id") => expect_identifier(value, 256),
+        ("plan.created" | "plan.revised", "plan_id") => expect_task_string(value, 256, true),
         ("plan.created" | "plan.revised", "revision") => expect_integer(value, 1, None),
         ("provider.selected" | "placement.selected", "locality") => {
             expect_one_of(value, &["local", "remote", "peer", "cloud"])
@@ -1199,7 +1199,7 @@ fn validate_creation_details(value: &Value) -> Result<()> {
     for (key, value) in object {
         match key.as_str() {
             "principal" => validate_principal(value)?,
-            "workspace_id" => expect_nullable_identifier(value, 256)?,
+            "workspace_id" => expect_nullable_task_string(value, 256)?,
             "original_intent_ref" => validate_commitment(value, "original_intent", false)?,
             "normalized_intent_ref" => {
                 validate_commitment(value, "normalized_intent", true)?;
@@ -1215,7 +1215,7 @@ fn validate_creation_details(value: &Value) -> Result<()> {
 fn validate_principal(value: &Value) -> Result<()> {
     let object = expect_exact_object(value, &["kind", "id"])?;
     expect_one_of(&object["kind"], &["user", "system-service"])?;
-    expect_identifier(&object["id"], 256)
+    expect_task_string(&object["id"], 256, true)
 }
 
 fn validate_active_program(value: &Value) -> Result<()> {
@@ -1274,7 +1274,7 @@ fn validate_waiting_on(value: &Value, with_commitments: bool) -> Result<()> {
             &object["kind"],
             &["input", "approval", "resource", "provider", "validation"],
         )?;
-        expect_identifier(&object["id"], 256)?;
+        expect_task_string(&object["id"], 256, true)?;
         if with_commitments {
             validate_commitment(&object["message_ref"], "waiting_message", true)?;
         }
@@ -1402,6 +1402,56 @@ fn expect_nullable_identifier(value: &Value, maximum: usize) -> Result<()> {
     } else {
         expect_identifier(value, maximum)
     }
+}
+
+fn expect_task_string(value: &Value, maximum: usize, nonempty: bool) -> Result<()> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid_details("Task-origin detail must be a string"))?;
+    let length = value.chars().count();
+    if length > maximum || (nonempty && length == 0) {
+        return Err(invalid_details(
+            "Task-origin detail exceeds its Unicode-scalar bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn expect_nullable_task_string(value: &Value, maximum: usize) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        expect_task_string(value, maximum, true)
+    }
+}
+
+fn expect_task_string_array(
+    value: &Value,
+    maximum_items: usize,
+    maximum_chars: usize,
+    nonempty: bool,
+) -> Result<()> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_details("Task-origin collection must be an array"))?;
+    if values.len() > maximum_items {
+        return Err(invalid_details(
+            "Task-origin collection exceeds its item bound",
+        ));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for value in values {
+        expect_task_string(value, maximum_chars, nonempty)?;
+        let value = value
+            .as_str()
+            .expect("Task-origin string was validated above");
+        if !unique.insert(value) {
+            return Err(invalid_details(
+                "Task-origin collection contains duplicate values",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn expect_token(value: &Value, maximum: usize) -> Result<()> {
@@ -2001,9 +2051,9 @@ mod tests {
         wrong_revision["details"]["revision"] = json!("raw private text");
         cases.push(wrong_revision);
 
-        let mut private_workspace = typed_creation_event("T-typed-workspace", 2);
-        private_workspace["details"]["creation"]["workspace_id"] = json!("private workspace notes");
-        cases.push(private_workspace);
+        let mut empty_workspace = typed_creation_event("T-typed-workspace", 2);
+        empty_workspace["details"]["creation"]["workspace_id"] = json!("");
+        cases.push(empty_workspace);
 
         let mut wrong_number = typed_creation_event("T-typed-number", 3);
         wrong_number["details"]["revision"] = json!(1.5);
@@ -2084,6 +2134,25 @@ mod tests {
             )
             .is_err()
         );
+        let bad_machine_identifier = json!({
+            "schema_version":"0.1",
+            "event_id":"event-typed-machine-id",
+            "task_id":"T-typed-transition",
+            "event_type":"execution.started",
+            "timestamp":NOW,
+            "actor":{"kind":"system-service","id":"service:test"},
+            "status":"pending",
+            "details":{"attempt_id":"raw secret value"}
+        });
+        assert!(
+            append_in_tx(
+                &transaction,
+                "T-typed-transition",
+                &bad_machine_identifier,
+                &ExpectedHead::Any
+            )
+            .is_err()
+        );
         let bad_size = json!({
             "schema_version":"0.1",
             "event_id":"event-typed-size",
@@ -2134,7 +2203,7 @@ mod tests {
         transaction.commit().unwrap();
 
         let mut invalid = typed_creation_event("T-offline-private", 13);
-        invalid["details"]["creation"]["workspace_id"] = json!("raw private workspace text");
+        invalid["details"]["creation"]["workspace_id"] = json!("");
         let stream = stream_id("T-offline-private").unwrap();
         let event_hash = hash_record(&stream, 1, None, &invalid).unwrap();
         let record = JournalRecord {

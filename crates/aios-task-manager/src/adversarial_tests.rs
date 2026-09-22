@@ -35,6 +35,25 @@ fn create(task_id: &str) -> CreateTask {
     }
 }
 
+fn compatibility_create(task_id: &str) -> CreateTask {
+    CreateTask {
+        task_id: task_id.to_owned(),
+        principal: Actor {
+            kind: "user".to_owned(),
+            id: "user:Alice Smith=👩\u{200d}💻e\u{301}".to_owned(),
+        },
+        workspace_id: Some("My Workspace=🧪e\u{301}".to_owned()),
+        original_intent: "Exercise opaque Task identifier compatibility.".to_owned(),
+        normalized_intent: None,
+        active_step_ids: vec![
+            "step one".to_owned(),
+            "step=two".to_owned(),
+            "step 👣".to_owned(),
+            "step-e\u{301}".to_owned(),
+        ],
+    }
+}
+
 fn request(
     id: &str,
     task_id: &str,
@@ -532,7 +551,7 @@ fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() 
     let task_id = "任务-迁移-é";
     let original_records = {
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        manager.create_task(&create(task_id)).unwrap();
+        manager.create_task(&compatibility_create(task_id)).unwrap();
         let transaction = manager.connection.transaction().unwrap();
         for index in 2..=3 {
             append_event(
@@ -622,11 +641,99 @@ fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() 
     assert_eq!(migrated_records.len(), 3);
     assert_eq!(migrated_records, original_records);
     assert!(manager.verify_provenance(task_id).unwrap());
+    let task = manager.get_task(task_id).unwrap().unwrap();
+    assert_eq!(task.principal.id, "user:Alice Smith=👩\u{200d}💻e\u{301}");
+    assert_eq!(
+        task.workspace_id.as_deref(),
+        Some("My Workspace=🧪e\u{301}")
+    );
+    assert_eq!(
+        task.active_step_ids,
+        ["step one", "step=two", "step 👣", "step-e\u{301}"]
+    );
+    let export = manager.export_provenance(task_id).unwrap();
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
     assert_eq!(
         manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id=?1", [task_id], |row| row.get::<_, String>(0)).unwrap(),
         "0.1:aios-provenance-event-v0.1"
     );
     assert!(!provenance_task_fk_cascades(&manager.connection).unwrap());
+}
+
+#[test]
+fn new_task_opaque_identifiers_preserve_exact_hash_and_export_after_reopen() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("opaque-task-identifiers.sqlite3");
+    let task_id = "Task = 🧭 e\u{301}";
+    let original = compatibility_create(task_id);
+    let original_head = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let task = manager.create_task(&original).unwrap();
+        assert_eq!(task.principal, original.principal);
+        assert_eq!(task.workspace_id, original.workspace_id);
+        assert_eq!(task.active_step_ids, original.active_step_ids);
+        let mut planning = request(
+            "transition = 🧭 e\u{301}",
+            task_id,
+            1,
+            TaskState::Created,
+            TaskState::Planning,
+        );
+        planning.requested_by = original.principal.clone();
+        planning.reason.related_ids = vec![String::new(), "related = 🧷 e\u{301}".to_owned()];
+        assert!(manager.transition(&planning).unwrap().applied);
+        let mut waiting = request(
+            "waiting = 🧭 e\u{301}",
+            task_id,
+            2,
+            TaskState::Planning,
+            TaskState::WaitingForInput,
+        );
+        waiting.requested_by = original.principal.clone();
+        waiting.mutation.waiting_on = Some(vec![WaitingOn {
+            kind: WaitingKind::Input,
+            id: "input = 🧩 e\u{301}".to_owned(),
+            message: None,
+        }]);
+        assert!(manager.transition(&waiting).unwrap().applied);
+        aios_provenance::get_head(
+            &manager.connection,
+            &aios_provenance::stream_id(task_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let reopened_head = aios_provenance::get_head(
+        &manager.connection,
+        &aios_provenance::stream_id(task_id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(reopened_head, original_head);
+    assert!(manager.verify_provenance(task_id).unwrap());
+    let export = manager.export_provenance(task_id).unwrap();
+    assert!(export.records_jsonl.contains("user:Alice Smith="));
+    assert!(export.records_jsonl.contains("My Workspace="));
+    assert!(export.records_jsonl.contains("step one"));
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(
+        verification.computed_head_hash,
+        Some(original_head.event_hash)
+    );
 }
 
 #[test]
