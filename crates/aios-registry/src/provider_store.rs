@@ -1831,6 +1831,66 @@ fn trust_admission_receipt(
     }))
 }
 
+/// The `SQLite` insert guard uses the same canonical receipt and domain-separated
+/// identity as the provider-store writer and the history verifier. This must
+/// run before insertion: an immutable forged row cannot be repaired in place.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trust_admission_matches_insert(
+    admission_id: &str,
+    registration_id: &str,
+    decision_id: &str,
+    revision: i64,
+    trust_status: &str,
+    authority_ref: &str,
+    admitted_at: &str,
+    receipt_json: &str,
+    previous_at: &str,
+    initial_trust: &str,
+    lifecycle_state: &str,
+) -> bool {
+    if !(1..i64::MAX).contains(&revision)
+        || decision_id.is_empty()
+        || decision_id.len() > 256
+        || authority_ref.is_empty()
+        || authority_ref.len() > 256
+        || !matches!(lifecycle_state, "disabled" | "registered")
+    {
+        return false;
+    }
+    let (Ok(initial), Ok(trust), Ok(previous), Ok(admitted)) = (
+        ProviderTrustStatus::parse(initial_trust),
+        ProviderTrustStatus::parse(trust_status),
+        parse_time(previous_at),
+        parse_time(admitted_at),
+    ) else {
+        return false;
+    };
+    if matches!(
+        initial,
+        ProviderTrustStatus::Denied | ProviderTrustStatus::Revoked
+    ) || !trust.permits_execution()
+        || admitted < previous
+    {
+        return false;
+    }
+    let Ok(expected) = trust_admission_receipt(
+        registration_id,
+        decision_id,
+        revision,
+        trust,
+        authority_ref,
+        admitted_at,
+    ) else {
+        return false;
+    };
+    receipt_json == expected
+        && admission_id
+            == digest(
+                b"AIOS-PROVIDER-TRUST-ADMISSION\0v0.1\0",
+                expected.as_bytes(),
+            )
+}
+
 /// Reconstructs the original immutable receipt and each appended trust review
 /// before returning the effective trust scope for this exact build.
 pub fn verified_provider_effective_trust(
@@ -2115,7 +2175,7 @@ mod tests {
             "policy_decision_refs": [],
             "authority": {"grant_refs": []},
             "execution_profile": {"profile_ref": "synthetic-profile"},
-            "placement": {},
+            "placement": {"locality": "local"},
             "inputs": {},
             "outputs": {},
             "created_at": created_at
@@ -3315,6 +3375,13 @@ mod tests {
                 }
                 _ => binding_json.to_owned(),
             };
+            let placement_json = serde_json::from_str::<Value>(&receipt_json)
+                .ok()
+                .and_then(|receipt| receipt.get("placement").cloned())
+                .map_or_else(
+                    || r#"{"locality":"local"}"#.to_owned(),
+                    |placement| placement.to_string(),
+                );
             connection.execute(
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -3323,7 +3390,7 @@ mod tests {
                   grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
                  VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                          ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?10,
-                         '[]','[]','synthetic-profile','{}',?8,?9)",
+                         '[]','[]','synthetic-profile',?13,?8,?9)",
                 params![
                     format!("binding-{suffix}"),
                     format!("attempt-{suffix}"),
@@ -3337,6 +3404,7 @@ mod tests {
                     attempt,
                     registration.manifest_hash,
                     registration.build_hash,
+                    placement_json,
                 ],
             )
         };
@@ -3412,6 +3480,42 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(trust_marked, registration.registration_id);
+        // Extra fields, malformed ports, and attempt overflow retain exact
+        // durable projections yet violate the public receipt schema. Missing
+        // placement locality also fails. None may consume an immutable ID.
+        for (suffix, attempt, override_value) in [
+            ("extra-field", 3, json!({"unexpected": "opaque"})),
+            ("missing-locality", 4, json!({"placement": {}})),
+            (
+                "bad-input",
+                5,
+                json!({"inputs": {"source": {"semantic_type": "artifact.blob@1"}}}),
+            ),
+        ] {
+            let mut candidate: Value = serde_json::from_str(&valid_pin).unwrap();
+            candidate
+                .as_object_mut()
+                .unwrap()
+                .extend(override_value.as_object().unwrap().clone());
+            assert!(
+                insert_at(&connection, suffix, &candidate.to_string(), attempt, NOW).is_err(),
+                "{suffix}"
+            );
+        }
+        assert!(insert_at(&connection, "attempt-overflow", &valid_pin, 101, NOW).is_err());
+        let counts: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM execution_bindings),
+                        (SELECT COUNT(*) FROM execution_binding_admission_markers),
+                        (SELECT COUNT(*) FROM execution_binding_trust_markers),
+                        (SELECT COUNT(*) FROM execution_binding_enablement_markers)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1, 1));
+        // Failed admission has not reserved the rejected immutable ID.
+        insert_at(&connection, "extra-field", &valid_pin, 3, NOW).unwrap();
         assert!(
             insert_at(
                 &connection,
@@ -3482,7 +3586,7 @@ mod tests {
               grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
              VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                      ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?10,
-                     '[]','[]','synthetic-profile','{}',?8,?9)",
+                     '[]','[]','synthetic-profile','{\"locality\":\"local\"}',?8,?9)",
             params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                 manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                 registration.registration_id,registration.provider_id,registration.provider_version,
@@ -3576,7 +3680,7 @@ mod tests {
                   grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
                  VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                          ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?8,
-                         '[]','[]','synthetic-profile','{}',?9,?10)",
+                         '[]','[]','synthetic-profile','{\"locality\":\"local\"}',?9,?10)",
                 params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                     manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                     registration.registration_id,registration.provider_id,registration.provider_version,
@@ -4006,8 +4110,8 @@ mod tests {
                 .unwrap(),
             first
         );
-        // The complete history verifier also rejects a pre-existing direct-SQL
-        // row whose timestamp moves backward despite its valid receipt hash.
+        // The SQL boundary rejects a direct writer before an immutable row can
+        // poison history, even when the writer uses a valid canonical digest.
         let receipt = trust_admission_receipt(
             &registration.registration_id,
             "backdated-review",
@@ -4023,9 +4127,119 @@ mod tests {
              (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json)
              VALUES (?1,?2,'backdated-review',2,'project-reviewed','reviewer','2026-09-22T11:00:00Z',?3)",
             params![forged_id,registration.registration_id,receipt],
-        ).unwrap();
+        ).unwrap_err();
         let parsed: CapabilityManifest = serde_json::from_value(manifest).unwrap();
-        assert!(verified_provider_trust_source(store.connection, &registration, &parsed).is_err());
+        assert!(verified_provider_trust_source(store.connection, &registration, &parsed).is_ok());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_trust_admissions WHERE registration_id=?1",
+                    [&registration.registration_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sql_rejects_forged_trust_receipt_before_consuming_revision() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::Unverified,
+                NOW,
+            )
+            .unwrap();
+        let receipt = trust_admission_receipt(
+            &registration.registration_id,
+            "review",
+            1,
+            ProviderTrustStatus::LocallyTrusted,
+            "reviewer",
+            NOW,
+        )
+        .unwrap();
+        let correct_id = digest(b"AIOS-PROVIDER-TRUST-ADMISSION\0v0.1\0", receipt.as_bytes());
+        let insert = |id: &str, raw: &str| {
+            store.connection.execute(
+            "INSERT INTO provider_trust_admissions
+             (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json)
+             VALUES (?1,?2,'review',1,'locally-trusted','reviewer',?3,?4)",
+            params![id, registration.registration_id, NOW, raw],
+        )
+        };
+        assert!(insert("arbitrary-id", &receipt).is_err());
+        let extra = receipt.replace(
+            "\"schema_version\":\"0.1\"",
+            "\"schema_version\":\"0.1\",\"extra\":true",
+        );
+        let extra_id = digest(b"AIOS-PROVIDER-TRUST-ADMISSION\0v0.1\0", extra.as_bytes());
+        assert!(insert(&extra_id, &extra).is_err());
+        assert!(insert(&correct_id, &receipt).is_ok());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_trust_admissions WHERE registration_id=?1",
+                    [&registration.registration_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        store.revoke(&registration.registration_id, NOW).unwrap();
+        let after_revocation = trust_admission_receipt(
+            &registration.registration_id,
+            "after-revocation",
+            2,
+            ProviderTrustStatus::ProjectReviewed,
+            "reviewer",
+            NOW,
+        )
+        .unwrap();
+        let next_id = digest(
+            b"AIOS-PROVIDER-TRUST-ADMISSION\0v0.1\0",
+            after_revocation.as_bytes(),
+        );
+        assert!(store.connection.execute(
+            "INSERT INTO provider_trust_admissions
+             (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json)
+             VALUES (?1,?2,'after-revocation',2,'project-reviewed','reviewer',?3,?4)",
+            params![next_id, registration.registration_id, NOW, after_revocation],
+        ).is_err());
+    }
+
+    #[test]
+    fn offset_trust_receipt_matches_shared_insert_guard() {
+        let receipt = trust_admission_receipt(
+            "sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b",
+            "offset-decision",
+            1,
+            ProviderTrustStatus::ProjectReviewed,
+            "review:offset",
+            "2026-09-19T15:00:00.200+15:00",
+        )
+        .unwrap();
+        assert!(trust_admission_matches_insert(
+            "sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986",
+            "sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b",
+            "offset-decision",
+            1,
+            "project-reviewed",
+            "review:offset",
+            "2026-09-19T15:00:00.200+15:00",
+            &receipt,
+            "2026-09-19T15:00:00+15:00",
+            "locally-trusted",
+            "registered",
+        ));
     }
 
     #[test]

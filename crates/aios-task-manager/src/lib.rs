@@ -3651,13 +3651,57 @@ fn provider_history_provable(connection: &Connection) -> Result<bool> {
 }
 
 fn provider_authority_history_provable(connection: &Connection) -> Result<bool> {
-    additive_guard_definitions_current(
+    let other_guards: Vec<&str> = PROVIDER_AUTHORITY_HISTORY_GUARDS
+        .iter()
+        .copied()
+        .filter(|guard| *guard != "provider_trust_admission_receipt_insert")
+        .collect();
+    if !additive_guard_definitions_current(connection, &other_guards, true, true, true)? {
+        return Ok(false);
+    }
+    if additive_guard_definitions_current(
         connection,
-        PROVIDER_AUTHORITY_HISTORY_GUARDS,
+        &["provider_trust_admission_receipt_insert"],
         true,
         true,
         true,
-    )
+    )? {
+        return Ok(true);
+    }
+    if !legacy_b0b_trust_admission_guard_present(connection)? {
+        return Ok(false);
+    }
+    // The old guard did not authenticate receipt identity or chronology.
+    // An existing immutable decision could have been forged while it ran.
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM provider_trust_admissions)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_b0b_trust_admission_guard_present(connection: &Connection) -> Result<bool> {
+    let actual: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_trust_admission_receipt_insert'",
+        [],
+        |row| row.get(0),
+    ).optional()?;
+    let Some(actual) = actual else {
+        return Ok(false);
+    };
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch("CREATE TABLE provider_trust_admissions(registration_id TEXT)")?;
+    canonical.execute_batch(include_str!(
+        "legacy_b0b7302_provider_trust_admission_guard.sql"
+    ))?;
+    let expected: String = canonical.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_trust_admission_receipt_insert'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(normalize_schema_sql(&actual) == normalize_schema_sql(&expected))
 }
 
 #[allow(
@@ -3727,6 +3771,7 @@ fn upgrade_stamped_registry_guards_fenced(
     let upgrade_provider = provider_stamped
         && (missing_additive_guard(connection, PROVIDER_ADDITIVE_GUARDS)?
             || !provider_additive_tables_current(connection, true, true)?
+            || legacy_b0b_trust_admission_guard_present(connection)?
             || legacy_provider_trust_guard_present(connection)?
             || legacy_c5a_provider_guard_present(connection)?
             || legacy_2b1_evidence_guard_present(connection)?);
@@ -3801,6 +3846,9 @@ fn upgrade_stamped_registry_guards_fenced(
         ))?;
     }
     if upgrade_provider {
+        if legacy_b0b_trust_admission_guard_present(&transaction)? {
+            transaction.execute_batch("DROP TRIGGER provider_trust_admission_receipt_insert")?;
+        }
         let has_epoch_table: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master
              WHERE type='table' AND name='provider_state_epochs')",
@@ -4058,6 +4106,10 @@ fn additive_guard_definitions_current(
             && !(provider && !require_all && legacy_provider_trust_guard_matches(guard, &actual)?)
             && !(provider && !require_all && legacy_c5a_provider_guard_matches(guard, &actual)?)
             && !(provider && !require_all && legacy_2b1_evidence_guard_matches(guard, &actual)?)
+            && !(provider
+                && !require_all
+                && *guard == "provider_trust_admission_receipt_insert"
+                && legacy_b0b_trust_admission_guard_present(connection)?)
         {
             return Ok(false);
         }
@@ -7724,7 +7776,8 @@ fn binding_receipt_projection(
         placement_json: &binding.placement_json,
         created_at: &binding.created_at,
     };
-    (receipt.matches_columns(&columns)
+    ((!require_pin || receipt.conforms_to_stamped_schema())
+        && receipt.matches_columns(&columns)
         && receipt.evidence_pin_matches(&binding.conformance_evidence_id, require_pin)
         && (!require_pin || receipt.trust_pin().is_some()))
     .then_some(receipt)
@@ -7879,7 +7932,8 @@ fn binding_grants_valid(
         // Older stores have no append-only trust decisions to verify, so the
         // immutable registration row remains the complete trust authority.
         binding_query.push_str(
-            " AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')",
+            " AND r.registry_snapshot_id=b.registry_snapshot_id
+               AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')",
         );
     }
     let binding = transaction
@@ -9869,6 +9923,57 @@ mod tests {
     }
 
     #[test]
+    fn old_trust_insert_guard_upgrades_only_without_prior_decisions() {
+        for poisoned in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("prior-trust-insert.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            manager
+                .connection
+                .execute_batch("DROP TRIGGER provider_trust_admission_receipt_insert")
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "legacy_b0b7302_provider_trust_admission_guard.sql"
+                ))
+                .unwrap();
+            assert!(legacy_b0b_trust_admission_guard_present(&manager.connection).unwrap());
+            if poisoned {
+                manager
+                    .connection
+                    .pragma_update(None, "foreign_keys", "OFF")
+                    .unwrap();
+                manager.connection.execute(
+                    "INSERT INTO provider_trust_admissions
+                     (admission_id,registration_id,decision_id,revision,trust_status,
+                      authority_ref,admitted_at,receipt_json)
+                     VALUES ('forged','missing-registration','review',1,
+                             'locally-trusted','reviewer',?1,
+                             '{\"registration_id\":\"missing-registration\",\"decision_id\":\"review\",\"revision\":1,\"trust_status\":\"locally-trusted\",\"authority_ref\":\"reviewer\",\"admitted_at\":\"2026-09-19T00:00:00Z\"}')",
+                    ["2026-09-19T00:00:00Z"],
+                ).unwrap();
+            }
+            drop(manager);
+            if poisoned {
+                assert!(matches!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                    Err(TaskManagerError::InvalidRecord(
+                        "provider evidence or trust history requires operator quarantine"
+                    ))
+                ));
+                let connection = Connection::open(&path).unwrap();
+                assert!(legacy_b0b_trust_admission_guard_present(&connection).unwrap());
+            } else {
+                let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                assert!(preflight_migration_state(&reopened.connection).is_ok());
+                assert!(!legacy_b0b_trust_admission_guard_present(&reopened.connection).unwrap());
+            }
+        }
+    }
+
+    #[test]
     fn lost_evidence_or_trust_history_refuses_fenced_reopen() {
         for guard in [
             "provider_evidence_no_duplicate_insert",
@@ -10568,40 +10673,40 @@ mod tests {
              INSERT INTO provider_registrations
              (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
               registry_snapshot_id,state,trust_status,registration_json,registered_at)
-             VALUES ('sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','build:offset',
+             VALUES ('sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
                      'offset-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}',
                      '2026-09-19T15:00:00+15:00');
              INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
-             VALUES ('sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770',
+             VALUES ('sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b',
                      '{\"id\":\"provider.offset\",\"provides\":[{\"conformance\":{\"status\":\"declared\",\"suite\":\"offset-suite\",\"suite_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"version\":\"1.0\"},\"effect_classes\":[\"PURE\"],\"execution\":{\"execution_class\":\"deterministic\",\"locality\":[\"local\"],\"minimum_isolation\":\"P2\"}}],\"publisher\":{\"id\":\"fixture\"},\"runtime\":{\"kind\":\"process\"},\"schema_version\":\"0.1\",\"version\":\"1.0.0\"}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T15:00:00+15:00'
-             WHERE registration_id='sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770';
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
              INSERT INTO provider_conformance_evidence
              (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
               status,evidence_json,tested_at)
-             VALUES ('offset-evidence','sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
+             VALUES ('offset-evidence','sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
                      'offset-suite','sha256:2222222222222222222222222222222222222222222222222222222222222222','pass',
-                     '{\"schema_version\":\"0.1\",\"result_id\":\"offset-evidence\",\"provider_id\":\"provider.offset\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"build:offset\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_suite\":{\"id\":\"offset-suite\",\"version\":\"0.1\",\"hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"harness\":{\"id\":\"harness:offset\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00.100Z\",\"expires_at\":\"2026-09-19T00:00:02Z\"}',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"offset-evidence\",\"provider_id\":\"provider.offset\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_suite\":{\"id\":\"offset-suite\",\"version\":\"0.1\",\"hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"harness\":{\"id\":\"harness:offset\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00.100Z\",\"expires_at\":\"2026-09-19T00:00:02Z\"}',
                      '2026-09-19T00:00:00.100Z');
              INSERT INTO provider_trust_admissions
              (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,
               admitted_at,receipt_json)
-             VALUES ('offset-trust','sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770','offset-decision',1,'project-reviewed',
+             VALUES ('sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986','sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','offset-decision',1,'project-reviewed',
                      'review:offset','2026-09-19T15:00:00.200+15:00',
-                     '{\"registration_id\":\"sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770\",\"decision_id\":\"offset-decision\",\"revision\":1,\"trust_status\":\"project-reviewed\",\"authority_ref\":\"review:offset\",\"admitted_at\":\"2026-09-19T15:00:00.200+15:00\"}');
+                     '{\"admitted_at\":\"2026-09-19T15:00:00.200+15:00\",\"authority_ref\":\"review:offset\",\"decision_id\":\"offset-decision\",\"registration_id\":\"sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b\",\"revision\":1,\"schema_version\":\"0.1\",\"trust_status\":\"project-reviewed\"}');
              INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
               ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
               provider_id,provider_version,provider_manifest_hash,provider_build_hash,
               attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
               placement_json,binding_json,created_at)
-             VALUES ('offset-binding','offset-attempt','T-offset-provider','offset-program',
+             VALUES ('offset-binding','offset-attempt','T-offset-provider','sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
                      'offset-snapshot','0.1','offset-node','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
-                     'sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','build:offset',
-                     1,'[]','[]','offset-profile','{}',
-                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"offset-program\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"offset-trust\",\"provider\":{\"id\":\"provider.offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c\",\"package_or_build_hash\":\"build:offset\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
+                     'sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                     1,'[]','[]','offset-profile','{\"locality\":\"local\"}',
+                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\",\"provider\":{\"id\":\"provider.offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c\",\"package_or_build_hash\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{\"locality\":\"local\"},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
                      '2026-09-19T01:00:00.300+01:00');",
         ).unwrap();
         let clone_receipt = |binding_id: &str, attempt_id: &str, attempt: i64| {
@@ -10624,6 +10729,11 @@ mod tests {
                             policy: &str,
                             grants: &str,
                             placement: &str| {
+            let placement = if placement == "{}" {
+                r#"{"locality":"local"}"#
+            } else {
+                placement
+            };
             connection.execute(
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -10857,14 +10967,14 @@ mod tests {
                 16,
                 "\"schema_version\":\"0.1\"".to_owned(),
                 "\"schema_version\\u0000suffix\":\"0.1\",\"schema_version\":\"0.1\"".to_owned(),
-                true,
+                false,
             ),
             (
                 "nul-after",
                 17,
                 "\"schema_version\":\"0.1\"".to_owned(),
                 "\"schema_version\":\"0.1\",\"schema_version\\u0000suffix\":\"0.1\"".to_owned(),
-                true,
+                false,
             ),
             (
                 "evidence-nul-only",
@@ -10876,8 +10986,8 @@ mod tests {
             (
                 "trust-nul-only",
                 19,
-                "\"provider_trust_source_id\":\"offset-trust\"".to_owned(),
-                "\"provider_trust_source_id\\u0000suffix\":\"offset-trust\"".to_owned(),
+                "\"provider_trust_source_id\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\"".to_owned(),
+                "\"provider_trust_source_id\\u0000suffix\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\"".to_owned(),
                 false,
             ),
             (
@@ -11041,7 +11151,7 @@ mod tests {
         let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
         assert!(!legacy_2b1_evidence_guard_present(&reopened.connection).unwrap());
         assert_eq!(reopened.connection.query_row(
-            "SELECT state FROM provider_registrations WHERE registration_id='sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770'",
+            "SELECT state FROM provider_registrations WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b'",
             [], |row| row.get::<_, String>(0),
         ).unwrap(),"registered");
         assert_eq!(
@@ -11073,10 +11183,10 @@ mod tests {
             .execute_batch(
                 "UPDATE provider_registrations SET state='disabled',
                  updated_at='2026-09-19T00:00:00.400Z'
-             WHERE registration_id='sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770';
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T15:00:00.400+15:00'
-             WHERE registration_id='sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770';
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
              INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
               ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
@@ -11103,7 +11213,7 @@ mod tests {
              JOIN provider_state_epochs e ON e.registration_id=m.registration_id
                  AND e.revision=m.revision WHERE m.binding_id='offset-fresh'
                  AND e.revision=(SELECT MAX(revision) FROM provider_state_epochs
-                                 WHERE registration_id='sha256:f2066605cf915a8f8e4d0486b15b173e2475afcf81c17039191b45c8fb6e1770')",
+                                 WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b')",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -11147,20 +11257,20 @@ mod tests {
              INSERT INTO provider_registrations
              (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
               registry_snapshot_id,state,trust_status,registration_json,registered_at)
-             VALUES ('sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','build:repair',
+             VALUES ('sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
                      'repair-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
               INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
-              VALUES ('sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac','{\"id\":\"provider.repair\",\"provides\":[{\"conformance\":{\"status\":\"declared\",\"suite\":\"repair-suite\",\"suite_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"version\":\"1.0\"},\"effect_classes\":[\"PURE\"],\"execution\":{\"execution_class\":\"deterministic\",\"locality\":[\"local\"],\"minimum_isolation\":\"P2\"}}],\"publisher\":{\"id\":\"fixture\"},\"runtime\":{\"kind\":\"process\"},\"schema_version\":\"0.1\",\"version\":\"1.0.0\"}');
+              VALUES ('sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','{\"id\":\"provider.repair\",\"provides\":[{\"conformance\":{\"status\":\"declared\",\"suite\":\"repair-suite\",\"suite_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"version\":\"1.0\"},\"effect_classes\":[\"PURE\"],\"execution\":{\"execution_class\":\"deterministic\",\"locality\":[\"local\"],\"minimum_isolation\":\"P2\"}}],\"publisher\":{\"id\":\"fixture\"},\"runtime\":{\"kind\":\"process\"},\"schema_version\":\"0.1\",\"version\":\"1.0.0\"}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T00:00:00Z'
-             WHERE registration_id='sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac';
+             WHERE registration_id='sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74';
              INSERT INTO provider_conformance_evidence
              (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
               status,evidence_json,tested_at)
-             VALUES ('repair-evidence','sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
+             VALUES ('repair-evidence','sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
                      'repair-suite','sha256:4444444444444444444444444444444444444444444444444444444444444444','pass',
-                     '{\"schema_version\":\"0.1\",\"result_id\":\"repair-evidence\",\"provider_id\":\"provider.repair\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"build:repair\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_suite\":{\"id\":\"repair-suite\",\"version\":\"0.1\",\"hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"harness\":{\"id\":\"harness:repair\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00Z\",\"expires_at\":\"2026-09-20T00:00:00Z\"}',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"repair-evidence\",\"provider_id\":\"provider.repair\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_suite\":{\"id\":\"repair-suite\",\"version\":\"0.1\",\"hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"harness\":{\"id\":\"harness:repair\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00Z\",\"expires_at\":\"2026-09-20T00:00:00Z\"}',
                      '2026-09-19T00:00:00Z');
              INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -11168,11 +11278,11 @@ mod tests {
               provider_id,provider_version,provider_manifest_hash,provider_build_hash,
               attempt,policy_decision_refs_json,grant_refs_json,
               execution_profile_ref,placement_json,binding_json,created_at)
-             VALUES ('repair-binding','repair-attempt','T-semantic-repair','repair-program',
+             VALUES ('repair-binding','repair-attempt','T-semantic-repair','sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
                      'repair-snapshot','0.1','repair-node','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
-                     'sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','build:repair',
-                     1,'[]','[]','repair-profile','{}',
-                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"repair-program\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"sha256:e14ec1704a8f670e2b521b8297ae4201df261b16d8f8d076eb0440f14e5251ac\",\"provider\":{\"id\":\"provider.repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777\",\"package_or_build_hash\":\"build:repair\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
+                     'sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                     1,'[]','[]','repair-profile','{\"locality\":\"local\"}',
+                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74\",\"provider\":{\"id\":\"provider.repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777\",\"package_or_build_hash\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{\"locality\":\"local\"},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
                      '2026-09-19T00:00:00Z');",
         ).unwrap();
         let stamp: (String, String) = manager

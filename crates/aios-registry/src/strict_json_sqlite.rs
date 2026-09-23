@@ -4,7 +4,7 @@ use rusqlite::{Connection, functions::FunctionFlags, types::ValueRef};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::provider_store::manifest_claim_matches_registration;
+use crate::provider_store::{manifest_claim_matches_registration, trust_admission_matches_insert};
 use crate::{
     BindingReceiptColumns, BindingReceiptProjection, EvidenceMatch, FullVersion,
     ProviderRegistration, StrictJsonLimits, evidence_matches_binding, parse_strict_value,
@@ -151,6 +151,59 @@ pub fn register_strict_json_sqlite(connection: &Connection) -> rusqlite::Result<
             std::cmp::Ordering::Greater => 1,
         }))
     })?;
+    connection.create_scalar_function(
+        "aios_trust_admission_matches_insert_v1",
+        11,
+        flags,
+        |context| {
+            let text = |index| match context.get_raw(index) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let (
+                Some(admission_id),
+                Some(registration_id),
+                Some(decision_id),
+                Some(trust_status),
+                Some(authority_ref),
+                Some(admitted_at),
+                Some(receipt_json),
+                Some(previous_at),
+                Some(initial_trust),
+                Some(lifecycle_state),
+            ) = (
+                text(0),
+                text(1),
+                text(2),
+                text(4),
+                text(5),
+                text(6),
+                text(7),
+                text(8),
+                text(9),
+                text(10),
+            )
+            else {
+                return Ok(false);
+            };
+            let ValueRef::Integer(revision) = context.get_raw(3) else {
+                return Ok(false);
+            };
+            Ok(trust_admission_matches_insert(
+                admission_id,
+                registration_id,
+                decision_id,
+                revision,
+                trust_status,
+                authority_ref,
+                admitted_at,
+                receipt_json,
+                previous_at,
+                initial_trust,
+                lifecycle_state,
+            ))
+        },
+    )?;
     connection.create_scalar_function("aios_binding_receipt_matches_v1", 20, flags, |context| {
         let raw: String = context.get(0)?;
         let binding_id: String = context.get(1)?;
@@ -196,7 +249,8 @@ pub fn register_strict_json_sqlite(connection: &Connection) -> rusqlite::Result<
             placement_json: &placement_json,
             created_at: &created_at,
         };
-        Ok(receipt.matches_columns(&columns)
+        Ok(receipt.conforms_to_stamped_schema()
+            && receipt.matches_columns(&columns)
             && receipt.evidence_pin().is_some()
             && receipt.trust_pin().is_some())
     })?;

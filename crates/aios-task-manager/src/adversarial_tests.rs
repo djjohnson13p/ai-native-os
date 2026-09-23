@@ -968,7 +968,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         "policy_decision_refs": [],
         "authority": {"grant_refs": []},
         "execution_profile": {"profile_ref": "profile:test"},
-        "placement": {},
+        "placement": {"locality": "local"},
         "inputs": {},
         "outputs": {},
         "created_at": TEST_TIME,
@@ -985,7 +985,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
          execution_profile_ref,placement_json,binding_json,created_at)
          VALUES ('binding-real-receipt','attempt-real-receipt','T-real-receipt',?1,?2,'0.1',
          'node-real','artifact.hash@1',?3,?4,?5,?6,?7,?8,1,'[]','[]','profile:test',
-         '{}',?9,?10)",
+         '{\"locality\":\"local\"}',?9,?10)",
             params![
                 HASH,
                 second.snapshot_id(),
@@ -10648,6 +10648,81 @@ fn prepare_completion_for_admission(manager: &TaskManager) {
              DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         )
         .unwrap();
+}
+
+#[test]
+fn legacy_provider_registration_cannot_cross_the_active_snapshot() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    // Exercise the pre-0013 launch profile while keeping the otherwise valid
+    // completion fixture. The second snapshot retains the capability hash but
+    // changes its type catalog, so a registration against it is not authority
+    // for the active program's snapshot.
+    manager
+        .connection
+        .execute(
+            "DELETE FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+            [],
+        )
+        .unwrap();
+    let check = BindingGrantCheck {
+        task_id: "T-completion",
+        semantic_hash: HASH,
+        node_id: "node-completion",
+        binding_id: "binding-completion",
+        attempt_id: "attempt-completion",
+        grant_refs_json: "[]",
+        checked_at: TEST_TIME,
+    };
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(binding_grants_valid(&transaction, &check).unwrap());
+    transaction.commit().unwrap();
+
+    manager.connection.execute_batch(
+        "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+           SELECT 'snapshot-other',
+                  json_set(manifest_json,'$.snapshot_id','snapshot-other',
+                           '$.type_contracts',json('[{\"id\":\"artifact.other\",\"version\":\"1.0\",\"content_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"}]')),
+                  created_at FROM registry_snapshots WHERE snapshot_id='snapshot-completion';
+         UPDATE provider_registrations SET registry_snapshot_id='snapshot-other'
+           WHERE registration_id='registration-completion';",
+    ).unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(!binding_grants_valid(&transaction, &check).unwrap());
+    transaction.commit().unwrap();
+
+    let task_before = manager.get_task("T-completion").unwrap().unwrap();
+    let step_before = manager
+        .get_step_execution("attempt-completion")
+        .unwrap()
+        .unwrap();
+    let provenance_before = manager.provenance_count("T-completion").unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-legacy-snapshot-mismatch",
+            "T-completion",
+            task_before.revision,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    assert_eq!(
+        manager.get_task("T-completion").unwrap().unwrap(),
+        task_before
+    );
+    assert_eq!(
+        manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap(),
+        step_before
+    );
+    assert_eq!(
+        manager.provenance_count("T-completion").unwrap(),
+        provenance_before
+    );
 }
 
 fn mutate_json_column(

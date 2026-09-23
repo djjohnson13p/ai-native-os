@@ -1,9 +1,13 @@
 //! One exact-key receipt projection for durable admission and launch.
 
+use std::sync::OnceLock;
+
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{StrictJsonError, StrictJsonLimits, parse_strict_value};
+
+static EXECUTION_BINDING_SCHEMA: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
 
 /// Immutable columns that a binding receipt must project exactly.
 pub struct BindingReceiptColumns<'a> {
@@ -40,6 +44,23 @@ impl BindingReceiptProjection {
     /// Returns a strict parser error for malformed, duplicate-key, or over-limit JSON.
     pub fn parse(raw: &[u8]) -> Result<Self, StrictJsonError> {
         parse_strict_value(raw, StrictJsonLimits::default()).map(|value| Self { value })
+    }
+
+    /// Stamped provider stores admit the complete public v0.1 receipt contract.
+    /// Historical unstamped receipts keep their separate compatibility profile.
+    pub fn conforms_to_stamped_schema(&self) -> bool {
+        let validator = EXECUTION_BINDING_SCHEMA.get_or_init(|| {
+            let schema: Value =
+                serde_json::from_str(include_str!("../../../specs/execution-binding.schema.json"))
+                    .map_err(|error| error.to_string())?;
+            jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .map_err(|error| error.to_string())
+        });
+        validator
+            .as_ref()
+            .is_ok_and(|validator| validator.is_valid(&self.value))
     }
 
     /// Match every column projection that launch needs before the attempt is consumed.
