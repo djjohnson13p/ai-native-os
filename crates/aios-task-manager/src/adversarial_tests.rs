@@ -757,7 +757,10 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         .map(str::to_owned);
     {
         let transaction = manager.connection.transaction().unwrap();
-        assert!(!verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
+        assert!(
+            !verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME)
+                .unwrap()
+        );
         transaction.rollback().unwrap();
     }
     manager
@@ -772,9 +775,13 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         )
         .unwrap();
     let transaction = manager.connection.transaction().unwrap();
-    assert!(verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
+    assert!(
+        verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap()
+    );
     binding.registry_snapshot_id = first.snapshot_id().into();
-    assert!(verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
+    assert!(
+        verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap()
+    );
     let original_receipt: String = transaction
         .query_row(
             "SELECT registration_json FROM provider_registrations WHERE registration_id=?1",
@@ -806,7 +813,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             )
             .unwrap();
         assert!(
-            !verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap(),
+            !verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME)
+                .unwrap(),
             "forged receipt field {pointer} must not authorize launch"
         );
         transaction
@@ -900,7 +908,30 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             &serde_json::to_vec(&evidence).unwrap(),
         )
         .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(
+            binding.provider_registration_id.as_deref().unwrap(),
+            TEST_TIME,
+        )
+        .unwrap();
     manager.create_task(&create("T-real-receipt")).unwrap();
+    let trust_source_id: String = manager
+        .connection
+        .query_row(
+            "SELECT admission_id FROM provider_trust_admissions
+             WHERE registration_id=?1 ORDER BY revision DESC LIMIT 1",
+            [binding.provider_registration_id.as_deref().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding_receipt = canonical_json(&json!({
+        "conformance_evidence_id": "cross-snapshot-pass",
+        "provider_trust_source_id": trust_source_id,
+    }))
+    .unwrap();
+    binding.binding_json = binding_receipt.clone();
     manager
         .connection
         .execute(
@@ -921,7 +952,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
                 binding.provider_version,
                 binding.provider_manifest_hash,
                 binding.provider_build_hash,
-                "{\"conformance_evidence_id\":\"cross-snapshot-pass\"}",
+                binding_receipt,
                 TEST_TIME
             ],
         )
@@ -938,8 +969,21 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     {
         let transaction = manager.connection.transaction().unwrap();
         assert!(
-            verified_provider_admission(&transaction, "binding-real-receipt", &binding).unwrap()
+            verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
+                .unwrap()
         );
+        let original_receipt = binding.binding_json.clone();
+        binding.binding_json = canonical_json(&json!({
+            "conformance_evidence_id": "cross-snapshot-pass",
+            "provider_trust_source_id": "decision:unrelated",
+        }))
+        .unwrap();
+        assert!(
+            !verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
+                .unwrap(),
+            "a binding receipt must identify its durable trust source"
+        );
+        binding.binding_json = original_receipt;
         transaction.rollback().unwrap();
     }
     manager
@@ -956,7 +1000,19 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     {
         let transaction = manager.connection.transaction().unwrap();
         assert!(
-            !verified_provider_admission(&transaction, "binding-real-receipt", &binding).unwrap()
+            verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
+                .unwrap(),
+            "a future trust decision must not invalidate the current binding early"
+        );
+        assert!(
+            !verified_provider_admission(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                "2026-09-19T00:00:01Z"
+            )
+            .unwrap(),
+            "the old binding expires when the new trust decision becomes effective"
         );
         transaction.rollback().unwrap();
     }
@@ -1057,7 +1113,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             .unwrap();
         let transaction = manager.connection.transaction().unwrap();
         assert_eq!(
-            verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap(),
+            verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap(),
             permitted
         );
     }
@@ -1227,6 +1283,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         receipt["registry_snapshot_id"] = registry.snapshot_id().into();
         receipt["capability_contract_hash"] = contract_hash.clone().into();
         receipt["conformance_evidence_id"] = pinned.into();
+        receipt["provider_trust_source_id"] = registration.registration_id.clone().into();
         let created_at = if pinned == "E2" {
             "2026-09-19T00:00:00.600Z"
         } else {

@@ -1275,9 +1275,22 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "execution_binding_evidence_pin_required"),
         ("table", "execution_binding_admission_markers"),
         ("table", "execution_binding_trust_markers"),
+        ("table", "execution_binding_legacy_trust_quarantine"),
         ("trigger", "execution_binding_admission_marker_insert"),
         ("trigger", "execution_binding_trust_marker_insert"),
         ("trigger", "execution_binding_trust_not_future"),
+        (
+            "trigger",
+            "execution_binding_legacy_trust_quarantine_no_update",
+        ),
+        (
+            "trigger",
+            "execution_binding_legacy_trust_quarantine_no_delete",
+        ),
+        (
+            "trigger",
+            "execution_binding_legacy_trust_quarantine_no_duplicate_insert",
+        ),
         (
             "trigger",
             "execution_binding_trust_marker_no_duplicate_insert",
@@ -1611,27 +1624,8 @@ fn verified_provider_effective_trust_at(
     manifest: &CapabilityManifest,
     at: &str,
 ) -> Result<ProviderTrustStatus> {
-    let checked = parse_time(at)?;
-    let (trust, source) = verified_provider_trust_source(connection, registration, manifest)?;
-    let admitted_at: String = if source == registration.registration_id {
-        connection.query_row(
-            "SELECT registered_at FROM provider_registrations WHERE registration_id=?1",
-            [&registration.registration_id],
-            |row| row.get(0),
-        )?
-    } else {
-        connection.query_row(
-            "SELECT admitted_at FROM provider_trust_admissions WHERE admission_id=?1",
-            [&source],
-            |row| row.get(0),
-        )?
-    };
-    if parse_time(&admitted_at)? > checked {
-        return Err(ProviderStoreError::Conflict(
-            "provider trust admission is in the future",
-        ));
-    }
-    Ok(trust)
+    verified_provider_trust_source_at(connection, registration, manifest, at)
+        .map(|(trust, _)| trust)
 }
 
 /// Returns effective trust and the immutable receipt ID that established it.
@@ -1641,13 +1635,39 @@ pub fn verified_provider_trust_source(
     registration: &ProviderRegistration,
     manifest: &CapabilityManifest,
 ) -> Result<(ProviderTrustStatus, String)> {
+    verified_provider_trust_source_checked(connection, registration, manifest, None)
+}
+
+/// Resolves the authenticated trust source effective at `at` while validating
+/// every immutable admission receipt, including later historical records.
+pub fn verified_provider_trust_source_at(
+    connection: &Connection,
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+    at: &str,
+) -> Result<(ProviderTrustStatus, String)> {
+    verified_provider_trust_source_checked(
+        connection,
+        registration,
+        manifest,
+        Some(parse_time(at)?),
+    )
+}
+
+fn verified_provider_trust_source_checked(
+    connection: &Connection,
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+    checked: Option<OffsetDateTime>,
+) -> Result<(ProviderTrustStatus, String)> {
     verify_stored_registration_receipt(connection, registration, manifest)?;
     let initial: String = connection.query_row(
         "SELECT trust_status FROM provider_registrations WHERE registration_id=?1",
         [&registration.registration_id],
         |row| row.get(0),
     )?;
-    let mut effective = ProviderTrustStatus::parse(&initial)?;
+    let initial_trust = ProviderTrustStatus::parse(&initial)?;
+    let mut effective = initial_trust;
     let mut source_id = registration.registration_id.clone();
     let mut statement = connection.prepare(
         "SELECT admission_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json
@@ -1661,6 +1681,11 @@ pub fn verified_provider_trust_source(
         |row| row.get(0),
     )?;
     let mut latest_time = parse_time(&registered_at)?;
+    if checked.is_some_and(|cutoff| latest_time > cutoff) {
+        return Err(ProviderStoreError::Conflict(
+            "provider registration is in the future",
+        ));
+    }
     while let Some(row) = rows.next()? {
         let (id, decision, revision, trust, authority, at, receipt): (
             String,
@@ -1680,7 +1705,7 @@ pub fn verified_provider_trust_source(
             row.get(6)?,
         );
         if matches!(
-            effective,
+            initial_trust,
             ProviderTrustStatus::Denied | ProviderTrustStatus::Revoked
         ) || revision != expected_revision
             || decision.is_empty()
@@ -1719,8 +1744,10 @@ pub fn verified_provider_trust_source(
                 "provider trust admission receipt mismatch",
             ));
         }
-        effective = parsed;
-        source_id = id;
+        if checked.is_none_or(|cutoff| decision_time <= cutoff) {
+            effective = parsed;
+            source_id = id;
+        }
         latest_time = decision_time;
         expected_revision =
             expected_revision
@@ -2768,6 +2795,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks disabled rejection and both before/after trust sources in one binding fixture"
+    )]
     fn binding_insert_requires_a_valid_text_evidence_pin() {
         let (mut connection, registry) = setup();
         let manifest = manifest(&registry);
@@ -2793,7 +2824,11 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "OFF")
             .unwrap();
-        let insert = |connection: &Connection, suffix: &str, binding_json: &str| {
+        let insert_at = |connection: &Connection,
+                         suffix: &str,
+                         binding_json: &str,
+                         attempt: i64,
+                         created_at: &str| {
             connection.execute(
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -2801,7 +2836,7 @@ mod tests {
                   provider_id,provider_version,attempt,policy_decision_refs_json,
                   grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
                  VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,1,
+                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?10,
                          '[]','[]','synthetic-profile','{}',?8,?9)",
                 params![
                     format!("binding-{suffix}"),
@@ -2812,9 +2847,13 @@ mod tests {
                     registration.provider_id,
                     registration.provider_version,
                     binding_json,
-                    NOW,
+                    created_at,
+                    attempt,
                 ],
             )
+        };
+        let insert = |connection: &Connection, suffix: &str, binding_json: &str| {
+            insert_at(connection, suffix, binding_json, 1, NOW)
         };
         for (name, raw) in [
             ("malformed", "{"),
@@ -2840,17 +2879,70 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rejected, 0);
-        insert(
-            &connection,
-            "valid",
-            &json!({"conformance_evidence_id": evidence_id}).to_string(),
-        )
-        .unwrap();
+        let valid_pin = json!({"conformance_evidence_id": evidence_id,
+            "provider_trust_source_id": registration.registration_id})
+        .to_string();
+        assert!(insert(&connection, "valid", &valid_pin).is_err());
+        let unadmitted: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM execution_binding_admission_markers),
+                    (SELECT COUNT(*) FROM execution_binding_trust_markers)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unadmitted, (0, 0));
+        ProviderStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .enable(&registration.registration_id, NOW)
+            .unwrap();
+        let future_id = ProviderStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .admit_trust(
+                &registration.registration_id,
+                "future-review",
+                ProviderTrustStatus::ProjectReviewed,
+                "authenticated-review",
+                "2026-09-22T14:00:00Z",
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        // A later, already stored review does not displace the original trust
+        // source for a binding created before that review's effective time.
+        insert(&connection, "valid", &valid_pin).unwrap();
         let marked: String = connection.query_row(
             "SELECT conformance_evidence_id FROM execution_binding_admission_markers WHERE binding_id='binding-valid'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(marked, evidence_id);
+        let trust_marked: String = connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-valid'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(trust_marked, registration.registration_id);
+        assert!(
+            insert_at(
+                &connection,
+                "old-source-after-review",
+                &valid_pin,
+                2,
+                "2026-09-22T14:00:00Z"
+            )
+            .is_err()
+        );
+        let reviewed_pin = json!({"conformance_evidence_id": evidence_id,
+            "provider_trust_source_id": future_id})
+        .to_string();
+        insert_at(
+            &connection,
+            "new-source-after-review",
+            &reviewed_pin,
+            2,
+            "2026-09-22T14:00:00Z",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2869,15 +2961,22 @@ mod tests {
             )
             .unwrap();
         let mut result = evidence(&manifest, BUILD_A, "pass");
-        result["executed_at"] = "2026-09-22T12:00:00.123456789+01:00".into();
+        result["executed_at"] = "2026-09-22T12:00:00.999999999+01:00".into();
         let evidence_id = store
             .record_evidence(&registration.registration_id, &bytes(&result))
             .unwrap();
+        let mut next_result = evidence(&manifest, BUILD_A, "pass");
+        next_result["result_id"] = "evidence-next-second".into();
+        next_result["executed_at"] = "2026-09-22T11:00:01.000000001Z".into();
+        let next_id = store
+            .record_evidence(&registration.registration_id, &bytes(&next_result))
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
         drop(store);
         connection
             .pragma_update(None, "foreign_keys", "OFF")
             .unwrap();
-        let insert = |suffix: &str, created_at: &str| {
+        let insert = |suffix: &str, created_at: &str, pin: &str, attempt: i64| {
             connection.execute(
             "INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -2890,12 +2989,29 @@ mod tests {
             params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                 manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                 registration.registration_id,registration.provider_id,registration.provider_version,
-                json!({"conformance_evidence_id":evidence_id}).to_string(),created_at,
-                if suffix == "after" { 2 } else { 1 }])
+                json!({"conformance_evidence_id":pin,
+                    "provider_trust_source_id":registration.registration_id}).to_string(),created_at,attempt])
         };
-        assert!(insert("before", "2026-09-22T11:00:00.123456788Z").is_err());
-        assert!(insert("before-registration", "2026-09-22T09:59:59Z").is_err());
-        assert!(insert("malformed", "not-a-date").is_err());
+        assert!(insert("before", "2026-09-22T11:00:00.999999998Z", &evidence_id, 1).is_err());
+        assert!(
+            insert(
+                "before-next-second",
+                "2026-09-22T11:00:00.999999999Z",
+                &next_id,
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                "before-registration",
+                "2026-09-22T09:59:59Z",
+                &evidence_id,
+                1
+            )
+            .is_err()
+        );
+        assert!(insert("malformed", "not-a-date", &evidence_id, 1).is_err());
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM execution_binding_admission_markers",
@@ -2904,8 +3020,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
-        insert("equal", "2026-09-22T11:00:00.123456789Z").unwrap();
-        insert("after", "2026-09-22T11:00:00.123456790Z").unwrap();
+        insert("equal", "2026-09-22T11:00:00.999999999Z", &evidence_id, 1).unwrap();
+        insert("after", "2026-09-22T11:00:01.000000001Z", &evidence_id, 2).unwrap();
+        insert("next-equal", "2026-09-22T11:00:01.000000001Z", &next_id, 3).unwrap();
     }
 
     #[test]
@@ -2955,7 +3072,7 @@ mod tests {
                     manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                     registration.registration_id,registration.provider_id,registration.provider_version,
                     attempt,json!({"conformance_evidence_id":evidence_id,
-                        "trust_admission_id":predicted}).to_string(),created_at],
+                        "provider_trust_source_id":predicted}).to_string(),created_at],
             )
         };
         assert!(insert(&connection, "before", 1, "predictable-future-decision", NOW).is_err());
@@ -2979,6 +3096,12 @@ mod tests {
                 "2026-09-22T12:00:00.123456789z",
             )
             .unwrap();
+        store
+            .enable(
+                &registration.registration_id,
+                "2026-09-22T12:00:00.123456789Z",
+            )
+            .unwrap();
         drop(store);
         connection
             .pragma_update(None, "foreign_keys", "OFF")
@@ -2990,6 +3113,16 @@ mod tests {
                 1,
                 &first,
                 "2026-09-22T12:00:00.123456788Z"
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                &connection,
+                "wrong-trust-source",
+                1,
+                &registration.registration_id,
+                "2026-09-22T12:00:00.123456789Z"
             )
             .is_err()
         );
@@ -3190,7 +3323,7 @@ mod tests {
                 &bytes(&evidence(&manifest, BUILD_A, "pass")),
             )
             .unwrap();
-        store
+        let future_id = store
             .admit_trust(
                 &registration.registration_id,
                 "future-review",
@@ -3199,6 +3332,30 @@ mod tests {
                 "2026-09-22T13:00:00Z",
             )
             .unwrap();
+        let parsed: CapabilityManifest = serde_json::from_value(manifest.clone()).unwrap();
+        assert_eq!(
+            verified_provider_trust_source_at(
+                store.connection,
+                &registration,
+                &parsed,
+                "2026-09-22T12:30:00Z"
+            )
+            .unwrap(),
+            (
+                ProviderTrustStatus::Unverified,
+                registration.registration_id.clone()
+            )
+        );
+        assert_eq!(
+            verified_provider_trust_source_at(
+                store.connection,
+                &registration,
+                &parsed,
+                "2026-09-22T13:00:00Z"
+            )
+            .unwrap(),
+            (ProviderTrustStatus::LocallyTrusted, future_id)
+        );
         assert!(
             store
                 .enable(&registration.registration_id, "2026-09-22T12:30:00Z")

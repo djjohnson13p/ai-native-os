@@ -17,7 +17,7 @@ For v0.1, an Execution Binding is an immutable attempt-specific record.
 
 Once an attempt begins, its binding's provider, input/output refs, authority-grant refs, execution profile, placement, and attempt identity are not rewritten.
 
-For Stage-1 provider admission, the binding also records the selected conformance evidence ID. The v0.1 Stage-1 schema requires this pin so a schema-valid new receipt cannot omit the evidence that launch checks. Refreshing conformance evidence requires a new attempt and binding.
+For Stage-1 provider admission, the binding also records the selected conformance evidence ID, the effective provider trust-source ID, and exact non-null capability-contract, manifest, and build hashes. The v0.1 Stage-1 schema requires these facts so a schema-valid new receipt cannot omit identities that launch checks. The trusted store verifies the trust source existed and was effective when the enabled provider was bound; launch compares the receipt and immutable store marker with the source effective at check time. Refreshing conformance evidence or changing effective trust requires a new attempt and binding.
 
 A material runtime change requires:
 
@@ -57,7 +57,7 @@ A new provider cannot inherit an old provider's binding/grant merely because it 
 
 This affects only pre-v1 runtime contracts. It does not alter AIOS IR semantic identity.
 
-Earlier unpinned receipts are historical data for unstamped stores; they cannot be newly admitted under the Stage-1 binding schema. The fixture and schema are tightened together because the Stage-1 spike exposed the mismatch between schema validity and launch eligibility.
+Earlier unpinned or nullable-identity receipts are historical data for unstamped stores; they are not rewritten or newly admitted under the Stage-1 binding schema. The schema, fixture, persistence guard, and launch check are tightened together because the Stage-1 spike exposed a mismatch between schema validity and launch eligibility. The runtime-only binding change does not alter AIOS IR or its semantic hash.
 
 ## Related
 

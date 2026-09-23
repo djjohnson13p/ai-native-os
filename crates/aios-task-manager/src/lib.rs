@@ -3442,6 +3442,9 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "execution_binding_trust_marker_no_duplicate_insert",
     "execution_binding_trust_marker_insert",
     "execution_binding_trust_not_future",
+    "execution_binding_legacy_trust_quarantine_no_update",
+    "execution_binding_legacy_trust_quarantine_no_delete",
+    "execution_binding_legacy_trust_quarantine_no_duplicate_insert",
 ];
 
 const PROVIDER_LEGACY_GUARDS: &[&str] = &[
@@ -3452,6 +3455,11 @@ const PROVIDER_LEGACY_GUARDS: &[&str] = &[
     "provider_registration_revocation_terminal",
     "provider_evidence_immutable_update",
     "provider_evidence_immutable_delete",
+];
+
+const PRIOR_PROVIDER_TRUST_GUARDS: &[&str] = &[
+    "execution_binding_trust_marker_insert",
+    "execution_binding_trust_not_future",
 ];
 
 fn missing_additive_guard(connection: &Connection, guards: &[&str]) -> Result<bool> {
@@ -3495,7 +3503,8 @@ fn upgrade_stamped_registry_guards_fenced(
         semantic_stamped && missing_additive_guard(connection, SEMANTIC_ADDITIVE_GUARDS)?;
     let upgrade_provider = provider_stamped
         && (missing_additive_guard(connection, PROVIDER_ADDITIVE_GUARDS)?
-            || !provider_additive_tables_current(connection, true, true)?);
+            || !provider_additive_tables_current(connection, true, true)?
+            || legacy_provider_trust_guard_present(connection)?);
     if !upgrade_semantic && !upgrade_provider {
         return Ok(());
     }
@@ -3508,9 +3517,40 @@ fn upgrade_stamped_registry_guards_fenced(
         ))?;
     }
     if upgrade_provider {
+        let mut replaced_historical_trust_guard = false;
+        for name in PRIOR_PROVIDER_TRUST_GUARDS {
+            let actual: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual
+                .as_deref()
+                .map(|sql| legacy_provider_trust_guard_matches(name, sql))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                replaced_historical_trust_guard = true;
+                transaction.execute_batch(match *name {
+                    "execution_binding_trust_marker_insert" => {
+                        "DROP TRIGGER execution_binding_trust_marker_insert"
+                    }
+                    _ => "DROP TRIGGER execution_binding_trust_not_future",
+                })?;
+            }
+        }
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))?;
+        if replaced_historical_trust_guard {
+            transaction.execute(
+                "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
+                 SELECT binding_id FROM execution_binding_trust_markers",
+                [],
+            )?;
+        }
     }
     preflight_migration_state(&transaction)?;
     assert_manager_lease(&transaction, owner, epoch)?;
@@ -3562,7 +3602,9 @@ fn additive_guard_definitions_current(
         )?;
         // SQLite preserves the SQL text but old stores may cross a platform's
         // line-ending convention. Whitespace changes do not alter this DDL.
-        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected) {
+        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected)
+            && !(provider && !require_all && legacy_provider_trust_guard_matches(guard, &actual)?)
+        {
             return Ok(false);
         }
     }
@@ -3571,6 +3613,55 @@ fn additive_guard_definitions_current(
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn legacy_provider_trust_guard_definition(name: &str) -> Result<String> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    canonical.execute_batch(
+        "DROP TRIGGER execution_binding_trust_marker_insert;
+         DROP TRIGGER execution_binding_trust_not_future;",
+    )?;
+    canonical.execute_batch(include_str!("legacy_5eb3b71_provider_trust_guards.sql"))?;
+    canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_provider_trust_guard_matches(name: &str, actual: &str) -> Result<bool> {
+    if !PRIOR_PROVIDER_TRUST_GUARDS.contains(&name) {
+        return Ok(false);
+    }
+    Ok(normalize_schema_sql(actual)
+        == normalize_schema_sql(&legacy_provider_trust_guard_definition(name)?))
+}
+
+fn legacy_provider_trust_guard_present(connection: &Connection) -> Result<bool> {
+    for name in PRIOR_PROVIDER_TRUST_GUARDS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(actual) = actual {
+            if legacy_provider_trust_guard_matches(name, &actual)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn provider_additive_tables_current(
@@ -3587,9 +3678,12 @@ fn provider_additive_tables_current(
         "../../../specs/persistence-v0.1-0013-provider-registry.sql"
     ))?;
     for name in [
+        "provider_manifest_payloads",
+        "provider_health_observations",
         "execution_binding_admission_markers",
         "provider_trust_admissions",
         "execution_binding_trust_markers",
+        "execution_binding_legacy_trust_quarantine",
     ] {
         let actual: Option<String> = connection
             .query_row(
@@ -6527,6 +6621,7 @@ type ProviderAdmissionRow = (
 fn verified_provider_receipt_and_compatibility(
     transaction: &Transaction<'_>,
     binding: &BindingEvidence,
+    checked_at: &str,
 ) -> Result<bool> {
     let Some(registration_id) = binding.provider_registration_id.as_deref() else {
         return Ok(false);
@@ -6626,10 +6721,11 @@ fn verified_provider_receipt_and_compatibility(
     {
         return Ok(false);
     }
-    let Ok(effective_trust) = aios_registry::verified_provider_effective_trust(
+    let Ok((effective_trust, _)) = aios_registry::verified_provider_trust_source_at(
         transaction,
         &admitted_registration,
         &manifest,
+        checked_at,
     ) else {
         return Ok(false);
     };
@@ -6751,22 +6847,41 @@ fn verified_provider_admission(
     transaction: &Transaction<'_>,
     binding_id: &str,
     binding: &BindingEvidence,
+    checked_at: &str,
 ) -> Result<bool> {
-    if !verified_provider_receipt_and_compatibility(transaction, binding)? {
+    let quarantined: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM execution_binding_legacy_trust_quarantine WHERE binding_id=?1)",
+        [binding_id],
+        |row| row.get(0),
+    )?;
+    if quarantined {
+        return Ok(false);
+    }
+    if !verified_provider_receipt_and_compatibility(transaction, binding, checked_at)? {
         return Ok(false);
     }
     let Some(registration_id) = binding.provider_registration_id.as_deref() else {
         return Ok(false);
     };
-    let latest_admission_id: Option<String> = transaction
-        .query_row(
-            "SELECT admission_id FROM provider_trust_admissions
-             WHERE registration_id=?1 ORDER BY revision DESC LIMIT 1",
-            [registration_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let expected_source = latest_admission_id.as_deref().unwrap_or(registration_id);
+    let Ok(checked_time) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
+        return Ok(false);
+    };
+    let mut statement = transaction.prepare(
+        "SELECT admission_id,admitted_at FROM provider_trust_admissions
+         WHERE registration_id=?1 ORDER BY revision DESC",
+    )?;
+    let mut rows = statement.query([registration_id])?;
+    let mut expected_source = registration_id.to_owned();
+    while let Some(row) = rows.next()? {
+        let admitted_at: String = row.get(1)?;
+        let Ok(admitted_time) = OffsetDateTime::parse(&admitted_at, &Rfc3339) else {
+            return Ok(false);
+        };
+        if admitted_time <= checked_time {
+            expected_source = row.get(0)?;
+            break;
+        }
+    }
     let admitted_source: Option<String> = transaction
         .query_row(
             "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id=?1",
@@ -6774,7 +6889,12 @@ fn verified_provider_admission(
             |row| row.get(0),
         )
         .optional()?;
-    Ok(admitted_source.as_deref() == Some(expected_source))
+    let receipt: Value = serde_json::from_str(&binding.binding_json)?;
+    Ok(admitted_source.as_deref() == Some(expected_source.as_str())
+        && receipt
+            .get("provider_trust_source_id")
+            .and_then(Value::as_str)
+            == Some(expected_source.as_str()))
 }
 
 fn load_admitted_semantic_registry(
@@ -7119,7 +7239,12 @@ fn binding_grants_valid(
         || binding.grant_refs_json != check.grant_refs_json
         || !binding_json_matches(&binding, check, has_provider_store)?
         || (has_provider_store
-            && !verified_provider_admission(transaction, check.binding_id, &binding)?)
+            && !verified_provider_admission(
+                transaction,
+                check.binding_id,
+                &binding,
+                check.checked_at,
+            )?)
     {
         return Ok(false);
     }
@@ -8915,6 +9040,76 @@ mod tests {
     }
 
     #[test]
+    fn stamped_provider_registry_rejects_same_name_malformed_legacy_tables_on_reopen() {
+        for name in ["provider_manifest_payloads", "provider_health_observations"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("malformed-provider.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            let manifest_guards = if name == "provider_manifest_payloads" {
+                [
+                    "provider_manifest_payload_immutable_update",
+                    "provider_manifest_payload_immutable_delete",
+                    "provider_manifest_payload_no_duplicate_insert",
+                ]
+                .iter()
+                .map(|trigger| {
+                    manager
+                        .connection
+                        .query_row(
+                            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                            [trigger],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            manager
+                .connection
+                .execute_batch(&format!("DROP TABLE {name}; CREATE TABLE {name}(x TEXT);"))
+                .unwrap();
+            for guard in manifest_guards {
+                manager
+                    .connection
+                    .execute_batch(&format!("{guard};"))
+                    .unwrap();
+            }
+            if name == "provider_manifest_payloads" {
+                let restored: i64 = manager
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+                     AND name IN ('provider_manifest_payload_immutable_update',
+                                  'provider_manifest_payload_immutable_delete',
+                                  'provider_manifest_payload_no_duplicate_insert')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(restored, 3);
+            }
+            drop(manager);
+
+            assert!(
+                TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err(),
+                "{name}"
+            );
+            let connection = Connection::open(&path).unwrap();
+            let columns: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, format!("CREATE TABLE {name}(x TEXT)"));
+        }
+    }
+
+    #[test]
     fn file_backed_reopen_upgrades_old_stamped_provider_guards() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("old-stamped-provider.sqlite3");
@@ -8955,6 +9150,180 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp, after);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises the full file-backed historical schema upgrade and audit preservation"
+    )]
+    fn file_backed_reopen_replaces_only_exact_5eb3b71_trust_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-trust-guard.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager.create_task(&create("T-old-trust-guard")).unwrap();
+        let stamp: (String, String) = manager.connection.query_row(
+            "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_trust_marker_insert;
+             DROP TRIGGER execution_binding_trust_not_future;",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(include_str!("legacy_5eb3b71_provider_trust_guards.sql"))
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_legacy_trust_quarantine_no_update;
+             DROP TRIGGER execution_binding_legacy_trust_quarantine_no_delete;
+             DROP TRIGGER execution_binding_legacy_trust_quarantine_no_duplicate_insert;
+             DROP TABLE execution_binding_legacy_trust_quarantine;",
+            )
+            .unwrap();
+        manager.connection.execute_batch(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+             VALUES ('legacy-snapshot','{}','2026-09-19T00:00:00Z');
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES ('legacy-provider','legacy-provider','1.0.0','legacy-build',
+                     'legacy-snapshot','disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,status,evidence_json,tested_at)
+             VALUES ('legacy-evidence','legacy-provider','artifact.hash@1','legacy-contract',
+                     'pass','{}','2026-09-19T00:00:00Z');
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES ('legacy-binding','legacy-attempt','T-old-trust-guard','legacy-program',
+                     'legacy-snapshot','0.1','legacy-node','artifact.hash@1','legacy-contract',
+                     'legacy-provider','legacy-provider','1.0.0',1,'[]','[]','legacy-profile','{}',
+                     '{\"conformance_evidence_id\":\"legacy-evidence\",\"provider_trust_source_id\":\"legacy-provider\"}',
+                     '2026-09-19T00:00:00Z');",
+        ).unwrap();
+        assert!(preflight_migration_state_allowing_guard_upgrade(&manager.connection).is_ok());
+        assert!(preflight_migration_state(&manager.connection).is_err());
+        let old_marker: String = manager.connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='legacy-binding'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(old_marker, "legacy-provider");
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        let after: (String, String) = reopened.connection.query_row(
+            "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(after, stamp);
+        for table in [
+            "tasks",
+            "provider_registrations",
+            "provider_conformance_evidence",
+            "execution_bindings",
+            "execution_binding_trust_markers",
+            "execution_binding_legacy_trust_quarantine",
+        ] {
+            let id = if table == "tasks" {
+                "T-old-trust-guard"
+            } else if table == "provider_registrations" {
+                "legacy-provider"
+            } else if table == "provider_conformance_evidence" {
+                "legacy-evidence"
+            } else {
+                "legacy-binding"
+            };
+            let key = if table == "tasks" {
+                "task_id"
+            } else if table == "provider_registrations" {
+                "registration_id"
+            } else if table == "provider_conformance_evidence" {
+                "evidence_id"
+            } else {
+                "binding_id"
+            };
+            let count: i64 = reopened
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {key}=?1"),
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
+        let preserved_marker: String = reopened.connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='legacy-binding'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(preserved_marker, old_marker);
+        for name in PRIOR_PROVIDER_TRUST_GUARDS {
+            let actual: String = reopened
+                .connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!legacy_provider_trust_guard_matches(name, &actual).unwrap());
+        }
+    }
+
+    #[test]
+    fn same_name_trust_guard_noop_rejects_reopen_before_lease_claim() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("forged-trust-guard.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        let old_epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_trust_marker_insert;
+             CREATE TRIGGER execution_binding_trust_marker_insert
+             BEFORE INSERT ON execution_bindings BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        let forged: String = manager.connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='execution_binding_trust_marker_insert'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(manager);
+
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let epoch: i64 = connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let still_forged: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='execution_binding_trust_marker_insert'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(epoch, old_epoch);
+        assert_eq!(still_forged, forged);
     }
 
     #[test]

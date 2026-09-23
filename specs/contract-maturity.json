@@ -89,7 +89,7 @@
       "controlling_adrs": ["ADR-0020", "ADR-0039", "ADR-0040", "ADR-0042"],
       "fixture_paths": ["examples/provider-runtime/"],
       "blocking_questions": [],
-      "notes": "Implementation should initially use one deterministic local fixture provider, not a general distributed runtime."
+      "notes": "Implementation should initially use one deterministic local fixture provider, not a general distributed runtime. Stage-1 spike tightened new binding receipts to require exact provider/build/contract identities, a conformance evidence pin, and an effective trust-source pin; earlier nullable or unpinned receipts remain historical and cannot launch through the stamped provider gate."
     },
     {
       "id": "crash-recovery-v0.1",

@@ -137,6 +137,22 @@ CREATE TABLE IF NOT EXISTS execution_binding_trust_markers (
         REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
     trust_source_id TEXT NOT NULL
 );
+-- Bindings admitted by the older 5eb3b71 trust guards retain their immutable
+-- sidecars for audit, but cannot become executable under the newer rules.
+CREATE TABLE IF NOT EXISTS execution_binding_legacy_trust_quarantine (
+    binding_id TEXT PRIMARY KEY NOT NULL REFERENCES execution_bindings(binding_id)
+);
+CREATE TRIGGER IF NOT EXISTS execution_binding_legacy_trust_quarantine_no_update
+BEFORE UPDATE ON execution_binding_legacy_trust_quarantine
+BEGIN SELECT RAISE(ABORT, 'legacy binding trust quarantine is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_legacy_trust_quarantine_no_delete
+BEFORE DELETE ON execution_binding_legacy_trust_quarantine
+BEGIN SELECT RAISE(ABORT, 'legacy binding trust quarantine cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_legacy_trust_quarantine_no_duplicate_insert
+BEFORE INSERT ON execution_binding_legacy_trust_quarantine
+WHEN EXISTS (SELECT 1 FROM execution_binding_legacy_trust_quarantine
+             WHERE binding_id=NEW.binding_id)
+BEGIN SELECT RAISE(ABORT, 'legacy binding trust quarantine cannot be replaced'); END;
 CREATE TRIGGER IF NOT EXISTS execution_binding_trust_marker_no_update
 BEFORE UPDATE ON execution_binding_trust_markers
 BEGIN SELECT RAISE(ABORT, 'execution binding trust marker is immutable'); END;
@@ -238,19 +254,43 @@ BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM provider_registrations r
         WHERE r.registration_id=NEW.provider_registration_id
-          AND r.state<>'revoked'
+          AND r.state='registered'
           AND r.trust_status NOT IN ('denied','revoked')
           AND (r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')
                OR EXISTS (SELECT 1 FROM provider_trust_admissions a
                           WHERE a.registration_id=r.registration_id))
     ) THEN RAISE(ABORT, 'binding requires current trusted provider admission') END;
+    SELECT CASE WHEN CASE WHEN json_valid(NEW.binding_json) THEN
+        json_type(NEW.binding_json,'$.provider_trust_source_id') IS NOT 'text'
+        OR length(json_extract(NEW.binding_json,'$.provider_trust_source_id')) NOT BETWEEN 1 AND 256
+        OR json_extract(NEW.binding_json,'$.provider_trust_source_id') IS NOT COALESCE(
+            (SELECT a.admission_id FROM provider_trust_admissions a
+             WHERE a.registration_id=NEW.provider_registration_id
+               AND CAST(strftime('%s', a.admitted_at) AS INTEGER) IS NOT NULL
+               AND CAST(strftime('%s', NEW.created_at) AS INTEGER) IS NOT NULL
+               AND (
+                   CAST(strftime('%s', a.admitted_at) AS INTEGER)
+                       < CAST(strftime('%s', NEW.created_at) AS INTEGER)
+                   OR (CAST(strftime('%s', a.admitted_at) AS INTEGER)
+                           = CAST(strftime('%s', NEW.created_at) AS INTEGER)
+                       AND substr(CASE WHEN substr(a.admitted_at,20,1)='.' THEN
+                           substr(a.admitted_at,21,
+                               instr(replace(replace(replace(substr(a.admitted_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                           ELSE '' END || '000000000',1,9)
+                           <= substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                           substr(NEW.created_at,21,
+                               instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                           ELSE '' END || '000000000',1,9))
+               )
+             ORDER BY a.revision DESC LIMIT 1),
+            CASE WHEN (SELECT r.trust_status FROM provider_registrations r
+                       WHERE r.registration_id=NEW.provider_registration_id)
+                IN ('locally-trusted','project-reviewed','organization-approved')
+                THEN NEW.provider_registration_id END)
+        ELSE 1 END
+    THEN RAISE(ABORT, 'binding trust source does not match current admission') END;
     INSERT INTO execution_binding_trust_markers(binding_id,trust_source_id)
-    SELECT NEW.binding_id, COALESCE(
-        (SELECT a.admission_id FROM provider_trust_admissions a
-         WHERE a.registration_id=NEW.provider_registration_id
-         ORDER BY a.revision DESC LIMIT 1),
-        NEW.provider_registration_id
-    );
+    VALUES (NEW.binding_id,json_extract(NEW.binding_json,'$.provider_trust_source_id'));
 END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_trust_not_future
@@ -260,9 +300,10 @@ WHEN NOT EXISTS (
         SELECT COALESCE(
             (SELECT admitted_at FROM provider_trust_admissions
              WHERE registration_id=NEW.provider_registration_id
-             ORDER BY revision DESC LIMIT 1),
+               AND admission_id=json_extract(NEW.binding_json,'$.provider_trust_source_id')),
             (SELECT registered_at FROM provider_registrations
-             WHERE registration_id=NEW.provider_registration_id)
+             WHERE registration_id=NEW.provider_registration_id
+               AND registration_id=json_extract(NEW.binding_json,'$.provider_trust_source_id'))
         ) AS admitted_at
     ), times AS (
         SELECT CAST(strftime('%s', admitted_at) AS INTEGER) AS admitted_second,

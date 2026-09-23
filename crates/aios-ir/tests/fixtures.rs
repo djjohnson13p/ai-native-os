@@ -417,7 +417,7 @@ fn downstream_examples_reference_generated_semantic_identities() {
 }
 
 #[test]
-fn stage1_binding_schema_requires_conformance_evidence_pin() {
+fn stage1_binding_schema_requires_launch_identities_and_pins() {
     let specs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../specs");
     let schema: Value =
         serde_json::from_slice(&fs::read(specs.join("execution-binding.schema.json")).unwrap())
@@ -433,9 +433,24 @@ fn stage1_binding_schema_requires_conformance_evidence_pin() {
         .remove("conformance_evidence_id");
     assert!(!compiled.is_valid(&unpinned));
 
-    let mut empty_pin = binding;
+    let mut empty_pin = binding.clone();
     empty_pin["conformance_evidence_id"] = "".into();
     assert!(!compiled.is_valid(&empty_pin));
+
+    for field in ["provider_trust_source_id", "capability_contract_hash"] {
+        let mut missing = binding.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(!compiled.is_valid(&missing), "missing {field}");
+        missing[field] = Value::Null;
+        assert!(!compiled.is_valid(&missing), "null {field}");
+    }
+    for field in ["manifest_hash", "package_or_build_hash"] {
+        let mut missing = binding.clone();
+        missing["provider"].as_object_mut().unwrap().remove(field);
+        assert!(!compiled.is_valid(&missing), "missing provider.{field}");
+        missing["provider"][field] = Value::Null;
+        assert!(!compiled.is_valid(&missing), "null provider.{field}");
+    }
 }
 
 const PROVIDER_TEST_SUITE_HASH: &str =
