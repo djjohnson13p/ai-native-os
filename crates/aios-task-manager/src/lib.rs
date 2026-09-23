@@ -647,7 +647,8 @@ impl TaskManager {
             (
                 "0013_provider_registry",
                 "'provider_manifest_payloads','provider_health_observations',
-                 'ix_provider_conformance_latest','execution_binding_admission_markers'",
+                 'ix_provider_conformance_latest','execution_binding_admission_markers',
+                 'provider_state_epochs','execution_binding_enablement_markers'",
                 PROVIDER_LEGACY_GUARDS,
                 PROVIDER_ADDITIVE_GUARDS,
             ),
@@ -692,6 +693,22 @@ impl TaskManager {
             [],
         )?;
         if provider {
+            let provider_stamped: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations
+                 WHERE migration_id='0013_provider_registry')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !provider_stamped {
+                // Baseline registrations predate the enabled-interval ledger.
+                // Their current 'registered' state has no provable transition
+                // identity, even when this is the first 0013 installation.
+                transaction.execute(
+                    "UPDATE provider_registrations SET state='disabled',updated_at=?1
+                     WHERE state='registered'",
+                    [self.clock.now()],
+                )?;
+            }
             transaction.execute_batch(include_str!(
                 "../../../specs/persistence-v0.1-0013-provider-registry.sql"
             ))?;
@@ -3439,12 +3456,23 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "provider_registration_no_initial_enablement",
     "provider_registration_state_transition_clock",
     "provider_registration_updated_at_requires_transition",
+    "provider_state_epoch_no_update",
+    "provider_state_epoch_no_delete",
+    "provider_state_epoch_no_duplicate_insert",
+    "provider_state_epoch_event_insert_guard",
+    "provider_state_epoch_initial",
+    "provider_state_epoch_transition",
     "provider_trust_admission_no_update",
     "provider_trust_admission_no_delete",
     "provider_trust_admission_no_duplicate_insert",
     "provider_trust_admission_receipt_insert",
     "execution_binding_evidence_pin_required",
     "execution_binding_evidence_not_future",
+    "execution_binding_evidence_unexpired_at_insert",
+    "execution_binding_enablement_marker_no_update",
+    "execution_binding_enablement_marker_no_delete",
+    "execution_binding_enablement_marker_no_duplicate_insert",
+    "execution_binding_enablement_marker_insert",
     "execution_binding_evidence_latest_at_insert",
     "execution_binding_provider_enablement_not_future",
     "execution_binding_trust_marker_no_update",
@@ -3486,6 +3514,10 @@ fn missing_additive_guard(connection: &Connection, guards: &[&str]) -> Result<bo
     Ok(false)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps fenced semantic and provider guard repairs in one atomic transaction"
+)]
 fn upgrade_stamped_registry_guards_fenced(
     connection: &mut Connection,
     owner: &str,
@@ -3523,6 +3555,14 @@ fn upgrade_stamped_registry_guards_fenced(
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     assert_manager_lease(&transaction, owner, epoch)?;
     if upgrade_semantic {
+        // A missing semantic guard leaves the prior admission history
+        // unprovable. Contain every previously usable snapshot before the
+        // guard is restored; a forged ADMITTED state cannot revive it.
+        transaction.execute(
+            "UPDATE registry_snapshot_admissions SET state='QUARANTINED'
+             WHERE state IN ('ADMITTED','DEPRECATED')",
+            [],
+        )?;
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
         ))?;
@@ -3534,7 +3574,22 @@ fn upgrade_stamped_registry_guards_fenced(
                 "provider_registration_no_initial_enablement",
                 "provider_registration_state_transition_clock",
                 "provider_registration_updated_at_requires_transition",
+                "provider_state_epoch_no_update",
+                "provider_state_epoch_no_delete",
+                "provider_state_epoch_no_duplicate_insert",
+                "provider_state_epoch_event_insert_guard",
+                "provider_state_epoch_initial",
+                "provider_state_epoch_transition",
+                "execution_binding_enablement_marker_no_update",
+                "execution_binding_enablement_marker_no_delete",
+                "execution_binding_enablement_marker_no_duplicate_insert",
+                "execution_binding_enablement_marker_insert",
             ],
+        )? && transaction.query_row(
+            "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                ('provider_state_epochs','execution_binding_enablement_markers'))=2",
+            [],
+            |row| row.get::<_, bool>(0),
         )?;
         for name in PRIOR_PROVIDER_TRUST_GUARDS {
             let actual: Option<String> = transaction
@@ -3565,7 +3620,8 @@ fn upgrade_stamped_registry_guards_fenced(
             // itself be untrusted or later than the current clock. A partial
             // upgrade may already have installed that exact guard.
             transaction.execute_batch(
-                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock",
+                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock;
+                 DROP TRIGGER IF EXISTS provider_state_epoch_transition",
             )?;
             transaction.execute(
                 "UPDATE provider_registrations SET state='disabled',updated_at=?1
@@ -3576,6 +3632,26 @@ fn upgrade_stamped_registry_guards_fenced(
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))?;
+        if !had_enablement_guards {
+            // A partially installed ledger may have missed the forced
+            // disable transition. Reconcile only that terminal interval;
+            // subsequent enables must mint a fresh revision normally.
+            transaction.execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+                 SELECT r.registration_id,
+                        (SELECT MAX(e.revision)+1 FROM provider_state_epochs e
+                         WHERE e.registration_id=r.registration_id),
+                        'disabled',r.updated_at
+                 FROM provider_registrations r
+                 WHERE r.state='disabled'
+                   AND EXISTS (SELECT 1 FROM provider_state_epochs e
+                               WHERE e.registration_id=r.registration_id)
+                   AND (SELECT e.state FROM provider_state_epochs e
+                        WHERE e.registration_id=r.registration_id
+                        ORDER BY e.revision DESC LIMIT 1) <> 'disabled'",
+                [],
+            )?;
+        }
         // Any repaired provider guard means historical binding admission was
         // not fully proven. Preserve immutable markers for audit and deny
         // their execution, including a store missing only one binding guard.
@@ -3586,6 +3662,18 @@ fn upgrade_stamped_registry_guards_fenced(
                      SELECT 1 FROM execution_binding_legacy_trust_quarantine q
                      WHERE q.binding_id=m.binding_id
                  )",
+            [],
+        )?;
+    }
+    if upgrade_semantic && provider_stamped && !upgrade_provider {
+        // Semantic guard loss also invalidates any prior provider bindings.
+        transaction.execute(
+            "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
+             SELECT m.binding_id FROM execution_binding_trust_markers m
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM execution_binding_legacy_trust_quarantine q
+                 WHERE q.binding_id=m.binding_id
+             )",
             [],
         )?;
     }
@@ -3721,6 +3809,8 @@ fn provider_additive_tables_current(
         "provider_trust_admissions",
         "execution_binding_trust_markers",
         "execution_binding_legacy_trust_quarantine",
+        "provider_state_epochs",
+        "execution_binding_enablement_markers",
     ] {
         let actual: Option<String> = connection
             .query_row(
@@ -7219,7 +7309,17 @@ fn binding_grants_valid(
     if has_provider_store {
         binding_query.push_str(
             " AND EXISTS(SELECT 1 FROM execution_binding_admission_markers marker
-               WHERE marker.binding_id=b.binding_id AND marker.conformance_evidence_id=c.evidence_id)",
+               WHERE marker.binding_id=b.binding_id AND marker.conformance_evidence_id=c.evidence_id)
+               AND EXISTS(SELECT 1 FROM execution_binding_enablement_markers marker
+                   JOIN provider_state_epochs epoch
+                     ON epoch.registration_id=marker.registration_id
+                    AND epoch.revision=marker.revision
+                   WHERE marker.binding_id=b.binding_id
+                     AND marker.registration_id=r.registration_id
+                     AND epoch.state='registered'
+                     AND epoch.transitioned_at=r.updated_at
+                     AND epoch.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                                         WHERE registration_id=r.registration_id))",
         );
     } else {
         // Older stores have no append-only trust decisions to verify, so the
@@ -9187,6 +9287,238 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp, after);
+    }
+
+    #[test]
+    fn partial_enablement_ledger_reopen_forces_new_interval_once() {
+        for missing in [
+            "provider_state_epoch_transition",
+            "execution_binding_enablement_marker_insert",
+            "provider_state_epochs",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("partial-enable-ledger.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            manager
+                .connection
+                .execute_batch(
+                    "INSERT INTO provider_registrations
+                 (registration_id,provider_id,provider_version,package_content_hash,state,
+                  trust_status,registration_json,registered_at)
+                 VALUES ('epoch-provider','provider:epoch','1.0.0','build:epoch','disabled',
+                         'locally-trusted','{\"trust\":{\"status\":\"locally-trusted\"}}',
+                         '2026-09-19T00:00:00Z');
+                 UPDATE provider_registrations SET state='registered',
+                     updated_at='2026-09-19T00:00:00Z'
+                 WHERE registration_id='epoch-provider';",
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(&format!(
+                    "DROP {} {missing}",
+                    if missing == "provider_state_epochs" {
+                        "TABLE"
+                    } else {
+                        "TRIGGER"
+                    }
+                ))
+                .unwrap();
+            drop(manager);
+
+            let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert_eq!(reopened.connection.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(), "disabled", "{missing}");
+            assert_eq!(reopened.connection.query_row(
+                "SELECT state FROM provider_state_epochs WHERE registration_id='epoch-provider'
+                 ORDER BY revision DESC LIMIT 1", [], |row| row.get::<_, String>(0),
+            ).unwrap(), "disabled", "{missing}");
+            reopened
+                .connection
+                .execute(
+                    "UPDATE provider_registrations SET state='registered',updated_at=?1
+                 WHERE registration_id='epoch-provider'",
+                    [T0],
+                )
+                .unwrap();
+            let revision: i64 = reopened.connection.query_row(
+                "SELECT MAX(revision) FROM provider_state_epochs WHERE registration_id='epoch-provider'",
+                [], |row| row.get(0),
+            ).unwrap();
+            drop(reopened);
+            let again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert_eq!(again.connection.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(), "registered", "{missing}");
+            assert_eq!(again.connection.query_row(
+                "SELECT MAX(revision) FROM provider_state_epochs WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(), revision, "{missing}");
+        }
+    }
+
+    #[test]
+    fn first_provider_migration_disables_unproven_baseline_enablement() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("baseline-provider-epoch.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at,updated_at)
+             VALUES ('baseline-provider','provider:baseline','1.0.0','build:baseline',
+                     'registered','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}',
+                     '2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');",
+            )
+            .unwrap();
+        manager.initialize_provider_store().unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='baseline-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "disabled");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT revision,state FROM provider_state_epochs
+             WHERE registration_id='baseline-provider'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (0, "disabled".to_owned())
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='registered',updated_at=?1
+             WHERE registration_id='baseline-provider'",
+                [T0],
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(reopened.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='baseline-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT revision,state FROM provider_state_epochs
+             WHERE registration_id='baseline-provider' ORDER BY revision DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "registered".to_owned())
+        );
+    }
+
+    #[test]
+    fn semantic_guard_repair_contains_forged_admission_and_existing_binding() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("semantic-guard-repair.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager.create_task(&create("T-semantic-repair")).unwrap();
+        manager.connection.execute_batch(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+             VALUES ('repair-snapshot','{}','2026-09-19T00:00:00Z');
+             INSERT INTO registry_snapshot_admissions(snapshot_id,state)
+             VALUES ('repair-snapshot','ADMITTED');
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES ('repair-provider','provider:repair','1.0.0','build:repair',
+                     'repair-snapshot','disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='repair-provider';
+             INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES ('repair-evidence','repair-provider','artifact.hash@1','repair-contract',
+                     'repair-suite','repair-suite-hash','pass','{}','2026-09-19T00:00:00Z');
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,attempt,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES ('repair-binding','repair-attempt','T-semantic-repair','repair-program',
+                     'repair-snapshot','0.1','repair-node','artifact.hash@1','repair-contract',
+                     'repair-provider','provider:repair','1.0.0',1,'[]','[]','repair-profile','{}',
+                     '{\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"repair-provider\"}',
+                     '2026-09-19T00:00:00Z');",
+        ).unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT COUNT(*) FROM execution_binding_trust_markers WHERE binding_id='repair-binding'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(),1);
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER one_way_registry_snapshot_admissions_update;
+             UPDATE registry_snapshot_admissions SET state='QUARANTINED'
+             WHERE snapshot_id='repair-snapshot';
+             UPDATE registry_snapshot_admissions SET state='ADMITTED'
+             WHERE snapshot_id='repair-snapshot';",
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(reopened.connection.query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id='repair-snapshot'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(),"QUARANTINED");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_binding_legacy_trust_quarantine
+             WHERE binding_id='repair-binding'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0012_semantic_registry_store'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            stamp
+        );
+        drop(reopened);
+        let again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(again.connection.query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id='repair-snapshot'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(),"QUARANTINED");
     }
 
     #[allow(

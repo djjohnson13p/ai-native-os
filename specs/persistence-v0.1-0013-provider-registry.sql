@@ -141,6 +141,65 @@ BEFORE UPDATE OF state,updated_at ON provider_registrations
 WHEN NEW.state IS OLD.state AND NEW.updated_at IS NOT OLD.updated_at
 BEGIN SELECT RAISE(ABORT, 'provider state time requires a transition'); END;
 
+-- Each state change mints a monotonic identity. Clock equality is permitted,
+-- so timestamps alone cannot distinguish an old enabled interval from a
+-- later disable/re-enable at the same instant.
+CREATE TABLE IF NOT EXISTS provider_state_epochs (
+    registration_id TEXT NOT NULL REFERENCES provider_registrations(registration_id),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    state TEXT NOT NULL CHECK (state IN ('registered','disabled','revoked','superseded','invalid')),
+    transitioned_at TEXT NOT NULL,
+    PRIMARY KEY (registration_id,revision)
+);
+-- Existing rows are disabled by fenced upgrade before this script runs.
+INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+SELECT r.registration_id,0,r.state,COALESCE(r.updated_at,r.registered_at)
+FROM provider_registrations r
+WHERE NOT EXISTS (SELECT 1 FROM provider_state_epochs e WHERE e.registration_id=r.registration_id);
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_no_update
+BEFORE UPDATE ON provider_state_epochs
+BEGIN SELECT RAISE(ABORT, 'provider state epoch is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_no_delete
+BEFORE DELETE ON provider_state_epochs
+BEGIN SELECT RAISE(ABORT, 'provider state epoch cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_no_duplicate_insert
+BEFORE INSERT ON provider_state_epochs
+WHEN EXISTS (SELECT 1 FROM provider_state_epochs
+             WHERE registration_id=NEW.registration_id AND revision=NEW.revision)
+BEGIN SELECT RAISE(ABORT, 'provider state epoch cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_event_insert_guard
+BEFORE INSERT ON provider_state_epochs
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_registrations r
+    WHERE r.registration_id=NEW.registration_id
+      AND r.state=NEW.state
+      AND COALESCE(r.updated_at,r.registered_at)=NEW.transitioned_at
+      AND NEW.revision=COALESCE((SELECT MAX(revision)+1 FROM provider_state_epochs
+                                 WHERE registration_id=NEW.registration_id),0)
+      AND NOT EXISTS (
+          SELECT 1 FROM provider_state_epochs e
+          WHERE e.registration_id=NEW.registration_id
+            AND e.revision=NEW.revision-1 AND e.state=NEW.state
+      )
+)
+BEGIN SELECT RAISE(ABORT, 'provider state epoch does not match transition'); END;
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_initial
+AFTER INSERT ON provider_registrations
+BEGIN
+    INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+    VALUES (NEW.registration_id,0,NEW.state,COALESCE(NEW.updated_at,NEW.registered_at));
+END;
+CREATE TRIGGER IF NOT EXISTS provider_state_epoch_transition
+AFTER UPDATE OF state ON provider_registrations
+WHEN NEW.state IS NOT OLD.state
+BEGIN
+    INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+    VALUES (NEW.registration_id,
+            COALESCE((SELECT MAX(revision)+1 FROM provider_state_epochs
+                      WHERE registration_id=NEW.registration_id),0),
+            NEW.state,NEW.updated_at);
+END;
+
 CREATE TRIGGER IF NOT EXISTS provider_evidence_immutable_update
 BEFORE UPDATE ON provider_conformance_evidence
 BEGIN SELECT RAISE(ABORT, 'provider conformance evidence is immutable'); END;
@@ -169,6 +228,45 @@ CREATE TABLE IF NOT EXISTS execution_binding_trust_markers (
         REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
     trust_source_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS execution_binding_enablement_markers (
+    binding_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
+    registration_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    FOREIGN KEY (registration_id,revision)
+        REFERENCES provider_state_epochs(registration_id,revision)
+);
+CREATE TRIGGER IF NOT EXISTS execution_binding_enablement_marker_no_update
+BEFORE UPDATE ON execution_binding_enablement_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding enablement marker is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_enablement_marker_no_delete
+BEFORE DELETE ON execution_binding_enablement_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding enablement marker cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_enablement_marker_no_duplicate_insert
+BEFORE INSERT ON execution_binding_enablement_markers
+WHEN EXISTS (SELECT 1 FROM execution_binding_enablement_markers
+             WHERE binding_id=NEW.binding_id)
+  OR EXISTS (SELECT 1 FROM execution_bindings WHERE binding_id=NEW.binding_id)
+BEGIN SELECT RAISE(ABORT, 'execution binding enablement marker cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_enablement_marker_insert
+BEFORE INSERT ON execution_bindings
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM provider_registrations r
+        JOIN provider_state_epochs e ON e.registration_id=r.registration_id
+        WHERE r.registration_id=NEW.provider_registration_id
+          AND r.state='registered' AND e.state='registered'
+          AND e.transitioned_at=r.updated_at
+          AND e.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                          WHERE registration_id=r.registration_id)
+    ) THEN RAISE(ABORT, 'binding requires current provider enablement interval') END;
+    INSERT INTO execution_binding_enablement_markers(binding_id,registration_id,revision)
+    SELECT NEW.binding_id,e.registration_id,e.revision
+    FROM provider_state_epochs e
+    WHERE e.registration_id=NEW.provider_registration_id
+      AND e.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                      WHERE registration_id=NEW.provider_registration_id);
+END;
 -- Bindings admitted by the older 5eb3b71 trust guards retain their immutable
 -- sidecars for audit, but cannot become executable under the newer rules.
 CREATE TABLE IF NOT EXISTS execution_binding_legacy_trust_quarantine (
@@ -275,6 +373,41 @@ WHEN NOT EXISTS (
            (tested_second = created_second AND tested_fraction <= created_fraction))
 )
 BEGIN SELECT RAISE(ABORT, 'binding predates pinned conformance evidence'); END;
+
+-- A result expiring at or before binding creation cannot authorize an
+-- immutable attempt. The optional absence of expires_at means unbounded;
+-- present values compare as UTC seconds plus full nanosecond fractions.
+CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_unexpired_at_insert
+BEFORE INSERT ON execution_bindings
+WHEN NOT EXISTS (
+    WITH pin AS (
+        SELECT evidence_json FROM provider_conformance_evidence
+        WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+    ), expiry AS (
+        SELECT json_extract(evidence_json, '$.expires_at') AS expires_at,
+               json_type(evidence_json, '$.expires_at') AS expiry_type
+        FROM pin WHERE json_valid(evidence_json)
+    ), times AS (
+        SELECT expiry_type,
+               CAST(strftime('%s', expires_at) AS INTEGER) AS expiry_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
+               substr(CASE WHEN substr(expires_at,20,1)='.' THEN
+                   substr(expires_at,21,
+                       instr(replace(replace(replace(substr(expires_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS expiry_fraction,
+               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                   substr(NEW.created_at,21,
+                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS created_fraction
+        FROM expiry
+    )
+    SELECT 1 FROM times
+    WHERE expiry_type IS NULL OR expiry_type='null'
+       OR (expiry_type='text' AND expiry_second IS NOT NULL AND created_second IS NOT NULL
+           AND (expiry_second>created_second OR
+                (expiry_second=created_second AND expiry_fraction>created_fraction)))
+)
+BEGIN SELECT RAISE(ABORT, 'binding conformance evidence expired at creation'); END;
 
 -- A pass that was current when tested is not enough: a later exact-suite
 -- result effective by binding creation supersedes it, including a failure.

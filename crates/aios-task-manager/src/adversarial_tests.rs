@@ -1301,10 +1301,10 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         receipt["capability_contract_hash"] = contract_hash.clone().into();
         receipt["conformance_evidence_id"] = pinned.into();
         receipt["provider_trust_source_id"] = registration.registration_id.clone().into();
-        let created_at = if pinned == "E2" {
-            "2026-09-19T00:00:00.600Z"
-        } else {
-            TEST_TIME
+        let created_at = match pinned {
+            "E2" => "2026-09-19T00:00:00.600Z",
+            "E5-unbounded" => "2026-09-19T00:00:00.980Z",
+            _ => TEST_TIME,
         };
         receipt["created_at"] = created_at.into();
         receipt["provider"]["id"] = registration.provider_id.clone().into();
@@ -1457,6 +1457,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         .execute_batch(
             "DROP TRIGGER execution_binding_evidence_present_at_insert;
          DROP TRIGGER execution_binding_evidence_not_future;
+         DROP TRIGGER execution_binding_evidence_unexpired_at_insert;
          DROP TRIGGER execution_binding_evidence_latest_at_insert;
          DROP TRIGGER execution_binding_admission_marker_insert;
          DROP TABLE execution_binding_admission_markers;",
@@ -1574,6 +1575,31 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "attempt-real-3",
         "2026-09-19T00:00:00.750Z"
     ));
+    // A second disable/enable at exactly the same timestamp still mints a
+    // distinct interval. The prior immutable binding cannot ride the new one.
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .disable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    assert!(!valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    let new_interval = insert(&manager, 4, "E2");
+    assert!(valid(
+        &mut manager,
+        &new_interval,
+        "attempt-real-4",
+        "2026-09-19T00:00:00.750Z"
+    ));
     // The immutable admission receipt is the trust ceiling. A retained row
     // whose projection was raised by an older writer cannot authorize launch.
     assert!(manager.connection.execute(
@@ -1590,8 +1616,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
     ).unwrap();
     assert!(!valid(
         &mut manager,
-        &second,
-        "attempt-real-3",
+        &new_interval,
+        "attempt-real-4",
         "2026-09-19T00:00:00.750Z"
     ));
     manager.connection.execute(
@@ -1606,8 +1632,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         .unwrap();
     assert!(valid(
         &mut manager,
-        &second,
-        "attempt-real-3",
+        &new_interval,
+        "attempt-real-4",
         "2026-09-19T00:00:00.750Z"
     ));
     for attack in [
@@ -1627,8 +1653,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
     manager.connection.execute_batch("VACUUM").unwrap();
     assert!(valid(
         &mut manager,
-        &second,
-        "attempt-real-3",
+        &new_interval,
+        "attempt-real-4",
         "2026-09-19T00:00:00.750Z"
     ));
     record(&mut manager, "E3", "fail", "2026-09-19T00:00:00.875Z");
@@ -1650,6 +1676,135 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         serde_json::from_str::<Value>(&stored).unwrap()["conformance_evidence_id"],
         "E1"
     );
+    let mut expiring = evidence("E4-expiring", "pass", "2026-09-19T00:00:00.950Z");
+    expiring["expires_at"] = "2026-09-19T01:00:00.960000001+01:00".into();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&expiring).unwrap(),
+        )
+        .unwrap();
+    let insert_expiry =
+        |manager: &TaskManager, id: &str, attempt: i64, pin: &str, created: &str| {
+            manager.connection.execute(
+                "INSERT INTO execution_bindings (
+             binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+             policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+             binding_json,created_at)
+             SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,?3,
+             policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+             json_set(binding_json,'$.binding_id',?1,'$.attempt_id',?2,'$.attempt',?3,
+                      '$.conformance_evidence_id',?4,'$.created_at',?5),?5
+             FROM execution_bindings WHERE binding_id=?6",
+                params![
+                    id,
+                    format!("attempt-{id}"),
+                    attempt,
+                    pin,
+                    created,
+                    new_interval
+                ],
+            )
+        };
+    for created in [
+        "2026-09-19T00:00:00.960000001Z",
+        "2026-09-19T00:00:00.960000002Z",
+    ] {
+        assert!(
+            insert_expiry(&manager, "binding-expiry", 10, "E4-expiring", created)
+                .unwrap_err()
+                .to_string()
+                .contains("expired at creation")
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-expiry'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained a failed insert");
+        }
+    }
+    insert_expiry(
+        &manager,
+        "binding-expiry",
+        10,
+        "E4-expiring",
+        "2026-09-19T00:00:00.960Z",
+    )
+    .unwrap();
+    let mut unbounded = evidence("E5-unbounded", "pass", "2026-09-19T00:00:00.970Z");
+    unbounded.as_object_mut().unwrap().remove("expires_at");
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&unbounded).unwrap(),
+        )
+        .unwrap();
+    let fresh = insert(&manager, 12, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &fresh,
+        "attempt-real-12",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER provider_state_epoch_transition")
+        .unwrap();
+    let owner = manager.lease_owner.clone();
+    upgrade_stamped_registry_guards_fenced(
+        &mut manager.connection,
+        &owner,
+        manager.lease_epoch,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(!valid(
+        &mut manager,
+        &fresh,
+        "attempt-real-12",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "disabled"
+    );
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, TEST_TIME)
+        .unwrap();
+    let after_repair = insert(&manager, 13, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &after_repair,
+        "attempt-real-13",
+        "2026-09-19T00:00:00.990Z"
+    ));
 }
 
 #[test]
