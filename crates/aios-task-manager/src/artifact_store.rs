@@ -14267,6 +14267,141 @@ mod tests {
     }
 
     #[test]
+    fn opaque_owner_export_operation_id_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"owner export".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "owner export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            12
+        );
+        let mut replay = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "owner export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut replay)
+                .unwrap(),
+            12
+        );
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='artifact.exported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/operation_id"),
+            Some(&json!("owner export 1"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+        for invalid in ["control\u{0001}id".to_owned(), "x".repeat(257)] {
+            assert!(
+                manager
+                    .issue_owned_artifact_export_destination(
+                        &scope,
+                        &invalid,
+                        &artifact.artifact_id,
+                        "user-selected-file",
+                        1_024,
+                        deferred(Vec::new()),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_bound_export_operation_id_commits() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"bound export".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "opaque-export",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut destination = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "bound export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            12
+        );
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='artifact.exported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/operation_id"),
+            Some(&json!("bound export 1"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "covers exact egress admission, transfer provenance, and authenticated replay"
@@ -17266,6 +17401,60 @@ mod tests {
                 challenge
             );
         }
+    }
+
+    #[test]
+    fn opaque_trusted_export_reconciliation_ids_commit() {
+        let temp = TempDir::new().unwrap();
+        let mut verifier = export_no_effect_verifier("user-selected-file", "evidence one", 'a');
+        verifier.verifier_id = "verifier one";
+        let mut manager = manager_with_export_verifiers(&temp, vec![Arc::new(verifier)]);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"reconcile export".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "reconcile export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        assert!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .is_err()
+        );
+        manager
+            .reconcile_unknown_artifact_export_no_effect("reconcile export 1")
+            .unwrap();
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='execution.completed' AND json_extract(event_json,'$.details.export_reconciliation') IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/export_reconciliation/verifier_id"),
+            Some(&json!("verifier one"))
+        );
+        assert_eq!(
+            event.pointer("/details/export_reconciliation/evidence_ref"),
+            Some(&json!("evidence one"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
     }
 
     #[test]

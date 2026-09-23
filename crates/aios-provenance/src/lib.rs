@@ -2076,7 +2076,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         ("execution.started", "attempt_id" | "binding_id") => expect_task_string(value, 256, true),
         ("execution.started", "node_id") => expect_task_string(value, 128, true),
         ("execution.started" | "execution.completed" | "execution.failed", "operation_id") => {
-            expect_identifier(value, 256)
+            expect_artifact_identifier(value)
         }
         ("execution.started" | "execution.completed" | "execution.failed", "phase") => {
             expect_one_of(
@@ -2152,7 +2152,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
             expect_artifact_identifier(value)
         }
         ("artifact.created", "type") => expect_token(value, 256),
-        ("artifact.exported", "operation_id") => expect_identifier(value, 256),
+        ("artifact.exported", "operation_id") => expect_artifact_identifier(value),
         ("artifact.integrity-failed", "observation_ordinal") => expect_integer(value, 1, None),
         ("artifact.integrity-failed", "previous_durability_state") => {
             expect_nullable_durability_state(value)
@@ -2284,8 +2284,8 @@ fn validate_export_reconciliation(value: &Value) -> Result<()> {
             "recovery_ref",
         ],
     )?;
-    expect_identifier(&object["verifier_id"], 256)?;
-    expect_identifier(&object["evidence_ref"], 256)?;
+    expect_artifact_identifier(&object["verifier_id"])?;
+    expect_artifact_identifier(&object["evidence_ref"])?;
     expect_digest(&object["proof_hash"])?;
     expect_identifier(&object["challenge"], 256)?;
     expect_timestamp(&object["observed_at"])?;
