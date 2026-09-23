@@ -2216,8 +2216,14 @@ impl TaskManager {
                 })
             })
         });
+        let replayed_completed_at = if material_state == Some(TaskState::Completed) {
+            material_updated_at.clone()
+        } else {
+            None
+        };
         if material_creation.as_ref() != Some(&expected_creation)
             || task.updated_at != material_updated_at.unwrap_or_default()
+            || task.completed_at != replayed_completed_at
             || task.active_plan != material_active_plan
             || task.active_program != material_active_program
             || active_program_digest != material_active_program_digest

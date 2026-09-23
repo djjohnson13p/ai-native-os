@@ -1,5 +1,8 @@
 //! Standalone provenance payload fixtures and runtime shape bounds.
 
+use aios_provenance::{
+    HASH_PROFILE, JournalRecord, SCHEMA_VERSION, hash_record, stream_id, verify_records,
+};
 use serde_json::{Value, json};
 
 fn validator() -> jsonschema::Validator {
@@ -25,6 +28,55 @@ fn event_payload_fixtures_match_schema() {
             validator.is_valid(&case["event"]),
             expected,
             "unexpected schema verdict for {name}"
+        );
+    }
+}
+
+#[test]
+fn event_payload_fixtures_match_runtime_verifier() {
+    let fixture = cases();
+    let chain: Value = serde_json::from_str(include_str!(
+        "../../../examples/provenance/chain-cases.json"
+    ))
+    .unwrap();
+    let mut genesis = chain["base_stream"]["events"][0]["event"].clone();
+    genesis["task_id"] = json!("task:fixture");
+    genesis["event_id"] = json!("event:genesis");
+    let stream = stream_id("task:fixture").unwrap();
+    let genesis_hash = hash_record(&stream, 1, None, &genesis).unwrap();
+    let first = JournalRecord {
+        schema_version: SCHEMA_VERSION.to_owned(),
+        hash_profile: HASH_PROFILE.to_owned(),
+        stream_id: stream.clone(),
+        sequence: 1,
+        previous_event_hash: None,
+        event: genesis,
+        event_hash: genesis_hash.clone(),
+    };
+
+    for case in fixture["cases"].as_array().unwrap() {
+        let event = &case["event"];
+        let second = JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 2,
+            previous_event_hash: Some(genesis_hash.clone()),
+            event: event.clone(),
+            event_hash: hash_record(&stream, 2, Some(&genesis_hash), event).unwrap(),
+        };
+        let result = verify_records(
+            &[first.clone(), second],
+            &stream,
+            None,
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            result.valid,
+            case["valid"].as_bool().unwrap(),
+            "{}",
+            case["name"]
         );
     }
 }

@@ -741,10 +741,6 @@ pub fn export_jsonl(
 ///
 /// # Errors
 /// Returns an error when validation, verification, projection, or storage fails.
-#[allow(
-    clippy::too_many_lines,
-    reason = "keeps snapshot validation, projection, and bounded export in one transaction"
-)]
 pub fn export_jsonl_with_validation<F>(
     connection: &Connection,
     stream_id: &str,
@@ -753,6 +749,30 @@ pub fn export_jsonl_with_validation<F>(
 ) -> Result<ProjectionPortableExport>
 where
     F: FnOnce(&Connection) -> Result<()>,
+{
+    export_jsonl_with_validation_and_random(
+        connection,
+        stream_id,
+        verified_at,
+        validate,
+        getrandom::fill,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps snapshot validation, projection, and bounded export in one transaction"
+)]
+fn export_jsonl_with_validation_and_random<F, R>(
+    connection: &Connection,
+    stream_id: &str,
+    verified_at: &str,
+    validate: F,
+    random: R,
+) -> Result<ProjectionPortableExport>
+where
+    F: FnOnce(&Connection) -> Result<()>,
+    R: FnOnce(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
 {
     validate_timestamp(verified_at)?;
     validate_stream_id(stream_id)?;
@@ -779,17 +799,11 @@ where
             "cannot export an invalid provenance stream".to_owned(),
         ));
     }
-    let alias_key =
-        transaction.query_row("SELECT randomblob(32)", [], |row| row.get::<_, Vec<u8>>(0))?;
-    if alias_key.len() != 32 {
-        return Err(Error::InvalidRecord(
-            "projection alias key generation failed".to_owned(),
-        ));
-    }
-    let bundle_random = transaction.query_row("SELECT hex(randomblob(32))", [], |row| {
-        row.get::<_, String>(0)
-    })?;
-    let bundle_id = format!("bundle:v1:{}", bundle_random.to_ascii_lowercase());
+    let mut random_bytes = [0_u8; 64];
+    random(&mut random_bytes)
+        .map_err(|_| Error::InvalidRecord("projection OS randomness unavailable".to_owned()))?;
+    let (alias_key, bundle_random) = random_bytes.split_at(32);
+    let bundle_id = format!("bundle:v1:{}", hex_digest(bundle_random));
     let mut records_jsonl = String::new();
     let mut cursor = None;
     let mut previous = None;
@@ -799,7 +813,7 @@ where
         let page = list_events(&transaction, stream_id, cursor, MAX_PAGE_SIZE)?;
         for record in page.records {
             validate_stored_event(&record.event)?;
-            let projected_event = project_event(&record.event, &alias_key)?;
+            let projected_event = project_event(&record.event, alias_key)?;
             validate_projected_event(&projected_event)?;
             let projection_hash = hash_projected_record(
                 &bundle_id,
@@ -2059,9 +2073,8 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         ("provider.selected" | "placement.selected", "isolation_class") => {
             expect_one_of(value, &["P0", "P1", "P2", "P3"])
         }
-        ("execution.started", "attempt_id") => expect_identifier(value, 256),
-        ("execution.started", "binding_id") => expect_identifier(value, 256),
-        ("execution.started", "node_id") => expect_identifier(value, 256),
+        ("execution.started", "attempt_id" | "binding_id") => expect_task_string(value, 256, true),
+        ("execution.started", "node_id") => expect_task_string(value, 128, true),
         ("execution.started" | "execution.completed" | "execution.failed", "operation_id") => {
             expect_identifier(value, 256)
         }
@@ -2100,7 +2113,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
             expect_identifier(value, 256)
         }
         ("execution.completed" | "execution.failed", "inventory_id") => {
-            expect_identifier(value, 256)
+            expect_task_string(value, 276, true)
         }
         ("execution.completed" | "execution.failed", "safe_action") => expect_one_of(
             value,
@@ -2127,16 +2140,16 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
             expect_integer(value, 0, None)
         }
         ("artifact.imported" | "artifact.created", "blob_reused") => expect_bool(value),
-        ("artifact.imported", "import_id") => expect_nullable_identifier(value, 256),
+        ("artifact.imported", "import_id") => expect_nullable_artifact_identifier(value),
         ("artifact.imported" | "artifact.integrity-failed", "request_digest") => {
             expect_digest(value)
         }
         ("artifact.imported", "source") => expect_one_of(value, &["user-selected"]),
         ("artifact.created" | "artifact.integrity-failed", "allocation_id") => {
-            expect_identifier(value, 256)
+            expect_artifact_identifier(value)
         }
         ("artifact.created" | "artifact.integrity-failed", "publication_id") => {
-            expect_identifier(value, 256)
+            expect_artifact_identifier(value)
         }
         ("artifact.created", "type") => expect_token(value, 256),
         ("artifact.exported", "operation_id") => expect_identifier(value, 256),
@@ -2371,6 +2384,27 @@ fn expect_nullable_identifier(value: &Value, maximum: usize) -> Result<()> {
         Ok(())
     } else {
         expect_identifier(value, maximum)
+    }
+}
+
+fn expect_artifact_identifier(value: &Value) -> Result<()> {
+    expect_task_string(value, 256, true)?;
+    if value
+        .as_str()
+        .is_some_and(|text| text.chars().any(char::is_control))
+    {
+        return Err(invalid_details(
+            "Artifact-origin identifier contains a control character",
+        ));
+    }
+    Ok(())
+}
+
+fn expect_nullable_artifact_identifier(value: &Value) -> Result<()> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        expect_artifact_identifier(value)
     }
 }
 
@@ -3368,7 +3402,7 @@ mod tests {
             "timestamp":NOW,
             "actor":{"kind":"system-service","id":"service:test"},
             "status":"pending",
-            "details":{"attempt_id":"raw secret value"}
+            "details":{"attempt_id":""}
         });
         assert!(
             append_in_tx(
@@ -4215,9 +4249,9 @@ mod tests {
 
         let mut execution = event("T-safe-identifiers", 2);
         execution["event_type"] = json!("execution.started");
-        execution["details"] = json!({"node_id":"!".repeat(256), "attempt_id":"$scope"});
+        execution["details"] = json!({"node_id":"!".repeat(128), "attempt_id":"$scope"});
         assert!(validate_event("T-safe-identifiers", &execution).is_ok());
-        execution["details"]["node_id"] = json!("!".repeat(257));
+        execution["details"]["node_id"] = json!("!".repeat(129));
         assert!(validate_event("T-safe-identifiers", &execution).is_err());
 
         let mut transition = typed_transition_event("T-safe-identifiers");
@@ -4429,6 +4463,77 @@ mod tests {
         ).unwrap();
         let error = export_jsonl(&connection, &stream, NOW).unwrap_err();
         assert!(error.to_string().contains("record-count bound"));
+    }
+
+    #[test]
+    fn projection_export_aborts_when_os_randomness_fails() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        let head_before = get_head(&connection, &stream).unwrap();
+        let mut random_called = false;
+        let error = export_jsonl_with_validation_and_random(
+            &connection,
+            &stream,
+            NOW,
+            |_| Ok(()),
+            |bytes| {
+                random_called = true;
+                bytes[..32].fill(0x11);
+                Err(getrandom::Error::UNEXPECTED)
+            },
+        )
+        .unwrap_err();
+        assert!(random_called);
+        assert!(matches!(
+            error,
+            Error::InvalidRecord(message) if message == "projection OS randomness unavailable"
+        ));
+        assert_eq!(get_head(&connection, &stream).unwrap(), head_before);
+    }
+
+    #[test]
+    fn projection_export_uses_separate_random_key_and_bundle_id_bytes() {
+        let mut connection = connection();
+        append_many(&mut connection, 1);
+        let stream = stream_id("T-provenance").unwrap();
+        let export_with_key = |key_byte| {
+            export_jsonl_with_validation_and_random(
+                &connection,
+                &stream,
+                NOW,
+                |_| Ok(()),
+                |bytes| {
+                    assert_eq!(bytes.len(), 64);
+                    bytes[..32].fill(key_byte);
+                    bytes[32..].fill(0x22);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        };
+        let first = export_with_key(0x11);
+        let second = export_with_key(0x33);
+        let first_manifest: ProjectionManifest =
+            serde_json::from_str(&first.manifest_json).unwrap();
+        let second_manifest: ProjectionManifest =
+            serde_json::from_str(&second.manifest_json).unwrap();
+        assert_eq!(
+            first_manifest.bundle_id,
+            format!("bundle:v1:{}", "22".repeat(32))
+        );
+        assert_eq!(first_manifest.bundle_id, second_manifest.bundle_id);
+        assert_ne!(first.records_jsonl, second.records_jsonl);
+        assert!(
+            verify_jsonl_export(&first.manifest_json, &first.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
+        assert!(
+            verify_jsonl_export(&second.manifest_json, &second.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
     }
 
     #[test]

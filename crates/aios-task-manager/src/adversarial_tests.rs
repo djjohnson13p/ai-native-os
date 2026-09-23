@@ -1016,6 +1016,104 @@ fn portable_export_rejects_private_task_and_journal_disagreement() {
 }
 
 #[test]
+fn provenance_export_and_replay_bind_completed_at_to_completion_transition() {
+    let task_id = "T-completed-at-export";
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, task_id, TaskState::Verifying);
+    let transaction = manager.connection.transaction().unwrap();
+    let completion = serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":"event:completed-at:completion",
+        "task_id":task_id,
+        "event_type":"task.transitioned",
+        "timestamp":TEST_TIME,
+        "actor":{"kind":"system-service","id":"service:test"},
+        "status":"success",
+        "task_transition":{
+            "transition_id":"transition:completed-at:completion",
+            "previous_state":"VERIFYING",
+            "new_state":"COMPLETED",
+            "previous_revision":5,
+            "new_revision":6,
+            "reason_code":"STATE_CHANGE_REQUESTED"
+        },
+        "committed_mutation":{
+            "active_plan":null,
+            "active_step_ids":null,
+            "waiting_on":null,
+            "failure":null,
+            "recovery":null
+        },
+        "details":{"reason_message_ref":null,"active_program":null}
+    });
+    let appended = append_event(&transaction, task_id, &completion).unwrap();
+    transaction.execute(
+        "UPDATE tasks SET revision=6,state='COMPLETED',state_reason_json=?2,updated_at=?3,completed_at=?3 WHERE task_id=?1",
+        rusqlite::params![task_id, serde_json::json!({"code":"STATE_CHANGE_REQUESTED","message":null,"provenance_event_id":appended.event_id}).to_string(), TEST_TIME],
+    ).unwrap();
+    transaction.commit().unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at='2026-09-20T00:00:00Z' WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.verify_provenance(task_id).unwrap());
+    assert!(manager.export_provenance(task_id).is_err());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at=NULL WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(task_id).is_err());
+
+    let cancelled_id = "T-noncompleted-at-export";
+    manager.create_task(&create(cancelled_id)).unwrap();
+    assert!(
+        manager
+            .transition(&request(
+                "tr-noncompleted-at",
+                cancelled_id,
+                1,
+                TaskState::Created,
+                TaskState::Cancelled
+            ))
+            .unwrap()
+            .applied
+    );
+    assert!(manager.export_provenance(cancelled_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at=?2 WHERE task_id=?1",
+            rusqlite::params![cancelled_id, TEST_TIME],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(cancelled_id).is_err());
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("completed-at-replay.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager
+            .create_task(&create("T-completed-at-replay"))
+            .unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=?1 WHERE task_id='T-completed-at-replay'",
+            [TEST_TIME],
+        )
+        .unwrap();
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+}
+
+#[test]
 fn startup_fails_closed_for_missing_corrupt_or_head_mismatched_provenance() {
     let directory = tempdir().unwrap();
     for (name, mutate) in [
@@ -5801,6 +5899,167 @@ fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
         event.pointer("/details/node_id").and_then(Value::as_str),
         Some("node-completion")
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds a second immutable attempt with opaque IDs and checks public admission"
+)]
+fn ready_frontier_accepts_opaque_attempt_id_with_whitespace() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager
+        .connection
+        .execute_batch(
+            r#"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
+           INSERT INTO execution_bindings (
+               binding_id, attempt_id, task_id, semantic_program_hash,
+               registry_snapshot_id, ir_version, node_id, capability,
+               capability_contract_hash, provider_registration_id,
+               provider_id, provider_version, provider_manifest_hash,
+               provider_build_hash, attempt, policy_decision_refs_json,
+               grant_refs_json, execution_profile_ref, placement_json,
+               binding_json, created_at
+           )
+           SELECT 'binding opaque 1', 'attempt 1', task_id, semantic_program_hash,
+                  registry_snapshot_id, ir_version, node_id, capability,
+                  capability_contract_hash, provider_registration_id,
+                  provider_id, provider_version, provider_manifest_hash,
+                  provider_build_hash, 2, policy_decision_refs_json,
+                  grant_refs_json, execution_profile_ref, placement_json,
+                  replace(replace(replace(replace(binding_json,
+                      'attempt-completion', 'attempt 1'),
+                      'binding-completion', 'binding opaque 1'),
+                      'allocation-completion', 'allocation-opaque'),
+                      '"attempt":1', '"attempt":2'),
+                  created_at
+           FROM execution_bindings WHERE binding_id='binding-completion';
+           INSERT INTO step_executions (
+               attempt_id, task_id, semantic_program_hash, registry_snapshot_id,
+               node_id, binding_id, provider_id, provider_version, attempt_number,
+               revision, state, outcome_certainty, input_artifacts_json,
+               output_artifacts_json, created_at, updated_at
+           )
+           SELECT 'attempt 1', task_id, semantic_program_hash, registry_snapshot_id,
+                  node_id, 'binding opaque 1', provider_id, provider_version, 2,
+                  1, 'READY', 'NOT_STARTED', '[]', '[]', created_at, updated_at
+           FROM step_executions WHERE attempt_id='attempt-completion';
+           INSERT INTO artifact_output_allocations (
+               allocation_id, task_id, semantic_program_hash, node_id,
+               binding_id, attempt_id, output_port, expected_semantic_type,
+               sensitivity, retention, state, created_at, expires_at
+           )
+           SELECT 'allocation-opaque', task_id, semantic_program_hash, node_id,
+                  'binding opaque 1', 'attempt 1', output_port, expected_semantic_type,
+                  sensitivity, retention, 'ALLOCATED', created_at, expires_at
+           FROM artifact_output_allocations WHERE allocation_id='allocation-completion';"#,
+        )
+        .unwrap();
+
+    let check_tx = manager.connection.transaction().unwrap();
+    assert_eq!(
+        count_active_steps(
+            &check_tx,
+            "T-completion",
+            &["node-completion".to_owned()],
+            "READY"
+        )
+        .unwrap(),
+        1
+    );
+    let binding_check = BindingGrantCheck {
+        task_id: "T-completion",
+        semantic_hash: HASH,
+        node_id: "node-completion",
+        binding_id: "binding opaque 1",
+        attempt_id: "attempt 1",
+        grant_refs_json: "[]",
+        checked_at: TEST_TIME,
+    };
+    assert!(
+        binding_grants_valid(&check_tx, &binding_check).unwrap(),
+        "binding grants"
+    );
+    assert!(
+        output_allocations_ready(&check_tx, &binding_check).unwrap(),
+        "allocations"
+    );
+    assert_eq!(
+        count_bound_active_steps(
+            &check_tx,
+            "T-completion",
+            &["node-completion".to_owned()],
+            &["READY"],
+            TEST_TIME
+        )
+        .unwrap(),
+        1
+    );
+    check_tx.rollback().unwrap();
+
+    let result = manager
+        .transition(&request(
+            "tr-opaque-attempt-running",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert!(result.applied, "{result:?}");
+    assert_eq!(
+        manager
+            .get_step_execution("attempt 1")
+            .unwrap()
+            .unwrap()
+            .state,
+        StepState::Running
+    );
+    let event_json: String = manager.connection.query_row(
+        "SELECT event_json FROM provenance_events WHERE task_id='T-completion' AND event_type='execution.started'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    let event: Value = serde_json::from_str(&event_json).unwrap();
+    assert_eq!(
+        event.pointer("/details/attempt_id"),
+        Some(&json!("attempt 1"))
+    );
+    assert!(manager.verify_provenance("T-completion").unwrap());
+}
+
+#[test]
+fn recovery_inventory_provenance_accepts_prefixed_maximum_attempt_id() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.create_task(&create("T-opaque-recovery")).unwrap();
+    let full_attempt = "a".repeat(256);
+    let inventory_id = recovery_subject_inventory_id("attempt", &full_attempt).unwrap();
+    assert_eq!(inventory_id.chars().count(), 264);
+
+    let event = json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": "event:opaque-recovery",
+        "task_id": "T-opaque-recovery",
+        "event_type": "execution.completed",
+        "timestamp": TEST_TIME,
+        "actor": {"kind": "system-service", "id": "service:recovery"},
+        "status": "success",
+        "details": {"inventory_id": inventory_id}
+    });
+    let transaction = manager.connection.transaction().unwrap();
+    append_event(&transaction, "T-opaque-recovery", &event).unwrap();
+    transaction.commit().unwrap();
+    assert!(manager.verify_provenance("T-opaque-recovery").unwrap());
+
+    let mut over_bound = event.clone();
+    over_bound["event_id"] = json!("event:over-bound-recovery");
+    over_bound["details"]["inventory_id"] =
+        json!("provider-invocation:".to_owned() + &"a".repeat(257));
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(append_event(&transaction, "T-opaque-recovery", &over_bound).is_err());
+    transaction.rollback().unwrap();
+    assert_eq!(manager.provenance_count("T-opaque-recovery").unwrap(), 2);
 }
 
 #[test]

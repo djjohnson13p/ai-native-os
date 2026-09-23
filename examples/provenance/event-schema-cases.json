@@ -225,6 +225,226 @@
           "plan_id": "plan:one"
         }
       }
+    },
+    {
+      "name": "opaque-import-id-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:12",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "import replay 1"
+        }
+      }
+    },
+    {
+      "name": "artifact-import-id-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:13",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "import\u0001id"
+        }
+      }
+    },
+    {
+      "name": "artifact-import-id-over-bound-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:14",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+        }
+      }
+    },
+    {
+      "name": "opaque-publication-ids-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:15",
+        "task_id": "task:fixture",
+        "event_type": "artifact.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "allocation_id": "allocation 1",
+          "publication_id": "publication 1"
+        }
+      }
+    },
+    {
+      "name": "artifact-publication-id-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:16",
+        "task_id": "task:fixture",
+        "event_type": "artifact.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "allocation_id": "allocation 1",
+          "publication_id": "publication\u0001id"
+        }
+      }
+    },
+    {
+      "name": "opaque-attempt-and-binding-ids-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:17",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "attempt 1",
+          "binding_id": "binding 1",
+          "node_id": "node 1"
+        }
+      }
+    },
+    {
+      "name": "max-length-attempt-id-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:18",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "over-bound-attempt-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:19",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "prefixed-max-length-attempt-inventory-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:20",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "attempt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "over-bound-recovery-inventory-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:21",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "authorization-resource-whitespace-still-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:22",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "resource": "artifact one"
+        }
+      }
+    },
+    {
+      "name": "max-derived-provider-invocation-inventory-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:23",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "provider-invocation:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
     }
   ]
 }

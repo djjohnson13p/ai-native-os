@@ -14241,6 +14241,32 @@ mod tests {
     }
 
     #[test]
+    fn opaque_import_id_with_whitespace_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let mut request = import_request();
+        request.import_id = Some("import replay 1".to_owned());
+        let first = manager
+            .import_artifact(&request, &mut Cursor::new(b"opaque import".as_slice()))
+            .unwrap();
+        let replay = manager
+            .import_artifact(&request, &mut Cursor::new(b"opaque import".as_slice()))
+            .unwrap();
+        assert_eq!(first.artifact_id, replay.artifact_id);
+        let event_json: String = manager.connection.query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-artifact' AND event_type='artifact.imported'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/import_id"),
+            Some(&json!("import replay 1"))
+        );
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "covers exact egress admission, transfer provenance, and authenticated replay"
@@ -20654,6 +20680,29 @@ mod tests {
                 .unwrap();
             assert_eq!(grants, [(1, "ACTIVE".to_owned()), (1, "ACTIVE".to_owned())]);
         }
+    }
+
+    #[test]
+    fn opaque_publication_id_with_whitespace_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let (allocation_id, _) =
+            finish_bound_output(&mut manager, "opaque-publication", "ONE_SHOT");
+        let request = publication("publication replay 1", &allocation_id);
+        let first = publish_bound(&mut manager, &request).unwrap();
+        assert!(first.published);
+        assert_eq!(publish_bound(&mut manager, &request).unwrap(), first);
+        let event_json: String = manager.connection.query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-artifact' AND event_type='artifact.created'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/publication_id"),
+            Some(&json!("publication replay 1"))
+        );
+        assert!(manager.verify_provenance("T-artifact").unwrap());
     }
 
     #[test]
