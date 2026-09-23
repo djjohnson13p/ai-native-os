@@ -43,6 +43,25 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'provider registration cannot be replaced'); END;
 
+-- The admitted trust level is part of the immutable registration receipt.
+-- Runtime disable/revocation uses state; later trust elevation requires a new
+-- admission identity and receipt rather than editing this projection.
+CREATE TRIGGER IF NOT EXISTS provider_registration_trust_receipt_insert
+BEFORE INSERT ON provider_registrations
+WHEN CASE WHEN json_valid(NEW.registration_json) THEN
+    json_type(NEW.registration_json, '$.trust.status') IS NOT 'text'
+    OR NEW.trust_status NOT IN (
+        'unverified','locally-trusted','project-reviewed',
+        'organization-approved','denied','revoked'
+    )
+    OR NEW.trust_status IS NOT json_extract(NEW.registration_json, '$.trust.status')
+    ELSE 1 END
+BEGIN SELECT RAISE(ABORT, 'provider trust must match immutable admission receipt'); END;
+CREATE TRIGGER IF NOT EXISTS provider_registration_trust_immutable_update
+BEFORE UPDATE OF trust_status ON provider_registrations
+WHEN NEW.trust_status IS NOT OLD.trust_status
+BEGIN SELECT RAISE(ABORT, 'provider trust cannot change without new admission'); END;
+
 CREATE TRIGGER IF NOT EXISTS provider_registration_revocation_terminal
 BEFORE UPDATE OF state ON provider_registrations
 WHEN OLD.state = 'revoked' AND NEW.state <> 'revoked'
@@ -99,6 +118,13 @@ BEGIN SELECT RAISE(ABORT, 'execution binding cannot be replaced'); END;
 -- The selected evidence must already be present when a binding is admitted.
 -- An old binding cannot become valid merely because a matching result is
 -- recorded later with a backdated executed_at claim.
+CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_pin_required
+BEFORE INSERT ON execution_bindings
+WHEN CASE WHEN json_valid(NEW.binding_json) THEN
+    json_type(NEW.binding_json, '$.conformance_evidence_id') IS NOT 'text'
+    OR length(json_extract(NEW.binding_json, '$.conformance_evidence_id')) NOT BETWEEN 1 AND 256
+    ELSE 1 END
+BEGIN SELECT RAISE(ABORT, 'binding requires a valid conformance evidence pin'); END;
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_present_at_insert
 BEFORE INSERT ON execution_bindings
 WHEN json_valid(NEW.binding_json)

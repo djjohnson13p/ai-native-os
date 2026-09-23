@@ -73,12 +73,9 @@ fn historical_validation_keeps_its_snapshot_after_default_switch_and_offline_reo
     .unwrap();
 
     let mut manager = TaskManager::open(&database).unwrap();
-    manager.initialize_registry_store().unwrap();
-    drop(manager);
     let first_id = {
-        let mut connection = Connection::open(&database).unwrap();
         let (first_id, second_id) = {
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = manager.registry_store_writer().unwrap();
             let first_id = store.admit_bundle(&first_bundle).unwrap();
             let second_id = store.admit_bundle(&second_bundle).unwrap();
             assert_ne!(first_id, second_id);
@@ -87,6 +84,7 @@ fn historical_validation_keeps_its_snapshot_after_default_switch_and_offline_reo
                 .unwrap();
             (first_id, second_id)
         };
+        let connection = Connection::open(&database).unwrap();
         connection.execute(
             "INSERT INTO validation_results \
              (validation_result_id,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,result_json,validated_at) \
@@ -96,12 +94,14 @@ fn historical_validation_keeps_its_snapshot_after_default_switch_and_offline_reo
                 first_id
             ],
         ).unwrap();
-        RegistryStore::initialize(&mut connection)
+        manager
+            .registry_store_writer()
             .unwrap()
             .activate_default("user", "u1", Some(1), &second_id)
             .unwrap();
         first_id
     };
+    drop(manager);
 
     fs::remove_dir_all(&first_bundle).unwrap();
     fs::remove_dir_all(&second_bundle).unwrap();

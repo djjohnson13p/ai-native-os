@@ -533,11 +533,11 @@ fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
         "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1','2026-09-19T00:00:00Z')",
         [],
     ).unwrap();
-    RegistryStore::initialize(&mut connection)
+    RegistryStore::initialize_in_memory(&mut connection)
         .unwrap()
         .admit_registry(&registry)
         .unwrap();
-    let mut providers = ProviderStore::initialize(&mut connection).unwrap();
+    let mut providers = ProviderStore::initialize_in_memory(&mut connection).unwrap();
     let mut manifest = fixture_value("provider-conformance-cases.json")[0]["provider"].clone();
     manifest["provides"][0]["contract"]["contract_hash"] = hash.into();
     manifest["provides"][0]["conformance"]["suite_hash"] = PROVIDER_TEST_SUITE_HASH.into();

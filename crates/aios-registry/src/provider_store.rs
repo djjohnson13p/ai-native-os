@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::store::{StoreOwner, WriteFence};
 use crate::{
     ProviderConformanceOptions, SemanticRegistry, StrictJsonLimits, canonicalize, is_sha256_id,
     parse_strict_value, validate_provider_manifest,
@@ -131,6 +132,7 @@ pub struct ProviderHealth {
 
 pub struct ProviderStore<'a> {
     connection: &'a mut Connection,
+    write_fence: Option<WriteFence<'a>>,
 }
 
 impl<'a> ProviderStore<'a> {
@@ -154,7 +156,41 @@ impl<'a> ProviderStore<'a> {
         crate::RegistryStore::initialize(connection).map_err(|_| {
             ProviderStoreError::Conflict("semantic registry migration is incomplete")
         })?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            write_fence: None,
+        })
+    }
+
+    /// Opens a provider writer using Task Manager's captured ownership lease.
+    /// File-backed stores also require the identity-bound owner lock.
+    pub fn initialize_writer(
+        connection: &'a mut Connection,
+        owner: &'a StoreOwner,
+    ) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(
+            WriteFence::new(store.connection, owner)
+                .map_err(|_| ProviderStoreError::Conflict("invalid provider write fence"))?,
+        );
+        Ok(store)
+    }
+
+    /// Allows a standalone ephemeral in-memory registry without a Task Manager
+    /// lease. A manager-owned in-memory store must use `initialize_writer`.
+    pub fn initialize_in_memory(connection: &'a mut Connection) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(WriteFence::in_memory(store.connection).map_err(|_| {
+            ProviderStoreError::Conflict("provider in-memory writer requires an unowned store")
+        })?);
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_unfenced_fixture(connection: &'a mut Connection) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(WriteFence::fixture());
+        Ok(store)
     }
 
     /// Register one exact build against one already admitted, strictly verified snapshot.
@@ -233,9 +269,18 @@ impl<'a> ProviderStore<'a> {
         };
         let registration_json = registration_record(&registration, &manifest, trust, registered_at);
         let registration_json = canonical_text(&registration_json)?;
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(ProviderStoreError::Conflict(
+                "provider mutation requires Task Manager write authority",
+            ))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         // Admission and identity insertion must share the write lock. Otherwise
         // a concurrent containment can commit after this check but before the
         // provider's immutable origin snapshot is recorded.
@@ -309,6 +354,9 @@ impl<'a> ProviderStore<'a> {
             )?;
         }
         verify_stored_registration_receipt(&transaction, &stored, &manifest)?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         transaction.commit()?;
         Ok(stored)
     }
@@ -385,9 +433,18 @@ impl<'a> ProviderStore<'a> {
             }
         }
         let canonical = canonical_text(&evidence)?;
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(ProviderStoreError::Conflict(
+                "provider mutation requires Task Manager write authority",
+            ))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         let expected = EvidenceProjection {
             registration_id: registration_id.to_owned(),
             capability: semantic_ref.to_owned(),
@@ -406,6 +463,9 @@ impl<'a> ProviderStore<'a> {
                 params![id,registration_id,semantic_ref,contract_hash,suite_id,suite_hash,result,canonical,tested_at],
             )?;
         }
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         transaction.commit()?;
         Ok(id)
     }
@@ -432,6 +492,8 @@ impl<'a> ProviderStore<'a> {
             return Err(ProviderStoreError::Conflict("revocation is terminal"));
         }
         if state == "registered" {
+            let manifest = self.verified_manifest(&registration)?;
+            verify_stored_registration_receipt(self.connection, &registration, &manifest)?;
             if !matches!(
                 old.1.as_str(),
                 "locally-trusted" | "project-reviewed" | "organization-approved"
@@ -446,10 +508,36 @@ impl<'a> ProviderStore<'a> {
                 ));
             }
         }
-        self.connection.execute(
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(ProviderStoreError::Conflict(
+                "provider mutation requires Task Manager write authority",
+            ))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
+        let current_state: String = transaction.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id=?1",
+            [registration_id],
+            |row| row.get(0),
+        )?;
+        if current_state != old.0 {
+            return Err(ProviderStoreError::Conflict(
+                "provider lifecycle changed concurrently",
+            ));
+        }
+        transaction.execute(
             "UPDATE provider_registrations SET state=?2,updated_at=?3 WHERE registration_id=?1",
             params![registration_id, state, now],
         )?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -498,6 +586,11 @@ impl<'a> ProviderStore<'a> {
         for id in ids {
             let registration = self.load_registration(&id)?;
             let mut manifest = self.verified_manifest(&registration)?;
+            if verify_stored_registration_receipt(self.connection, &registration, &manifest)
+                .is_err()
+            {
+                continue;
+            }
             manifest.provides.retain(|claim| {
                 let major = claim.contract.version.split('.').next().unwrap_or("");
                 semantic_capability_ref == format!("{}@{major}", claim.contract.capability)
@@ -553,9 +646,18 @@ impl<'a> ProviderStore<'a> {
         // BEGIN IMMEDIATE holds the SQLite write lock across the read and
         // update. OffsetDateTime compares full nanosecond precision even when
         // callers use different RFC 3339 timezone offsets.
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(ProviderStoreError::Conflict(
+                "provider mutation requires Task Manager write authority",
+            ))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         let old: Option<String> = transaction
             .query_row(
                 "SELECT checked_at FROM provider_health_observations WHERE registration_id=?1",
@@ -582,6 +684,9 @@ impl<'a> ProviderStore<'a> {
                 health.reason
             ],
         )?;
+        fence.verify(&transaction).map_err(|_| {
+            ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
+        })?;
         transaction.commit()?;
         Ok(())
     }
@@ -1004,10 +1109,13 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "provider_evidence_immutable_update"),
         ("trigger", "provider_evidence_immutable_delete"),
         ("trigger", "provider_registration_no_duplicate_insert"),
+        ("trigger", "provider_registration_trust_receipt_insert"),
+        ("trigger", "provider_registration_trust_immutable_update"),
         ("trigger", "provider_manifest_payload_no_duplicate_insert"),
         ("trigger", "provider_evidence_no_duplicate_insert"),
         ("trigger", "execution_binding_no_duplicate_insert"),
         ("trigger", "execution_binding_evidence_present_at_insert"),
+        ("trigger", "execution_binding_evidence_pin_required"),
         ("table", "execution_binding_admission_markers"),
         ("trigger", "execution_binding_admission_marker_insert"),
         ("trigger", "execution_binding_marker_no_duplicate_insert"),
@@ -1288,10 +1396,10 @@ fn verify_stored_registration_receipt(
     registration: &ProviderRegistration,
     manifest: &CapabilityManifest,
 ) -> Result<()> {
-    let (receipt_json, registered_at): (String, String) = connection.query_row(
-        "SELECT registration_json,registered_at FROM provider_registrations WHERE registration_id=?1",
+    let (receipt_json, registered_at, projected_trust): (String, String, String) = connection.query_row(
+        "SELECT registration_json,registered_at,trust_status FROM provider_registrations WHERE registration_id=?1",
         [&registration.registration_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     parse_time(&registered_at)?;
     let receipt = parse_document(
@@ -1313,6 +1421,11 @@ fn verify_stored_registration_receipt(
             ));
         }
     };
+    if projected_trust != trust.as_str() {
+        return Err(ProviderStoreError::Conflict(
+            "provider trust differs from immutable admission receipt",
+        ));
+    }
     let expected = canonical_text(&registration_record(
         registration,
         manifest,
@@ -1479,7 +1592,7 @@ mod tests {
             RegistryBuildOptions::default(),
         )
         .unwrap();
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&registry)
             .unwrap();
@@ -1728,7 +1841,7 @@ mod tests {
             .capability_contract_hash("artifact.hash", 1)
             .unwrap()
             .to_string();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let first_manifest = manifest(&registry);
         let mut second_manifest = first_manifest.clone();
         second_manifest["id"] = "org.ainative.fixture.artifact-hash-b".into();
@@ -1834,7 +1947,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn rejects_duplicate_json_invalid_envelope_and_stale_build_or_suite() {
         let (mut connection, registry) = setup();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let duplicate = br#"{"schema_version":"0.1","schema_version":"0.1"}"#;
         assert!(
             store
@@ -1945,7 +2058,7 @@ mod tests {
     #[test]
     fn legacy_mismatched_evidence_and_health_never_grant_eligibility() {
         let (mut connection, registry) = setup();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let manifest = manifest(&registry);
         let registration = store
             .register(
@@ -2016,11 +2129,11 @@ mod tests {
     fn migration_preflight_rejects_unstamped_or_incomplete_provider_schema() {
         let (mut connection, _) = setup_with_provider_migration(false);
         connection.execute_batch("CREATE TABLE provider_manifest_payloads (registration_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL)").unwrap();
-        assert!(ProviderStore::initialize(&mut connection).is_err());
+        assert!(ProviderStore::initialize_unfenced_fixture(&mut connection).is_err());
         connection
             .execute_batch("DROP TABLE provider_manifest_payloads")
             .unwrap();
-        assert!(ProviderStore::initialize(&mut connection).is_err());
+        assert!(ProviderStore::initialize_unfenced_fixture(&mut connection).is_err());
         connection
             .execute_batch(include_str!(
                 "../../../specs/persistence-v0.1-0013-provider-registry.sql"
@@ -2032,11 +2145,363 @@ mod tests {
                 params![MIGRATION_ID, MIGRATION_CHECKSUM, NOW],
             )
             .unwrap();
-        ProviderStore::initialize(&mut connection).unwrap();
+        ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         connection
             .execute_batch("DROP TRIGGER provider_evidence_immutable_update")
             .unwrap();
-        assert!(ProviderStore::initialize(&mut connection).is_err());
+        assert!(ProviderStore::initialize_unfenced_fixture(&mut connection).is_err());
+    }
+
+    #[test]
+    fn trust_projection_cannot_be_elevated_past_immutable_admission_receipt() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let registration = ProviderStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::Unverified,
+                NOW,
+            )
+            .unwrap();
+        assert!(connection.execute(
+            "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+            [&registration.registration_id],
+        ).is_err());
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             SELECT 'forged-registration',provider_id||'.forged',provider_version,manifest_hash,
+                    package_content_hash,registry_snapshot_id,'disabled','organization-approved',
+                    registration_json,registered_at
+             FROM provider_registrations WHERE registration_id=?1",
+                    [&registration.registration_id],
+                )
+                .is_err()
+        );
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        assert!(store.enable(&registration.registration_id, NOW).is_err());
+
+        // A trusted admission and ordinary terminal runtime revocation still work.
+        let trusted = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_B,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let mut trusted_evidence = evidence(&manifest, BUILD_B, "pass");
+        trusted_evidence["result_id"] = "evidence-trusted".into();
+        store
+            .record_evidence(&trusted.registration_id, &bytes(&trusted_evidence))
+            .unwrap();
+        store.enable(&trusted.registration_id, NOW).unwrap();
+        store.revoke(&trusted.registration_id, NOW).unwrap();
+        assert!(store.enable(&trusted.registration_id, NOW).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::drop_non_drop)]
+    fn historical_trust_projection_mismatch_does_not_yield_a_candidate() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+
+        // Simulate a historical store whose trust projection was changed before
+        // the new immutable guard existed. Reinstall the guard without rewriting
+        // either the admission receipt or the historical row.
+        connection
+            .execute_batch("DROP TRIGGER provider_registration_trust_immutable_update")
+            .unwrap();
+        connection.execute(
+            "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+            [&registration.registration_id],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.enable(&registration.registration_id, NOW).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::drop_non_drop)]
+    fn provider_mutations_require_current_manager_lease_or_unowned_memory() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut reader = ProviderStore::initialize(&mut connection).unwrap();
+        assert!(
+            reader
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .is_err()
+        );
+        drop(reader);
+        let mut standalone = ProviderStore::initialize_in_memory(&mut connection).unwrap();
+        let registration = standalone
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let owner = StoreOwner::claim(standalone.connection, None, NOW).unwrap();
+        assert!(
+            standalone
+                .record_evidence(
+                    &registration.registration_id,
+                    &bytes(&evidence(&manifest, BUILD_A, "pass")),
+                )
+                .is_err()
+        );
+        drop(standalone);
+        assert!(ProviderStore::initialize_in_memory(&mut connection).is_err());
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE aios_task_manager_startup_ready (
+                nonce TEXT NOT NULL, owner_id TEXT NOT NULL, fence_epoch INTEGER NOT NULL
+            );
+             INSERT INTO temp.aios_task_manager_startup_ready(nonce,owner_id,fence_epoch)
+             SELECT c.nonce,l.owner_id,l.fence_epoch
+             FROM temp.aios_store_owner_capability c CROSS JOIN task_manager_lease l
+             WHERE l.singleton_id=1;",
+            )
+            .unwrap();
+        let mut writer = ProviderStore::initialize_writer(&mut connection, &owner).unwrap();
+        let evidence_id = writer
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        writer.enable(&registration.registration_id, NOW).unwrap();
+        writer
+            .observe_health(
+                &registration.registration_id,
+                &ProviderHealth {
+                    status: "ready".into(),
+                    checked_at: NOW.into(),
+                    reason: None,
+                },
+            )
+            .unwrap();
+        writer
+            .connection
+            .execute(
+                "UPDATE task_manager_lease SET fence_epoch=fence_epoch+1 WHERE singleton_id=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            writer
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_B,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .is_err()
+        );
+        let mut later = evidence(&manifest, BUILD_A, "pass");
+        later["result_id"] = "later-evidence".into();
+        assert!(
+            writer
+                .record_evidence(&registration.registration_id, &bytes(&later))
+                .is_err()
+        );
+        assert!(writer.disable(&registration.registration_id, NOW).is_err());
+        assert!(writer.revoke(&registration.registration_id, NOW).is_err());
+        assert!(
+            writer
+                .observe_health(
+                    &registration.registration_id,
+                    &ProviderHealth {
+                        status: "degraded".into(),
+                        checked_at: "2026-09-22T13:00:00Z".into(),
+                        reason: None,
+                    }
+                )
+                .is_err()
+        );
+        let state: String = writer
+            .connection
+            .query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "registered");
+        let evidence_count: i64 = writer
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_conformance_evidence WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_count, 1);
+        assert_eq!(evidence_id, "evidence-a");
+    }
+
+    #[test]
+    fn file_backed_provider_writer_cannot_omit_identity_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider-lock.db");
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        seed_test_registry_schemas(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO task_manager_lease VALUES (1,'owner',1,'2026-09-22T00:00:00Z');",
+            )
+            .unwrap();
+        assert!(StoreOwner::claim(&connection, None, NOW).is_err());
+        assert!(ProviderStore::initialize_in_memory(&mut connection).is_err());
+    }
+
+    #[test]
+    fn binding_insert_requires_a_valid_text_evidence_pin() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let registration = ProviderStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let evidence_id = ProviderStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        // The fixture omits Task rows so only the provider admission triggers
+        // determine whether each attempted binding is accepted.
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        let insert = |connection: &Connection, suffix: &str, binding_json: &str| {
+            connection.execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,attempt,policy_decision_refs_json,
+                  grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
+                 VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,1,
+                         '[]','[]','synthetic-profile','{}',?8,?9)",
+                params![
+                    format!("binding-{suffix}"),
+                    format!("attempt-{suffix}"),
+                    registry.snapshot_id(),
+                    manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
+                    registration.registration_id,
+                    registration.provider_id,
+                    registration.provider_version,
+                    binding_json,
+                    NOW,
+                ],
+            )
+        };
+        for (name, raw) in [
+            ("malformed", "{"),
+            ("missing", "{}"),
+            ("null", r#"{"conformance_evidence_id":null}"#),
+            ("number", r#"{"conformance_evidence_id":1}"#),
+            ("array", r#"{"conformance_evidence_id":[]}"#),
+            ("empty", r#"{"conformance_evidence_id":""}"#),
+        ] {
+            assert!(insert(&connection, name, raw).is_err(), "{name}");
+        }
+        assert!(
+            insert(
+                &connection,
+                "long",
+                &json!({"conformance_evidence_id": "x".repeat(257)}).to_string(),
+            )
+            .is_err()
+        );
+        let rejected: i64 = connection
+            .query_row("SELECT COUNT(*) FROM execution_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rejected, 0);
+        insert(
+            &connection,
+            "valid",
+            &json!({"conformance_evidence_id": evidence_id}).to_string(),
+        )
+        .unwrap();
+        let marked: String = connection.query_row(
+            "SELECT conformance_evidence_id FROM execution_binding_admission_markers WHERE binding_id='binding-valid'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(marked, evidence_id);
     }
 
     #[test]
@@ -2062,7 +2527,7 @@ mod tests {
                 ).unwrap();
             }
             assert!(matches!(
-                ProviderStore::initialize(&mut connection),
+                ProviderStore::initialize_unfenced_fixture(&mut connection),
                 Err(ProviderStoreError::Conflict(_))
             ));
             let semantic_stamp: i64 = connection.query_row(
@@ -2086,7 +2551,7 @@ mod tests {
             .execute_batch("DROP TRIGGER immutable_registry_snapshot_entries_delete")
             .unwrap();
         assert!(matches!(
-            ProviderStore::initialize(&mut incomplete),
+            ProviderStore::initialize_unfenced_fixture(&mut incomplete),
             Err(ProviderStoreError::Conflict(
                 "semantic registry migration is incomplete"
             ))
@@ -2105,12 +2570,12 @@ mod tests {
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
         seed_test_registry_schemas(&connection);
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&registry)
             .unwrap();
         let registration = {
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let registration = store
                 .register(
                     &registry,
@@ -2159,7 +2624,7 @@ mod tests {
         ).is_err());
         drop(connection);
         let mut connection = Connection::open(&database).unwrap();
-        let store = ProviderStore::initialize(&mut connection).unwrap();
+        let store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let state: String = store
             .connection
             .query_row(
@@ -2206,12 +2671,12 @@ mod tests {
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
         seed_test_registry_schemas(&connection);
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&registry)
             .unwrap();
         let registration = {
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let registration = store
                 .register(
                     &registry,
@@ -2250,7 +2715,7 @@ mod tests {
         );
         drop(connection);
         let mut connection = Connection::open(&database).unwrap();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let (status, payload): (String, String) = store.connection.query_row(
             "SELECT status,evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-a'",
             [], |row| Ok((row.get(0)?,row.get(1)?)),
@@ -2295,7 +2760,7 @@ mod tests {
                 ))
                 .unwrap();
             assert!(matches!(
-                ProviderStore::initialize(&mut connection),
+                ProviderStore::initialize_unfenced_fixture(&mut connection),
                 Err(ProviderStoreError::Conflict(
                     "provider guard exists without migration stamp"
                 ))
@@ -2309,7 +2774,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            ProviderStore::initialize(&mut connection),
+            ProviderStore::initialize_unfenced_fixture(&mut connection),
             Err(ProviderStoreError::Conflict(
                 "provider guard exists without migration stamp"
             ))
@@ -2319,7 +2784,7 @@ mod tests {
     #[test]
     fn stamped_provider_store_rejects_same_name_noop_marker_guard() {
         let (mut connection, _) = setup();
-        ProviderStore::initialize(&mut connection).unwrap();
+        ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         connection
             .execute_batch(
                 "DROP TRIGGER execution_binding_admission_marker_insert;
@@ -2328,7 +2793,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            ProviderStore::initialize(&mut connection),
+            ProviderStore::initialize_unfenced_fixture(&mut connection),
             Err(ProviderStoreError::Conflict(
                 "provider additive guard definition differs"
             ))
@@ -2338,7 +2803,7 @@ mod tests {
     #[test]
     fn stamped_provider_store_rejects_same_name_noop_legacy_evidence_guard() {
         let (mut connection, _) = setup();
-        ProviderStore::initialize(&mut connection).unwrap();
+        ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         connection
             .execute_batch(
                 "DROP TRIGGER provider_evidence_immutable_update;
@@ -2347,7 +2812,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            ProviderStore::initialize(&mut connection),
+            ProviderStore::initialize_unfenced_fixture(&mut connection),
             Err(ProviderStoreError::Conflict(
                 "provider additive guard definition differs"
             ))
@@ -2368,7 +2833,8 @@ mod tests {
             let manifest = manifest(&registry);
             let result = evidence(&manifest, BUILD_A, "pass");
             let (registration, id) = {
-                let mut store = ProviderStore::initialize(&mut connection).unwrap();
+                let mut store =
+                    ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
                 let registration = store
                     .register(
                         &registry,
@@ -2399,7 +2865,7 @@ mod tests {
                     "../../../specs/persistence-v0.1-0013-provider-registry.sql"
                 ))
                 .unwrap();
-            let mut reopened = ProviderStore::initialize(&mut connection).unwrap();
+            let mut reopened = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             assert!(
                 matches!(
                     reopened.record_evidence(&registration.registration_id, &bytes(&result)),
@@ -2426,7 +2892,7 @@ mod tests {
         for malformed in [true, false] {
             let (mut connection, registry) = setup();
             let manifest = manifest(&registry);
-            let registration = ProviderStore::initialize(&mut connection)
+            let registration = ProviderStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .register(
                     &registry,
@@ -2464,7 +2930,7 @@ mod tests {
                     "../../../specs/persistence-v0.1-0013-provider-registry.sql"
                 ))
                 .unwrap();
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             assert!(
                 store
                     .register(
@@ -2492,7 +2958,7 @@ mod tests {
     fn legacy_same_build_retry_rolls_back_new_payload_when_receipt_is_corrupt() {
         let (mut connection, registry) = setup();
         let manifest = manifest(&registry);
-        let registration = ProviderStore::initialize(&mut connection)
+        let registration = ProviderStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .register(
                 &registry,
@@ -2527,7 +2993,7 @@ mod tests {
                 "../../../specs/persistence-v0.1-0013-provider-registry.sql"
             ))
             .unwrap();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert!(matches!(
             store.register(
                 &registry,
@@ -2554,7 +3020,7 @@ mod tests {
         let (mut connection, first) = setup();
         for missing_version in [false, true] {
             let incomplete = missing_suite_identity(&first, missing_version);
-            RegistryStore::initialize(&mut connection)
+            RegistryStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .admit_registry(&incomplete)
                 .unwrap();
@@ -2562,7 +3028,7 @@ mod tests {
             if !missing_version {
                 manifest["provides"][0]["conformance"]["suite_hash"] = Value::Null;
             }
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             assert!(matches!(
                 store.register(
                     &incomplete,
@@ -2590,11 +3056,11 @@ mod tests {
                 .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
                 .unwrap();
             seed_test_registry_schemas(&connection);
-            RegistryStore::initialize(&mut connection)
+            RegistryStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .admit_registry(&registry)
                 .unwrap();
-            ProviderStore::initialize(&mut connection)
+            ProviderStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .register(
                     &registry,
@@ -2617,7 +3083,8 @@ mod tests {
             let registration_id = registration_id.clone();
             threads.push(std::thread::spawn(move || {
                 let mut connection = Connection::open(database).unwrap();
-                let mut store = ProviderStore::initialize(&mut connection).unwrap();
+                let mut store =
+                    ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
                 barrier.wait();
                 store
                     .observe_health(
@@ -2636,7 +3103,7 @@ mod tests {
             thread.join().unwrap();
         }
         let mut connection = Connection::open(&database).unwrap();
-        let store = ProviderStore::initialize(&mut connection).unwrap();
+        let store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert_eq!(
             store.health(&registration_id).unwrap().unwrap().status,
             "ready"
@@ -2668,11 +3135,11 @@ mod tests {
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
         seed_test_registry_schemas(&writer);
-        RegistryStore::initialize(&mut writer)
+        RegistryStore::initialize_unfenced_fixture(&mut writer)
             .unwrap()
             .admit_registry(&first)
             .unwrap();
-        RegistryStore::initialize(&mut writer)
+        RegistryStore::initialize_unfenced_fixture(&mut writer)
             .unwrap()
             .admit_registry(&second)
             .unwrap();
@@ -2682,7 +3149,7 @@ mod tests {
         WAITING_FOR_WRITER.store(false, Ordering::SeqCst);
         let worker = std::thread::spawn(move || {
             let mut connection = Connection::open(worker_database).unwrap();
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             store.connection.busy_handler(Some(signal_busy)).unwrap();
             ready_tx.send(()).unwrap();
             start_rx.recv().unwrap();
@@ -2723,7 +3190,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
-        let mut store = ProviderStore::initialize(&mut writer).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut writer).unwrap();
         store
             .register(
                 &second,
@@ -2742,11 +3209,11 @@ mod tests {
         let second = snapshot_change(&first, "table.normalize");
         let changed_claim = snapshot_change(&first, "artifact.hash");
         assert_ne!(first.snapshot_id(), second.snapshot_id());
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&second)
             .unwrap();
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&changed_claim)
             .unwrap();
@@ -2756,7 +3223,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let original = {
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let original = store
                 .register(
                     &first,
@@ -2819,11 +3286,11 @@ mod tests {
             (SnapshotState::Quarantined, 0),
             (SnapshotState::Revoked, 0),
         ] {
-            RegistryStore::initialize(&mut connection)
+            RegistryStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .set_snapshot_state(first.snapshot_id(), state)
                 .unwrap();
-            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
             assert_eq!(
                 store
                     .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
@@ -2846,7 +3313,7 @@ mod tests {
     #[test]
     fn latest_exact_result_controls_failure_expiry_and_renewal() {
         let (mut connection, registry) = setup();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let manifest = manifest(&registry);
         let registration = store
             .register(
@@ -2913,13 +3380,13 @@ mod tests {
             first.capability_contract_hash("artifact.hash", 1),
             second.capability_contract_hash("artifact.hash", 1)
         );
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&second)
             .unwrap();
         let mut manifest = manifest(&first);
         manifest["provides"][0]["representations"]["source"] = json!(["artifact-handle"]);
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let registration = store
             .register(
                 &first,
@@ -2969,12 +3436,12 @@ mod tests {
     fn unrelated_claim_change_or_failure_does_not_hide_valid_claim() {
         let (mut connection, first) = setup();
         let second = snapshot_change(&first, "table.normalize");
-        RegistryStore::initialize(&mut connection)
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
             .unwrap()
             .admit_registry(&second)
             .unwrap();
         let manifest = two_claim_manifest(&first);
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let registration = store
             .register(
                 &first,

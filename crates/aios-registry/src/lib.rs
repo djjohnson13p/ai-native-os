@@ -39,7 +39,10 @@ pub use provider_store::{
     ProviderCandidate, ProviderHealth, ProviderRegistration, ProviderStore, ProviderStoreError,
     ProviderTrustStatus,
 };
-pub use store::{Activation, RegistryStore, RegistryStoreError, SnapshotState};
+pub use store::{
+    Activation, RegistryStore, RegistryStoreError, SnapshotState, StoreIdentity, StoreLock,
+    StoreOwner, store_identity,
+};
 pub use strict_json::{
     StrictJsonError, StrictJsonErrorKind, StrictJsonLimits, parse_strict_json, parse_strict_value,
 };

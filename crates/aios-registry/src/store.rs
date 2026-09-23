@@ -9,10 +9,13 @@
 )]
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::Arc;
 
 use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
-use rusqlite::{Connection, OptionalExtension, params};
+use fs2::FileExt;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::schema::{self, RecordKind};
 use crate::{
@@ -157,6 +160,9 @@ fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<
         ("immutable_semantic_capability_contracts_reinsert", true),
         ("immutable_registry_snapshot_entries_reinsert", true),
         ("immutable_admitted_registry_snapshot_entries_insert", true),
+        ("registry_activation_no_duplicate_insert", true),
+        ("registry_activation_revision_monotonic", true),
+        ("registry_activation_no_delete", true),
     ] {
         let actual: Option<String> = connection
             .query_row(
@@ -235,6 +241,7 @@ fn verify_snapshot_identity(snapshot: &RegistrySnapshot, expected_id: &str) -> R
 
 #[derive(Debug)]
 pub enum RegistryStoreError {
+    Io(std::io::Error),
     Database(rusqlite::Error),
     Registry(crate::RegistryError),
     Serialization(serde_json::Error),
@@ -247,6 +254,7 @@ pub enum RegistryStoreError {
 impl std::fmt::Display for RegistryStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Io(e) => write!(f, "registry I/O error: {e}"),
             Self::Database(e) => write!(f, "registry database error: {e}"),
             Self::Registry(e) => write!(f, "{e}"),
             Self::Serialization(e) => write!(f, "registry serialization error: {e}"),
@@ -259,6 +267,12 @@ impl std::fmt::Display for RegistryStoreError {
 }
 
 impl std::error::Error for RegistryStoreError {}
+
+impl From<std::io::Error> for RegistryStoreError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
 
 impl From<rusqlite::Error> for RegistryStoreError {
     fn from(value: rusqlite::Error) -> Self {
@@ -277,6 +291,395 @@ impl From<serde_json::Error> for RegistryStoreError {
 }
 
 pub type Result<T> = std::result::Result<T, RegistryStoreError>;
+
+/// Identity of the database file guarded by a live store lock.
+#[derive(Debug, Clone)]
+pub struct StoreIdentity {
+    canonical_path: std::path::PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl PartialEq for StoreIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number == other.volume_serial_number
+                && self.file_index == other.file_index
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.canonical_path == other.canonical_path
+        }
+    }
+}
+
+impl Eq for StoreIdentity {}
+
+impl StoreIdentity {
+    pub fn persistent_key(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("unix:{}:{}", self.device, self.inode)
+        }
+        #[cfg(windows)]
+        {
+            format!("windows:{}:{}", self.volume_serial_number, self.file_index)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("path:{}", self.canonical_path.display())
+        }
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
+pub fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
+    #[cfg(not(windows))]
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let information = winx::winapi_util::file::information(file)?;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+            volume_serial_number: information.volume_serial_number(),
+            file_index: information.file_index(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(StoreIdentity {
+            canonical_path: path.canonicalize()?,
+        })
+    }
+}
+
+/// Exclusive, identity-bound ownership of a file-backed control-plane store.
+pub struct StoreLock {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    database_file: File,
+    _lock_file: File,
+    identity: StoreIdentity,
+}
+
+impl StoreLock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let database_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let identity = store_identity(path, &database_file)?;
+        #[cfg(windows)]
+        let lock_path = {
+            // The alternate data stream is shared by every NTFS path alias.
+            let mut value = path.as_os_str().to_os_string();
+            value.push(":aios-task-manager-lock");
+            std::path::PathBuf::from(value)
+        };
+        #[cfg(not(windows))]
+        let lock_path = path.to_path_buf();
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock_file.try_lock_exclusive()?;
+        Ok(Self {
+            database_file,
+            _lock_file: lock_file,
+            identity,
+        })
+    }
+
+    pub fn verify_connection(&self, connection: &Connection) -> Result<()> {
+        let main_filename = connection.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        if main_filename.is_empty() {
+            return Err(RegistryStoreError::Conflict(
+                "SQLite main database has no durable file identity",
+            ));
+        }
+        let main_path = std::path::PathBuf::from(main_filename);
+        let main_file = OpenOptions::new().read(true).write(true).open(&main_path)?;
+        if store_identity(&main_path, &main_file)? != self.identity {
+            return Err(RegistryStoreError::Conflict(
+                "SQLite main database identity does not match the locked store",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn identity(&self) -> &StoreIdentity {
+        &self.identity
+    }
+
+    pub fn database_file(&self) -> &File {
+        &self.database_file
+    }
+}
+
+/// Opaque runtime authority minted by a fresh, atomic Task Manager lease claim.
+/// It cannot be reconstructed from owner and epoch values read from `SQLite`.
+pub struct StoreOwner {
+    lock: Option<Arc<StoreLock>>,
+    owner: String,
+    epoch: i64,
+    nonce: String,
+}
+
+impl StoreOwner {
+    pub fn claim(
+        connection: &Connection,
+        lock: Option<Arc<StoreLock>>,
+        acquired_at: &str,
+    ) -> Result<Self> {
+        if let Some(lock) = &lock {
+            lock.verify_connection(connection)?;
+        } else {
+            require_in_memory(connection)?;
+        }
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let claimed = (|| -> Result<Self> {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS task_manager_lease (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    owner_id TEXT NOT NULL,
+                    fence_epoch INTEGER NOT NULL CHECK (fence_epoch >= 1),
+                    acquired_at TEXT NOT NULL
+                );
+                CREATE TEMP TABLE IF NOT EXISTS aios_store_owner_capability (
+                    nonce TEXT NOT NULL
+                );",
+            )?;
+            if lock.is_none() {
+                let already_owned: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id=1)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if already_owned {
+                    return Err(RegistryStoreError::Conflict(
+                        "in-memory Task Manager store already has an owner",
+                    ));
+                }
+            }
+            let owner: String =
+                connection.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            let nonce: String =
+                connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
+            connection.execute("DELETE FROM temp.aios_store_owner_capability", [])?;
+            connection.execute(
+                "INSERT INTO temp.aios_store_owner_capability(nonce) VALUES (?1)",
+                [&nonce],
+            )?;
+            connection.execute(
+                "INSERT INTO task_manager_lease(singleton_id,owner_id,fence_epoch,acquired_at)
+                 VALUES (1,?1,1,?2)
+                 ON CONFLICT(singleton_id) DO UPDATE SET owner_id=excluded.owner_id,
+                   fence_epoch=task_manager_lease.fence_epoch+1,
+                   acquired_at=excluded.acquired_at",
+                params![owner, acquired_at],
+            )?;
+            let epoch: i64 = connection.query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1 AND owner_id=?1",
+                [&owner],
+                |row| row.get(0),
+            )?;
+            Ok(Self {
+                lock,
+                owner,
+                epoch,
+                nonce,
+            })
+        })();
+        match claimed {
+            Ok(owner) => {
+                connection.execute_batch("COMMIT")?;
+                Ok(owner)
+            }
+            Err(error) => {
+                connection.execute_batch("ROLLBACK")?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn verify(&self, connection: &Connection) -> Result<()> {
+        if let Some(lock) = &self.lock {
+            lock.verify_connection(connection)?;
+        } else {
+            require_in_memory(connection)?;
+        }
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT nonce FROM temp.aios_store_owner_capability",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&self.nonce) {
+            return Err(RegistryStoreError::Conflict(
+                "registry writer is not on its owner connection",
+            ));
+        }
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id=1 AND owner_id=?1 AND fence_epoch=?2)",
+            params![&self.owner, self.epoch],
+            |row| row.get(0),
+        )?;
+        if !current {
+            return Err(RegistryStoreError::Conflict(
+                "registry write rejected by stale Task Manager ownership fence",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_writer_ready(&self, connection: &Connection) -> Result<()> {
+        self.verify(connection)?;
+        let marker_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='aios_task_manager_startup_ready')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !marker_exists {
+            return Err(RegistryStoreError::Conflict(
+                "Task Manager startup recovery is not complete",
+            ));
+        }
+        let ready: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.aios_task_manager_startup_ready
+             WHERE nonce=?1 AND owner_id=?2 AND fence_epoch=?3)",
+            params![&self.nonce, &self.owner, self.epoch],
+            |row| row.get(0),
+        )?;
+        if !ready {
+            return Err(RegistryStoreError::Conflict(
+                "Task Manager startup recovery is not complete",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+}
+
+pub(crate) struct WriteFence<'a> {
+    mode: WriteFenceMode<'a>,
+}
+
+enum WriteFenceMode<'a> {
+    Owner(&'a StoreOwner),
+    InMemoryFixture,
+    #[cfg(test)]
+    TestFixture,
+}
+
+impl<'a> WriteFence<'a> {
+    pub(crate) fn new(connection: &Connection, owner: &'a StoreOwner) -> Result<Self> {
+        let fence = Self {
+            mode: WriteFenceMode::Owner(owner),
+        };
+        fence.verify(connection)?;
+        Ok(fence)
+    }
+
+    pub(crate) fn verify(&self, connection: &Connection) -> Result<()> {
+        match self.mode {
+            WriteFenceMode::Owner(owner) => owner.verify_writer_ready(connection),
+            WriteFenceMode::InMemoryFixture => require_unleased_in_memory(connection),
+            #[cfg(test)]
+            WriteFenceMode::TestFixture => Ok(()),
+        }
+    }
+
+    pub(crate) fn in_memory(connection: &Connection) -> Result<Self> {
+        require_unleased_in_memory(connection)?;
+        Ok(Self {
+            mode: WriteFenceMode::InMemoryFixture,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self {
+            mode: WriteFenceMode::TestFixture,
+        }
+    }
+}
+
+fn require_unleased_in_memory(connection: &Connection) -> Result<()> {
+    require_in_memory(connection)?;
+    let has_lease_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_manager_lease')",
+            [],
+            |row| row.get(0),
+        )?;
+    let has_lease: bool = if has_lease_table {
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id=1)",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        false
+    };
+    if has_lease {
+        return Err(RegistryStoreError::Conflict(
+            "in-memory Task Manager store requires current ownership fence",
+        ));
+    }
+    Ok(())
+}
+
+fn require_in_memory(connection: &Connection) -> Result<()> {
+    let main_filename: String = connection.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !main_filename.is_empty() {
+        return Err(RegistryStoreError::Conflict(
+            "unlocked registry writer requires an in-memory database",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotState {
@@ -307,6 +710,7 @@ pub struct Activation {
 
 pub struct RegistryStore<'a> {
     connection: &'a mut Connection,
+    write_fence: Option<WriteFence<'a>>,
 }
 
 impl<'a> RegistryStore<'a> {
@@ -316,7 +720,35 @@ impl<'a> RegistryStore<'a> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_store_migration(connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            write_fence: None,
+        })
+    }
+
+    /// Opens a runtime mutation handle bound to Task Manager's locked `SQLite`
+    /// connection and current durable owner/epoch.
+    pub fn initialize_writer(
+        connection: &'a mut Connection,
+        owner: &'a StoreOwner,
+    ) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(WriteFence::new(store.connection, owner)?);
+        Ok(store)
+    }
+
+    /// Creates a writer only for an unleased in-memory fixture database.
+    pub fn initialize_in_memory(connection: &'a mut Connection) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(WriteFence::in_memory(store.connection)?);
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_unfenced_fixture(connection: &'a mut Connection) -> Result<Self> {
+        let mut store = Self::initialize(connection)?;
+        store.write_fence = Some(WriteFence::fixture());
+        Ok(store)
     }
 
     /// Strictly validates an explicitly supplied local bundle before any write.
@@ -326,13 +758,26 @@ impl<'a> RegistryStore<'a> {
     }
 
     /// Persists only a strictly verified, immutable semantic registry.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps verified admission and fenced publication in one operation"
+    )]
     pub fn admit_registry(&mut self, registry: &SemanticRegistry) -> Result<String> {
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(RegistryStoreError::Conflict(
+                "registry mutation requires Task Manager write authority",
+            ))?;
         if !registry.is_strictly_verified() {
             return Err(RegistryStoreError::NotAdmitted);
         }
         let snapshot_id = registry.snapshot_id().to_owned();
         let manifest_json = serde_json::to_string(registry.snapshot())?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction)?;
         let already_admitted = defer_entry_fk_until_admission(&transaction, &snapshot_id)?;
         let prior: Option<String> = transaction
             .query_row(
@@ -422,6 +867,7 @@ impl<'a> RegistryStore<'a> {
             ));
         }
         publish_admission(&transaction, &snapshot_id, already_admitted)?;
+        fence.verify(&transaction)?;
         transaction.commit()?;
         // Read back through the same strict builder; persisted records, rather
         // than caller memory, become the admissible historical source.
@@ -551,8 +997,22 @@ impl<'a> RegistryStore<'a> {
 
     pub fn set_snapshot_state(&mut self, snapshot_id: &str, state: SnapshotState) -> Result<()> {
         // State changes never delete historical content or rewrite Task evidence.
-        let current: String = self
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(RegistryStoreError::Conflict(
+                "registry mutation requires Task Manager write authority",
+            ))?;
+        // A corrupt admission must still be containable. Only states eligible
+        // for ordinary use require a successful strict reopen before changing.
+        if matches!(state, SnapshotState::Admitted | SnapshotState::Deprecated) {
+            self.open_snapshot(snapshot_id)?;
+        }
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction)?;
+        let current: String = transaction
             .query_row(
                 "SELECT a.state FROM registry_snapshot_admissions a JOIN registry_snapshots s USING(snapshot_id) WHERE a.snapshot_id=?1",
                 [snapshot_id],
@@ -575,18 +1035,15 @@ impl<'a> RegistryStore<'a> {
                 "snapshot state transition would reverse restriction",
             ));
         }
-        // A corrupt admission must still be containable. Only states eligible
-        // for ordinary use require a successful strict reopen before changing.
-        if matches!(state, SnapshotState::Admitted | SnapshotState::Deprecated) {
-            self.open_snapshot(snapshot_id)?;
-        }
-        let affected = self.connection.execute(
+        let affected = transaction.execute(
             "UPDATE registry_snapshot_admissions SET state=?2 WHERE snapshot_id=?1 AND state=?3",
             params![snapshot_id, state.as_str(), current],
         )?;
         if affected != 1 {
             return Err(RegistryStoreError::Conflict("snapshot state changed"));
         }
+        fence.verify(&transaction)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -598,11 +1055,20 @@ impl<'a> RegistryStore<'a> {
         expected_revision: Option<u64>,
         snapshot_id: &str,
     ) -> Result<Activation> {
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(RegistryStoreError::Conflict(
+                "registry mutation requires Task Manager write authority",
+            ))?;
         if !matches!(scope_kind, "device" | "user" | "organization") || scope_id.is_empty() {
             return Err(RegistryStoreError::Conflict("invalid activation scope"));
         }
         self.open_snapshot(snapshot_id)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction)?;
         let state: Option<String> = transaction
             .query_row(
                 "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
@@ -620,18 +1086,35 @@ impl<'a> RegistryStore<'a> {
                 |row| row.get(0),
             )
             .optional()?;
-        if current.and_then(|value| u64::try_from(value).ok()) != expected_revision {
+        let current_revision = current
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| RegistryStoreError::Conflict("invalid activation revision"))
+            })
+            .transpose()?;
+        if current_revision != expected_revision {
             return Err(RegistryStoreError::Conflict("activation revision changed"));
         }
         let next = current
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(RegistryStoreError::Conflict("activation revision overflow"))?;
-        transaction.execute(
-            "INSERT INTO registry_activations(scope_kind,scope_id,snapshot_id,revision) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(scope_kind,scope_id) DO UPDATE SET snapshot_id=excluded.snapshot_id,revision=excluded.revision",
-            params![scope_kind, scope_id, snapshot_id, next],
-        )?;
+        if let Some(current) = current {
+            let updated = transaction.execute(
+                "UPDATE registry_activations SET snapshot_id=?3,revision=?4
+                 WHERE scope_kind=?1 AND scope_id=?2 AND revision=?5",
+                params![scope_kind, scope_id, snapshot_id, next, current],
+            )?;
+            if updated != 1 {
+                return Err(RegistryStoreError::Conflict("activation revision changed"));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO registry_activations(scope_kind,scope_id,snapshot_id,revision) VALUES (?1,?2,?3,?4)",
+                params![scope_kind, scope_id, snapshot_id, next],
+            )?;
+        }
+        fence.verify(&transaction)?;
         transaction.commit()?;
         Ok(Activation {
             scope_kind: scope_kind.to_owned(),
@@ -844,6 +1327,22 @@ mod tests {
         ).unwrap();
     }
 
+    fn mark_startup_ready(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE aios_task_manager_startup_ready (
+                    nonce TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    fence_epoch INTEGER NOT NULL
+                );
+                INSERT INTO temp.aios_task_manager_startup_ready(nonce,owner_id,fence_epoch)
+                  SELECT c.nonce,l.owner_id,l.fence_epoch
+                  FROM temp.aios_store_owner_capability c CROSS JOIN task_manager_lease l
+                  WHERE l.singleton_id=1;",
+            )
+            .unwrap();
+    }
+
     fn fixture_registry() -> SemanticRegistry {
         SemanticRegistry::from_records(
             serde_json::from_str(SNAPSHOT).unwrap(),
@@ -908,7 +1407,7 @@ mod tests {
         baseline(&connection);
         // Historical Task Manager tests insert synthetic rows; they are not admissions.
         connection.execute("INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES ('legacy-fixture','{}','2026-09-19T00:00:00Z')", []).unwrap();
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert!(matches!(
             store.open_snapshot("legacy-fixture"),
             Err(RegistryStoreError::NotAdmitted)
@@ -987,6 +1486,259 @@ mod tests {
     }
 
     #[test]
+    fn direct_sql_cannot_reset_activation_revision_or_replace_pointer() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        baseline(&connection);
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let first_id = store.admit_registry(&fixture_registry()).unwrap();
+        let second_id = store.admit_registry(&second_registry()).unwrap();
+        let first = store
+            .activate_default("user", "u1", None, &first_id)
+            .unwrap();
+        assert_eq!(first.revision, 1);
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE registry_activations SET snapshot_id=?1,revision=1 WHERE scope_kind='user' AND scope_id='u1'",
+                    [&second_id],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT OR REPLACE INTO registry_activations(scope_kind,scope_id,snapshot_id,revision) VALUES ('user','u1',?1,99)",
+                    [&second_id],
+                )
+                .is_err()
+        );
+        assert_eq!(store.activation_pointer("user", "u1").unwrap(), Some(first));
+
+        let second = store
+            .activate_default("user", "u1", Some(1), &second_id)
+            .unwrap();
+        assert_eq!(second.snapshot_id, second_id);
+        assert_eq!(second.revision, 2);
+        assert!(
+            store
+                .connection
+                .execute(
+                    "DELETE FROM registry_activations WHERE scope_kind='user' AND scope_id='u1'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT OR REPLACE INTO registry_activations(scope_kind,scope_id,snapshot_id,revision) VALUES ('user','u1',?1,1)",
+                    [&first_id],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.activation_pointer("user", "u1").unwrap(),
+            Some(second)
+        );
+        assert!(
+            store
+                .activate_default("user", "u1", Some(1), &first_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reopened_file_store_mints_fresh_owner_instead_of_reusing_persisted_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let prior = {
+            let lock = Arc::new(StoreLock::acquire(&database).unwrap());
+            let connection = Connection::open(&database).unwrap();
+            baseline(&connection);
+            let owner = StoreOwner::claim(&connection, Some(lock), "2026-09-23T00:00:00Z").unwrap();
+            (owner.owner().to_owned(), owner.epoch())
+        };
+
+        let lock = Arc::new(StoreLock::acquire(&database).unwrap());
+        let connection = Connection::open(&database).unwrap();
+        let current = StoreOwner::claim(&connection, Some(lock), "2026-09-23T00:01:00Z").unwrap();
+        assert_ne!(current.owner(), prior.0);
+        assert_eq!(current.epoch(), prior.1 + 1);
+        current.verify(&connection).unwrap();
+    }
+
+    #[test]
+    fn shared_memory_second_connection_cannot_borrow_owner_capability() {
+        let uri = "file:registry-second-connection?mode=memory&cache=shared";
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let mut owner_connection = Connection::open_with_flags(uri, flags).unwrap();
+        baseline(&owner_connection);
+        let owner = StoreOwner::claim(&owner_connection, None, "2026-09-23T00:00:00Z").unwrap();
+        let mut independent = Connection::open_with_flags(uri, flags).unwrap();
+        assert!(StoreOwner::claim(&independent, None, "2026-09-23T00:01:00Z").is_err());
+        assert!(RegistryStore::initialize_writer(&mut independent, &owner).is_err());
+        assert!(RegistryStore::initialize_in_memory(&mut independent).is_err());
+        assert!(RegistryStore::initialize_writer(&mut owner_connection, &owner).is_err());
+        mark_startup_ready(&owner_connection);
+        let mut store = RegistryStore::initialize_writer(&mut owner_connection, &owner).unwrap();
+        assert!(store.admit_registry(&fixture_registry()).is_ok());
+    }
+
+    #[test]
+    fn file_backed_registry_writer_requires_startup_bound_connection_and_current_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let lock = Arc::new(StoreLock::acquire(&database).unwrap());
+        let mut owner = Connection::open(&database).unwrap();
+        baseline(&owner);
+        let owner_cap =
+            StoreOwner::claim(&owner, Some(Arc::clone(&lock)), "2026-09-23T00:00:00Z").unwrap();
+        assert!(RegistryStore::initialize_writer(&mut owner, &owner_cap).is_err());
+        mark_startup_ready(&owner);
+
+        let first = fixture_registry();
+        let second = second_registry();
+        let first_id = {
+            let mut store = RegistryStore::initialize_writer(&mut owner, &owner_cap).unwrap();
+            let first_id = store.admit_registry(&first).unwrap();
+            store
+                .activate_default("user", "u1", None, &first_id)
+                .unwrap();
+            first_id
+        };
+
+        let mut independent = Connection::open(&database).unwrap();
+        assert!(RegistryStore::initialize_in_memory(&mut independent).is_err());
+        assert!(RegistryStore::initialize_writer(&mut independent, &owner_cap).is_err());
+        assert!(
+            RegistryStore::initialize(&mut independent)
+                .unwrap()
+                .admit_registry(&second)
+                .is_err()
+        );
+
+        let mut stale = RegistryStore::initialize_writer(&mut owner, &owner_cap).unwrap();
+
+        independent
+            .execute(
+                "UPDATE task_manager_lease SET owner_id='owner-b',fence_epoch=2 WHERE singleton_id=1",
+                [],
+            )
+            .unwrap();
+        assert!(stale.admit_registry(&second).is_err());
+        assert!(
+            stale
+                .set_snapshot_state(&first_id, SnapshotState::Revoked)
+                .is_err()
+        );
+        assert!(
+            stale
+                .activate_default("user", "u1", Some(1), &first_id)
+                .is_err()
+        );
+        assert!(stale.open_snapshot(&first_id).is_ok());
+        let admission_state: String = stale
+            .connection
+            .query_row(
+                "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                [&first_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(admission_state, "ADMITTED");
+        assert_eq!(
+            stale
+                .activation_pointer("user", "u1")
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn in_memory_fixture_writer_stops_when_manager_lease_appears() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        baseline(&connection);
+        let mut store = RegistryStore::initialize_in_memory(&mut connection).unwrap();
+        let first_id = store.admit_registry(&fixture_registry()).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_manager_lease(singleton_id,owner_id,fence_epoch,acquired_at) VALUES (1,'owner-a',1,'2026-09-23T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        assert!(store.admit_registry(&second_registry()).is_err());
+        assert!(
+            store
+                .set_snapshot_state(&first_id, SnapshotState::Revoked)
+                .is_err()
+        );
+        assert!(
+            store
+                .activate_default("user", "u1", None, &first_id)
+                .is_err()
+        );
+        assert_eq!(
+            store.open_snapshot(&first_id).unwrap().snapshot_id(),
+            first_id
+        );
+    }
+
+    #[test]
+    fn lease_change_during_activation_rolls_back_before_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let lock = Arc::new(StoreLock::acquire(&database).unwrap());
+        let mut connection = Connection::open(&database).unwrap();
+        baseline(&connection);
+        let owner_cap =
+            StoreOwner::claim(&connection, Some(Arc::clone(&lock)), "2026-09-23T00:00:00Z")
+                .unwrap();
+        mark_startup_ready(&connection);
+        let mut store = RegistryStore::initialize_writer(&mut connection, &owner_cap).unwrap();
+        let first_id = store.admit_registry(&fixture_registry()).unwrap();
+        let second_id = store.admit_registry(&second_registry()).unwrap();
+        let first = store
+            .activate_default("user", "u1", None, &first_id)
+            .unwrap();
+
+        // A connection-local trigger changes the lease as a side effect of the
+        // activation write. The final fence check must abort the entire write.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER change_lease_during_activation
+                 AFTER UPDATE ON main.registry_activations BEGIN
+                   UPDATE task_manager_lease SET owner_id='owner-b',fence_epoch=2 WHERE singleton_id=1;
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .activate_default("user", "u1", Some(first.revision), &second_id)
+                .is_err()
+        );
+        assert_eq!(store.activation_pointer("user", "u1").unwrap(), Some(first));
+        let lease: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT owner_id,fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease, (owner_cap.owner().to_owned(), owner_cap.epoch()));
+    }
+
+    #[test]
     fn default_selection_uses_one_read_snapshot_across_concurrent_revoke_and_switch() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("control.db");
@@ -996,7 +1748,7 @@ mod tests {
                 .pragma_update(None, "journal_mode", "WAL")
                 .unwrap();
             baseline(&connection);
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let first_id = store.admit_registry(&fixture_registry()).unwrap();
             let second_id = store.admit_registry(&second_registry()).unwrap();
             store
@@ -1006,7 +1758,7 @@ mod tests {
         };
 
         let mut reader = Connection::open(&database).unwrap();
-        let store = RegistryStore::initialize(&mut reader).unwrap();
+        let store = RegistryStore::initialize_unfenced_fixture(&mut reader).unwrap();
         let writer = Connection::open(&database).unwrap();
         writer
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -1060,7 +1812,8 @@ mod tests {
             let (id, activation) = {
                 let mut connection = Connection::open(&database).unwrap();
                 baseline(&connection);
-                let mut store = RegistryStore::initialize(&mut connection).unwrap();
+                let mut store =
+                    RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
                 let id = store.admit_registry(&fixture_registry()).unwrap();
                 let activation = store.activate_default("user", "u1", None, &id).unwrap();
                 store
@@ -1085,7 +1838,7 @@ mod tests {
             };
 
             let mut connection = Connection::open(&database).unwrap();
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             assert_eq!(
                 store.activation_pointer("user", "u1").unwrap(),
                 Some(activation.clone())
@@ -1115,7 +1868,7 @@ mod tests {
         let id = {
             let mut connection = Connection::open(&database).unwrap();
             baseline(&connection);
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let id = store.admit_registry(&fixture_registry()).unwrap();
             store
                 .set_snapshot_state(&id, SnapshotState::Quarantined)
@@ -1140,13 +1893,13 @@ mod tests {
         };
 
         let mut connection = Connection::open(&database).unwrap();
-        assert!(RegistryStore::initialize(&mut connection).is_err());
+        assert!(RegistryStore::initialize_unfenced_fixture(&mut connection).is_err());
         connection
             .execute_batch(include_str!(
                 "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
             ))
             .unwrap();
-        let store = RegistryStore::initialize(&mut connection).unwrap();
+        let store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert!(
             store
                 .connection
@@ -1207,7 +1960,7 @@ mod tests {
     fn same_semantic_identity_accepts_excluded_metadata_without_overwrite() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let original = fixture_registry();
         let id = store.admit_registry(&original).unwrap();
         let original_manifest: String = store
@@ -1268,14 +2021,14 @@ mod tests {
         let snapshot_id = {
             let mut connection = Connection::open(&database).unwrap();
             baseline(&connection);
-            RegistryStore::initialize(&mut connection)
+            RegistryStore::initialize_unfenced_fixture(&mut connection)
                 .unwrap()
                 .admit_bundle(&bundle)
                 .unwrap()
         };
         fs::remove_dir_all(&bundle).unwrap();
         let mut connection = Connection::open(&database).unwrap();
-        let store = RegistryStore::initialize(&mut connection).unwrap();
+        let store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let reopened = store.open_snapshot(&snapshot_id).unwrap();
         assert!(
             reopened
@@ -1289,7 +2042,7 @@ mod tests {
     fn rejects_entry_append_and_blocks_direct_mutation() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let id = store.admit_registry(&fixture_registry()).unwrap();
         assert!(
             store
@@ -1352,7 +2105,7 @@ mod tests {
         let id = {
             let mut connection = Connection::open(&database).unwrap();
             baseline(&connection);
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let id = store.admit_registry(&fixture_registry()).unwrap();
             store.activate_default("user", "u1", None, &id).unwrap();
             let expected_entries: i64 = store
@@ -1377,7 +2130,7 @@ mod tests {
         };
 
         let mut connection = Connection::open(&database).unwrap();
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert_eq!(store.admit_registry(&fixture_registry()).unwrap(), id);
         assert_eq!(
             store
@@ -1404,7 +2157,7 @@ mod tests {
     fn stamped_same_name_noop_entry_guard_fails_before_migration_ddl() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        RegistryStore::initialize(&mut connection).unwrap();
+        RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         connection
             .execute_batch(
                 "DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
@@ -1418,7 +2171,7 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert!(matches!(
-            RegistryStore::initialize(&mut connection),
+            RegistryStore::initialize_unfenced_fixture(&mut connection),
             Err(RegistryStoreError::Conflict(
                 "semantic registry admission guard definition mismatch"
             ))
@@ -1435,7 +2188,7 @@ mod tests {
     fn stamped_legacy_immutability_guard_rejects_noop_but_accepts_line_endings() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        RegistryStore::initialize(&mut connection).unwrap();
+        RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let name = "immutable_registry_snapshot_entries_update";
         let canonical: String = connection
             .query_row(
@@ -1450,7 +2203,7 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(
-            RegistryStore::initialize(&mut connection),
+            RegistryStore::initialize_unfenced_fixture(&mut connection),
             Err(RegistryStoreError::Conflict(
                 "semantic registry admission guard definition mismatch"
             ))
@@ -1460,7 +2213,7 @@ mod tests {
             .unwrap();
         let alternate_line_endings = canonical.replace("\r\n", "\n").replace('\n', "\r\n");
         connection.execute_batch(&alternate_line_endings).unwrap();
-        RegistryStore::initialize(&mut connection).unwrap();
+        RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
     }
 
     #[test]
@@ -1474,7 +2227,7 @@ mod tests {
         let id = {
             let mut connection = Connection::open(&database).unwrap();
             baseline(&connection);
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let id = store.admit_registry(&fixture_registry()).unwrap();
             let snapshot: (String, String) = store
                 .connection
@@ -1573,7 +2326,7 @@ mod tests {
         };
 
         let mut connection = Connection::open(&database).unwrap();
-        let store = RegistryStore::initialize(&mut connection).unwrap();
+        let store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert_eq!(store.open_snapshot(&id).unwrap().snapshot_id(), id);
     }
 
@@ -1581,7 +2334,7 @@ mod tests {
     fn rejects_tampered_stored_contract_on_reopen() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let id = store.admit_registry(&fixture_registry()).unwrap();
         store
             .connection
@@ -1599,7 +2352,7 @@ mod tests {
         for containment in [SnapshotState::Quarantined, SnapshotState::Revoked] {
             let mut connection = Connection::open_in_memory().unwrap();
             baseline(&connection);
-            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
             let id = store.admit_registry(&fixture_registry()).unwrap();
             let original_manifest: String = store
                 .connection
@@ -1679,7 +2432,7 @@ mod tests {
     fn cannot_contain_unadmitted_snapshot() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         assert!(matches!(
             store.set_snapshot_state("missing", SnapshotState::Revoked),
             Err(RegistryStoreError::NotAdmitted)
@@ -1690,7 +2443,7 @@ mod tests {
     fn persisted_underflow_token_fails_before_typed_numeric_rounding() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let id = store.admit_registry(&fixture_registry()).unwrap();
         let json: String = store.connection.query_row(
             "SELECT contract_json FROM semantic_capability_contracts WHERE semantic_id='stats.compare_periods'",
@@ -1732,14 +2485,14 @@ mod tests {
                         .unwrap();
                 }
                 _ => {
-                    RegistryStore::initialize(&mut connection).unwrap();
+                    RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
                     connection
                         .execute_batch("DROP TRIGGER immutable_registry_snapshot_entries_delete")
                         .unwrap();
                 }
             }
             assert!(
-                RegistryStore::initialize(&mut connection).is_err(),
+                RegistryStore::initialize_unfenced_fixture(&mut connection).is_err(),
                 "{mutation}"
             );
             let present: bool = connection.query_row(
@@ -1754,7 +2507,7 @@ mod tests {
     fn preseeded_contract_conflict_rolls_back_all_new_admission_rows() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let registry = fixture_registry();
         let contract = registry.capability_contract("artifact.hash", 1).unwrap();
         let hash = registry
@@ -1787,7 +2540,7 @@ mod tests {
         fs::write(bundle.join("capability-contracts.json"), CAPABILITIES).unwrap();
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
-        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        let mut store = RegistryStore::initialize_unfenced_fixture(&mut connection).unwrap();
         let source: serde_json::Value = serde_json::from_str(SNAPSHOT).unwrap();
         for mutation in ["duplicate-major", "missing-source", "hash-mismatch"] {
             let mut snapshot = source.clone();

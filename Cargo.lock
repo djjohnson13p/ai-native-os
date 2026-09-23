@@ -81,6 +81,7 @@ version = "0.1.0"
 dependencies = [
  "aios-contracts",
  "cap-std",
+ "fs2",
  "jsonschema",
  "rusqlite",
  "serde",
@@ -89,6 +90,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "time",
+ "winx",
 ]
 
 [[package]]

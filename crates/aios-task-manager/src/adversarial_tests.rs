@@ -1,5 +1,6 @@
 use super::*;
 
+use std::fs::OpenOptions;
 use std::process::Command;
 
 use rusqlite::Connection;
@@ -613,8 +614,7 @@ fn stamped_provider_migration_rejects_legacy_registration_without_admission_rece
 fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
     use aios_registry::{
-        ProviderStore, ProviderTrustStatus, RegistryBuildOptions, RegistryStore, SemanticRegistry,
-        SnapshotHashEntry,
+        ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
     };
 
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
@@ -699,7 +699,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     .unwrap();
     assert_ne!(first.snapshot_id(), second.snapshot_id());
     {
-        let mut store = RegistryStore::initialize(&mut manager.connection).unwrap();
+        let mut store = manager.registry_store_writer().unwrap();
         store.admit_registry(&first).unwrap();
         store.admit_registry(&second).unwrap();
     }
@@ -715,7 +715,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         .to_string();
     manifest["provides"][0]["contract"]["contract_hash"] = contract_hash.clone().into();
     let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let registration = ProviderStore::initialize(&mut manager.connection)
+    let registration = manager
+        .provider_store_writer()
         .unwrap()
         .register(
             &first,
@@ -837,7 +838,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     );
     transaction.rollback().unwrap();
     evidence["expires_at"] = "2026-09-19T00:00:02Z".into();
-    ProviderStore::initialize(&mut manager.connection)
+    manager
+        .provider_store_writer()
         .unwrap()
         .record_evidence(
             binding.provider_registration_id.as_deref().unwrap(),
@@ -855,7 +857,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
          execution_profile_ref,placement_json,binding_json,created_at)
          VALUES ('binding-real-receipt','attempt-real-receipt','T-real-receipt',?1,?2,'0.1',
          'node-real','artifact.hash@1',?3,?4,?5,?6,?7,?8,1,'[]','[]','profile:test',
-         '{}','{}',?9)",
+         '{}',?9,?10)",
             params![
                 HASH,
                 second.snapshot_id(),
@@ -865,6 +867,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
                 binding.provider_version,
                 binding.provider_manifest_hash,
                 binding.provider_build_hash,
+                "{\"conformance_evidence_id\":\"cross-snapshot-pass\"}",
                 TEST_TIME
             ],
         )
@@ -920,7 +923,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     };
     evidence["result_id"] = "renewed-pass".into();
     evidence["executed_at"] = "2026-09-19T00:00:00.500000Z".into();
-    ProviderStore::initialize(&mut manager.connection)
+    manager
+        .provider_store_writer()
         .unwrap()
         .record_evidence(
             binding.provider_registration_id.as_deref().unwrap(),
@@ -938,7 +942,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     evidence["tests_passed"] = 1.into();
     evidence["tests_failed"] = 1.into();
     evidence["executed_at"] = "2026-09-19T00:00:00.750000Z".into();
-    ProviderStore::initialize(&mut manager.connection)
+    manager
+        .provider_store_writer()
         .unwrap()
         .record_evidence(
             binding.provider_registration_id.as_deref().unwrap(),
@@ -957,7 +962,8 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         (aios_registry::SnapshotState::Quarantined, false),
         (aios_registry::SnapshotState::Revoked, false),
     ] {
-        RegistryStore::initialize(&mut manager.connection)
+        manager
+            .registry_store_writer()
             .unwrap()
             .set_snapshot_state(first.snapshot_id(), state)
             .unwrap();
@@ -974,13 +980,12 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
 fn immutable_binding_pins_real_provider_evidence_across_retests() {
     use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
     use aios_registry::{
-        ProviderStore, ProviderTrustStatus, RegistryBuildOptions, RegistryStore, SemanticRegistry,
-        SnapshotHashEntry,
+        ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
     };
 
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    manager.initialize_provider_store().unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager.initialize_provider_store().unwrap();
     prepare_completion_for_admission(&manager);
     let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
         "../../../examples/aios-ir/registry-snapshot.json"
@@ -1042,7 +1047,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         RegistryBuildOptions::default(),
     )
     .unwrap();
-    RegistryStore::initialize(&mut manager.connection)
+    manager
+        .registry_store_writer()
         .unwrap()
         .admit_registry(&registry)
         .unwrap();
@@ -1060,7 +1066,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
     manifest["provides"][0]["authority"]["actions"] = json!([]);
     manifest["provides"][0]["authority"]["resource_classes"] = json!([]);
     let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let registration = ProviderStore::initialize(&mut manager.connection)
+    let registration = manager
+        .provider_store_writer()
         .unwrap()
         .register(
             &registry,
@@ -1086,7 +1093,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         })
     };
     let record = |manager: &mut TaskManager, id, result, at| {
-        ProviderStore::initialize(&mut manager.connection)
+        manager
+            .provider_store_writer()
             .unwrap()
             .record_evidence(
                 &registration.registration_id,
@@ -1095,7 +1103,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             .unwrap();
     };
     record(&mut manager, "E1", "pass", TEST_TIME);
-    ProviderStore::initialize(&mut manager.connection)
+    manager
+        .provider_store_writer()
         .unwrap()
         .enable(&registration.registration_id, TEST_TIME)
         .unwrap();
@@ -1296,7 +1305,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))
         .unwrap();
-    ProviderStore::initialize(&mut manager.connection).unwrap();
+    manager.provider_store_writer().unwrap();
     let old_markers: i64 = manager
         .connection
         .query_row(
@@ -1333,6 +1342,42 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "2026-09-19T00:00:00.750Z"
     ));
     let second = insert(&manager, 3, "E2");
+    assert!(valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    // The immutable admission receipt is the trust ceiling. A retained row
+    // whose projection was raised by an older writer cannot authorize launch.
+    assert!(manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).is_err());
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER provider_registration_trust_immutable_update")
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).unwrap();
+    assert!(!valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='locally-trusted' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).unwrap();
+    manager
+        .connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
     assert!(valid(
         &mut manager,
         &second,

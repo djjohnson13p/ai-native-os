@@ -35,11 +35,10 @@ pub use artifact_store::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fs2::FileExt;
+use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +56,8 @@ pub enum TaskManagerError {
     Serialization(serde_json::Error),
     Canonicalization(String),
     Provenance(aios_provenance::Error),
+    Registry(aios_registry::RegistryStoreError),
+    Provider(aios_registry::ProviderStoreError),
     InvalidRecord(&'static str),
 }
 
@@ -70,6 +71,8 @@ impl fmt::Display for TaskManagerError {
                 write!(formatter, "provenance canonicalization failure: {error}")
             }
             Self::Provenance(error) => write!(formatter, "{error}"),
+            Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Provider(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
         }
     }
@@ -98,6 +101,18 @@ impl From<serde_json::Error> for TaskManagerError {
 impl From<aios_provenance::Error> for TaskManagerError {
     fn from(error: aios_provenance::Error) -> Self {
         Self::Provenance(error)
+    }
+}
+
+impl From<aios_registry::RegistryStoreError> for TaskManagerError {
+    fn from(error: aios_registry::RegistryStoreError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+impl From<aios_registry::ProviderStoreError> for TaskManagerError {
+    fn from(error: aios_registry::ProviderStoreError) -> Self {
+        Self::Provider(error)
     }
 }
 
@@ -466,7 +481,8 @@ pub struct TaskManager {
     database_locator: DatabaseLocator,
     artifact_store_root: PathBuf,
     artifact_store_dir: cap_std::fs::Dir,
-    store_lock: Option<StoreLock>,
+    store_lock: Option<Arc<StoreLock>>,
+    store_owner: StoreOwner,
     artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
     artifact_export_verifiers:
         BTreeMap<String, Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
@@ -487,93 +503,6 @@ impl Clock for SystemClock {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-    }
-}
-
-struct StoreLock {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    database_file: File,
-    _lock_file: File,
-    identity: StoreIdentity,
-}
-
-#[derive(Debug, Clone)]
-struct StoreIdentity {
-    canonical_path: PathBuf,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: u64,
-    #[cfg(windows)]
-    file_index: u64,
-}
-
-impl PartialEq for StoreIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        #[cfg(unix)]
-        {
-            self.device == other.device && self.inode == other.inode
-        }
-        #[cfg(windows)]
-        {
-            self.volume_serial_number == other.volume_serial_number
-                && self.file_index == other.file_index
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            self.canonical_path == other.canonical_path
-        }
-    }
-}
-
-impl Eq for StoreIdentity {}
-
-impl StoreIdentity {
-    fn persistent_key(&self) -> String {
-        #[cfg(unix)]
-        {
-            format!("unix:{}:{}", self.device, self.inode)
-        }
-        #[cfg(windows)]
-        {
-            format!("windows:{}:{}", self.volume_serial_number, self.file_index)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            format!("path:{}", self.canonical_path.display())
-        }
-    }
-}
-
-fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
-    #[cfg(not(windows))]
-    let metadata = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let information = winx::winapi_util::file::information(file)?;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-            volume_serial_number: information.volume_serial_number(),
-            file_index: information.file_index(),
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-        })
     }
 }
 
@@ -598,58 +527,11 @@ impl DatabaseLocator {
 }
 
 fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
-    // Materialize the database before acquiring an identity-bound lock.
-    let database_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    let identity = store_identity(path, &database_file)?;
-    #[cfg(windows)]
-    let lock_path = {
-        // An NTFS alternate data stream belongs to the underlying file, so all
-        // hardlink, symlink, case, and short-name aliases address one stream.
-        // It also avoids interfering with SQLite's locks on the default stream.
-        let mut value = path.as_os_str().to_os_string();
-        value.push(":aios-task-manager-lock");
-        std::path::PathBuf::from(value)
-    };
-    #[cfg(not(windows))]
-    let lock_path = path.to_path_buf();
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    file.try_lock_exclusive()?;
-    Ok(StoreLock {
-        database_file,
-        _lock_file: file,
-        identity,
-    })
+    StoreLock::acquire(path).map_err(Into::into)
 }
 
 fn verify_locked_store_identity(connection: &Connection, lock: &StoreLock) -> Result<()> {
-    let main_filename = connection.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-    if main_filename.is_empty() {
-        return Err(TaskManagerError::InvalidRecord(
-            "SQLite main database has no durable file identity",
-        ));
-    }
-    let main_path = PathBuf::from(main_filename);
-    let main_file = OpenOptions::new().read(true).write(true).open(&main_path)?;
-    if store_identity(&main_path, &main_file)? != lock.identity {
-        return Err(TaskManagerError::InvalidRecord(
-            "SQLite main database identity does not match the locked store",
-        ));
-    }
-    Ok(())
+    lock.verify_connection(connection).map_err(Into::into)
 }
 
 fn open_locked_store<F>(
@@ -661,7 +543,7 @@ fn open_locked_store<F>(
 where
     F: FnOnce(&Path),
 {
-    let lock = acquire_store_lock(path)?;
+    let lock = Arc::new(acquire_store_lock(path)?);
     after_lock(path);
     let connection = Connection::open(path)?;
     verify_locked_store_identity(&connection, &lock)?;
@@ -686,47 +568,6 @@ pub(crate) fn rebind_legacy_windows_artifact_store(path: &Path) -> Result<()> {
     artifact_store::rebind_legacy_windows_root(&lock, &mut connection)
 }
 
-fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {
-    connection.execute_batch("BEGIN IMMEDIATE")?;
-    let claimed = (|| -> Result<(String, i64)> {
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS task_manager_lease (
-                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-                owner_id TEXT NOT NULL,
-                fence_epoch INTEGER NOT NULL CHECK (fence_epoch >= 1),
-                acquired_at TEXT NOT NULL
-            );",
-        )?;
-        let owner = connection.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
-            row.get::<_, String>(0)
-        })?;
-        connection.execute(
-            "INSERT INTO task_manager_lease(singleton_id, owner_id, fence_epoch, acquired_at)
-             VALUES (1, ?1, 1, ?2)
-             ON CONFLICT(singleton_id) DO UPDATE SET owner_id = excluded.owner_id,
-                 fence_epoch = task_manager_lease.fence_epoch + 1,
-                 acquired_at = excluded.acquired_at",
-            params![owner, acquired_at],
-        )?;
-        let epoch = connection.query_row(
-            "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id = 1 AND owner_id = ?1",
-            [&owner],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok((owner, epoch))
-    })();
-    match claimed {
-        Ok(value) => {
-            connection.execute_batch("COMMIT")?;
-            Ok(value)
-        }
-        Err(error) => {
-            connection.execute_batch("ROLLBACK")?;
-            Err(error)
-        }
-    }
-}
-
 fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) -> Result<()> {
     let current = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id = 1 AND owner_id = ?1 AND fence_epoch = ?2)",
@@ -742,6 +583,32 @@ fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) 
 }
 
 impl TaskManager {
+    /// Opens a semantic registry writer under this manager's live store lock
+    /// and durable lease. The required optional schema is installed first.
+    ///
+    /// # Errors
+    /// Returns an error if migration, store identity, or the lease fails.
+    pub fn registry_store_writer(&mut self) -> Result<aios_registry::RegistryStore<'_>> {
+        self.initialize_registry_store()?;
+        Ok(aios_registry::RegistryStore::initialize_writer(
+            &mut self.connection,
+            &self.store_owner,
+        )?)
+    }
+
+    /// Opens a provider writer under this manager's live store lock and lease.
+    /// The required optional schemas are installed first.
+    ///
+    /// # Errors
+    /// Returns an error if migration, store identity, or the lease fails.
+    pub fn provider_store_writer(&mut self) -> Result<aios_registry::ProviderStore<'_>> {
+        self.initialize_provider_store()?;
+        Ok(aios_registry::ProviderStore::initialize_writer(
+            &mut self.connection,
+            &self.store_owner,
+        )?)
+    }
+
     /// Installs or upgrades the optional semantic registry schema while this
     /// manager owns the identity-bound store lock and current durable lease.
     ///
@@ -914,7 +781,7 @@ impl TaskManager {
     fn initialize(
         mut connection: Connection,
         clock: Box<dyn Clock>,
-        store_lock: Option<StoreLock>,
+        store_lock: Option<Arc<StoreLock>>,
         database_locator: DatabaseLocator,
         export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
@@ -922,13 +789,15 @@ impl TaskManager {
         preflight_migration_state_allowing_guard_upgrade(&connection)?;
         let clock: Arc<dyn Clock> = Arc::from(clock);
         let acquired_at = clock.now();
-        let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
+        let store_owner = StoreOwner::claim(&connection, store_lock.clone(), &acquired_at)?;
+        let lease_owner = store_owner.owner().to_owned();
+        let lease_epoch = store_owner.epoch();
         upgrade_stamped_registry_guards_fenced(&mut connection, &lease_owner, lease_epoch)?;
         preflight_migration_state(&connection)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
-            artifact_store::initialize_root(store_lock.as_ref(), &mut connection)?;
+            artifact_store::initialize_root(store_lock.as_deref(), &mut connection)?;
         let artifact_scope_issuer =
             connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
         let mut artifact_export_verifiers = BTreeMap::new();
@@ -962,6 +831,7 @@ impl TaskManager {
             artifact_store_root,
             artifact_store_dir,
             store_lock,
+            store_owner,
             artifact_store_cleanup,
             artifact_export_verifiers,
             delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
@@ -971,6 +841,28 @@ impl TaskManager {
         manager.reconcile_export_operations_startup()?;
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
+        // Runtime registry writers are admitted only after the complete
+        // Task Manager startup and recovery sequence has succeeded on this
+        // exact connection and lease.
+        manager.connection.execute_batch(
+            "CREATE TEMP TABLE aios_task_manager_startup_ready (
+                nonce TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                fence_epoch INTEGER NOT NULL
+            );",
+        )?;
+        let ready = manager.connection.execute(
+            "INSERT INTO temp.aios_task_manager_startup_ready(nonce,owner_id,fence_epoch)
+             SELECT c.nonce,l.owner_id,l.fence_epoch
+             FROM temp.aios_store_owner_capability c CROSS JOIN task_manager_lease l
+             WHERE l.singleton_id=1 AND l.owner_id=?1 AND l.fence_epoch=?2",
+            params![&manager.lease_owner, manager.lease_epoch],
+        )?;
+        if ready != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task Manager startup lost the current ownership lease",
+            ));
+        }
         Ok(manager)
     }
 
@@ -3510,6 +3402,9 @@ const SEMANTIC_ADDITIVE_GUARDS: &[&str] = &[
     "immutable_semantic_capability_contracts_reinsert",
     "immutable_registry_snapshot_entries_reinsert",
     "immutable_admitted_registry_snapshot_entries_insert",
+    "registry_activation_no_duplicate_insert",
+    "registry_activation_revision_monotonic",
+    "registry_activation_no_delete",
 ];
 
 const SEMANTIC_LEGACY_GUARDS: &[&str] = &[
@@ -3534,6 +3429,9 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "execution_binding_marker_no_duplicate_insert",
     "execution_binding_marker_no_update",
     "execution_binding_marker_no_delete",
+    "provider_registration_trust_receipt_insert",
+    "provider_registration_trust_immutable_update",
+    "execution_binding_evidence_pin_required",
 ];
 
 const PROVIDER_LEGACY_GUARDS: &[&str] = &[
@@ -6592,6 +6490,7 @@ type ProviderAdmissionRow = (
     String,
     String,
     String,
+    String,
 );
 
 #[allow(
@@ -6608,7 +6507,8 @@ fn verified_provider_admission(
     let record: Option<ProviderAdmissionRow> = transaction
         .query_row(
             "SELECT r.provider_id,r.provider_version,r.manifest_hash,r.package_content_hash,
-                r.registry_snapshot_id,r.registration_json,r.registered_at,m.manifest_json
+                r.registry_snapshot_id,r.registration_json,r.registered_at,
+                r.trust_status,m.manifest_json
          FROM provider_registrations r JOIN provider_manifest_payloads m
            ON m.registration_id=r.registration_id WHERE r.registration_id=?1",
             [registration_id],
@@ -6622,6 +6522,7 @@ fn verified_provider_admission(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
@@ -6634,6 +6535,7 @@ fn verified_provider_admission(
         snapshot_id,
         receipt_json,
         registered_at,
+        trust_status,
         manifest_json,
     )) = record
     else {
@@ -6696,6 +6598,7 @@ fn verified_provider_admission(
             != Some(build_hash.as_str())
         || receipt.get("registry_snapshot_id").and_then(Value::as_str) != Some(snapshot_id.as_str())
         || receipt.get("registered_at").and_then(Value::as_str) != Some(registered_at.as_str())
+        || receipt.pointer("/trust/status").and_then(Value::as_str) != Some(trust_status.as_str())
     {
         return Ok(false);
     }

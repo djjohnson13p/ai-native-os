@@ -142,3 +142,24 @@ WHEN EXISTS (
     SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
 )
 BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot entry set is immutable'); END;
+
+-- A default's revision is an optimistic concurrency token. A direct writer
+-- cannot reset it through UPDATE or REPLACE and revive a stale CAS token.
+CREATE TRIGGER IF NOT EXISTS registry_activation_no_duplicate_insert
+BEFORE INSERT ON registry_activations
+WHEN EXISTS (
+    SELECT 1 FROM registry_activations
+    WHERE scope_kind IS NEW.scope_kind AND scope_id IS NEW.scope_id
+)
+BEGIN SELECT RAISE(ABORT, 'registry activation cannot be replaced'); END;
+
+CREATE TRIGGER IF NOT EXISTS registry_activation_revision_monotonic
+BEFORE UPDATE ON registry_activations
+WHEN NEW.scope_kind IS NOT OLD.scope_kind
+    OR NEW.scope_id IS NOT OLD.scope_id
+    OR NEW.revision <= OLD.revision
+BEGIN SELECT RAISE(ABORT, 'registry activation revision must advance'); END;
+
+CREATE TRIGGER IF NOT EXISTS registry_activation_no_delete
+BEFORE DELETE ON registry_activations
+BEGIN SELECT RAISE(ABORT, 'registry activation cannot be deleted'); END;

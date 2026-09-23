@@ -1534,18 +1534,18 @@ pub(super) fn initialize_root(
         store_lock
     {
         let file_name = lock
-            .identity
-            .canonical_path
+            .identity()
+            .canonical_path()
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or(TaskManagerError::InvalidRecord(
                 "Task store path has no portable file name",
             ))?;
         let proposed = lock
-            .identity
-            .canonical_path
+            .identity()
+            .canonical_path()
             .with_file_name(format!("{file_name}.artifacts"));
-        let identity = lock.identity.persistent_key();
+        let identity = lock.identity().persistent_key();
         let stored = connection
             .query_row(
                 "SELECT database_identity,canonical_root,root_identity FROM artifact_store_binding WHERE singleton_id=1",
@@ -1677,23 +1677,23 @@ pub(super) fn rebind_legacy_windows_root(
     )?;
     let stored_database_creation = parse_legacy_windows_identity(&stored_database_identity)?;
     let stored_root_creation = parse_legacy_windows_identity(&stored_root_identity)?;
-    if store_lock.database_file.metadata()?.creation_time() != stored_database_creation {
+    if store_lock.database_file().metadata()?.creation_time() != stored_database_creation {
         return Err(TaskManagerError::InvalidRecord(
             "legacy Windows database binding does not match the locked database",
         ));
     }
 
     let file_name = store_lock
-        .identity
-        .canonical_path
+        .identity()
+        .canonical_path()
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(TaskManagerError::InvalidRecord(
             "Task store path has no portable file name",
         ))?;
     let expected_root = store_lock
-        .identity
-        .canonical_path
+        .identity()
+        .canonical_path()
         .with_file_name(format!("{file_name}.artifacts"))
         .canonicalize()?;
     let persisted_root = PathBuf::from(&stored_root).canonicalize()?;
@@ -1729,7 +1729,7 @@ pub(super) fn rebind_legacy_windows_root(
              WHERE singleton_id=1 AND database_identity=?4 AND canonical_root=?5
                AND root_identity=?6",
             params![
-                store_lock.identity.persistent_key(),
+                store_lock.identity().persistent_key(),
                 current_root_identity.persistent_key(),
                 OffsetDateTime::now_utc().format(&Rfc3339).map_err(|_| {
                     TaskManagerError::InvalidRecord(
@@ -2912,7 +2912,7 @@ impl TaskManager {
         validate_id(allocation_id, 256, "invalid Artifact allocation ID")?;
         let authority_connection = self.database_locator.open()?;
         authority_connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        if let Some(lock) = self.store_lock.as_ref() {
+        if let Some(lock) = self.store_lock.as_deref() {
             super::verify_locked_store_identity(&authority_connection, lock)?;
         }
         // Prepare every capability required by the returned writer before the
@@ -3794,7 +3794,8 @@ impl TaskManager {
                 reader_setup_step()?;
                 let authority_connection = self.database_locator.open()?;
                 authority_connection.busy_timeout(std::time::Duration::from_secs(5))?;
-                let database_identity = self.store_lock.as_ref().map(|lock| lock.identity.clone());
+                let database_identity =
+                    self.store_lock.as_ref().map(|lock| lock.identity().clone());
                 if let Some(identity) = database_identity.as_ref() {
                     verify_database_identity(&authority_connection, identity)?;
                 }
