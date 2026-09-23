@@ -32,7 +32,7 @@ Do not tell the project owner to open separate Luna/Terra/Sol/Astra chats for ro
 Use GitHub as the durable bridge. Maintain the active issue/PR and one concise AIOS-HANDOFF comment containing issue, PR, branch, HEAD, stage, tests, reviews, blockers, next action, owner, required agent/model, and stop condition. Keep issue #38 current when a work item changes state.
 
 Normal loop:
-bounded issue -> early boundary/failure-case map -> explorer as needed -> implementer -> tests -> reviewer/test_auditor -> astra_reviewer when required -> consolidate repairs -> full exact-head gate -> stable PR head/GitHub review -> merge-ready handoff -> next queued issue.
+bounded issue -> early boundary/failure-case map -> explorer as needed -> implementer -> tests -> reviewer/test_auditor -> astra_reviewer when required -> consolidate findings -> implementer repairs substantive findings -> required local re-review -> full exact-head gate -> stable PR head/GitHub review -> merge-ready handoff -> next queued issue.
 
 Prefer smaller reviewable increments where the roadmap permits without dropping issue requirements. Record actionable findings by source, head-changing review cycles, and available agent usage. Let the scheduled loop watch an active external review; avoid duplicate review requests and repeated unchanged-status polling.
 

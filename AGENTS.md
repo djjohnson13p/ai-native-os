@@ -156,7 +156,7 @@ The root coordinator integrates the work and remains accountable for the final r
 
 Before implementing a substantial change, map its public contract, trust boundaries, migration/recovery paths, and likely adversarial cases with the implementer and test auditor. Prefer smaller reviewable increments where the roadmap permits, while retaining every issue requirement and stage gate.
 
-Collect local correctness, test-audit, and required Astra findings into one repair plan before pushing a stable candidate. Run every required exact-head check after changes. Request GitHub-native review on that candidate, then repair and re-review if it finds a substantive issue. Do not trigger duplicate reviews or repeatedly poll an active review when the scheduled review loop is already watching it.
+Collect local correctness, test-audit, and required Astra findings into one repair plan. Have the implementer apply substantive repairs and obtain required local re-review before pushing a stable candidate. Run every required exact-head check after changes. Request GitHub-native review on that candidate, then repair and re-review if it finds a substantive issue. Do not trigger duplicate reviews or repeatedly poll an active review when the scheduled review loop is already watching it.
 
 Record actionable findings by review source, head-changing review cycles, and available root/subagent usage in the durable handoff. Use measured completed-work quality and consumption to tune the workflow; do not infer savings from model labels or skip a required independent review.
 

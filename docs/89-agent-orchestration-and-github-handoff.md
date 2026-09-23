@@ -85,7 +85,7 @@ The agent roles and required gates stay fixed. Improve the timing of feedback:
 
 1. Before a substantial implementation, map public contracts, trust boundaries, migration/recovery paths, and likely adversarial cases. Give the implementer and test auditor the same bounded acceptance criteria.
 2. Prefer smaller reviewable PRs or increments where the stage runbook permits. This changes packaging, not issue scope: every requirement and gate still needs evidence before the issue closes.
-3. Consolidate local correctness, test-audit, and required Astra findings into one repair plan before pushing a candidate. Run the complete required gate after changes and request GitHub-native review on a stable exact HEAD.
+3. Consolidate local correctness, test-audit, and required Astra findings into one repair plan. Have the implementer apply substantive repairs, obtain required local re-review, run the complete required gate after changes, and request GitHub-native review on a stable exact HEAD.
 4. Use the scheduled review loop while an external review is running. Do not request duplicate reviews or spend interactive turns polling an unchanged status. Repair substantive new findings, rerun the required gate, and request review on the new exact HEAD.
 5. Record actionable findings by source, head-changing review cycles, and available root/subagent usage in the handoff. Compare quality and consumption of completed work before changing model/reasoning routing; model names alone do not prove savings.
 
