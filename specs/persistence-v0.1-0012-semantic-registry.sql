@@ -133,3 +133,12 @@ WHEN EXISTS (
         AND major IS NEW.major
 )
 BEGIN SELECT RAISE(ABORT, 'registry snapshot entry cannot be replaced'); END;
+
+-- The entry set is complete when admission is published. New entries for an
+-- admitted snapshot would change its meaning and can never be appended later.
+CREATE TRIGGER IF NOT EXISTS immutable_admitted_registry_snapshot_entries_insert
+BEFORE INSERT ON registry_snapshot_entries
+WHEN EXISTS (
+    SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
+)
+BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot entry set is immutable'); END;

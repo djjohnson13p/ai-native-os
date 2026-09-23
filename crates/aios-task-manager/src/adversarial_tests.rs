@@ -742,7 +742,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         execution_profile_ref: String::new(),
         placement_json: String::new(),
         binding_json: String::new(),
-        created_at: String::new(),
+        created_at: TEST_TIME.into(),
         conformance_evidence_id: String::new(),
         conformance_suite_id: Some("suite:artifact-hash".into()),
         conformance_suite_hash: Some(SUITE_HASH.into()),
@@ -1128,6 +1128,12 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         receipt["registry_snapshot_id"] = registry.snapshot_id().into();
         receipt["capability_contract_hash"] = contract_hash.clone().into();
         receipt["conformance_evidence_id"] = pinned.into();
+        let created_at = if pinned == "E2" {
+            "2026-09-19T00:00:00.600Z"
+        } else {
+            TEST_TIME
+        };
+        receipt["created_at"] = created_at.into();
         receipt["provider"]["id"] = registration.provider_id.clone().into();
         receipt["provider"]["version"] = registration.provider_version.clone().into();
         receipt["provider"]["manifest_hash"] = registration.manifest_hash.clone().into();
@@ -1143,7 +1149,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
              ?5,?6,?7,?8,?9,?10,?11,'[]','[]','profile:test','{\"locality\":\"local\"}',?12,?13)",
             params![binding_id,attempt_id,HASH,registry.snapshot_id(),contract_hash,
                 registration.registration_id,registration.provider_id,registration.provider_version,
-                registration.manifest_hash,registration.build_hash,attempt,canonical_json(&receipt).unwrap(),TEST_TIME],
+                registration.manifest_hash,registration.build_hash,attempt,canonical_json(&receipt).unwrap(),created_at],
         ).unwrap();
         manager.connection.execute(
             "INSERT INTO artifact_output_allocations(allocation_id,task_id,semantic_program_hash,node_id,
@@ -1178,7 +1184,126 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "attempt-real-2",
         "2026-09-19T00:00:00.250Z"
     ));
+    manager
+        .connection
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF;")
+        .unwrap();
+    // A result recorded later cannot retroactively authenticate a binding.
+    // The trigger checks row existence at the instant the immutable row is inserted.
+    assert!(
+        manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-premature','attempt-premature',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,98,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+           json_set(binding_json,'$.conformance_evidence_id','E2'),
+           '2026-09-19T00:00:00.600Z'
+         FROM execution_bindings WHERE binding_id=?1",
+                [&first],
+            )
+            .is_err()
+    );
+    assert!(
+        manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO execution_bindings
+         SELECT * FROM execution_bindings WHERE binding_id=?1 AND 1=1",
+                [&first],
+            )
+            .is_err()
+    );
+    assert!(
+        manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-replaced-attempt',attempt_id,task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,99,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,binding_json,created_at
+         FROM execution_bindings WHERE binding_id=?1",
+                [&first],
+            )
+            .is_err()
+    );
+    assert_eq!(manager.connection.query_row(
+        "SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1 AND attempt_id='attempt-real-2'",
+        [&first], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    let reopened_copy = tempdir().unwrap();
+    let copied_path = reopened_copy.path().join("bindings.sqlite3");
+    manager
+        .connection
+        .execute("VACUUM INTO ?1", [copied_path.to_str().unwrap()])
+        .unwrap();
+    let reopened = Connection::open(copied_path).unwrap();
+    assert_eq!(reopened.query_row(
+        "SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1 AND attempt_id='attempt-real-2'",
+        [&first], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    // Emulate a stamped 0013 database written before the insert guard and
+    // admission marker existed. This immutable binding predicts absent E2.
+    manager
+        .connection
+        .execute_batch(
+            "DROP TRIGGER execution_binding_evidence_present_at_insert;
+         DROP TRIGGER execution_binding_admission_marker_insert;
+         DROP TABLE execution_binding_admission_markers;",
+        )
+        .unwrap();
+    let historical = insert(&manager, 98, "E2");
+    manager
+        .connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    ProviderStore::initialize(&mut manager.connection).unwrap();
+    let old_markers: i64 = manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM execution_binding_admission_markers WHERE binding_id=?1",
+            [&historical],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_markers, 0);
+    for attack in [
+        format!(
+            "INSERT INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{historical}','E2')"
+        ),
+        format!(
+            "INSERT OR REPLACE INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{historical}','E2')"
+        ),
+    ] {
+        assert!(
+            manager.connection.execute_batch(&attack).is_err(),
+            "{attack}"
+        );
+    }
     record(&mut manager, "E2", "pass", "2026-09-19T00:00:00.500Z");
+    assert!(!valid(
+        &mut manager,
+        &historical,
+        "attempt-real-98",
+        "2026-09-19T00:00:00.750Z"
+    ));
     assert!(!valid(
         &mut manager,
         &first,
@@ -1186,6 +1311,27 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "2026-09-19T00:00:00.750Z"
     ));
     let second = insert(&manager, 3, "E2");
+    assert!(valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    for attack in [
+        format!(
+            "UPDATE execution_binding_admission_markers SET conformance_evidence_id='E1' WHERE binding_id='{second}'"
+        ),
+        format!("DELETE FROM execution_binding_admission_markers WHERE binding_id='{second}'"),
+        format!(
+            "INSERT OR REPLACE INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{second}','E1')"
+        ),
+    ] {
+        assert!(
+            manager.connection.execute_batch(&attack).is_err(),
+            "{attack}"
+        );
+    }
+    manager.connection.execute_batch("VACUUM").unwrap();
     assert!(valid(
         &mut manager,
         &second,

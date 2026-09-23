@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::schema::{self, RecordKind};
 use crate::{
@@ -133,25 +133,60 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
 
 fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<()> {
     // Older stores have the 0012 stamp but predate the admission guards.
-    // Their absence is upgraded below; a guard without the stamp is incomplete.
-    for guard in [
-        "one_way_registry_snapshot_admissions_update",
-        "immutable_registry_snapshot_admissions_reinsert",
-        "immutable_admitted_registry_snapshots_reinsert",
-        "immutable_admitted_registry_snapshots_target_update",
-        "immutable_semantic_type_contracts_reinsert",
-        "immutable_semantic_capability_contracts_reinsert",
-        "immutable_registry_snapshot_entries_reinsert",
+    // Their absence is upgraded below. A same-name substitute must fail before
+    // CREATE IF NOT EXISTS can silently accept an ineffective trigger body.
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    for (guard, additive) in [
+        ("immutable_admitted_registry_snapshots_update", false),
+        ("immutable_admitted_registry_snapshots_delete", false),
+        ("immutable_semantic_type_contracts_update", false),
+        ("immutable_semantic_type_contracts_delete", false),
+        ("immutable_semantic_capability_contracts_update", false),
+        ("immutable_semantic_capability_contracts_delete", false),
+        ("immutable_registry_snapshot_entries_update", false),
+        ("immutable_registry_snapshot_entries_delete", false),
+        ("immutable_registry_snapshot_admissions_delete", false),
+        ("one_way_registry_snapshot_admissions_update", true),
+        ("immutable_registry_snapshot_admissions_reinsert", true),
+        ("immutable_admitted_registry_snapshots_reinsert", true),
+        ("immutable_admitted_registry_snapshots_target_update", true),
+        ("immutable_semantic_type_contracts_reinsert", true),
+        ("immutable_semantic_capability_contracts_reinsert", true),
+        ("immutable_registry_snapshot_entries_reinsert", true),
+        ("immutable_admitted_registry_snapshot_entries_insert", true),
     ] {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
-            [guard],
-            |row| row.get(0),
-        )?;
-        if present && !stamped {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [guard],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.is_some() && !stamped {
             return Err(RegistryStoreError::Conflict(
                 "semantic registry migration is incomplete or unstamped",
             ));
+        }
+        if actual.is_none() && stamped && !additive {
+            return Err(RegistryStoreError::Conflict(
+                "semantic registry migration is incomplete or unstamped",
+            ));
+        }
+        if let Some(actual) = actual {
+            let expected: String = canonical.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [guard],
+                |row| row.get(0),
+            )?;
+            if actual.split_whitespace().ne(expected.split_whitespace()) {
+                return Err(RegistryStoreError::Conflict(
+                    "semantic registry admission guard definition mismatch",
+                ));
+            }
         }
     }
     Ok(())
@@ -277,7 +312,7 @@ impl<'a> RegistryStore<'a> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_store_migration(connection)?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<String> = transaction
             .query_row(
                 "SELECT checksum FROM schema_migrations WHERE migration_id=?1",
@@ -314,6 +349,7 @@ impl<'a> RegistryStore<'a> {
         let snapshot_id = registry.snapshot_id().to_owned();
         let manifest_json = serde_json::to_string(registry.snapshot())?;
         let transaction = self.connection.transaction()?;
+        let already_admitted = defer_entry_fk_until_admission(&transaction, &snapshot_id)?;
         let prior: Option<String> = transaction
             .query_row(
                 "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
@@ -335,10 +371,6 @@ impl<'a> RegistryStore<'a> {
                     registry.snapshot().publisher.as_ref().and_then(|p| p.signature.as_deref())],
             )?;
         }
-        transaction.execute(
-            "INSERT INTO registry_snapshot_admissions(snapshot_id,state) SELECT ?1,'ADMITTED' WHERE NOT EXISTS (SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id=?1)",
-            [&snapshot_id],
-        )?;
         for contract in registry.type_contracts() {
             let major = crate::FullVersion::parse(&contract.version)?.major;
             let hash = registry
@@ -405,6 +437,7 @@ impl<'a> RegistryStore<'a> {
                 "snapshot has unexpected persisted entries",
             ));
         }
+        publish_admission(&transaction, &snapshot_id, already_admitted)?;
         transaction.commit()?;
         // Read back through the same strict builder; persisted records, rather
         // than caller memory, become the admissible historical source.
@@ -664,6 +697,37 @@ impl<'a> RegistryStore<'a> {
         self.open_snapshot(snapshot_id)?;
         Ok(Some(activation))
     }
+}
+
+fn defer_entry_fk_until_admission(
+    transaction: &rusqlite::Transaction<'_>,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let already_admitted: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id=?1)",
+        [snapshot_id],
+        |row| row.get(0),
+    )?;
+    if !already_admitted {
+        // Entries reference admissions in 0012. Defer that FK within this
+        // transaction so the complete entry set can precede publication.
+        transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+    }
+    Ok(already_admitted)
+}
+
+fn publish_admission(
+    transaction: &rusqlite::Transaction<'_>,
+    snapshot_id: &str,
+    already_admitted: bool,
+) -> Result<()> {
+    if !already_admitted {
+        transaction.execute(
+            "INSERT INTO registry_snapshot_admissions(snapshot_id,state) VALUES (?1,'ADMITTED')",
+            [snapshot_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_contract(
@@ -992,7 +1056,8 @@ mod tests {
                  DROP TRIGGER immutable_admitted_registry_snapshots_target_update;
                  DROP TRIGGER immutable_semantic_type_contracts_reinsert;
                  DROP TRIGGER immutable_semantic_capability_contracts_reinsert;
-                 DROP TRIGGER immutable_registry_snapshot_entries_reinsert;",
+                 DROP TRIGGER immutable_registry_snapshot_entries_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;",
                 )
                 .unwrap();
             id
@@ -1034,6 +1099,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained_manifest, original_manifest);
+        assert!(store.connection.execute(
+            "INSERT INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) VALUES (?1,'type','forged.type',1,'1.0','sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+            [&id],
+        ).is_err());
         let retained: (String, String) = store.connection.query_row(
             "SELECT s.snapshot_id,a.state FROM registry_snapshots s JOIN registry_snapshot_admissions a USING(snapshot_id) WHERE s.snapshot_id=?1",
             [&id],
@@ -1135,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_extra_entry_and_blocks_direct_mutation() {
+    fn rejects_entry_append_and_blocks_direct_mutation() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
         let mut store = RegistryStore::initialize(&mut connection).unwrap();
@@ -1149,22 +1218,41 @@ mod tests {
                 )
                 .is_err()
         );
-        store.connection.execute(
+        let entries_before: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM registry_snapshot_entries WHERE snapshot_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let append_error = store.connection.execute(
             "INSERT INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) VALUES (?1,'type','forged.type',1,'1.0','sha256:0000000000000000000000000000000000000000000000000000000000000000')",
             [&id],
-        ).unwrap();
-        assert!(matches!(
-            store.open_snapshot(&id),
-            Err(RegistryStoreError::Conflict(_))
-        ));
+        ).unwrap_err();
+        assert!(
+            append_error
+                .to_string()
+                .contains("admitted registry snapshot entry set is immutable")
+        );
+        assert!(store.open_snapshot(&id).is_ok());
         store
             .connection
             .execute(
-                "DELETE FROM registry_snapshot_entries WHERE semantic_id='forged.type'",
-                [],
+                "DELETE FROM registry_snapshot_entries WHERE snapshot_id=?1",
+                [&id],
             )
             .unwrap_err();
-        let count: i64 = store
+        let entries_after: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM registry_snapshot_entries WHERE snapshot_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries_after, entries_before);
+        let admissions: i64 = store
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM registry_snapshot_admissions",
@@ -1172,7 +1260,125 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(admissions, 1);
+    }
+
+    #[test]
+    fn published_entry_set_stays_complete_and_immutable_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let id = {
+            let mut connection = Connection::open(&database).unwrap();
+            baseline(&connection);
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let id = store.admit_registry(&fixture_registry()).unwrap();
+            store.activate_default("user", "u1", None, &id).unwrap();
+            let expected_entries: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM registry_snapshot_entries WHERE snapshot_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(expected_entries > 0);
+            let error = store.connection.execute(
+                "INSERT INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) VALUES (?1,'type','forged.type',1,'1.0','sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+                [&id],
+            ).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("admitted registry snapshot entry set is immutable")
+            );
+            id
+        };
+
+        let mut connection = Connection::open(&database).unwrap();
+        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        assert_eq!(store.admit_registry(&fixture_registry()).unwrap(), id);
+        assert_eq!(
+            store
+                .default_snapshot("user", "u1")
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            id
+        );
+        assert_eq!(store.open_snapshot(&id).unwrap().snapshot_id(), id);
+        let mut fk_check = store
+            .connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap();
+        assert!(fk_check.query([]).unwrap().next().unwrap().is_none());
+        let deferral: i64 = store
+            .connection
+            .query_row("PRAGMA defer_foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deferral, 0);
+    }
+
+    #[test]
+    fn stamped_same_name_noop_entry_guard_fails_before_migration_ddl() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        baseline(&connection);
+        RegistryStore::initialize(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
+             CREATE TRIGGER immutable_admitted_registry_snapshot_entries_insert
+             BEFORE INSERT ON registry_snapshot_entries BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        let before: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='immutable_admitted_registry_snapshot_entries_insert'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(matches!(
+            RegistryStore::initialize(&mut connection),
+            Err(RegistryStoreError::Conflict(
+                "semantic registry admission guard definition mismatch"
+            ))
+        ));
+        let after: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='immutable_admitted_registry_snapshot_entries_insert'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn stamped_legacy_immutability_guard_rejects_noop_but_accepts_line_endings() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        baseline(&connection);
+        RegistryStore::initialize(&mut connection).unwrap();
+        let name = "immutable_registry_snapshot_entries_update";
+        let canonical: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE UPDATE ON registry_snapshot_entries BEGIN SELECT 1; END;"
+            ))
+            .unwrap();
+        assert!(matches!(
+            RegistryStore::initialize(&mut connection),
+            Err(RegistryStoreError::Conflict(
+                "semantic registry admission guard definition mismatch"
+            ))
+        ));
+        connection
+            .execute_batch(&format!("DROP TRIGGER {name}"))
+            .unwrap();
+        let alternate_line_endings = canonical.replace("\r\n", "\n").replace('\n', "\r\n");
+        connection.execute_batch(&alternate_line_endings).unwrap();
+        RegistryStore::initialize(&mut connection).unwrap();
     }
 
     #[test]
@@ -1255,7 +1461,7 @@ mod tests {
                         entry_major.as_str(),
                         entry.5.as_str(),
                     ],
-                    "registry snapshot entry cannot be replaced",
+                    "admitted registry snapshot entry set is immutable",
                 ),
             ] {
                 let error = store

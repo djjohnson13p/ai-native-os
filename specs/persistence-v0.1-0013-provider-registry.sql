@@ -62,3 +62,70 @@ BEGIN SELECT RAISE(ABORT, 'provider conformance evidence cannot be replaced'); E
 
 CREATE INDEX IF NOT EXISTS ix_provider_conformance_latest
 ON provider_conformance_evidence(registration_id,capability,contract_hash,suite_id,suite_hash,tested_at);
+
+-- Only bindings inserted after this trigger is installed receive an admission
+-- marker. Historical bindings cannot acquire one later, even if a result with
+-- a backdated executed_at is recorded. The key remains stable across VACUUM.
+CREATE TABLE IF NOT EXISTS execution_binding_admission_markers (
+    binding_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
+    conformance_evidence_id TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS execution_binding_marker_no_update
+BEFORE UPDATE ON execution_binding_admission_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding admission marker is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_marker_no_delete
+BEFORE DELETE ON execution_binding_admission_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding admission marker cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_marker_no_duplicate_insert
+BEFORE INSERT ON execution_binding_admission_markers
+WHEN EXISTS (SELECT 1 FROM execution_binding_admission_markers
+             WHERE binding_id=NEW.binding_id)
+  OR EXISTS (SELECT 1 FROM execution_bindings WHERE binding_id=NEW.binding_id)
+BEGIN SELECT RAISE(ABORT, 'execution binding admission marker cannot be backfilled or replaced'); END;
+
+-- A REPLACE can delete an immutable binding without firing its DELETE trigger
+-- when recursive_triggers is disabled. Reject every key it could replace first.
+CREATE TRIGGER IF NOT EXISTS execution_binding_no_duplicate_insert
+BEFORE INSERT ON execution_bindings
+WHEN EXISTS (
+    SELECT 1 FROM execution_bindings
+    WHERE binding_id=NEW.binding_id OR attempt_id=NEW.attempt_id
+       OR (task_id=NEW.task_id AND semantic_program_hash=NEW.semantic_program_hash
+           AND node_id=NEW.node_id AND attempt=NEW.attempt)
+)
+BEGIN SELECT RAISE(ABORT, 'execution binding cannot be replaced'); END;
+
+-- The selected evidence must already be present when a binding is admitted.
+-- An old binding cannot become valid merely because a matching result is
+-- recorded later with a backdated executed_at claim.
+CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_present_at_insert
+BEFORE INSERT ON execution_bindings
+WHEN json_valid(NEW.binding_json)
+ AND json_type(NEW.binding_json, '$.conformance_evidence_id') = 'text'
+ AND NOT EXISTS (
+    SELECT 1 FROM provider_conformance_evidence
+    WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+      AND registration_id=NEW.provider_registration_id
+      AND capability=NEW.capability
+      AND contract_hash=NEW.capability_contract_hash
+      AND status='pass'
+)
+BEGIN SELECT RAISE(ABORT, 'binding conformance evidence was not admitted'); END;
+
+CREATE TRIGGER IF NOT EXISTS execution_binding_admission_marker_insert
+BEFORE INSERT ON execution_bindings
+WHEN json_valid(NEW.binding_json)
+ AND json_type(NEW.binding_json, '$.conformance_evidence_id') = 'text'
+ AND EXISTS (
+    SELECT 1 FROM provider_conformance_evidence
+    WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+      AND registration_id=NEW.provider_registration_id
+      AND capability=NEW.capability
+      AND contract_hash=NEW.capability_contract_hash
+      AND status='pass'
+)
+BEGIN
+    INSERT INTO execution_binding_admission_markers(binding_id,conformance_evidence_id)
+    VALUES (NEW.binding_id,json_extract(NEW.binding_json, '$.conformance_evidence_id'));
+END;

@@ -153,7 +153,7 @@ impl<'a> ProviderStore<'a> {
         crate::RegistryStore::initialize(connection).map_err(|_| {
             ProviderStoreError::Conflict("semantic registry migration is incomplete")
         })?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))?;
@@ -254,8 +254,15 @@ impl<'a> ProviderStore<'a> {
             build_hash: build_hash.to_owned(),
             snapshot_id,
         };
-        let admitted: Option<String> = self
+        let registration_json = registration_record(&registration, &manifest, trust, registered_at);
+        let registration_json = canonical_text(&registration_json)?;
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Admission and identity insertion must share the write lock. Otherwise
+        // a concurrent containment can commit after this check but before the
+        // provider's immutable origin snapshot is recorded.
+        let admitted: Option<String> = transaction
             .query_row(
                 "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
                 [&registration.snapshot_id],
@@ -267,11 +274,6 @@ impl<'a> ProviderStore<'a> {
                 "semantic snapshot has not been admitted",
             ));
         }
-        let registration_json = registration_record(&registration, &manifest, trust, registered_at);
-        let registration_json = canonical_text(&registration_json)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<ProviderRegistration> = transaction.query_row(
             "SELECT registration_id,provider_id,provider_version,manifest_hash,package_content_hash,registry_snapshot_id
              FROM provider_registrations WHERE provider_id=?1 AND provider_version=?2 AND package_content_hash=?3",
@@ -1016,6 +1018,25 @@ impl<'a> ProviderStore<'a> {
     reason = "keeps migration stamps and required schema objects in one fail-closed preflight"
 )]
 fn preflight_migrations(connection: &Connection) -> Result<()> {
+    const ADDITIVE: &[(&str, &str)] = &[
+        ("trigger", "provider_manifest_payload_immutable_update"),
+        ("trigger", "provider_manifest_payload_immutable_delete"),
+        ("trigger", "provider_registration_identity_immutable"),
+        ("trigger", "provider_registration_no_delete"),
+        ("trigger", "provider_registration_revocation_terminal"),
+        ("trigger", "provider_evidence_immutable_update"),
+        ("trigger", "provider_evidence_immutable_delete"),
+        ("trigger", "provider_registration_no_duplicate_insert"),
+        ("trigger", "provider_manifest_payload_no_duplicate_insert"),
+        ("trigger", "provider_evidence_no_duplicate_insert"),
+        ("trigger", "execution_binding_no_duplicate_insert"),
+        ("trigger", "execution_binding_evidence_present_at_insert"),
+        ("table", "execution_binding_admission_markers"),
+        ("trigger", "execution_binding_admission_marker_insert"),
+        ("trigger", "execution_binding_marker_no_duplicate_insert"),
+        ("trigger", "execution_binding_marker_no_update"),
+        ("trigger", "execution_binding_marker_no_delete"),
+    ];
     const KNOWN: &[(&str, &str)] = &[
         (
             "0001_v0_1_trusted_control_plane",
@@ -1118,20 +1139,41 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
             ));
         }
     }
-    for guard in [
-        "provider_registration_no_duplicate_insert",
-        "provider_manifest_payload_no_duplicate_insert",
-        "provider_evidence_no_duplicate_insert",
-    ] {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
-            [guard],
-            |row| row.get(0),
-        )?;
-        if present && !stamped {
+    let mut present_objects = Vec::with_capacity(ADDITIVE.len());
+    for &(kind, name) in ADDITIVE {
+        let sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if sql.is_some() && !stamped {
             return Err(ProviderStoreError::Conflict(
                 "provider guard exists without migration stamp",
             ));
+        }
+        present_objects.push((kind, name, sql));
+    }
+    if stamped && present_objects.iter().any(|(_, _, sql)| sql.is_some()) {
+        let canonical = Connection::open_in_memory()?;
+        canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))?;
+        let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (kind, name, actual) in present_objects {
+            let Some(actual) = actual else { continue };
+            let expected: String = canonical.query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if normalize(&actual) != normalize(&expected) {
+                return Err(ProviderStoreError::Conflict(
+                    "provider additive guard definition differs",
+                ));
+            }
         }
     }
     Ok(())
@@ -2187,6 +2229,10 @@ mod tests {
                 "provider_evidence_no_duplicate_insert",
                 "provider_conformance_evidence",
             ),
+            (
+                "execution_binding_admission_marker_insert",
+                "execution_bindings",
+            ),
         ] {
             let (mut connection, _) = setup();
             connection
@@ -2201,6 +2247,57 @@ mod tests {
                 ))
             ));
         }
+        let (mut connection, _) = setup();
+        connection
+            .execute_batch(
+                "CREATE TABLE execution_binding_admission_markers (
+                binding_id TEXT PRIMARY KEY, conformance_evidence_id TEXT NOT NULL)",
+            )
+            .unwrap();
+        assert!(matches!(
+            ProviderStore::initialize(&mut connection),
+            Err(ProviderStoreError::Conflict(
+                "provider guard exists without migration stamp"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stamped_provider_store_rejects_same_name_noop_marker_guard() {
+        let (mut connection, _) = setup();
+        ProviderStore::initialize(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_admission_marker_insert;
+             CREATE TRIGGER execution_binding_admission_marker_insert
+             BEFORE INSERT ON execution_bindings BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            ProviderStore::initialize(&mut connection),
+            Err(ProviderStoreError::Conflict(
+                "provider additive guard definition differs"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stamped_provider_store_rejects_same_name_noop_legacy_evidence_guard() {
+        let (mut connection, _) = setup();
+        ProviderStore::initialize(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER provider_evidence_immutable_update;
+                 CREATE TRIGGER provider_evidence_immutable_update
+                 BEFORE UPDATE ON provider_conformance_evidence BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            ProviderStore::initialize(&mut connection),
+            Err(ProviderStoreError::Conflict(
+                "provider additive guard definition differs"
+            ))
+        ));
     }
 
     #[test]
@@ -2489,6 +2586,97 @@ mod tests {
             store.health(&registration_id).unwrap().unwrap().status,
             "ready"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn concurrent_snapshot_revocation_precedes_registration_admission() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        static WAITING_FOR_WRITER: AtomicBool = AtomicBool::new(false);
+        fn signal_busy(_count: i32) -> bool {
+            WAITING_FOR_WRITER.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("registration-race.db");
+        let (_, first) = setup();
+        let second = snapshot_change(&first, "table.normalize");
+        let first_manifest = manifest(&first);
+        let first_id = first.snapshot_id().to_owned();
+        let mut writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        RegistryStore::initialize(&mut writer)
+            .unwrap()
+            .admit_registry(&first)
+            .unwrap();
+        RegistryStore::initialize(&mut writer)
+            .unwrap()
+            .admit_registry(&second)
+            .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let worker_database = database.clone();
+        WAITING_FOR_WRITER.store(false, Ordering::SeqCst);
+        let worker = std::thread::spawn(move || {
+            let mut connection = Connection::open(worker_database).unwrap();
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            store.connection.busy_handler(Some(signal_busy)).unwrap();
+            ready_tx.send(()).unwrap();
+            start_rx.recv().unwrap();
+            matches!(
+                store.register(
+                    &first,
+                    &bytes(&first_manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                ),
+                Err(ProviderStoreError::Invalid(
+                    "semantic snapshot has not been admitted"
+                ))
+            )
+        });
+        ready_rx.recv().unwrap();
+        let transaction = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE registry_snapshot_admissions SET state='REVOKED' WHERE snapshot_id=?1",
+                [&first_id],
+            )
+            .unwrap();
+        start_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !WAITING_FOR_WRITER.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(WAITING_FOR_WRITER.load(Ordering::SeqCst));
+        transaction.commit().unwrap();
+        assert!(worker.join().unwrap());
+        let count: i64 = writer
+            .query_row("SELECT COUNT(*) FROM provider_registrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let mut store = ProviderStore::initialize(&mut writer).unwrap();
+        store
+            .register(
+                &second,
+                &bytes(&manifest(&second)),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
     }
 
     #[test]
