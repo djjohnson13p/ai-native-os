@@ -4,9 +4,10 @@ use rusqlite::{Connection, functions::FunctionFlags, types::ValueRef};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::provider_store::manifest_claim_matches_registration;
 use crate::{
-    BindingReceiptColumns, BindingReceiptProjection, EvidenceMatch, FullVersion, StrictJsonLimits,
-    evidence_matches_binding, parse_strict_value,
+    BindingReceiptColumns, BindingReceiptProjection, EvidenceMatch, FullVersion,
+    ProviderRegistration, StrictJsonLimits, evidence_matches_binding, parse_strict_value,
 };
 
 /// Register the parser required by the durable execution-binding insert guard.
@@ -44,6 +45,42 @@ pub fn register_strict_json_sqlite(connection: &Connection) -> rusqlite::Result<
             };
             Ok(FullVersion::parse(&version)
                 .is_ok_and(|version| capability == format!("{base}@{}", version.major)))
+        },
+    )?;
+    connection.create_scalar_function(
+        "aios_manifest_claim_matches_registration_v1",
+        11,
+        flags,
+        |context| {
+            let ValueRef::Text(raw) = context.get_raw(0) else {
+                return Ok(false);
+            };
+            let Ok(manifest_json) = std::str::from_utf8(raw) else {
+                return Ok(false);
+            };
+            let fields = (1..11)
+                .map(|index| context.get::<Option<String>>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let Some(fields) = fields.into_iter().collect::<Option<Vec<_>>>() else {
+                return Ok(false);
+            };
+            let registration = ProviderRegistration {
+                registration_id: fields[0].clone(),
+                provider_id: fields[1].clone(),
+                provider_version: fields[2].clone(),
+                manifest_hash: fields[3].clone(),
+                build_hash: fields[4].clone(),
+                snapshot_id: String::new(),
+            };
+            Ok(manifest_claim_matches_registration(
+                manifest_json,
+                &registration,
+                &fields[5],
+                &fields[6],
+                &fields[7],
+                &fields[8],
+                &fields[9],
+            ))
         },
     )?;
     connection.create_scalar_function("aios_evidence_unexpired_at_v1", 2, flags, |context| {

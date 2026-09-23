@@ -390,23 +390,25 @@ WHEN aios_binding_evidence_pin_v1(NEW.binding_json) IS NOT NULL
           SELECT 1 FROM provider_manifest_payloads m
           JOIN provider_registrations r ON r.registration_id=m.registration_id
           JOIN semantic_capability_contracts c
-            ON c.content_hash=NEW.capability_contract_hash,
-               json_each(m.manifest_json,'$.provides') AS offered
+            ON c.content_hash=NEW.capability_contract_hash
+          JOIN registry_snapshot_entries selected
+            ON selected.snapshot_id=NEW.registry_snapshot_id
+           AND selected.contract_class='capability'
+           AND selected.semantic_id=c.semantic_id
+           AND selected.full_version=c.full_version
+           AND selected.content_hash=c.content_hash
+           AND selected.major=CAST(substr(NEW.capability,
+                                          instr(NEW.capability,'@')+1) AS INTEGER)
+           AND NEW.capability=(c.semantic_id || '@' || selected.major)
           WHERE m.registration_id=NEW.provider_registration_id
-            AND aios_strict_json(m.manifest_json)
-            AND aios_manifest_capability_matches_v1(
-                json_extract(offered.value,'$.contract.capability'),
-                json_extract(offered.value,'$.contract.version'),NEW.capability)
-            AND c.semantic_id IS json_extract(offered.value,'$.contract.capability')
-            AND c.full_version IS json_extract(offered.value,'$.contract.version')
-            AND json_extract(offered.value,'$.contract.contract_hash') IS NEW.capability_contract_hash
-            AND json_extract(offered.value,'$.conformance.suite') IS e.suite_id
-            AND json_extract(offered.value,'$.conformance.suite_hash') IS e.suite_hash
             AND aios_strict_json(c.contract_json)
+            AND aios_manifest_claim_matches_registration_v1(
+                m.manifest_json,r.registration_id,r.provider_id,r.provider_version,
+                r.manifest_hash,r.package_content_hash,e.capability,c.full_version,
+                e.contract_hash,e.suite_id,e.suite_hash)
             AND aios_evidence_matches_binding_v1(
                 e.evidence_json,e.evidence_id,r.provider_id,r.provider_version,
-                r.package_content_hash,NEW.capability,
-                json_extract(offered.value,'$.contract.version'),
+                r.package_content_hash,NEW.capability,c.full_version,
                 NEW.capability_contract_hash,e.suite_id,e.suite_hash,
                 json_extract(c.contract_json,'$.conformance.suite_version'),
                 e.status,e.tested_at,NEW.created_at)

@@ -1433,6 +1433,310 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             .unwrap(),
     )
     .unwrap();
+    // A globally stored contract is insufficient when the selected snapshot
+    // never admitted that contract. The failed insert must publish no markers.
+    manager
+        .connection
+        .execute_batch(
+            "SAVEPOINT missing_selected_contract;
+             DROP TRIGGER immutable_registry_snapshot_entries_delete;",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "DELETE FROM registry_snapshot_entries
+             WHERE snapshot_id=?1 AND contract_class='capability'
+             AND semantic_id='test.complete'",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let mut absent_receipt = first_receipt.clone();
+    absent_receipt["binding_id"] = "binding-absent-selected-contract".into();
+    absent_receipt["attempt_id"] = "attempt-absent-selected-contract".into();
+    absent_receipt["attempt"] = 99.into();
+    let missing_contract_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+          attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+          placement_json,binding_json,created_at)
+         SELECT 'binding-absent-selected-contract','attempt-absent-selected-contract',
+                task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                capability,capability_contract_hash,provider_registration_id,provider_id,
+                provider_version,provider_manifest_hash,provider_build_hash,99,
+                policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                placement_json,?1,created_at
+         FROM execution_bindings WHERE binding_id=?2",
+            params![canonical_json(&absent_receipt).unwrap(), first],
+        )
+        .unwrap_err();
+    assert!(
+        missing_contract_error
+            .to_string()
+            .contains("binding conformance evidence was not admitted"),
+        "{missing_contract_error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        let count: i64 = manager.connection.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-absent-selected-contract'"),
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    manager
+        .connection
+        .execute_batch("ROLLBACK TO missing_selected_contract; RELEASE missing_selected_contract")
+        .unwrap();
+    // Even a hash/version row selected under a different semantic ID cannot
+    // authenticate this provider's claim. This catches accidental reliance on
+    // the global contract hash without comparing the claimed capability name.
+    manager
+        .connection
+        .execute_batch(
+            "SAVEPOINT mismatched_selected_name;
+         DROP TRIGGER immutable_semantic_capability_contracts_update;
+         DROP TRIGGER immutable_registry_snapshot_entries_update;",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE semantic_capability_contracts SET semantic_id='other.name'
+         WHERE content_hash=?1",
+            [&contract_hash],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_entries SET semantic_id='other.name'
+         WHERE snapshot_id=?1 AND contract_class='capability'
+         AND semantic_id='test.complete'",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let mut wrong_name_receipt = first_receipt.clone();
+    wrong_name_receipt["binding_id"] = "binding-wrong-selected-name".into();
+    wrong_name_receipt["attempt_id"] = "attempt-wrong-selected-name".into();
+    wrong_name_receipt["attempt"] = 100.into();
+    let wrong_name_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+          attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+          placement_json,binding_json,created_at)
+         SELECT 'binding-wrong-selected-name','attempt-wrong-selected-name',
+                task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                capability,capability_contract_hash,provider_registration_id,provider_id,
+                provider_version,provider_manifest_hash,provider_build_hash,100,
+                policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                placement_json,?1,created_at
+         FROM execution_bindings WHERE binding_id=?2",
+            params![canonical_json(&wrong_name_receipt).unwrap(), first],
+        )
+        .unwrap_err();
+    assert!(
+        wrong_name_error
+            .to_string()
+            .contains("binding conformance evidence was not admitted"),
+        "{wrong_name_error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        let count: i64 = manager
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE binding_id='binding-wrong-selected-name'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    manager
+        .connection
+        .execute_batch("ROLLBACK TO mismatched_selected_name; RELEASE mismatched_selected_name")
+        .unwrap();
+    let original_manifest: Value = serde_json::from_str(
+        &manager
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    for (suffix, attempt, hostile_build) in [
+        (
+            "invalid-schema",
+            101,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        (
+            "duplicate-claim",
+            102,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+    ] {
+        manager
+            .connection
+            .execute_batch("SAVEPOINT invalid_admission_manifest")
+            .unwrap();
+        let mut hostile = original_manifest.clone();
+        if suffix == "invalid-schema" {
+            hostile["forbidden_property"] = json!(true);
+        } else {
+            let mut repeated = hostile["provides"][0].clone();
+            repeated["conformance"]["suite"] = json!("different-suite");
+            hostile["provides"].as_array_mut().unwrap().push(repeated);
+        }
+        let hostile_manifest_json = canonical_json(&hostile).unwrap();
+        let hostile_manifest_hash = provider_identity_digest(
+            b"AIOS-PROVIDER-MANIFEST\0v0.1\0",
+            hostile_manifest_json.as_bytes(),
+        );
+        let hostile_registration_id = provider_identity_digest(
+            b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+            format!(
+                "{}\0{}\0{}\0{hostile_build}",
+                registration.provider_id, registration.provider_version, hostile_manifest_hash
+            )
+            .as_bytes(),
+        );
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}',?7)",
+                params![
+                    hostile_registration_id,
+                    registration.provider_id,
+                    registration.provider_version,
+                    hostile_manifest_hash,
+                    hostile_build,
+                    registry.snapshot_id(),
+                    TEST_TIME
+                ],
+            )
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO provider_manifest_payloads(registration_id,manifest_json) VALUES (?1,?2)",
+            params![hostile_registration_id,hostile_manifest_json],
+        ).unwrap();
+        let hostile_evidence_id = format!("evidence-{suffix}");
+        let mut hostile_evidence = evidence(&hostile_evidence_id, "pass", TEST_TIME);
+        hostile_evidence["provider_build_identity"]["value"] = hostile_build.into();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES (?1,?2,'test.complete@1',?3,'suite:test',?4,'pass',?5,?6)",
+                params![
+                    hostile_evidence_id,
+                    hostile_registration_id,
+                    contract_hash,
+                    SUITE_HASH,
+                    canonical_json(&hostile_evidence).unwrap(),
+                    TEST_TIME
+                ],
+            )
+            .unwrap();
+        manager.connection.execute(
+            "UPDATE provider_registrations SET state='registered',updated_at=?1 WHERE registration_id=?2",
+            params![TEST_TIME,hostile_registration_id],
+        ).unwrap();
+        let binding_id = format!("binding-{suffix}");
+        let attempt_id = format!("attempt-{suffix}");
+        let mut hostile_receipt = first_receipt.clone();
+        hostile_receipt["binding_id"] = binding_id.clone().into();
+        hostile_receipt["attempt_id"] = attempt_id.clone().into();
+        hostile_receipt["attempt"] = attempt.into();
+        hostile_receipt["conformance_evidence_id"] = hostile_evidence_id.into();
+        hostile_receipt["provider_trust_source_id"] = hostile_registration_id.clone().into();
+        hostile_receipt["provider"]["manifest_hash"] = hostile_manifest_hash.clone().into();
+        hostile_receipt["provider"]["package_or_build_hash"] = hostile_build.into();
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+              placement_json,binding_json,created_at)
+             SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                    capability,capability_contract_hash,?3,provider_id,
+                    provider_version,?4,?5,?6,
+                    policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                    placement_json,?7,created_at
+             FROM execution_bindings WHERE binding_id=?8",
+                params![
+                    binding_id,
+                    attempt_id,
+                    hostile_registration_id,
+                    hostile_manifest_hash,
+                    hostile_build,
+                    attempt,
+                    canonical_json(&hostile_receipt).unwrap(),
+                    first
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("binding conformance evidence was not admitted"),
+            "{suffix}: {error}"
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id=?1"),
+                    [&binding_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{suffix}: {table}");
+        }
+        manager
+            .connection
+            .execute_batch(
+                "ROLLBACK TO invalid_admission_manifest; RELEASE invalid_admission_manifest",
+            )
+            .unwrap();
+    }
     for case in [
         "valid-control",
         "offset-equivalent-tie",

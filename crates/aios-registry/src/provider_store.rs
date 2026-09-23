@@ -12,7 +12,9 @@ use std::fmt::Write;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use aios_contracts::{CapabilityContract, CapabilityManifest, RegistrySnapshot, TypeContract};
+use aios_contracts::{
+    CapabilityContract, CapabilityManifest, ProviderCapability, RegistrySnapshot, TypeContract,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -35,6 +37,10 @@ static REGISTRATION_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, 
     OnceLock::new();
 static EVIDENCE_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
     OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug)]
 pub enum ProviderStoreError {
@@ -672,7 +678,7 @@ impl<'a> ProviderStore<'a> {
                     "trust status does not permit enablement",
                 ));
             }
-            if !self.has_live_evidence(&registration, at)? {
+            if !self.has_live_evidence(&registration, &manifest, at)? {
                 return Err(ProviderStoreError::Invalid(
                     "no exact, current passing evidence for every claim",
                 ));
@@ -822,6 +828,7 @@ impl<'a> ProviderStore<'a> {
                 }
                 let matching = self.valid_passes(
                     &registration,
+                    &manifest.provides[0],
                     semantic_capability_ref,
                     contract_hash,
                     checked,
@@ -1108,13 +1115,13 @@ impl<'a> ProviderStore<'a> {
     fn has_live_evidence(
         &self,
         registration: &ProviderRegistration,
+        manifest: &CapabilityManifest,
         at: OffsetDateTime,
     ) -> Result<bool> {
         // Enablement opens the registration for consideration when at least one
         // claim is proven. Candidate lookup still checks the requested claim's
         // own static compatibility and latest evidence, so another claim cannot
         // rescue a failed or changed one.
-        let manifest = self.verified_manifest(registration)?;
         for claim in &manifest.provides {
             let major = claim.contract.version.split('.').next().unwrap_or("");
             let semantic_ref = format!("{}@{major}", claim.contract.capability);
@@ -1122,7 +1129,7 @@ impl<'a> ProviderStore<'a> {
                 continue;
             };
             if self
-                .valid_passes(registration, &semantic_ref, hash, at)?
+                .valid_passes(registration, claim, &semantic_ref, hash, at)?
                 .len()
                 == 1
             {
@@ -1136,19 +1143,19 @@ impl<'a> ProviderStore<'a> {
     fn valid_passes(
         &self,
         registration: &ProviderRegistration,
+        claim: &ProviderCapability,
         semantic_ref: &str,
         contract_hash: &str,
         at: OffsetDateTime,
     ) -> Result<Vec<(String, String, String)>> {
-        let manifest = self.verified_manifest(registration)?;
-        let matching_claim = manifest.provides.iter().find(|claim| {
+        let matches_claim = {
             let major = claim.contract.version.split('.').next().unwrap_or("");
             semantic_ref == format!("{}@{major}", claim.contract.capability)
                 && claim.contract.contract_hash.as_deref() == Some(contract_hash)
-        });
-        let Some(claim) = matching_claim else {
-            return Ok(Vec::new());
         };
+        if !matches_claim {
+            return Ok(Vec::new());
+        }
         let suite_id = &claim.conformance.suite;
         let Some(suite_hash) = claim.conformance.suite_hash.as_deref() else {
             return Ok(Vec::new());
@@ -1250,29 +1257,83 @@ impl<'a> ProviderStore<'a> {
             )
             .optional()?
             .ok_or(ProviderStoreError::NotFound)?;
-        let (value, manifest) = parse_manifest(manifest_json.as_bytes())?;
-        let canonical = canonical_text(&value)?;
-        let hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", canonical.as_bytes());
-        let id = digest(
-            b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
-            format!(
-                "{}\0{}\0{}\0{}",
-                manifest.id, manifest.version, hash, registration.build_hash
-            )
-            .as_bytes(),
-        );
-        if canonical != manifest_json
-            || hash != registration.manifest_hash
-            || id != registration.registration_id
-            || manifest.id != registration.provider_id
-            || manifest.version != registration.provider_version
-        {
-            return Err(ProviderStoreError::Conflict(
-                "stored provider manifest does not match registration identity",
-            ));
-        }
-        Ok(manifest)
+        verified_manifest_payload(&manifest_json, registration)
     }
+}
+
+fn verified_manifest_payload(
+    manifest_json: &str,
+    registration: &ProviderRegistration,
+) -> Result<CapabilityManifest> {
+    let (value, manifest) = parse_manifest(manifest_json.as_bytes())?;
+    let canonical = canonical_text(&value)?;
+    let hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", canonical.as_bytes());
+    let id = digest(
+        b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+        format!(
+            "{}\0{}\0{}\0{}",
+            manifest.id, manifest.version, hash, registration.build_hash
+        )
+        .as_bytes(),
+    );
+    if canonical != manifest_json
+        || hash != registration.manifest_hash
+        || id != registration.registration_id
+        || manifest.id != registration.provider_id
+        || manifest.version != registration.provider_version
+    {
+        return Err(ProviderStoreError::Conflict(
+            "stored provider manifest does not match registration identity",
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Bounded, schema-valid projection for the Task Manager binding gate.
+pub(crate) fn manifest_claim_matches_registration(
+    manifest_json: &str,
+    registration: &ProviderRegistration,
+    semantic_capability_ref: &str,
+    contract_version: &str,
+    contract_hash: &str,
+    suite_id: &str,
+    suite_hash: &str,
+) -> bool {
+    let Ok(manifest) = verified_manifest_payload(manifest_json, registration) else {
+        return false;
+    };
+    let Ok(version) = crate::FullVersion::parse(contract_version) else {
+        return false;
+    };
+    let Some((base, major)) = semantic_capability_ref.rsplit_once('@') else {
+        return false;
+    };
+    if major != version.major.to_string()
+        || !is_sha256_id(contract_hash)
+        || !is_sha256_id(suite_hash)
+    {
+        return false;
+    }
+    let mut claim_keys = BTreeSet::new();
+    if manifest
+        .provides
+        .iter()
+        .any(|claim| !claim_keys.insert((&claim.contract.capability, &claim.contract.version)))
+    {
+        return false;
+    }
+    manifest
+        .provides
+        .iter()
+        .filter(|claim| {
+            claim.contract.capability == base
+                && claim.contract.version == contract_version
+                && claim.contract.contract_hash.as_deref() == Some(contract_hash)
+                && claim.conformance.suite == suite_id
+                && claim.conformance.suite_hash.as_deref() == Some(suite_hash)
+        })
+        .count()
+        == 1
 }
 
 #[allow(
@@ -1514,6 +1575,8 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
 }
 
 fn parse_manifest(raw: &[u8]) -> Result<(Value, CapabilityManifest)> {
+    #[cfg(test)]
+    MANIFEST_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     let value = parse_document(
         raw,
         MAX_MANIFEST_BYTES,
@@ -5285,5 +5348,110 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn evidence_selection_parses_each_verified_manifest_once() {
+        let (mut connection, registry) = setup();
+        let mut manifest = two_claim_manifest(&registry);
+        manifest["publisher"]["name"] = json!("x".repeat(900_000));
+        let hash = manifest["provides"][1]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let mut last_claim_first = manifest.clone();
+        last_claim_first["provides"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        let mut final_claim_evidence = evidence(&last_claim_first, BUILD_A, "pass");
+        final_claim_evidence["semantic_capability_ref"] = json!("table.normalize@1");
+        final_claim_evidence["conformance_suite"]["hash"] = json!(SUITE_HASH_B);
+        store
+            .record_evidence(&registration.registration_id, &bytes(&final_claim_evidence))
+            .unwrap();
+        let before_enable = MANIFEST_PARSE_COUNT.with(std::cell::Cell::get);
+        store.enable(&registration.registration_id, NOW).unwrap();
+        assert_eq!(
+            MANIFEST_PARSE_COUNT.with(std::cell::Cell::get) - before_enable,
+            1
+        );
+        let before_lookup = MANIFEST_PARSE_COUNT.with(std::cell::Cell::get);
+        assert_eq!(
+            store
+                .eligible_candidates("table.normalize@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            MANIFEST_PARSE_COUNT.with(std::cell::Cell::get) - before_lookup,
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_manifest_projection_rejects_schema_duplicate_claim_and_wrong_identity() {
+        let (connection, registry) = setup();
+        crate::register_strict_json_sqlite(&connection).unwrap();
+        let mut value = manifest(&registry);
+        let claim = value["provides"][0].clone();
+        let contract_hash = claim["contract"]["contract_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let suite_id = claim["conformance"]["suite"].as_str().unwrap().to_owned();
+        let suite_hash = claim["conformance"]["suite_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let accepts = |value: &Value, provider_id: &str| {
+            let raw = canonical_text(value).unwrap();
+            let manifest_hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", raw.as_bytes());
+            let registration_id = digest(
+                b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    value["id"].as_str().unwrap(),
+                    value["version"].as_str().unwrap(),
+                    manifest_hash,
+                    BUILD_A
+                )
+                .as_bytes(),
+            );
+            connection.query_row(
+                "SELECT aios_manifest_claim_matches_registration_v1(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![raw, registration_id, provider_id, value["version"].as_str().unwrap(), manifest_hash, BUILD_A,
+                    "artifact.hash@1", claim["contract"]["version"].as_str().unwrap(), contract_hash, suite_id, suite_hash],
+                |row| row.get::<_, bool>(0),
+            ).unwrap()
+        };
+        assert!(accepts(&value, value["id"].as_str().unwrap()));
+        assert!(!accepts(&value, "wrong-provider"));
+        value["provides"]
+            .as_array_mut()
+            .unwrap()
+            .push(claim.clone());
+        assert!(!accepts(&value, value["id"].as_str().unwrap()));
+        value["provides"].as_array_mut().unwrap().pop();
+        let mut different_suite = claim.clone();
+        different_suite["conformance"]["suite"] = json!("different-suite");
+        value["provides"]
+            .as_array_mut()
+            .unwrap()
+            .push(different_suite);
+        assert!(!accepts(&value, value["id"].as_str().unwrap()));
+        value["provides"].as_array_mut().unwrap().pop();
+        value["forbidden_property"] = json!(true);
+        assert!(!accepts(&value, value["id"].as_str().unwrap()));
     }
 }
