@@ -79,6 +79,18 @@ The root coordinator plans, delegates, integrates, commits, and writes the final
 
 The parent coordinator may run independent agents in parallel when their work does not depend on one another, but must wait for required review agents before declaring a gate passed.
 
+## Efficient review cadence
+
+The agent roles and required gates stay fixed. Improve the timing of feedback:
+
+1. Before a substantial implementation, map public contracts, trust boundaries, migration/recovery paths, and likely adversarial cases. Give the implementer and test auditor the same bounded acceptance criteria.
+2. Prefer smaller reviewable PRs or increments where the stage runbook permits. This changes packaging, not issue scope: every requirement and gate still needs evidence before the issue closes.
+3. Consolidate local correctness, test-audit, and required Astra findings into one repair plan before pushing a candidate. Run the complete required gate after changes and request GitHub-native review on a stable exact HEAD.
+4. Use the scheduled review loop while an external review is running. Do not request duplicate reviews or spend interactive turns polling an unchanged status. Repair substantive new findings, rerun the required gate, and request review on the new exact HEAD.
+5. Record actionable findings by source, head-changing review cycles, and available root/subagent usage in the handoff. Compare quality and consumption of completed work before changing model/reasoning routing; model names alone do not prove savings.
+
+Keep full end-to-end roadmap evidence, including Demonstration A integration, visible alongside issue and test counts. Passing a component gate is progress toward the system, not proof that the whole system works.
+
 ## Independence levels
 
 Not every review needs a fresh human-visible chat.
@@ -236,9 +248,7 @@ If a configured subagent/model cannot be spawned:
 
 ## Current transition
 
-PR #36 / Issue #17 is the final manually over-orchestrated workflow.
-
-After Issue #17 merges, Stage 1 should use this orchestration model by default:
+Issue #17 is closed and Stage 1 uses this orchestration model:
 
 ```text
 owner gives direction once
@@ -248,7 +258,7 @@ owner gives direction once
 → GitHub/Codex review loop
 → coordinator repairs through subagents or @codex
 → gate passes
-→ owner is asked only for merge/architecture decisions when needed
+→ owner is asked only for decisions that genuinely require them
 ```
 
 ## Principle
