@@ -37,7 +37,7 @@ pub use loader::{
 };
 pub use provider_store::{
     ProviderCandidate, ProviderHealth, ProviderRegistration, ProviderStore, ProviderStoreError,
-    ProviderTrustStatus,
+    ProviderTrustStatus, verified_provider_effective_trust, verify_provider_registration_receipt,
 };
 pub use store::{
     Activation, RegistryStore, RegistryStoreError, SnapshotState, StoreIdentity, StoreLock,

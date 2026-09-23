@@ -722,7 +722,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             &first,
             &serde_json::to_vec(&manifest).unwrap(),
             build,
-            ProviderTrustStatus::LocallyTrusted,
+            ProviderTrustStatus::Unverified,
             TEST_TIME,
         )
         .unwrap();
@@ -755,10 +755,64 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     binding.conformance_suite_id = manifest["provides"][0]["conformance"]["suite"]
         .as_str()
         .map(str::to_owned);
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(!verified_provider_admission(&transaction, &binding).unwrap());
+        transaction.rollback().unwrap();
+    }
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .admit_trust(
+            binding.provider_registration_id.as_deref().unwrap(),
+            "decision:fixture-promotion",
+            ProviderTrustStatus::LocallyTrusted,
+            "review:fixture-owner",
+            TEST_TIME,
+        )
+        .unwrap();
     let transaction = manager.connection.transaction().unwrap();
     assert!(verified_provider_admission(&transaction, &binding).unwrap());
     binding.registry_snapshot_id = first.snapshot_id().into();
     assert!(verified_provider_admission(&transaction, &binding).unwrap());
+    let original_receipt: String = transaction
+        .query_row(
+            "SELECT registration_json FROM provider_registrations WHERE registration_id=?1",
+            [binding.provider_registration_id.as_deref().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let original_value: Value = serde_json::from_str(&original_receipt).unwrap();
+    for (pointer, replacement) in [
+        ("/runtime/kind", json!("wasm")),
+        ("/runtime/minimum_isolation", json!("P3")),
+        ("/package/source_kind", json!("registry")),
+        ("/state", json!("registered")),
+        (
+            "/capabilities/0/representations",
+            json!({"artifact":["forged"]}),
+        ),
+    ] {
+        transaction.execute_batch("SAVEPOINT forged_provider_receipt; DROP TRIGGER provider_registration_identity_immutable;").unwrap();
+        let mut forged = original_value.clone();
+        *forged.pointer_mut(pointer).unwrap() = replacement;
+        transaction
+            .execute(
+                "UPDATE provider_registrations SET registration_json=?2 WHERE registration_id=?1",
+                params![
+                    binding.provider_registration_id.as_deref().unwrap(),
+                    canonical_json(&forged).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(
+            !verified_provider_admission(&transaction, &binding).unwrap(),
+            "forged receipt field {pointer} must not authorize launch"
+        );
+        transaction
+            .execute_batch("ROLLBACK TO forged_provider_receipt; RELEASE forged_provider_receipt;")
+            .unwrap();
+    }
     let suite_version = first
         .capability_contract("artifact.hash", 1)
         .unwrap()

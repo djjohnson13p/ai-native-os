@@ -3431,7 +3431,12 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "execution_binding_marker_no_delete",
     "provider_registration_trust_receipt_insert",
     "provider_registration_trust_immutable_update",
+    "provider_trust_admission_no_update",
+    "provider_trust_admission_no_delete",
+    "provider_trust_admission_no_duplicate_insert",
+    "provider_trust_admission_receipt_insert",
     "execution_binding_evidence_pin_required",
+    "execution_binding_evidence_not_future",
 ];
 
 const PROVIDER_LEGACY_GUARDS: &[&str] = &[
@@ -3485,7 +3490,7 @@ fn upgrade_stamped_registry_guards_fenced(
         semantic_stamped && missing_additive_guard(connection, SEMANTIC_ADDITIVE_GUARDS)?;
     let upgrade_provider = provider_stamped
         && (missing_additive_guard(connection, PROVIDER_ADDITIVE_GUARDS)?
-            || !marker_table_definition_current(connection, true, true)?);
+            || !provider_additive_tables_current(connection, true, true)?);
     if !upgrade_semantic && !upgrade_provider {
         return Ok(());
     }
@@ -3563,22 +3568,11 @@ fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn marker_table_definition_current(
+fn provider_additive_tables_current(
     connection: &Connection,
     stamped: bool,
     require_all: bool,
 ) -> Result<bool> {
-    let actual: Option<String> = connection.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_binding_admission_markers'",
-        [],
-        |row| row.get(0),
-    ).optional()?;
-    if !stamped {
-        return Ok(actual.is_none());
-    }
-    let Some(actual) = actual else {
-        return Ok(!require_all);
-    };
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
     canonical.execute_batch(include_str!(
@@ -3587,12 +3581,39 @@ fn marker_table_definition_current(
     canonical.execute_batch(include_str!(
         "../../../specs/persistence-v0.1-0013-provider-registry.sql"
     ))?;
-    let expected: String = canonical.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_binding_admission_markers'",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(normalize_schema_sql(&actual) == normalize_schema_sql(&expected))
+    for name in [
+        "execution_binding_admission_markers",
+        "provider_trust_admissions",
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !stamped {
+            if actual.is_some() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let Some(actual) = actual else {
+            if require_all {
+                return Ok(false);
+            }
+            continue;
+        };
+        let expected: String = canonical.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn preflight_migration_state_allowing_guard_upgrade(connection: &Connection) -> Result<()> {
@@ -3970,7 +3991,7 @@ fn preflight_migration_state_with_mode(
                 "provider registry migration is incomplete",
             ));
         }
-        if !marker_table_definition_current(
+        if !provider_additive_tables_current(
             connection,
             has_provider_registry,
             require_additive_guards,
@@ -6580,6 +6601,40 @@ fn verified_provider_admission(
     {
         return Ok(false);
     }
+    let admitted_registration = aios_registry::ProviderRegistration {
+        registration_id: registration_id.to_owned(),
+        provider_id: provider_id.clone(),
+        provider_version: version.clone(),
+        manifest_hash: manifest_hash.clone(),
+        build_hash: build_hash.clone(),
+        snapshot_id: snapshot_id.clone(),
+    };
+    if aios_registry::verify_provider_registration_receipt(
+        &admitted_registration,
+        &manifest,
+        &trust_status,
+        &registered_at,
+        &receipt_json,
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    let Ok(effective_trust) = aios_registry::verified_provider_effective_trust(
+        transaction,
+        &admitted_registration,
+        &manifest,
+    ) else {
+        return Ok(false);
+    };
+    if !matches!(
+        effective_trust,
+        aios_registry::ProviderTrustStatus::LocallyTrusted
+            | aios_registry::ProviderTrustStatus::ProjectReviewed
+            | aios_registry::ProviderTrustStatus::OrganizationApproved
+    ) {
+        return Ok(false);
+    }
     let Ok(receipt) = aios_registry::parse_strict_value(receipt_json.as_bytes(), limits) else {
         return Ok(false);
     };
@@ -6950,7 +7005,6 @@ fn binding_grants_valid(
              JOIN provider_registrations r ON r.registration_id = b.provider_registration_id
                 AND r.provider_id = b.provider_id AND r.provider_version = b.provider_version
                 AND r.state = 'registered'
-                AND r.trust_status IN ('locally-trusted', 'project-reviewed', 'organization-approved')
                 AND r.manifest_hash = b.provider_manifest_hash
                 AND r.package_content_hash = b.provider_build_hash
              JOIN provider_conformance_evidence c ON c.evidence_id = ?6
@@ -8845,7 +8899,7 @@ mod tests {
         let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
         assert!(preflight_migration_state(&reopened.connection).is_ok());
         assert!(!missing_additive_guard(&reopened.connection, PROVIDER_ADDITIVE_GUARDS).unwrap());
-        assert!(marker_table_definition_current(&reopened.connection, true, true).unwrap());
+        assert!(provider_additive_tables_current(&reopened.connection, true, true).unwrap());
         let after: (String, String) = reopened
             .connection
             .query_row(

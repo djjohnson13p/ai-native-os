@@ -62,6 +62,48 @@ BEFORE UPDATE OF trust_status ON provider_registrations
 WHEN NEW.trust_status IS NOT OLD.trust_status
 BEGIN SELECT RAISE(ABORT, 'provider trust cannot change without new admission'); END;
 
+-- A later review of the same exact build is an appended decision, not a rewrite
+-- of its original registration receipt or a second build identity.
+CREATE TABLE IF NOT EXISTS provider_trust_admissions (
+    admission_id TEXT PRIMARY KEY,
+    registration_id TEXT NOT NULL REFERENCES provider_registrations(registration_id),
+    decision_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    trust_status TEXT NOT NULL CHECK (trust_status IN
+        ('locally-trusted','project-reviewed','organization-approved')),
+    authority_ref TEXT NOT NULL,
+    admitted_at TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    UNIQUE (registration_id, decision_id),
+    UNIQUE (registration_id, revision)
+);
+CREATE TRIGGER IF NOT EXISTS provider_trust_admission_no_update
+BEFORE UPDATE ON provider_trust_admissions
+BEGIN SELECT RAISE(ABORT, 'provider trust admission is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_trust_admission_no_delete
+BEFORE DELETE ON provider_trust_admissions
+BEGIN SELECT RAISE(ABORT, 'provider trust admission cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS provider_trust_admission_no_duplicate_insert
+BEFORE INSERT ON provider_trust_admissions
+WHEN EXISTS (SELECT 1 FROM provider_trust_admissions
+    WHERE admission_id=NEW.admission_id
+       OR (registration_id=NEW.registration_id AND decision_id=NEW.decision_id)
+       OR (registration_id=NEW.registration_id AND revision=NEW.revision))
+BEGIN SELECT RAISE(ABORT, 'provider trust admission cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS provider_trust_admission_receipt_insert
+BEFORE INSERT ON provider_trust_admissions
+WHEN CASE WHEN json_valid(NEW.receipt_json) THEN
+    json_extract(NEW.receipt_json,'$.registration_id') IS NOT NEW.registration_id
+    OR json_extract(NEW.receipt_json,'$.decision_id') IS NOT NEW.decision_id
+    OR json_extract(NEW.receipt_json,'$.revision') IS NOT NEW.revision
+    OR json_extract(NEW.receipt_json,'$.trust_status') IS NOT NEW.trust_status
+    OR json_extract(NEW.receipt_json,'$.authority_ref') IS NOT NEW.authority_ref
+    OR json_extract(NEW.receipt_json,'$.admitted_at') IS NOT NEW.admitted_at
+    OR NEW.revision IS NOT COALESCE((SELECT MAX(revision)+1
+        FROM provider_trust_admissions WHERE registration_id=NEW.registration_id),1)
+    ELSE 1 END
+BEGIN SELECT RAISE(ABORT, 'provider trust admission receipt mismatch'); END;
+
 CREATE TRIGGER IF NOT EXISTS provider_registration_revocation_terminal
 BEFORE UPDATE OF state ON provider_registrations
 WHEN OLD.state = 'revoked' AND NEW.state <> 'revoked'
@@ -138,6 +180,36 @@ WHEN json_valid(NEW.binding_json)
       AND status='pass'
 )
 BEGIN SELECT RAISE(ABORT, 'binding conformance evidence was not admitted'); END;
+
+-- A pinned result must have existed by the binding's declared creation time.
+-- Compare UTC seconds and then all nine fractional digits; julianday alone
+-- rounds at millisecond precision and raw RFC 3339 text compares offsets wrong.
+CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_not_future
+BEFORE INSERT ON execution_bindings
+WHEN NOT EXISTS (
+    WITH pin AS (
+        SELECT tested_at FROM provider_conformance_evidence
+        WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+    ), times AS (
+        SELECT
+            CAST(strftime('%s', tested_at) AS INTEGER) AS tested_second,
+            CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
+            substr(CASE WHEN substr(tested_at,20,1)='.' THEN
+                substr(tested_at,21,
+                    instr(replace(replace(substr(tested_at,21),'+','Z'),'-','Z'),'Z')-1)
+                ELSE '' END || '000000000',1,9) AS tested_fraction,
+            substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                substr(NEW.created_at,21,
+                    instr(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'Z')-1)
+                ELSE '' END || '000000000',1,9) AS created_fraction
+        FROM pin
+    )
+    SELECT 1 FROM times
+    WHERE tested_second IS NOT NULL AND created_second IS NOT NULL
+      AND (tested_second < created_second OR
+           (tested_second = created_second AND tested_fraction <= created_fraction))
+)
+BEGIN SELECT RAISE(ABORT, 'binding predates pinned conformance evidence'); END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_admission_marker_insert
 BEFORE INSERT ON execution_bindings
