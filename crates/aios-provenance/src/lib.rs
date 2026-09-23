@@ -724,11 +724,9 @@ pub fn verify_records(
         verified_at,
     ))
 }
-/// Produces a separately hashed privacy-redacted projection and manifest.
-///
-/// # Errors
-/// Returns an error when the stream is invalid, unsafe to export, or cannot be read.
-pub fn export_jsonl(
+// Fixture-only shortcut. Normal exports must validate the private Task row.
+#[cfg(test)]
+fn export_jsonl(
     connection: &Connection,
     stream_id: &str,
     verified_at: &str,
@@ -736,8 +734,18 @@ pub fn export_jsonl(
     export_jsonl_with_validation(connection, stream_id, verified_at, |_| Ok(()))
 }
 
-/// Exports one snapshot after the caller validates its private Task state in
-/// that same transaction. The callback must not commit or mutate the journal.
+/// Low-level export primitive for trusted Task integrations. The callback MUST
+/// validate the private Task row in this same snapshot, including its nonce,
+/// creation commitment, and current state against the committed journal. It
+/// must not commit or mutate the journal. Task Manager's `export_provenance` is
+/// the normal Task-facing export API.
+///
+/// The callback-free fixture shortcut is intentionally unavailable to external
+/// callers:
+///
+/// ```compile_fail
+/// use aios_provenance::export_jsonl;
+/// ```
 ///
 /// # Errors
 /// Returns an error when validation, verification, projection, or storage fails.

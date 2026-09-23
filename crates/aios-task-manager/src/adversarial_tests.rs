@@ -665,7 +665,92 @@ fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() 
         manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id=?1", [task_id], |row| row.get::<_, String>(0)).unwrap(),
         "0.1:aios-provenance-event-v0.1"
     );
-    assert!(!provenance_task_fk_cascades(&manager.connection).unwrap());
+    assert!(provenance_task_fk_is_current(&manager.connection).unwrap());
+}
+
+#[test]
+fn stamped_provenance_table_without_task_fk_rejects_orphan_stream() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("stamped-missing-provenance-fk.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-fk-original")).unwrap();
+        assert!(provenance_task_fk_is_current(&manager.connection).unwrap());
+    }
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER provenance_events_no_update;
+         DROP TRIGGER provenance_events_no_delete;
+         CREATE TABLE provenance_events_without_fk AS SELECT * FROM provenance_events;
+         DROP TABLE provenance_events;
+         ALTER TABLE provenance_events_without_fk RENAME TO provenance_events;",
+        )
+        .unwrap();
+    let raw: String = connection
+        .query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-fk-original'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut orphan: Value = serde_json::from_str(&raw).unwrap();
+    orphan["task_id"] = serde_json::json!("T-fk-orphan");
+    orphan["event_id"] = serde_json::json!("event:fk-orphan");
+    let orphan_stream = aios_provenance::stream_id("T-fk-orphan").unwrap();
+    let orphan_hash = aios_provenance::hash_record(&orphan_stream, 1, None, &orphan).unwrap();
+    connection.execute(
+        "UPDATE provenance_events SET task_id='T-fk-orphan',stream_id=?1,event_id='event:fk-orphan',event_hash=?2,event_json=?3",
+        rusqlite::params![orphan_stream, orphan_hash, orphan.to_string()],
+    ).unwrap();
+    assert!(!provenance_task_fk_is_current(&connection).unwrap());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id='T-fk-orphan'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    assert!(matches!(
+        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+        Err(TaskManagerError::InvalidRecord(
+            "provenance service-boundary migration is incomplete"
+        ))
+    ));
+}
+
+#[test]
+fn provenance_task_fk_rejects_extra_cascading_constraint() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+         CREATE TABLE provenance_events(
+             task_id TEXT NOT NULL,
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+         );",
+        )
+        .unwrap();
+    assert!(!provenance_task_fk_is_current(&connection).unwrap());
 }
 
 #[test]
@@ -989,7 +1074,11 @@ fn portable_export_rejects_private_task_and_journal_disagreement() {
         manager.create_task(&create(task_id)).unwrap();
         assert!(manager.export_provenance(task_id).is_ok());
         manager.connection.execute(tamper, [task_id]).unwrap();
-        assert!(manager.export_provenance(task_id).is_err(), "{task_id}");
+        let error = manager.export_provenance(task_id).unwrap_err();
+        assert!(
+            matches!(error, TaskManagerError::InvalidRecord(_)),
+            "{task_id}: {error}"
+        );
     }
 
     let task_id = "T-export-terminal-bad-nonce";
@@ -1013,6 +1102,34 @@ fn portable_export_rejects_private_task_and_journal_disagreement() {
         )
         .unwrap();
     assert!(manager.export_provenance(task_id).is_err());
+}
+
+#[test]
+fn portable_export_preserves_storage_failure_from_task_validation() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-export-storage-fault";
+    manager.create_task(&create(task_id)).unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute_batch("DROP TABLE task_artifacts")
+        .unwrap();
+    let error = manager.export_provenance(task_id).unwrap_err();
+    assert!(matches!(error, TaskManagerError::Storage(_)), "{error}");
+}
+
+#[test]
+fn portable_export_preserves_storage_failure_from_task_row_read() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-export-row-read-fault";
+    manager.create_task(&create(task_id)).unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE tasks")
+        .unwrap();
+    let error = manager.export_provenance(task_id).unwrap_err();
+    assert!(matches!(error, TaskManagerError::Storage(_)), "{error}");
 }
 
 #[test]

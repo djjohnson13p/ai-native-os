@@ -2639,24 +2639,37 @@ impl TaskManager {
     /// Returns an error when the stream is invalid, unsafe to export, or cannot be read.
     pub fn export_provenance(&self, task_id: &str) -> Result<ProvenancePortableExport> {
         let stream_id = aios_provenance::stream_id(task_id)?;
-        Ok(aios_provenance::export_jsonl_with_validation(
+        let mut validation_error = None;
+        let export = aios_provenance::export_jsonl_with_validation(
             &self.connection,
             &stream_id,
             &self.clock.now(),
             |connection| {
-                let (revision, state): (i64, String) = connection.query_row(
-                    "SELECT revision, state FROM tasks WHERE task_id = ?1",
-                    [task_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
+                let (revision, state): (i64, String) = connection
+                    .query_row(
+                        "SELECT revision, state FROM tasks WHERE task_id = ?1",
+                        [task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| {
+                        validation_error = Some(TaskManagerError::Storage(error));
+                        aios_provenance::Error::InvalidRecord(
+                            "Task security state cannot be read".to_owned(),
+                        )
+                    })?;
                 self.verify_task_head(task_id, revision, &state)
-                    .map_err(|_| {
+                    .map_err(|error| {
+                        validation_error = Some(error);
                         aios_provenance::Error::InvalidRecord(
                             "Task security state does not match committed provenance".to_owned(),
                         )
                     })
             },
-        )?)
+        );
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        Ok(export?)
     }
 
     fn verify_all_provenance_chains(&self) -> Result<()> {
@@ -3633,7 +3646,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         if has_v11
             && (!table_has_column(connection, "provenance_events", "schema_version")?
                 || !table_has_column(connection, "provenance_events", "hash_profile")?
-                || provenance_task_fk_cascades(connection)?)
+                || !provenance_task_fk_is_current(connection)?)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "provenance service-boundary migration is incomplete",
@@ -3754,7 +3767,7 @@ fn migrate_task_manager_schema(
     let provenance_requires_rebuild =
         !table_has_column(connection, "provenance_events", "schema_version")?
             || !table_has_column(connection, "provenance_events", "hash_profile")?
-            || provenance_task_fk_cascades(connection)?;
+            || !provenance_task_fk_is_current(connection)?;
     let foreign_key_rebuild =
         transition_has_foreign_key || operations_require_rebuild || provenance_requires_rebuild;
     let foreign_keys_enabled =
@@ -4423,22 +4436,40 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
     Ok(false)
 }
 
-fn provenance_task_fk_cascades(connection: &Connection) -> Result<bool> {
+fn provenance_task_fk_is_current(connection: &Connection) -> Result<bool> {
     let mut statement = connection.prepare("PRAGMA foreign_key_list(provenance_events)")?;
     let rows = statement.query_map([], |row| {
         Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
         ))
     })?;
-    for row in rows {
-        let (table, from, on_delete) = row?;
-        if table == "tasks" && from == "task_id" && on_delete.eq_ignore_ascii_case("CASCADE") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let foreign_keys = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(foreign_keys
+        .iter()
+        .filter(|(_, _, table, from, ..)| table == "tasks" || from == "task_id")
+        .count()
+        == 1
+        && foreign_keys
+            .iter()
+            .any(|(id, sequence, table, from, to, on_update, on_delete)| {
+                *sequence == 0
+                    && table == "tasks"
+                    && from == "task_id"
+                    && to == "task_id"
+                    && on_update.eq_ignore_ascii_case("NO ACTION")
+                    && on_delete.eq_ignore_ascii_case("NO ACTION")
+                    && foreign_keys
+                        .iter()
+                        .filter(|(other_id, ..)| other_id == id)
+                        .count()
+                        == 1
+            }))
 }
 
 fn table_column_not_null(connection: &Connection, table: &str, column: &str) -> Result<bool> {

@@ -125,6 +125,12 @@ domains separate from the journal hash. Offline verification is explicitly
 limited to `scope=exported-projection` and proves neither original-chain validity
 nor linkage to the authoritative journal.
 
+Normal Task-facing export must also validate the private Task row, nonce,
+creation commitment, and current state against that journal in the same
+snapshot. The provenance library's callback-based exporter is a trusted
+integration primitive; it does not infer Task security state on its own.
+There is no public callback-free export shortcut.
+
 The projection validator is path- and event-specific: it checks required
 non-null fields, exact nested keys, fixed enums and scalar types, commitment
 field discriminators, and the namespace of every alias, including approval
@@ -146,6 +152,9 @@ producer relying on the former permissive schema must correct any event the
 runtime already rejected. The positive chain fixture uses the opaque derived
 stream ID required by the existing runtime; its Task ID and semantic payload
 remain unchanged.
+The former public callback-free `export_jsonl` shortcut is internal to tests;
+integrations must provide same-snapshot Task validation through the trusted
+callback exporter or use `TaskManager::export_provenance`.
 
 ## Related
 
