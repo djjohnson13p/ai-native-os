@@ -160,6 +160,7 @@ impl<'a> ProviderStore<'a> {
     /// Opens a fully migrated provider registry. Task Manager installs or
     /// upgrades the schema under its store lock and durable ownership fence.
     pub fn initialize(connection: &'a mut Connection) -> Result<Self> {
+        crate::register_strict_json_sqlite(connection)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let baseline: Option<String> = connection.query_row(
@@ -1298,6 +1299,8 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "provider_registration_identity_immutable"),
         ("trigger", "provider_registration_no_delete"),
         ("trigger", "provider_registration_revocation_terminal"),
+        ("trigger", "provider_registration_revoked_epoch_insert"),
+        ("trigger", "provider_registration_revoked_epoch_update"),
         ("trigger", "provider_registration_no_initial_enablement"),
         ("trigger", "provider_registration_state_transition_clock"),
         (
@@ -1925,6 +1928,53 @@ mod tests {
     const SUITE_HASH_B: &str =
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const NOW: &str = "2026-09-22T12:00:00Z";
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test fixture exposes every admission identity varied by the focused cases"
+    )]
+    fn synthetic_binding_receipt(
+        suffix: &str,
+        attempt: i64,
+        created_at: &str,
+        evidence_id: Option<&str>,
+        trust_source: &str,
+        registration: &ProviderRegistration,
+        registry: &SemanticRegistry,
+        manifest: &Value,
+    ) -> Value {
+        let mut receipt = json!({
+            "schema_version": "0.1",
+            "binding_id": format!("binding-{suffix}"),
+            "attempt_id": format!("attempt-{suffix}"),
+            "task_id": "synthetic-task",
+            "semantic_program_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "registry_snapshot_id": registry.snapshot_id(),
+            "ir_version": "0.1",
+            "node_id": "synthetic-node",
+            "capability": "artifact.hash@1",
+            "capability_contract_hash": manifest["provides"][0]["contract"]["contract_hash"],
+            "provider": {
+                "id": registration.provider_id,
+                "version": registration.provider_version,
+                "manifest_hash": registration.manifest_hash,
+                "package_or_build_hash": registration.build_hash
+            },
+            "provider_trust_source_id": trust_source,
+            "attempt": attempt,
+            "policy_decision_refs": [],
+            "authority": {"grant_refs": []},
+            "execution_profile": {"profile_ref": "synthetic-profile"},
+            "placement": {},
+            "inputs": {},
+            "outputs": {},
+            "created_at": created_at
+        });
+        if let Some(evidence_id) = evidence_id {
+            receipt["conformance_evidence_id"] = evidence_id.into();
+        }
+        receipt
+    }
 
     fn seed_test_registry_schemas(connection: &Connection) {
         connection.execute(
@@ -2714,6 +2764,16 @@ mod tests {
     fn migration_preflight_authenticates_new_lifecycle_and_binding_guards() {
         for (name, table, event) in [
             (
+                "provider_registration_revoked_epoch_insert",
+                "provider_registrations",
+                "INSERT",
+            ),
+            (
+                "provider_registration_revoked_epoch_update",
+                "provider_registrations",
+                "UPDATE",
+            ),
+            (
                 "provider_registration_no_initial_enablement",
                 "provider_registrations",
                 "INSERT",
@@ -2743,6 +2803,15 @@ mod tests {
             connection
                 .execute_batch(&format!("DROP TRIGGER {name}"))
                 .unwrap();
+            assert!(
+                matches!(
+                    ProviderStore::initialize(&mut connection),
+                    Err(ProviderStoreError::Conflict(
+                        "provider registry migration is incomplete"
+                    ))
+                ),
+                "reader opened with missing {name}"
+            );
             assert!(
                 matches!(
                     ProviderStore::initialize_unfenced_fixture(&mut connection),
@@ -3079,6 +3148,23 @@ mod tests {
                          binding_json: &str,
                          attempt: i64,
                          created_at: &str| {
+            let receipt_json = match serde_json::from_str::<Value>(binding_json) {
+                Ok(Value::Object(overrides)) => {
+                    let mut receipt = synthetic_binding_receipt(
+                        suffix,
+                        attempt,
+                        created_at,
+                        None,
+                        &registration.registration_id,
+                        &registration,
+                        &registry,
+                        &manifest,
+                    );
+                    receipt.as_object_mut().unwrap().extend(overrides);
+                    receipt.to_string()
+                }
+                _ => binding_json.to_owned(),
+            };
             connection.execute(
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
@@ -3096,7 +3182,7 @@ mod tests {
                     registration.registration_id,
                     registration.provider_id,
                     registration.provider_version,
-                    binding_json,
+                    receipt_json,
                     created_at,
                     attempt,
                     registration.manifest_hash,
@@ -3250,10 +3336,10 @@ mod tests {
             params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                 manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                 registration.registration_id,registration.provider_id,registration.provider_version,
-                json!({"conformance_evidence_id":pin,
-                    "provider_trust_source_id":registration.registration_id,
-                    "provider":{"id":registration.provider_id,"version":registration.provider_version,
-                        "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash}}).to_string(),
+                 synthetic_binding_receipt(
+                     suffix, attempt, created_at, Some(pin), &registration.registration_id,
+                     &registration, &registry, &manifest,
+                 ).to_string(),
                 created_at,attempt,registration.manifest_hash,registration.build_hash])
         };
         assert!(insert("before", "2026-09-22T11:00:00.999999998Z", &evidence_id, 1).is_err());
@@ -3344,10 +3430,10 @@ mod tests {
                 params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                     manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                     registration.registration_id,registration.provider_id,registration.provider_version,
-                    attempt,json!({"conformance_evidence_id":evidence_id,
-                        "provider_trust_source_id":predicted,
-                        "provider":{"id":registration.provider_id,"version":registration.provider_version,
-                            "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash}}).to_string(),
+                     attempt,synthetic_binding_receipt(
+                         suffix, attempt, created_at, Some(&evidence_id), predicted,
+                         &registration, &registry, &manifest,
+                     ).to_string(),
                     created_at,registration.manifest_hash,registration.build_hash],
             )
         };

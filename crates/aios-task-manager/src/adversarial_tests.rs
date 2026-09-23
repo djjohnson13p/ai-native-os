@@ -14,6 +14,25 @@ const TEST_TIME: &str = "2026-09-19T00:00:00Z";
 const COMPLETION_ARTIFACT_ID: &str =
     "artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe";
 
+fn verified_provider_admission_from_binding(
+    transaction: &Transaction<'_>,
+    binding_id: &str,
+    binding: &BindingEvidence,
+    checked_at: &str,
+) -> Result<bool> {
+    let Ok(receipt) =
+        aios_registry::BindingReceiptProjection::parse(binding.binding_json.as_bytes())
+    else {
+        return Ok(false);
+    };
+    verified_provider_admission(transaction, binding_id, binding, checked_at, &receipt)
+}
+
+fn conformance_pin_matches(value: &Value, latest_id: &str, required: bool) -> bool {
+    aios_registry::BindingReceiptProjection::parse(value.to_string().as_bytes())
+        .is_ok_and(|receipt| receipt.evidence_pin_matches(latest_id, required))
+}
+
 struct FixedClock;
 
 impl Clock for FixedClock {
@@ -927,6 +946,16 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         )
         .unwrap();
     let binding_receipt = canonical_json(&json!({
+        "schema_version": "0.1",
+        "binding_id": "binding-real-receipt",
+        "attempt_id": "attempt-real-receipt",
+        "task_id": "T-real-receipt",
+        "semantic_program_hash": HASH,
+        "registry_snapshot_id": second.snapshot_id(),
+        "ir_version": "0.1",
+        "node_id": "node-real",
+        "capability": "artifact.hash@1",
+        "capability_contract_hash": binding.contract_hash,
         "conformance_evidence_id": "cross-snapshot-pass",
         "provider_trust_source_id": trust_source_id,
         "provider": {
@@ -935,6 +964,14 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             "manifest_hash": binding.provider_manifest_hash,
             "package_or_build_hash": binding.provider_build_hash,
         },
+        "attempt": 1,
+        "policy_decision_refs": [],
+        "authority": {"grant_refs": []},
+        "execution_profile": {"profile_ref": "profile:test"},
+        "placement": {},
+        "inputs": {},
+        "outputs": {},
+        "created_at": TEST_TIME,
     }))
     .unwrap();
     binding.binding_json = binding_receipt.clone();
@@ -975,8 +1012,13 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     {
         let transaction = manager.connection.transaction().unwrap();
         assert!(
-            verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
-                .unwrap()
+            verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap()
         );
         let original_receipt = binding.binding_json.clone();
         binding.binding_json = canonical_json(&json!({
@@ -985,8 +1027,13 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         }))
         .unwrap();
         assert!(
-            !verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
-                .unwrap(),
+            !verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap(),
             "a binding receipt must identify its durable trust source"
         );
         binding.binding_json = original_receipt;
@@ -1006,12 +1053,17 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     {
         let transaction = manager.connection.transaction().unwrap();
         assert!(
-            verified_provider_admission(&transaction, "binding-real-receipt", &binding, TEST_TIME)
-                .unwrap(),
+            verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap(),
             "a future trust decision must not invalidate the current binding early"
         );
         assert!(
-            !verified_provider_admission(
+            !verified_provider_admission_from_binding(
                 &transaction,
                 "binding-real-receipt",
                 &binding,
@@ -1318,6 +1370,13 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         receipt["provider"]["manifest_hash"] = registration.manifest_hash.clone().into();
         receipt["provider"]["package_or_build_hash"] = registration.build_hash.clone().into();
         receipt["outputs"]["report"]["allocation_ref"] = allocation_id.clone().into();
+        let receipt_json = canonical_json(&receipt).unwrap();
+        // Formatting is not receipt identity; the typed projection is.
+        let receipt_json = if attempt == 14 {
+            format!(" \n{receipt_json}")
+        } else {
+            receipt_json
+        };
         manager.connection.execute(
             "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
              registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
@@ -1328,7 +1387,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
              ?5,?6,?7,?8,?9,?10,?11,'[]','[]','profile:test','{\"locality\":\"local\"}',?12,?13)",
             params![binding_id,attempt_id,HASH,registry.snapshot_id(),contract_hash,
                 registration.registration_id,registration.provider_id,registration.provider_version,
-                registration.manifest_hash,registration.build_hash,attempt,canonical_json(&receipt).unwrap(),created_at],
+                 registration.manifest_hash,registration.build_hash,attempt,receipt_json,created_at],
         ).unwrap();
         manager.connection.execute(
             "INSERT INTO artifact_output_allocations(allocation_id,task_id,semantic_program_hash,node_id,
@@ -1374,6 +1433,34 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             .unwrap(),
     )
     .unwrap();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence
+         (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+          status,evidence_json,tested_at)
+         SELECT 'E-other',registration_id,capability,contract_hash,'suite:other',
+                suite_hash,
+                status,json_set(evidence_json,'$.result_id','E-other',
+                                '$.conformance_suite.id','suite:other'),
+                tested_at
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+            [],
+        )
+        .unwrap();
+    manager.connection.execute(
+        "INSERT INTO provider_conformance_evidence
+         (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+          status,evidence_json,tested_at)
+         SELECT 'E-other-hash',registration_id,capability,contract_hash,suite_id,
+                'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                status,json_set(evidence_json,'$.result_id','E-other-hash',
+                                '$.conformance_suite.hash',
+                                'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'),
+                tested_at
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+        [],
+    ).unwrap();
     for mismatch in [
         "id",
         "version",
@@ -1384,6 +1471,26 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "missing-manifest",
         "duplicate-provider-id",
         "duplicate-provider-object",
+        "schema-version",
+        "binding-id",
+        "attempt-id",
+        "task-id",
+        "semantic-program-hash",
+        "registry-snapshot-id",
+        "ir-version",
+        "node-id",
+        "capability",
+        "contract-hash",
+        "attempt",
+        "created-at",
+        "policy-decisions",
+        "grant-refs",
+        "execution-profile",
+        "placement",
+        "inputs",
+        "outputs",
+        "suite-id",
+        "suite-hash",
     ] {
         let mut receipt = first_receipt.clone();
         receipt["binding_id"] = "binding-real-5".into();
@@ -1409,6 +1516,28 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             "duplicate-provider-id" | "duplicate-provider-object" => {
                 receipt["provider"]["id"] = "provider:forged".into();
             }
+            "schema-version" => receipt["schema_version"] = "wrong".into(),
+            "binding-id" => receipt["binding_id"] = "binding:wrong".into(),
+            "attempt-id" => receipt["attempt_id"] = "attempt:wrong".into(),
+            "task-id" => receipt["task_id"] = "task:wrong".into(),
+            "semantic-program-hash" => receipt["semantic_program_hash"] = "sha256:wrong".into(),
+            "registry-snapshot-id" => receipt["registry_snapshot_id"] = "snapshot:wrong".into(),
+            "ir-version" => receipt["ir_version"] = "wrong".into(),
+            "node-id" => receipt["node_id"] = "node:wrong".into(),
+            "capability" => receipt["capability"] = "wrong@1".into(),
+            "contract-hash" => receipt["capability_contract_hash"] = "sha256:wrong".into(),
+            "attempt" => receipt["attempt"] = "5".into(),
+            "created-at" => receipt["created_at"] = "2026-09-19T00:00:00.300Z".into(),
+            "policy-decisions" => receipt["policy_decision_refs"] = json!(["wrong"]),
+            "grant-refs" => receipt["authority"]["grant_refs"] = json!(["wrong"]),
+            "execution-profile" => {
+                receipt["execution_profile"]["profile_ref"] = "wrong".into();
+            }
+            "placement" => receipt["placement"] = json!({"locality":"wrong"}),
+            "inputs" => receipt["inputs"] = json!([]),
+            "outputs" => receipt["outputs"] = json!([]),
+            "suite-id" => receipt["conformance_evidence_id"] = "E-other".into(),
+            "suite-hash" => receipt["conformance_evidence_id"] = "E-other-hash".into(),
             _ => unreachable!(),
         }
         let mut binding_json = canonical_json(&receipt).unwrap();
@@ -1428,11 +1557,10 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
                 1,
             );
         }
-        assert!(
-            manager
-                .connection
-                .execute(
-                    "INSERT INTO execution_bindings
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
               ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
               provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
@@ -1443,20 +1571,30 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
               provider_registration_id,?2,?3,?4,?5,5,policy_decision_refs_json,
               grant_refs_json,execution_profile_ref,placement_json,?6,created_at
              FROM execution_bindings WHERE binding_id=?1",
-                    params![
-                        first,
-                        projected_id,
-                        projected_version,
-                        projected_manifest,
-                        projected_build,
-                        binding_json
-                    ],
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("binding provider identity"),
-            "{mismatch}"
-        );
+                params![
+                    first,
+                    projected_id,
+                    projected_version,
+                    projected_manifest,
+                    projected_build,
+                    binding_json
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        let expected_rejection = if matches!(mismatch, "suite-id" | "suite-hash") {
+            error.contains("binding conformance evidence was not admitted")
+        } else if matches!(
+            mismatch,
+            "duplicate-provider-id" | "duplicate-provider-object"
+        ) {
+            // Both guards reject the duplicate; SQLite does not promise trigger order.
+            error.contains("binding provider identity")
+                || error.contains("binding predates provider trust admission")
+        } else {
+            error.contains("binding provider identity")
+        };
+        assert!(expected_rejection, "{mismatch}: {error}");
         for table in [
             "execution_bindings",
             "execution_binding_admission_markers",
@@ -1501,17 +1639,43 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "attempt-real-2",
         "2026-09-19T00:00:00.250Z"
     ));
+    let null_suite_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-null-suite','attempt-null-suite',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,15,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-null-suite',
+                                      '$.attempt_id','attempt-null-suite','$.attempt',15,
+                                      '$.conformance_evidence_id','legacy-null-suite'),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&first],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        null_suite_error.contains("binding conformance evidence is not latest"),
+        "{null_suite_error}"
+    );
     manager
         .connection
         .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF;")
         .unwrap();
     // A result recorded later cannot retroactively authenticate a binding.
     // The trigger checks row existence at the instant the immutable row is inserted.
-    assert!(
-        manager
-            .connection
-            .execute(
-                "INSERT INTO execution_bindings (
+    let premature_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings (
            binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
            ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
            provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
@@ -1522,12 +1686,20 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
            provider_registration_id,provider_id,provider_version,provider_manifest_hash,
            provider_build_hash,98,policy_decision_refs_json,grant_refs_json,
            execution_profile_ref,placement_json,
-           json_set(binding_json,'$.conformance_evidence_id','E2'),
+            json_set(binding_json,'$.binding_id','binding-premature',
+                                  '$.attempt_id','attempt-premature',
+                                  '$.attempt',98,
+                                  '$.conformance_evidence_id','E2',
+                                  '$.created_at','2026-09-19T00:00:00.600Z'),
            '2026-09-19T00:00:00.600Z'
          FROM execution_bindings WHERE binding_id=?1",
-                [&first],
-            )
-            .is_err()
+            [&first],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        premature_error.contains("binding conformance evidence is not latest"),
+        "{premature_error}"
     );
     assert!(
         manager
@@ -1890,7 +2062,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
     ));
     manager
         .connection
-        .execute_batch("DROP TRIGGER provider_state_epoch_transition")
+        .execute_batch("DROP TRIGGER execution_binding_evidence_present_at_insert")
         .unwrap();
     let owner = manager.lease_owner.clone();
     upgrade_stamped_registry_guards_fenced(
@@ -1915,13 +2087,8 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
-        "disabled"
+        "registered"
     );
-    manager
-        .provider_store_writer()
-        .unwrap()
-        .enable(&registration.registration_id, TEST_TIME)
-        .unwrap();
     let after_repair = insert(&manager, 13, "E5-unbounded");
     assert!(valid(
         &mut manager,
@@ -1929,6 +2096,56 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "attempt-real-13",
         "2026-09-19T00:00:00.990Z"
     ));
+    let spaced = insert(&manager, 14, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &spaced,
+        "attempt-real-14",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    manager
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_admissions SET state='DEPRECATED'
+         WHERE snapshot_id=?1",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let generation: i64 = manager
+        .connection
+        .query_row(
+            "SELECT MAX(generation) FROM semantic_repair_fences",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(generation, 0);
+    let deprecated_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-real-15','attempt-real-15',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,15,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-real-15',
+                                      '$.attempt_id','attempt-real-15','$.attempt',15),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&spaced],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        deprecated_error.contains("binding requires current semantic re-attestation"),
+        "{deprecated_error}"
+    );
 }
 
 #[test]
@@ -1989,6 +2206,36 @@ fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
     )
     .unwrap()
     .to_string();
+    let mut selected_snapshot = snapshot.clone();
+    selected_snapshot
+        .capability_contracts
+        .retain(|entry| entry.id != "artifact.copy.compat");
+    selected_snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &selected_snapshot.schema_version,
+        &selected_snapshot
+            .type_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+        &selected_snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let selected_registry = SemanticRegistry::from_records(
+        selected_snapshot,
+        types.clone(),
+        capabilities
+            .iter()
+            .filter(|contract| contract.capability != "artifact.copy.compat")
+            .cloned()
+            .collect(),
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
     let registry = SemanticRegistry::from_records(
         snapshot,
         types,
@@ -2000,6 +2247,11 @@ fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
         .registry_store_writer()
         .unwrap()
         .admit_registry(&registry)
+        .unwrap();
+    manager
+        .registry_store_writer()
+        .unwrap()
+        .admit_registry(&selected_registry)
         .unwrap();
     let cases: Value = serde_json::from_str(include_str!(
         "../../../examples/aios-ir/provider-conformance-cases.json"
@@ -2140,8 +2392,14 @@ fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
             )
             .unwrap();
         current_enablement
-            && binding_json_matches(&binding, &check, true).unwrap()
-            && verified_provider_admission(&transaction, binding_id, &binding, TEST_TIME).unwrap()
+            && binding_receipt_projection(&binding, &check, true).is_some()
+            && verified_provider_admission_from_binding(
+                &transaction,
+                binding_id,
+                &binding,
+                TEST_TIME,
+            )
+            .unwrap()
     };
     let (old_binding, old_attempt) = insert(&manager, 1);
     assert!(accepted(&mut manager, &old_binding, &old_attempt));
@@ -2158,6 +2416,15 @@ fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
         .reattest_snapshot(
             registry.snapshot_id(),
             "decision:same-build-recovery",
+            "local-authority",
+        )
+        .unwrap();
+    repaired
+        .registry_store_writer()
+        .unwrap()
+        .reattest_snapshot(
+            selected_registry.snapshot_id(),
+            "decision:selected-snapshot-recovery",
             "local-authority",
         )
         .unwrap();
@@ -2194,6 +2461,112 @@ fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
     let mut stable = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
     assert!(!accepted(&mut stable, &old_binding, &old_attempt));
     assert!(accepted(&mut stable, &fresh_binding, &fresh_attempt));
+    stable
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_admissions SET state='DEPRECATED'
+         WHERE snapshot_id=?1",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let candidates = stable
+        .provider_store_writer()
+        .unwrap()
+        .eligible_candidates(
+            "artifact.hash@1",
+            &contract_hash,
+            selected_registry.snapshot_id(),
+            TEST_TIME,
+        )
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].registration.registration_id,
+        registration.registration_id
+    );
+    let error = stable
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-same-build-3','attempt-same-build-3',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-same-build-3',
+                                      '$.attempt_id','attempt-same-build-3','$.attempt',3),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&fresh_binding],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("binding requires current semantic re-attestation"),
+        "{error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        assert_eq!(
+            stable
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE binding_id='binding-same-build-3'"
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    drop(stable);
+    let stable = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    stable
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-same-build-3','attempt-same-build-3',task_id,semantic_program_hash,
+                ?2,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-same-build-3',
+                                      '$.attempt_id','attempt-same-build-3','$.attempt',3,
+                                      '$.registry_snapshot_id',?2),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            params![fresh_binding, selected_registry.snapshot_id()],
+        )
+        .unwrap();
+    assert_eq!(
+        stable
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM execution_binding_admission_markers
+         WHERE binding_id='binding-same-build-3'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -9569,12 +9942,14 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
         PolicyDecisionRefs,
         ExecutionProfile,
         BindingJson(&'static str, Value),
+        BindingJsonDuplicate,
         RegistrationProviderIdentity,
     }
 
     let cases = vec![
         ("policy-decision-refs", Tamper::PolicyDecisionRefs),
         ("execution-profile", Tamper::ExecutionProfile),
+        ("duplicate-binding-key", Tamper::BindingJsonDuplicate),
         (
             "binding-id",
             Tamper::BindingJson("/binding_id", serde_json::json!("binding:forged")),
@@ -9704,6 +10079,26 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
                     .execute(
                         "UPDATE execution_bindings SET binding_json=?1 WHERE binding_id='binding-completion'",
                         [canonical_json(&binding).unwrap()],
+                    )
+                    .unwrap();
+            }
+            Tamper::BindingJsonDuplicate => {
+                let raw: String = manager
+                    .connection
+                    .query_row(
+                        "SELECT binding_json FROM execution_bindings
+                     WHERE binding_id='binding-completion'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let ambiguous = raw.replacen('{', "{\"attempt\":1,", 1);
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE execution_bindings SET binding_json=?1
+                     WHERE binding_id='binding-completion'",
+                        [ambiguous],
                     )
                     .unwrap();
             }

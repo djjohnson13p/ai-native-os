@@ -108,6 +108,19 @@ CREATE TRIGGER IF NOT EXISTS provider_registration_revocation_terminal
 BEFORE UPDATE OF state ON provider_registrations
 WHEN OLD.state = 'revoked' AND NEW.state <> 'revoked'
 BEGIN SELECT RAISE(ABORT, 'provider revocation is terminal'); END;
+-- A retained terminal epoch also survives a registration row replaced while
+-- an older uniqueness or initial-epoch guard was missing.
+CREATE TRIGGER IF NOT EXISTS provider_registration_revoked_epoch_insert
+BEFORE INSERT ON provider_registrations
+WHEN EXISTS (SELECT 1 FROM provider_state_epochs
+             WHERE registration_id=NEW.registration_id AND state='revoked')
+BEGIN SELECT RAISE(ABORT, 'provider revocation epoch is terminal'); END;
+CREATE TRIGGER IF NOT EXISTS provider_registration_revoked_epoch_update
+BEFORE UPDATE OF state ON provider_registrations
+WHEN NEW.state<>'revoked' AND EXISTS (
+    SELECT 1 FROM provider_state_epochs
+    WHERE registration_id=NEW.registration_id AND state='revoked')
+BEGIN SELECT RAISE(ABORT, 'provider revocation epoch is terminal'); END;
 
 -- Registration creates a disabled candidate. An enabled interval must have
 -- its own transition time. Equal-time transitions preserve insertion order;
@@ -344,25 +357,14 @@ WHEN NOT EXISTS (
       AND r.package_content_hash IS NEW.provider_build_hash
       AND r.provider_id IS NEW.provider_id
       AND r.provider_version IS NEW.provider_version
-      AND json_valid(NEW.binding_json)
-      -- SQLite resolves duplicate object keys to the first occurrence while
-      -- serde_json resolves them to the last. Reject every duplicate so a
-      -- durable admission cannot disagree with the Rust receipt projection.
-      AND NOT EXISTS (
-          SELECT 1 FROM json_tree(NEW.binding_json) AS member
-          WHERE member.key IS NOT NULL
-          GROUP BY member.parent, member.key
-          HAVING COUNT(*) > 1
-      )
-      AND json_type(NEW.binding_json,'$.provider')='object'
-      AND json_type(NEW.binding_json,'$.provider.id')='text'
-      AND json_type(NEW.binding_json,'$.provider.version')='text'
-      AND json_type(NEW.binding_json,'$.provider.manifest_hash')='text'
-      AND json_type(NEW.binding_json,'$.provider.package_or_build_hash')='text'
-      AND json_extract(NEW.binding_json,'$.provider.id') IS NEW.provider_id
-      AND json_extract(NEW.binding_json,'$.provider.version') IS NEW.provider_version
-      AND json_extract(NEW.binding_json,'$.provider.manifest_hash') IS NEW.provider_manifest_hash
-      AND json_extract(NEW.binding_json,'$.provider.package_or_build_hash') IS NEW.provider_build_hash
+      AND aios_binding_receipt_matches_v1(
+          NEW.binding_json,NEW.binding_id,NEW.attempt_id,NEW.task_id,
+          NEW.semantic_program_hash,NEW.registry_snapshot_id,NEW.ir_version,
+          NEW.node_id,NEW.capability,NEW.capability_contract_hash,
+          NEW.provider_id,NEW.provider_version,NEW.provider_manifest_hash,
+          NEW.provider_build_hash,NEW.attempt,NEW.policy_decision_refs_json,
+          NEW.grant_refs_json,NEW.execution_profile_ref,NEW.placement_json,
+          NEW.created_at)=1
 )
 BEGIN SELECT RAISE(ABORT, 'binding provider identity does not match registration'); END;
 
@@ -371,22 +373,30 @@ BEGIN SELECT RAISE(ABORT, 'binding provider identity does not match registration
 -- recorded later with a backdated executed_at claim.
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_pin_required
 BEFORE INSERT ON execution_bindings
-WHEN CASE WHEN json_valid(NEW.binding_json) THEN
-    json_type(NEW.binding_json, '$.conformance_evidence_id') IS NOT 'text'
-    OR length(json_extract(NEW.binding_json, '$.conformance_evidence_id')) NOT BETWEEN 1 AND 256
-    ELSE 1 END
+WHEN aios_binding_evidence_pin_v1(NEW.binding_json) IS NULL
 BEGIN SELECT RAISE(ABORT, 'binding requires a valid conformance evidence pin'); END;
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_present_at_insert
 BEFORE INSERT ON execution_bindings
-WHEN json_valid(NEW.binding_json)
- AND json_type(NEW.binding_json, '$.conformance_evidence_id') = 'text'
+WHEN aios_binding_evidence_pin_v1(NEW.binding_json) IS NOT NULL
  AND NOT EXISTS (
-    SELECT 1 FROM provider_conformance_evidence
-    WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
-      AND registration_id=NEW.provider_registration_id
-      AND capability=NEW.capability
-      AND contract_hash=NEW.capability_contract_hash
-      AND status='pass'
+    SELECT 1 FROM provider_conformance_evidence e
+    WHERE e.evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
+      AND e.registration_id=NEW.provider_registration_id
+      AND e.capability=NEW.capability
+      AND e.contract_hash=NEW.capability_contract_hash
+      AND e.status='pass'
+      AND e.suite_id IS NOT NULL AND e.suite_hash IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM provider_manifest_payloads m,
+               json_each(m.manifest_json,'$.provides') AS offered
+          WHERE m.registration_id=NEW.provider_registration_id
+            AND json_valid(m.manifest_json)
+            AND json_extract(offered.value,'$.contract.capability') IS
+                substr(NEW.capability,1,instr(NEW.capability,'@')-1)
+            AND json_extract(offered.value,'$.contract.contract_hash') IS NEW.capability_contract_hash
+            AND json_extract(offered.value,'$.conformance.suite') IS e.suite_id
+            AND json_extract(offered.value,'$.conformance.suite_hash') IS e.suite_hash
+      )
 )
 BEGIN SELECT RAISE(ABORT, 'binding conformance evidence was not admitted'); END;
 
@@ -398,7 +408,7 @@ BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
     WITH pin AS (
         SELECT tested_at FROM provider_conformance_evidence
-        WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+        WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
     ), times AS (
         SELECT
             COALESCE(CAST(strftime('%s', tested_at) AS INTEGER),CASE WHEN substr(tested_at,-6,1) IN ('+','-') AND substr(tested_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(tested_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(tested_at,1,length(tested_at)-6)||'Z') AS INTEGER) - (CASE substr(tested_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(tested_at,-5,2) AS INTEGER)*3600 + CAST(substr(tested_at,-2,2) AS INTEGER)*60) END) AS tested_second,
@@ -428,7 +438,7 @@ BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
     WITH pin AS (
         SELECT evidence_json FROM provider_conformance_evidence
-        WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+        WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
     ), expiry AS (
         SELECT json_extract(evidence_json, '$.expires_at') AS expires_at,
                json_type(evidence_json, '$.expires_at') AS expiry_type
@@ -470,7 +480,7 @@ WHEN NOT EXISTS (
     ), pin AS (
         SELECT registration_id,capability,contract_hash,suite_id,suite_hash
         FROM provider_conformance_evidence
-        WHERE evidence_id=json_extract(NEW.binding_json,'$.conformance_evidence_id')
+        WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
           AND suite_id IS NOT NULL AND suite_hash IS NOT NULL
     ), candidates AS (
         SELECT e.evidence_id,e.status,
@@ -490,7 +500,7 @@ WHEN NOT EXISTS (
                (c.second=t.second AND c.fraction<=t.fraction))
     )
     SELECT 1 FROM eligible selected
-    WHERE selected.evidence_id=json_extract(NEW.binding_json,'$.conformance_evidence_id')
+    WHERE selected.evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
       AND selected.status='pass'
       AND NOT EXISTS (SELECT 1 FROM candidates WHERE second IS NULL)
       AND NOT EXISTS (
@@ -518,10 +528,8 @@ BEGIN
                OR EXISTS (SELECT 1 FROM provider_trust_admissions a
                           WHERE a.registration_id=r.registration_id))
     ) THEN RAISE(ABORT, 'binding requires current trusted provider admission') END;
-    SELECT CASE WHEN CASE WHEN json_valid(NEW.binding_json) THEN
-        json_type(NEW.binding_json,'$.provider_trust_source_id') IS NOT 'text'
-        OR length(json_extract(NEW.binding_json,'$.provider_trust_source_id')) NOT BETWEEN 1 AND 256
-        OR json_extract(NEW.binding_json,'$.provider_trust_source_id') IS NOT COALESCE(
+    SELECT CASE WHEN aios_binding_trust_pin_v1(NEW.binding_json) IS NULL
+        OR aios_binding_trust_pin_v1(NEW.binding_json) IS NOT COALESCE(
             (SELECT a.admission_id FROM provider_trust_admissions a
              WHERE a.registration_id=NEW.provider_registration_id
                AND COALESCE(CAST(strftime('%s', a.admitted_at) AS INTEGER),CASE WHEN substr(a.admitted_at,-6,1) IN ('+','-') AND substr(a.admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(a.admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(a.admitted_at,1,length(a.admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(a.admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(a.admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(a.admitted_at,-2,2) AS INTEGER)*60) END) IS NOT NULL
@@ -545,10 +553,9 @@ BEGIN
                        WHERE r.registration_id=NEW.provider_registration_id)
                 IN ('locally-trusted','project-reviewed','organization-approved')
                 THEN NEW.provider_registration_id END)
-        ELSE 1 END
     THEN RAISE(ABORT, 'binding trust source does not match current admission') END;
     INSERT INTO execution_binding_trust_markers(binding_id,trust_source_id)
-    VALUES (NEW.binding_id,json_extract(NEW.binding_json,'$.provider_trust_source_id'));
+    VALUES (NEW.binding_id,aios_binding_trust_pin_v1(NEW.binding_json));
 END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_trust_not_future
@@ -558,10 +565,10 @@ WHEN NOT EXISTS (
         SELECT COALESCE(
             (SELECT admitted_at FROM provider_trust_admissions
              WHERE registration_id=NEW.provider_registration_id
-               AND admission_id=json_extract(NEW.binding_json,'$.provider_trust_source_id')),
+               AND admission_id=aios_binding_trust_pin_v1(NEW.binding_json)),
             (SELECT registered_at FROM provider_registrations
              WHERE registration_id=NEW.provider_registration_id
-               AND registration_id=json_extract(NEW.binding_json,'$.provider_trust_source_id'))
+               AND registration_id=aios_binding_trust_pin_v1(NEW.binding_json))
         ) AS admitted_at
     ), times AS (
         SELECT COALESCE(CAST(strftime('%s', admitted_at) AS INTEGER),CASE WHEN substr(admitted_at,-6,1) IN ('+','-') AND substr(admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(admitted_at,1,length(admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(admitted_at,-2,2) AS INTEGER)*60) END) AS admitted_second,
@@ -612,11 +619,10 @@ BEGIN SELECT RAISE(ABORT, 'binding predates provider enablement'); END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_admission_marker_insert
 BEFORE INSERT ON execution_bindings
-WHEN json_valid(NEW.binding_json)
- AND json_type(NEW.binding_json, '$.conformance_evidence_id') = 'text'
+WHEN aios_binding_evidence_pin_v1(NEW.binding_json) IS NOT NULL
  AND EXISTS (
     SELECT 1 FROM provider_conformance_evidence
-    WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
+    WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
       AND registration_id=NEW.provider_registration_id
       AND capability=NEW.capability
       AND contract_hash=NEW.capability_contract_hash
@@ -624,5 +630,5 @@ WHEN json_valid(NEW.binding_json)
 )
 BEGIN
     INSERT INTO execution_binding_admission_markers(binding_id,conformance_evidence_id)
-    VALUES (NEW.binding_id,json_extract(NEW.binding_json, '$.conformance_evidence_id'));
+    VALUES (NEW.binding_id,aios_binding_evidence_pin_v1(NEW.binding_json));
 END;

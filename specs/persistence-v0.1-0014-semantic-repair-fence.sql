@@ -228,10 +228,9 @@ WHEN (SELECT MAX(generation) FROM semantic_repair_fences)>0
 BEGIN SELECT RAISE(ABORT, 'enablement requires current semantic re-attestation'); END;
 CREATE TRIGGER IF NOT EXISTS semantic_repair_binding_insert
 BEFORE INSERT ON execution_bindings
-WHEN (SELECT MAX(generation) FROM semantic_repair_fences)>0
- AND (NOT EXISTS (SELECT 1 FROM semantic_current_usable_snapshots
-                  WHERE snapshot_id=NEW.registry_snapshot_id)
-   OR NOT EXISTS (
+WHEN NOT EXISTS (SELECT 1 FROM semantic_current_usable_snapshots
+                 WHERE snapshot_id=NEW.registry_snapshot_id AND state='ADMITTED')
+ OR ((SELECT MAX(generation) FROM semantic_repair_fences)>0 AND NOT EXISTS (
       SELECT 1 FROM provider_registrations p
       JOIN semantic_current_usable_snapshots s ON s.snapshot_id=p.registry_snapshot_id
       WHERE p.registration_id=NEW.provider_registration_id))

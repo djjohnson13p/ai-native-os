@@ -820,6 +820,7 @@ impl TaskManager {
         export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        aios_registry::register_strict_json_sqlite(&connection)?;
         preflight_migration_state_allowing_guard_upgrade(&connection)?;
         let clock: Arc<dyn Clock> = Arc::from(clock);
         let acquired_at = clock.now();
@@ -3495,6 +3496,8 @@ const SEMANTIC_FENCE_GUARDS: &[&str] = &[
 
 const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "provider_registration_no_duplicate_insert",
+    "provider_registration_revoked_epoch_insert",
+    "provider_registration_revoked_epoch_update",
     "provider_manifest_payload_no_duplicate_insert",
     "provider_evidence_no_duplicate_insert",
     "execution_binding_no_duplicate_insert",
@@ -3538,6 +3541,26 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "execution_binding_legacy_trust_quarantine_no_duplicate_insert",
 ];
 
+// Loss of any of these guards can rewrite the provider state ledger or erase
+// a terminal transition. A stamped store cannot reconstruct that history.
+const PROVIDER_HISTORY_GUARDS: &[&str] = &[
+    "provider_registration_identity_immutable",
+    "provider_registration_no_delete",
+    "provider_registration_no_duplicate_insert",
+    "provider_registration_revocation_terminal",
+    "provider_registration_revoked_epoch_insert",
+    "provider_registration_revoked_epoch_update",
+    "provider_registration_no_initial_enablement",
+    "provider_registration_state_transition_clock",
+    "provider_registration_updated_at_requires_transition",
+    "provider_state_epoch_no_update",
+    "provider_state_epoch_no_delete",
+    "provider_state_epoch_no_duplicate_insert",
+    "provider_state_epoch_event_insert_guard",
+    "provider_state_epoch_initial",
+    "provider_state_epoch_transition",
+];
+
 const PROVIDER_LEGACY_GUARDS: &[&str] = &[
     "provider_manifest_payload_immutable_update",
     "provider_manifest_payload_immutable_delete",
@@ -3579,6 +3602,33 @@ fn missing_additive_guard(connection: &Connection, guards: &[&str]) -> Result<bo
     Ok(false)
 }
 
+fn provider_history_provable(connection: &Connection) -> Result<bool> {
+    if !additive_guard_definitions_current(connection, PROVIDER_HISTORY_GUARDS, true, true, true)? {
+        return Ok(false);
+    }
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_state_epochs'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected: String = canonical.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_state_epochs'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(actual.is_some_and(|sql| normalize_schema_sql(&sql) == normalize_schema_sql(&expected)))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps fenced semantic and provider guard repairs in one atomic transaction"
@@ -3607,6 +3657,11 @@ fn upgrade_stamped_registry_guards_fenced(
         [],
         |row| row.get(0),
     )?;
+    if provider_stamped && !provider_history_provable(connection)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "provider state history requires operator quarantine",
+        ));
+    }
     let fence_stamped: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0014_semantic_repair_fence')",
         [],
@@ -3806,9 +3861,50 @@ fn upgrade_stamped_registry_guards_fenced(
                 [upgraded_at],
             )?;
         }
+        if has_epoch_table {
+            // A missing duplicate-insert or initial-epoch guard once allowed
+            // INSERT OR REPLACE to obscure the registration row. The ledger's
+            // terminal revocation still wins over the replacement's state.
+            transaction.execute_batch(
+                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock;
+                 DROP TRIGGER IF EXISTS provider_state_epoch_transition",
+            )?;
+            transaction.execute(
+                "UPDATE provider_registrations SET state='revoked',updated_at=
+                     CASE WHEN (SELECT e.state FROM provider_state_epochs e
+                                WHERE e.registration_id=provider_registrations.registration_id
+                                ORDER BY e.revision DESC LIMIT 1)='revoked'
+                          THEN (SELECT e.transitioned_at FROM provider_state_epochs e
+                                WHERE e.registration_id=provider_registrations.registration_id
+                                ORDER BY e.revision DESC LIMIT 1)
+                          ELSE ?1 END
+                 WHERE state<>'revoked' AND EXISTS (
+                     SELECT 1 FROM provider_state_epochs e
+                     WHERE e.registration_id=provider_registrations.registration_id
+                       AND e.state='revoked')",
+                [upgraded_at],
+            )?;
+        }
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))?;
+        if has_epoch_table {
+            transaction.execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+                 SELECT r.registration_id,
+                        (SELECT MAX(e.revision)+1 FROM provider_state_epochs e
+                         WHERE e.registration_id=r.registration_id),
+                        'revoked',r.updated_at
+                 FROM provider_registrations r
+                 WHERE r.state='revoked'
+                   AND EXISTS (SELECT 1 FROM provider_state_epochs e
+                               WHERE e.registration_id=r.registration_id AND e.state='revoked')
+                   AND (SELECT e.state FROM provider_state_epochs e
+                        WHERE e.registration_id=r.registration_id
+                        ORDER BY e.revision DESC LIMIT 1)<>'revoked'",
+                [],
+            )?;
+        }
         if !had_enablement_guards {
             // A partially installed ledger may have missed the forced
             // disable transition. Reconcile only that terminal interval;
@@ -7290,6 +7386,7 @@ fn verified_provider_admission(
     binding_id: &str,
     binding: &BindingEvidence,
     checked_at: &str,
+    receipt: &aios_registry::BindingReceiptProjection,
 ) -> Result<bool> {
     let quarantined: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM execution_binding_legacy_trust_quarantine WHERE binding_id=?1)",
@@ -7331,12 +7428,8 @@ fn verified_provider_admission(
             |row| row.get(0),
         )
         .optional()?;
-    let receipt: Value = serde_json::from_str(&binding.binding_json)?;
     Ok(admitted_source.as_deref() == Some(expected_source.as_str())
-        && receipt
-            .get("provider_trust_source_id")
-            .and_then(Value::as_str)
-            == Some(expected_source.as_str()))
+        && receipt.trust_pin() == Some(expected_source.as_str()))
 }
 
 fn load_admitted_semantic_registry(
@@ -7428,67 +7521,38 @@ fn admitted_suite_version(
     Ok(contract.conformance.suite_version.clone())
 }
 
-fn conformance_pin_matches(value: &Value, latest_id: &str, required: bool) -> bool {
-    match value.get("conformance_evidence_id") {
-        Some(Value::String(pinned)) => pinned == latest_id,
-        None => !required,
-        _ => false,
-    }
-}
-
-fn binding_json_matches(
+fn binding_receipt_projection(
     binding: &BindingEvidence,
     check: &BindingGrantCheck<'_>,
     require_pin: bool,
-) -> Result<bool> {
-    let value: Value = serde_json::from_str(&binding.binding_json)?;
-    if canonical_json(&value)? != binding.binding_json {
-        return Ok(false);
-    }
-    let policy_refs: Value = serde_json::from_str(&binding.policy_decision_refs_json)?;
-    let grant_refs: Value = serde_json::from_str(&binding.grant_refs_json)?;
-    let placement: Value = serde_json::from_str(&binding.placement_json)?;
-    Ok(
-        conformance_pin_matches(&value, &binding.conformance_evidence_id, require_pin)
-            && value.get("schema_version").and_then(Value::as_str) == Some(SCHEMA_VERSION)
-            && value.get("binding_id").and_then(Value::as_str) == Some(check.binding_id)
-            && value.get("attempt_id").and_then(Value::as_str) == Some(check.attempt_id)
-            && value.get("task_id").and_then(Value::as_str) == Some(check.task_id)
-            && value.get("semantic_program_hash").and_then(Value::as_str)
-                == Some(check.semantic_hash)
-            && value.get("registry_snapshot_id").and_then(Value::as_str)
-                == Some(binding.registry_snapshot_id.as_str())
-            && value.get("ir_version").and_then(Value::as_str) == Some(binding.ir_version.as_str())
-            && value.get("node_id").and_then(Value::as_str) == Some(check.node_id)
-            && value.get("capability").and_then(Value::as_str) == Some(binding.capability.as_str())
-            && value
-                .get("capability_contract_hash")
-                .and_then(Value::as_str)
-                == binding.contract_hash.as_deref()
-            && value.pointer("/provider/id").and_then(Value::as_str)
-                == Some(binding.principal_id.as_str())
-            && value.pointer("/provider/version").and_then(Value::as_str)
-                == Some(binding.provider_version.as_str())
-            && value
-                .pointer("/provider/manifest_hash")
-                .and_then(Value::as_str)
-                == binding.provider_manifest_hash.as_deref()
-            && value
-                .pointer("/provider/package_or_build_hash")
-                .and_then(Value::as_str)
-                == binding.provider_build_hash.as_deref()
-            && value.get("policy_decision_refs") == Some(&policy_refs)
-            && value.pointer("/authority/grant_refs") == Some(&grant_refs)
-            && value
-                .pointer("/execution_profile/profile_ref")
-                .and_then(Value::as_str)
-                == Some(binding.execution_profile_ref.as_str())
-            && value.get("placement") == Some(&placement)
-            && value.get("attempt").and_then(Value::as_i64) == Some(binding.attempt)
-            && value.get("created_at").and_then(Value::as_str) == Some(binding.created_at.as_str())
-            && value.get("inputs").is_some_and(Value::is_object)
-            && value.get("outputs").is_some_and(Value::is_object),
-    )
+) -> Option<aios_registry::BindingReceiptProjection> {
+    let receipt =
+        aios_registry::BindingReceiptProjection::parse(binding.binding_json.as_bytes()).ok()?;
+    let columns = aios_registry::BindingReceiptColumns {
+        binding_id: check.binding_id,
+        attempt_id: check.attempt_id,
+        task_id: check.task_id,
+        semantic_program_hash: check.semantic_hash,
+        registry_snapshot_id: &binding.registry_snapshot_id,
+        ir_version: &binding.ir_version,
+        node_id: check.node_id,
+        capability: &binding.capability,
+        capability_contract_hash: binding.contract_hash.as_deref(),
+        provider_id: &binding.principal_id,
+        provider_version: &binding.provider_version,
+        provider_manifest_hash: binding.provider_manifest_hash.as_deref(),
+        provider_build_hash: binding.provider_build_hash.as_deref(),
+        attempt: binding.attempt,
+        policy_decision_refs_json: &binding.policy_decision_refs_json,
+        grant_refs_json: &binding.grant_refs_json,
+        execution_profile_ref: &binding.execution_profile_ref,
+        placement_json: &binding.placement_json,
+        created_at: &binding.created_at,
+    };
+    (receipt.matches_columns(&columns)
+        && receipt.evidence_pin_matches(&binding.conformance_evidence_id, require_pin)
+        && (!require_pin || receipt.trust_pin().is_some()))
+    .then_some(receipt)
 }
 
 fn program_node<'a>(program: &'a Value, node_id: &str) -> Option<&'a Value> {
@@ -7689,14 +7753,20 @@ fn binding_grants_valid(
     };
     if binding.provider_registration_id.is_none()
         || binding.grant_refs_json != check.grant_refs_json
-        || !binding_json_matches(&binding, check, has_provider_store)?
-        || (has_provider_store
-            && !verified_provider_admission(
-                transaction,
-                check.binding_id,
-                &binding,
-                check.checked_at,
-            )?)
+    {
+        return Ok(false);
+    }
+    let Some(receipt) = binding_receipt_projection(&binding, check, has_provider_store) else {
+        return Ok(false);
+    };
+    if has_provider_store
+        && !verified_provider_admission(
+            transaction,
+            check.binding_id,
+            &binding,
+            check.checked_at,
+            &receipt,
+        )?
     {
         return Ok(false);
     }
@@ -9599,8 +9669,7 @@ mod tests {
         manager
             .connection
             .execute_batch(
-                "DROP TRIGGER provider_registration_no_duplicate_insert;
-                 DROP TRIGGER provider_manifest_payload_no_duplicate_insert;
+                "DROP TRIGGER provider_manifest_payload_no_duplicate_insert;
                  DROP TRIGGER provider_evidence_no_duplicate_insert;
                  DROP TRIGGER execution_binding_no_duplicate_insert;
                  DROP TRIGGER execution_binding_evidence_present_at_insert;
@@ -9626,7 +9695,250 @@ mod tests {
     }
 
     #[test]
-    fn partial_enablement_ledger_reopen_forces_new_interval_once() {
+    fn erased_revocation_history_requires_operator_quarantine() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("replaced-revoked-provider.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='terminal-provider';
+             UPDATE provider_registrations SET state='revoked',
+                 updated_at='2026-09-19T00:00:01Z'
+             WHERE registration_id='terminal-provider';
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('unaffected-provider','provider:unaffected','1.0.0','build:unaffected',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             DROP TRIGGER provider_registration_no_duplicate_insert;
+             DROP TRIGGER provider_state_epoch_initial;
+             DROP TRIGGER provider_state_epoch_transition;
+             DROP TRIGGER provider_state_epoch_no_duplicate_insert;
+             DROP TRIGGER provider_state_epoch_event_insert_guard;
+             DROP TRIGGER provider_state_epoch_no_delete;
+             DROP TRIGGER provider_registration_revoked_epoch_insert;
+             DROP TRIGGER provider_registration_revoked_epoch_update;
+             INSERT OR REPLACE INTO provider_state_epochs
+             (registration_id,revision,state,transitioned_at)
+             VALUES ('terminal-provider',2,'disabled','2026-09-19T00:00:01Z');
+             INSERT OR REPLACE INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:02Z'
+             WHERE registration_id='terminal-provider';",
+            )
+            .unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(manager);
+        let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+            Ok(_) => panic!("unprovable legacy provider history reopened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &reopen_error,
+                TaskManagerError::InvalidRecord(
+                    "provider state history requires operator quarantine"
+                        | "provider registry migration is incomplete"
+                )
+            ),
+            "{reopen_error}"
+        );
+        let after = Connection::open(&path).unwrap();
+        assert_eq!(after.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            after
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn retained_revoked_epoch_blocks_replacement_and_state_update() {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='terminal-provider';
+             UPDATE provider_registrations SET state='revoked',
+                 updated_at='2026-09-19T00:00:01Z'
+             WHERE registration_id='terminal-provider';
+             DROP TRIGGER provider_registration_no_duplicate_insert;",
+            )
+            .unwrap();
+        let replacement = manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replacement.contains("provider revocation epoch is terminal"),
+            "{replacement}"
+        );
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER provider_registration_revocation_terminal")
+            .unwrap();
+        let update = manager
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='disabled',
+                updated_at='2026-09-19T00:00:02Z'
+             WHERE registration_id='terminal-provider'",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            update.contains("provider revocation epoch is terminal"),
+            "{update}"
+        );
+        let state: String = manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(state, "revoked");
+        let terminal_epochs: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_epochs, 1);
+    }
+
+    #[test]
+    fn stamped_provider_history_defects_are_not_auto_repaired() {
+        for defect in [
+            "provider_registration_no_duplicate_insert",
+            "provider_registration_revoked_epoch_insert",
+            "provider_state_epoch_no_update",
+            "provider_state_epoch_no_duplicate_insert",
+            "provider_state_epoch_event_insert_guard",
+            "provider_state_epoch_initial",
+            "provider_state_epoch_transition",
+            "provider_state_epochs",
+            "malformed_provider_state_epochs",
+            "malformed_provider_state_epoch_event_insert_guard",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("unprovable-provider-history.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            match defect {
+                "provider_state_epochs" => manager
+                    .connection
+                    .execute_batch("DROP TABLE provider_state_epochs")
+                    .unwrap(),
+                "malformed_provider_state_epochs" => manager
+                    .connection
+                    .execute_batch("ALTER TABLE provider_state_epochs ADD COLUMN forged TEXT")
+                    .unwrap(),
+                "malformed_provider_state_epoch_event_insert_guard" => manager
+                    .connection
+                    .execute_batch(
+                        "DROP TRIGGER provider_state_epoch_event_insert_guard;
+                     CREATE TRIGGER provider_state_epoch_event_insert_guard
+                     BEFORE INSERT ON provider_state_epochs BEGIN SELECT 1; END",
+                    )
+                    .unwrap(),
+                name => manager
+                    .connection
+                    .execute_batch(&format!("DROP TRIGGER {name}"))
+                    .unwrap(),
+            }
+            drop(manager);
+            let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+                Ok(_) => panic!("unprovable provider history reopened: {defect}"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &reopen_error,
+                    TaskManagerError::InvalidRecord(
+                        "provider state history requires operator quarantine"
+                            | "provider registry migration is incomplete"
+                    )
+                ),
+                "{defect}: {reopen_error}"
+            );
+            let retained = Connection::open(&path).unwrap();
+            assert_eq!(
+                retained
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations
+                 WHERE migration_id='0013_provider_registry'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_history_guard_or_ledger_quarantines_before_repair() {
         for missing in [
             "provider_state_epoch_transition",
             "execution_binding_enablement_marker_insert",
@@ -9662,6 +9974,18 @@ mod tests {
                 ))
                 .unwrap();
             drop(manager);
+            if missing != "execution_binding_enablement_marker_insert" {
+                assert!(
+                    matches!(
+                        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                        Err(TaskManagerError::InvalidRecord(
+                            "provider state history requires operator quarantine"
+                        ))
+                    ),
+                    "{missing}"
+                );
+                continue;
+            }
 
             let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
             assert_eq!(reopened.connection.query_row(
@@ -9756,7 +10080,7 @@ mod tests {
             assert!(matches!(
                 TaskManager::open_with_clock(&path, Box::new(FixedClock)),
                 Err(TaskManagerError::InvalidRecord(
-                    "provider state epoch revision requires operator quarantine"
+                    "provider state history requires operator quarantine"
                 ))
             ));
             let retained = Connection::open(&path).unwrap();
@@ -9918,6 +10242,9 @@ mod tests {
                      'offset-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}',
                      '2026-09-19T15:00:00+15:00');
+             INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
+             VALUES ('offset-provider',
+                     '{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"offset-contract\"},\"conformance\":{\"suite\":\"offset-suite\",\"suite_hash\":\"offset-suite-hash\"}}]}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T15:00:00+15:00'
              WHERE registration_id='offset-provider';
@@ -9944,9 +10271,385 @@ mod tests {
                      'offset-snapshot','0.1','offset-node','artifact.hash@1','offset-contract',
                      'offset-provider','provider:offset','1.0.0','manifest:offset','build:offset',
                      1,'[]','[]','offset-profile','{}',
-                     '{\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"offset-trust\",\"provider\":{\"id\":\"provider:offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:offset\",\"package_or_build_hash\":\"build:offset\"}}',
+                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"offset-program\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"offset-contract\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"offset-trust\",\"provider\":{\"id\":\"provider:offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:offset\",\"package_or_build_hash\":\"build:offset\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
                      '2026-09-19T01:00:00.300+01:00');",
         ).unwrap();
+        let clone_receipt = |binding_id: &str, attempt_id: &str, attempt: i64| {
+            manager
+                .connection
+                .query_row(
+                    "SELECT json_set(binding_json,'$.binding_id',?1,
+                    '$.attempt_id',?2,'$.attempt',?3)
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                    params![binding_id, attempt_id, attempt],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        let insert_clone = |connection: &Connection,
+                            binding_id: &str,
+                            attempt_id: &str,
+                            attempt: i64,
+                            receipt: &str,
+                            policy: &str,
+                            grants: &str,
+                            placement: &str| {
+            connection.execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+                  attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                  placement_json,binding_json,created_at)
+                 SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                        ir_version,node_id,capability,capability_contract_hash,
+                        provider_registration_id,provider_id,provider_version,
+                        provider_manifest_hash,provider_build_hash,?3,
+                        ?5,?6,execution_profile_ref,
+                        ?7,?4,created_at
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                params![
+                    binding_id, attempt_id, attempt, receipt, policy, grants, placement
+                ],
+            )
+        };
+        let receipt = clone_receipt("offset-invalid-unicode", "offset-unicode-attempt", 4);
+        let malformed = receipt.replace("\"outputs\":{}", "\"outputs\":{\"bad\":\"\\ud800\"}");
+        assert_ne!(malformed, receipt);
+        assert!(
+            insert_clone(
+                &manager.connection,
+                "offset-invalid-unicode",
+                "offset-unicode-attempt",
+                4,
+                &malformed,
+                "[]",
+                "[]",
+                "{}"
+            )
+            .is_err()
+        );
+        let raw = Connection::open(&path).unwrap();
+        let raw_receipt = clone_receipt("offset-raw-writer", "offset-raw-attempt", 5);
+        let error = insert_clone(
+            &raw,
+            "offset-raw-writer",
+            "offset-raw-attempt",
+            5,
+            &raw_receipt,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no such function: aios_binding_"), "{error}");
+        let padding = " ".repeat(8 * 1024 * 1024);
+        for (binding_id, attempt_id, attempt, policy, grants, placement) in [
+            (
+                "offset-large-policy",
+                "offset-large-policy-attempt",
+                6,
+                format!("{padding}[]"),
+                "[]".to_owned(),
+                "{}".to_owned(),
+            ),
+            (
+                "offset-large-grants",
+                "offset-large-grants-attempt",
+                7,
+                "[]".to_owned(),
+                format!("{padding}[]"),
+                "{}".to_owned(),
+            ),
+            (
+                "offset-large-placement",
+                "offset-large-placement-attempt",
+                8,
+                "[]".to_owned(),
+                "[]".to_owned(),
+                format!("{padding}{{}}"),
+            ),
+        ] {
+            let receipt = clone_receipt(binding_id, attempt_id, attempt);
+            assert!(
+                insert_clone(
+                    &manager.connection,
+                    binding_id,
+                    attempt_id,
+                    attempt,
+                    &receipt,
+                    &policy,
+                    &grants,
+                    &placement
+                )
+                .is_err(),
+                "{binding_id}"
+            );
+        }
+        let count_binding_and_markers = |id: &str| -> i64 {
+            manager.connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_admission_markers WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_trust_markers WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_enablement_markers WHERE binding_id=?1)",
+                [id], |row| row.get(0),
+            ).unwrap()
+        };
+        let binding_id = "offset-non-rfc3339";
+        let attempt_id = "offset-non-rfc3339-attempt";
+        let mut receipt: Value =
+            serde_json::from_str(&clone_receipt(binding_id, attempt_id, 23)).unwrap();
+        let missing_offset = "2026-09-19T00:00:01";
+        receipt["created_at"] = json!(missing_offset);
+        assert!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT julianday(?1) IS NOT NULL",
+                    [missing_offset],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+                  attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                  placement_json,binding_json,created_at)
+                 SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                        ir_version,node_id,capability,capability_contract_hash,
+                        provider_registration_id,provider_id,provider_version,
+                        provider_manifest_hash,provider_build_hash,23,
+                        policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                        placement_json,?3,?4
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                params![binding_id, attempt_id, receipt.to_string(), missing_offset],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("binding provider identity does not match registration"),
+            "{error}"
+        );
+        assert_eq!(count_binding_and_markers(binding_id), 0);
+        let corrected = clone_receipt(binding_id, attempt_id, 23);
+        insert_clone(
+            &manager.connection,
+            binding_id,
+            attempt_id,
+            23,
+            &corrected,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(count_binding_and_markers(binding_id), 4);
+        for id in [
+            "offset-invalid-unicode",
+            "offset-raw-writer",
+            "offset-large-policy",
+            "offset-large-grants",
+            "offset-large-placement",
+        ] {
+            assert_eq!(
+                count_binding_and_markers(id),
+                0,
+                "rejected {id} must leave no binding or markers"
+            );
+        }
+        let overlong = json!((0..65).map(|i| format!("ref:{i}")).collect::<Vec<_>>());
+        for (suffix, attempt, policy, grants) in [
+            ("policy-number", 9, json!([0]), json!([])),
+            ("grant-number", 10, json!([]), json!([0])),
+            ("policy-duplicate", 11, json!(["same", "same"]), json!([])),
+            ("grant-duplicate", 12, json!([]), json!(["same", "same"])),
+            ("policy-overlong", 13, overlong.clone(), json!([])),
+            ("grant-overlong", 14, json!([]), overlong.clone()),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let mut receipt: Value =
+                serde_json::from_str(&clone_receipt(&binding_id, &attempt_id, attempt)).unwrap();
+            receipt["policy_decision_refs"] = policy.clone();
+            receipt["authority"]["grant_refs"] = grants.clone();
+            let error = insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &receipt.to_string(),
+                &policy.to_string(),
+                &grants.to_string(),
+                "{}",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("binding provider identity does not match registration"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(
+                count_binding_and_markers(&binding_id),
+                0,
+                "rejected {suffix} must not consume its immutable identity"
+            );
+        }
+        let corrected = clone_receipt("offset-policy-number", "offset-policy-number-attempt", 9);
+        insert_clone(
+            &manager.connection,
+            "offset-policy-number",
+            "offset-policy-number-attempt",
+            9,
+            &corrected,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(count_binding_and_markers("offset-policy-number"), 4);
+        for (suffix, attempt, old, replacement, valid) in [
+            (
+                "nul-only",
+                15,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\\u0000suffix\":\"0.1\"".to_owned(),
+                false,
+            ),
+            (
+                "nul-before",
+                16,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\\u0000suffix\":\"0.1\",\"schema_version\":\"0.1\"".to_owned(),
+                true,
+            ),
+            (
+                "nul-after",
+                17,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\":\"0.1\",\"schema_version\\u0000suffix\":\"0.1\"".to_owned(),
+                true,
+            ),
+            (
+                "evidence-nul-only",
+                18,
+                "\"conformance_evidence_id\":\"offset-evidence\"".to_owned(),
+                "\"conformance_evidence_id\\u0000suffix\":\"offset-evidence\"".to_owned(),
+                false,
+            ),
+            (
+                "trust-nul-only",
+                19,
+                "\"provider_trust_source_id\":\"offset-trust\"".to_owned(),
+                "\"provider_trust_source_id\\u0000suffix\":\"offset-trust\"".to_owned(),
+                false,
+            ),
+            (
+                "overflow",
+                20,
+                "\"attempt\":20".to_owned(),
+                "\"attempt\":18446744073709551615".to_owned(),
+                false,
+            ),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let receipt = clone_receipt(&binding_id, &attempt_id, attempt);
+            let forged = receipt.replacen(&old, &replacement, 1);
+            assert_ne!(
+                forged, receipt,
+                "fixture mutation {suffix} must be effective"
+            );
+            let result = insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &forged,
+                "[]",
+                "[]",
+                "{}",
+            );
+            if valid {
+                result.unwrap();
+                assert_eq!(count_binding_and_markers(&binding_id), 4, "{suffix}");
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("binding "), "{suffix}: {error}");
+                assert_eq!(count_binding_and_markers(&binding_id), 0, "{suffix}");
+            }
+        }
+        for (suffix, attempt) in [("nul-only", 15), ("overflow", 20)] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let receipt = clone_receipt(&binding_id, &attempt_id, attempt);
+            insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &receipt,
+                "[]",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+            assert_eq!(count_binding_and_markers(&binding_id), 4);
+        }
+        aios_registry::register_strict_json_sqlite(&raw).unwrap();
+        raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let ignored_sql = "INSERT OR IGNORE INTO execution_bindings
+            (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+             attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+             placement_json,binding_json,created_at)
+            SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                   ir_version,node_id,capability,capability_contract_hash,
+                   provider_registration_id,provider_id,provider_version,
+                   provider_manifest_hash,provider_build_hash,?3,
+                   policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                   placement_json,?4,created_at
+            FROM execution_bindings WHERE binding_id='offset-binding'";
+        for (suffix, valid_attempt, sql) in [
+            ("ignored-check", 21, ignored_sql.to_owned()),
+            (
+                "replaced-check",
+                22,
+                ignored_sql.replacen("OR IGNORE", "OR REPLACE", 1),
+            ),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let invalid = clone_receipt(&binding_id, &attempt_id, 0);
+            let error = raw
+                .execute(&sql, params![&binding_id, &attempt_id, 0, &invalid])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("binding provider identity does not match registration"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(count_binding_and_markers(&binding_id), 0, "{suffix}");
+            let corrected = clone_receipt(&binding_id, &attempt_id, valid_attempt);
+            insert_clone(
+                &raw,
+                &binding_id,
+                &attempt_id,
+                valid_attempt,
+                &corrected,
+                "[]",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+            assert_eq!(count_binding_and_markers(&binding_id), 4);
+        }
         assert!(
             manager
                 .connection
@@ -9973,15 +10676,9 @@ mod tests {
                 .to_string()
                 .contains("expired at creation")
         );
-        for name in PRIOR_PROVIDER_C5A_GUARDS {
-            manager
-                .connection
-                .execute_batch(&format!("DROP TRIGGER {name}"))
-                .unwrap();
-        }
         manager
             .connection
-            .execute_batch(include_str!("legacy_c5a_provider_registry.sql"))
+            .execute_batch("DROP TRIGGER execution_binding_evidence_unexpired_at_insert")
             .unwrap();
         let stamp: (String, String) = manager
             .connection
@@ -10088,6 +10785,8 @@ mod tests {
              VALUES ('repair-provider','provider:repair','1.0.0','manifest:repair','build:repair',
                      'repair-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+              INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
+              VALUES ('repair-provider','{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"version\":\"1.0\",\"contract_hash\":\"repair-contract\"},\"conformance\":{\"suite\":\"repair-suite\",\"suite_hash\":\"repair-suite-hash\"}}]}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T00:00:00Z'
              WHERE registration_id='repair-provider';
@@ -10106,7 +10805,7 @@ mod tests {
                      'repair-snapshot','0.1','repair-node','artifact.hash@1','repair-contract',
                      'repair-provider','provider:repair','1.0.0','manifest:repair','build:repair',
                      1,'[]','[]','repair-profile','{}',
-                     '{\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"repair-provider\",\"provider\":{\"id\":\"provider:repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:repair\",\"package_or_build_hash\":\"build:repair\"}}',
+                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"repair-program\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"repair-contract\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"repair-provider\",\"provider\":{\"id\":\"provider:repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:repair\",\"package_or_build_hash\":\"build:repair\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
                      '2026-09-19T00:00:00Z');",
         ).unwrap();
         let stamp: (String, String) = manager
@@ -10763,7 +11462,9 @@ mod tests {
                 "DROP TRIGGER provider_registration_state_transition_clock;
              DROP TRIGGER provider_registration_updated_at_requires_transition;
              DROP TRIGGER execution_binding_provider_enablement_not_future;
-             DROP TRIGGER execution_binding_evidence_latest_at_insert;",
+              DROP TRIGGER execution_binding_evidence_latest_at_insert;
+              DROP TRIGGER execution_binding_evidence_present_at_insert;
+              DROP TRIGGER execution_binding_provider_identity_at_insert;",
             )
             .unwrap();
         if !existing_quarantine_table {
@@ -10780,6 +11481,8 @@ mod tests {
         manager.connection.execute_batch(
             "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
              VALUES ('legacy-snapshot','{}','2026-09-19T00:00:00Z');
+              INSERT INTO registry_snapshot_admissions(snapshot_id,state)
+              VALUES ('legacy-snapshot','ADMITTED');
              INSERT INTO provider_registrations
              (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
               registry_snapshot_id,state,trust_status,registration_json,registered_at)
@@ -10806,7 +11509,6 @@ mod tests {
                      '{\"conformance_evidence_id\":\"legacy-evidence\",\"provider_trust_source_id\":\"legacy-provider\",\"provider\":{\"id\":\"legacy-provider\",\"version\":\"1.0.0\",\"manifest_hash\":\"legacy-manifest\",\"package_or_build_hash\":\"legacy-build\"}}',
                      '2026-09-19T00:00:00Z');",
         ).unwrap();
-        assert!(preflight_migration_state_allowing_guard_upgrade(&manager.connection).is_ok());
         assert!(preflight_migration_state(&manager.connection).is_err());
         let old_marker: String = manager.connection.query_row(
             "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='legacy-binding'",
@@ -10857,74 +11559,74 @@ mod tests {
         }
         drop(manager);
 
-        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        assert!(preflight_migration_state(&reopened.connection).is_ok());
-        let after: (String, String) = reopened.connection.query_row(
-            "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
-            [], |row| Ok((row.get(0)?,row.get(1)?)),
-        ).unwrap();
-        assert_eq!(after, stamp);
-        let upgraded_state: (String, String) = reopened.connection.query_row(
-            "SELECT state,updated_at FROM provider_registrations WHERE registration_id='legacy-provider'",
-            [], |row| Ok((row.get(0)?,row.get(1)?)),
-        ).unwrap();
         if partial_binding_guard_only {
-            assert_eq!(upgraded_state.0, "registered");
-        } else {
-            assert_eq!(upgraded_state, ("disabled".to_owned(), T0.to_owned()));
+            let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert!(preflight_migration_state(&reopened.connection).is_ok());
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM execution_binding_legacy_trust_quarantine
+                 WHERE binding_id='legacy-binding'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT state FROM provider_registrations
+                 WHERE registration_id='legacy-provider'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "registered"
+            );
+            return;
         }
-        for table in [
-            "tasks",
-            "provider_registrations",
-            "provider_conformance_evidence",
-            "execution_bindings",
-            "execution_binding_trust_markers",
-            "execution_binding_legacy_trust_quarantine",
-        ] {
-            let id = if table == "tasks" {
-                "T-old-trust-guard"
-            } else if table == "provider_registrations" {
-                "legacy-provider"
-            } else if table == "provider_conformance_evidence" {
-                "legacy-evidence"
-            } else {
-                "legacy-binding"
-            };
-            let key = if table == "tasks" {
-                "task_id"
-            } else if table == "provider_registrations" {
-                "registration_id"
-            } else if table == "provider_conformance_evidence" {
-                "evidence_id"
-            } else {
-                "binding_id"
-            };
-            let count: i64 = reopened
-                .connection
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE {key}=?1"),
-                    [id],
-                    |row| row.get(0),
+        let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+            Ok(_) => panic!("unprovable legacy provider history reopened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &reopen_error,
+                TaskManagerError::InvalidRecord(
+                    "provider state history requires operator quarantine"
+                        | "provider registry migration is incomplete"
                 )
-                .unwrap();
-            assert_eq!(count, 1, "{table}");
-        }
-        let preserved_marker: String = reopened.connection.query_row(
-            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='legacy-binding'",
-            [], |row| row.get(0),
-        ).unwrap();
+            ),
+            "{reopen_error}"
+        );
+        let retained = Connection::open(&path).unwrap();
+        assert_eq!(
+            retained
+                .query_row(
+                    "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0013_provider_registry'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            stamp
+        );
+        let preserved_marker: String = retained
+            .query_row(
+                "SELECT trust_source_id FROM execution_binding_trust_markers
+             WHERE binding_id='legacy-binding'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(preserved_marker, old_marker);
-        for name in PRIOR_PROVIDER_TRUST_GUARDS {
-            let actual: String = reopened
-                .connection
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
-                    [name],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(!legacy_provider_trust_guard_matches(name, &actual).unwrap());
-        }
+        assert_eq!(retained.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='legacy-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
     }
 
     #[test]

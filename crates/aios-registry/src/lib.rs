@@ -7,6 +7,7 @@
 #![allow(missing_docs)]
 
 mod authority;
+mod binding_receipt;
 mod conformance;
 mod error;
 mod hash;
@@ -16,9 +17,11 @@ mod provider_store;
 mod schema;
 mod store;
 mod strict_json;
+mod strict_json_sqlite;
 mod version;
 
 pub use authority::effect_for_authority_class;
+pub use binding_receipt::{BindingReceiptColumns, BindingReceiptProjection};
 pub use conformance::{
     ProviderConformanceDiagnostic, ProviderConformanceOptions, ProviderConformanceReport,
     validate_provider_manifest,
@@ -47,4 +50,5 @@ pub use store::{
 pub use strict_json::{
     StrictJsonError, StrictJsonErrorKind, StrictJsonLimits, parse_strict_json, parse_strict_value,
 };
+pub use strict_json_sqlite::register_strict_json_sqlite;
 pub use version::{FullVersion, SemanticRef};
