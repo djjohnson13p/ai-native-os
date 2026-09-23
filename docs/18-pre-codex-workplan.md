@@ -1,5 +1,9 @@
 # 18 — Pre-Codex Work Plan and Implementation Dependency Graph
 
+Historical pre-implementation plan. Issue #17 is closed after PR #36 merged
+on 2026-09-20. Use Issue #38, the active issue/PR, and
+`docs/82-stage1-core-substrate-codex-runbook.md` for current assignment order.
+
 ## Purpose
 
 This file is now the compact dependency map between architecture work and implementation.
@@ -48,7 +52,7 @@ These interfaces exist so the trusted core does not accidentally make them impos
 
 ## First serious Codex task
 
-**Issue #17 remains first.**
+**Issue #17 was the first planned implementation task and is complete.**
 
 The exact runbook is `docs/62-first-codex-session-runbook.md`.
 

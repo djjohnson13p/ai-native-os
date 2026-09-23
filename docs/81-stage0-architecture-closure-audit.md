@@ -1,5 +1,12 @@
 # 81 — Stage-0 Architecture Closure Audit
 
+Historical Stage 0 snapshot. [Issue #17](https://github.com/djjohnson13p/ai-native-os/issues/17)
+closed after [PR #36](https://github.com/djjohnson13p/ai-native-os/pull/36)
+merged on 2026-09-20. Statements below about what to implement next describe
+the pre-implementation plan, not the current assignment. Use
+[Issue #38](https://github.com/djjohnson13p/ai-native-os/issues/38), the active
+issue/PR, and `docs/82-stage1-core-substrate-codex-runbook.md` for live order.
+
 ## Purpose
 
 This document answers one question:
@@ -12,7 +19,9 @@ It is a snapshot of pre-implementation closure, not a claim that the architectur
 
 **Stage 0 is close enough to begin bounded trusted-core implementation.**
 
-The first implementation task remains Issue #17. The immediate Phase-I contracts following it are now also sufficiently specified for bounded spikes.
+At this snapshot, Issue #17 was the first planned implementation task. The
+immediate Phase-I contracts following it were sufficiently specified for
+bounded spikes.
 
 This does **not** mean broad AIOS implementation should begin in parallel. The safe implementation sequence remains dependency-driven.
 

@@ -1,5 +1,9 @@
 # 59 — Pre-Codex Foundation Closure Plan
 
+Historical pre-implementation plan. Issue #17 is closed after PR #36 merged
+on 2026-09-20. For current work, use Issue #38, the active issue/PR, and
+`docs/82-stage1-core-substrate-codex-runbook.md`.
+
 ## Purpose
 
 The architecture has intentionally expanded to cover the long-term System-of-Everything destination. Before implementation accelerates, the project needs a closure discipline: decide which architecture questions must be settled now, which only need a stable interface, and which are deliberately deferred.

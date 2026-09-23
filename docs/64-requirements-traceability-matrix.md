@@ -65,7 +65,9 @@ A requirement can be both `INTERFACE` and `CROSS-CUTTING`.
 
 ## Phase-0 / Issue #17 direct requirement map
 
-Issue #17 is the first implementation spike. The following requirements are direct merge gates or controlling constraints.
+Issue #17 was the first implementation spike and is closed. The following
+requirements were its direct merge gates or controlling constraints; retain
+this map as historical traceability evidence.
 
 | Requirement | Validator responsibility | Primary evidence |
 | --- | --- | --- |

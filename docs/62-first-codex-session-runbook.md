@@ -1,10 +1,15 @@
 # 62 — First Codex Session Runbook
 
+Historical first-session runbook. Issue #17 is closed after PR #36 merged on
+2026-09-20. Instructions below describe that completed assignment; for current
+work use Issue #38, the active issue/PR, and
+`docs/82-stage1-core-substrate-codex-runbook.md`.
+
 ## Purpose
 
 When Codex/Work capacity becomes available, the first serious implementation session should start from a bounded, high-signal task rather than the full AIOS vision.
 
-The recommended first assignment remains GitHub Issue #17:
+The recommended first assignment at the time was GitHub Issue #17:
 
 > Implement the deterministic AIOS IR validator, normalizer, static effect summary, and semantic hash boundary.
 
