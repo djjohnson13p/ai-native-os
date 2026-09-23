@@ -738,6 +738,119 @@ fn stamped_provenance_table_without_task_fk_rejects_orphan_stream() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers both auxiliary foreign keys across stamped rejection and unstamped rebuild"
+)]
+fn provenance_requires_all_declared_foreign_keys_in_stamped_and_unstamped_stores() {
+    for (missing_fk, name) in [
+        (
+            "FOREIGN KEY (registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),",
+            "registry-snapshot",
+        ),
+        (
+            "FOREIGN KEY (execution_binding_id) REFERENCES execution_bindings(binding_id),",
+            "execution-binding",
+        ),
+    ] {
+        for stamped in [true, false] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join(format!("missing-{name}-fk.sqlite3"));
+            let task_id = "T-missing-provenance-fk";
+            let original_hash = {
+                let mut manager =
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                manager.create_task(&create(task_id)).unwrap();
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash
+            };
+            let connection = Connection::open(&path).unwrap();
+            let schema: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let malformed = schema
+                .replacen(
+                    "CREATE TABLE provenance_events",
+                    "CREATE TABLE provenance_events_without_fk",
+                    1,
+                )
+                .replacen(missing_fk, "", 1);
+            assert_ne!(malformed, schema, "{name} FK must be present in fixture");
+            assert!(!malformed.contains(missing_fk));
+            let clear_stamp = if stamped {
+                ""
+            } else {
+                "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';"
+            };
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys=OFF;
+                     DROP TRIGGER provenance_events_no_update;
+                     DROP TRIGGER provenance_events_no_delete;
+                     {malformed};
+                     INSERT INTO provenance_events_without_fk SELECT * FROM provenance_events;
+                     DROP TABLE provenance_events;
+                     ALTER TABLE provenance_events_without_fk RENAME TO provenance_events;
+                     {clear_stamp}"
+                ))
+                .unwrap();
+            assert!(provenance_task_fk_is_current(&connection).unwrap());
+            assert!(!provenance_foreign_keys_are_current(&connection).unwrap());
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert!(
+                aios_provenance::verify_stream(
+                    &connection,
+                    &provenance_stream_id(task_id),
+                    None,
+                    None,
+                    TEST_TIME,
+                )
+                .unwrap()
+                .valid
+            );
+            drop(connection);
+
+            if stamped {
+                assert!(matches!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                    Err(TaskManagerError::InvalidRecord(
+                        "provenance service-boundary migration is incomplete"
+                    ))
+                ));
+            } else {
+                let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                assert!(provenance_foreign_keys_are_current(&manager.connection).unwrap());
+                assert!(manager.verify_provenance(task_id).unwrap());
+                assert_eq!(
+                    manager
+                        .provenance_head(task_id)
+                        .unwrap()
+                        .unwrap()
+                        .event_hash,
+                    original_hash
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn provenance_task_fk_rejects_extra_cascading_constraint() {
     let connection = Connection::open_in_memory().unwrap();
     connection

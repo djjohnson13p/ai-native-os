@@ -3648,7 +3648,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 || !table_has_column(connection, "provenance_events", "hash_profile")?
                 || !provenance_event_id_is_primary_key(connection)?
                 || !table_column_not_null(connection, "provenance_events", "task_id")?
-                || !provenance_task_fk_is_current(connection)?)
+                || !provenance_foreign_keys_are_current(connection)?)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "provenance service-boundary migration is incomplete",
@@ -3797,7 +3797,7 @@ fn migrate_task_manager_schema(
             || !table_has_column(connection, "provenance_events", "hash_profile")?
             || !provenance_event_id_is_primary_key(connection)?
             || !table_column_not_null(connection, "provenance_events", "task_id")?
-            || !provenance_task_fk_is_current(connection)?;
+            || !provenance_foreign_keys_are_current(connection)?;
     let foreign_key_rebuild =
         transition_has_foreign_key || operations_require_rebuild || provenance_requires_rebuild;
     let foreign_keys_enabled =
@@ -4523,6 +4523,45 @@ fn provenance_task_fk_is_current(connection: &Connection) -> Result<bool> {
                         .count()
                         == 1
             }))
+}
+
+fn provenance_foreign_keys_are_current(connection: &Connection) -> Result<bool> {
+    if !provenance_task_fk_is_current(connection)? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare("PRAGMA foreign_key_list(provenance_events)")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let foreign_keys = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        ("tasks", "task_id", "task_id"),
+        ("registry_snapshots", "registry_snapshot_id", "snapshot_id"),
+        ("execution_bindings", "execution_binding_id", "binding_id"),
+    ];
+    Ok(foreign_keys.len() == expected.len()
+        && expected.iter().all(|(target, source, key)| {
+            foreign_keys
+                .iter()
+                .filter(|(_, sequence, table, from, to, on_update, on_delete)| {
+                    *sequence == 0
+                        && table == target
+                        && from == source
+                        && to == key
+                        && on_update.eq_ignore_ascii_case("NO ACTION")
+                        && on_delete.eq_ignore_ascii_case("NO ACTION")
+                })
+                .count()
+                == 1
+        }))
 }
 
 fn table_column_not_null(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -7615,6 +7654,44 @@ mod tests {
             )
             .unwrap();
         assert!(provenance_event_id_is_primary_key(&connection).unwrap());
+    }
+
+    #[test]
+    fn provenance_foreign_key_shape_rejects_misbound_and_cascading_evidence_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+                 CREATE TABLE registry_snapshots(snapshot_id TEXT PRIMARY KEY);
+                 CREATE TABLE execution_bindings(binding_id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        for (registry_target, binding_delete, expected) in [
+            ("snapshot_id", "", true),
+            ("wrong_snapshot_id", "", false),
+            ("snapshot_id", "ON DELETE CASCADE", false),
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE provenance_events(
+                         task_id TEXT,
+                         registry_snapshot_id TEXT,
+                         execution_binding_id TEXT,
+                         FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+                         FOREIGN KEY(registry_snapshot_id) REFERENCES registry_snapshots({registry_target}),
+                         FOREIGN KEY(execution_binding_id) REFERENCES execution_bindings(binding_id) {binding_delete}
+                     );"
+                ))
+                .unwrap();
+            assert_eq!(
+                provenance_foreign_keys_are_current(&connection).unwrap(),
+                expected,
+                "registry target {registry_target}, binding delete {binding_delete}"
+            );
+            connection
+                .execute_batch("DROP TABLE provenance_events")
+                .unwrap();
+        }
     }
 
     #[test]

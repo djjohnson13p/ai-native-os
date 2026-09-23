@@ -163,6 +163,11 @@ column and reject null event IDs. Otherwise duplicate IDs across separately
 valid streams make receipt lookup ambiguous, and SQLite ordinary rowid tables
 can accept null values in a `TEXT PRIMARY KEY`. This rejects malformed stamped
 stores without rewriting valid rows.
+Stamped stores also require all three exact provenance foreign keys to Task,
+Registry Snapshot, and Execution Binding. A foreign-key check cannot detect an
+undeclared constraint, so accepting only the Task key could silently admit
+orphaned security-evidence references. Unstamped stores rebuild the declared
+shape transactionally or reject invalid references.
 Integers in the canonical hash view are limited in magnitude to
 `9007199254740991` before RFC 8785 serialization; v0.1 typed event and
 envelope integer fields are also nonnegative. Out-of-range values were
