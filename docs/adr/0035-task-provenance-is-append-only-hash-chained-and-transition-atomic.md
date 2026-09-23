@@ -155,6 +155,9 @@ remain unchanged.
 The former public callback-free `export_jsonl` shortcut is internal to tests;
 integrations must provide same-snapshot Task validation through the trusted
 callback exporter or use `TaskManager::export_provenance`.
+Stamped stores with a nullable provenance Task key or any unowned journal row
+are rejected at startup rather than treated as a valid migrated store; existing
+valid records and hashes are unaffected.
 
 ## Related
 

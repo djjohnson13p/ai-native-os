@@ -753,6 +753,147 @@ fn provenance_task_fk_rejects_extra_cascading_constraint() {
     assert!(!provenance_task_fk_is_current(&connection).unwrap());
 }
 
+fn duplicate_provenance_row(
+    connection: &Connection,
+    original_task_id: &str,
+    event_id: &str,
+    task_id: Option<&str>,
+    stream_id: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO provenance_events
+         SELECT schema_version,hash_profile,?2,?3,?4,2,timestamp,event_type,
+                semantic_program_hash,ir_version,registry_snapshot_id,node_id,
+                execution_binding_id,provider_id,status,previous_event_hash,event_hash,event_json
+         FROM provenance_events WHERE task_id=?1 AND sequence=1",
+            rusqlite::params![original_task_id, event_id, task_id, stream_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn stamped_nullable_provenance_task_id_rejects_null_orphan() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("stamped-null-provenance-task.sqlite3");
+    let task_id = "T-null-provenance-owner";
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create(task_id)).unwrap();
+    }
+    let connection = Connection::open(&path).unwrap();
+    let schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let nullable_schema = schema
+        .replacen(
+            "CREATE TABLE provenance_events",
+            "CREATE TABLE provenance_events_nullable_task",
+            1,
+        )
+        .replacen(
+            "task_id                  TEXT NOT NULL",
+            "task_id                  TEXT",
+            1,
+        );
+    assert!(nullable_schema.contains("task_id                  TEXT,"));
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER provenance_events_no_update;
+         DROP TRIGGER provenance_events_no_delete;
+         {nullable_schema};
+         INSERT INTO provenance_events_nullable_task SELECT * FROM provenance_events;
+         DROP TABLE provenance_events;
+         ALTER TABLE provenance_events_nullable_task RENAME TO provenance_events;"
+        ))
+        .unwrap();
+    assert!(provenance_task_fk_is_current(&connection).unwrap());
+    assert!(!table_column_not_null(&connection, "provenance_events", "task_id").unwrap());
+    duplicate_provenance_row(
+        &connection,
+        task_id,
+        "event:null-provenance-owner",
+        None,
+        "stream:v1:null-provenance-owner",
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    assert!(matches!(
+        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+        Err(TaskManagerError::InvalidRecord(
+            "provenance service-boundary migration is incomplete"
+        ))
+    ));
+}
+
+#[test]
+fn stamped_provenance_rejects_unowned_or_wrong_stream_extra_rows() {
+    for (event_id, owner, stream_id, expected_error) in [
+        (
+            "event:unowned-extra",
+            "T-provenance-owner-missing",
+            "stream:v1:unowned-extra",
+            "provenance event has no owning Task",
+        ),
+        (
+            "event:wrong-stream-extra",
+            "T-provenance-owner",
+            "stream:v1:wrong-stream-extra",
+            "Task provenance chain is missing or invalid before startup reconciliation",
+        ),
+    ] {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("stamped-extra-provenance-row.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-provenance-owner")).unwrap();
+        drop(manager);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        assert!(provenance_task_fk_is_current(&connection).unwrap());
+        duplicate_provenance_row(
+            &connection,
+            "T-provenance-owner",
+            event_id,
+            Some(owner),
+            stream_id,
+        );
+        let foreign_key_violations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            foreign_key_violations,
+            i64::from(owner != "T-provenance-owner")
+        );
+        drop(connection);
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(message)) if message == expected_error
+        ));
+    }
+}
+
 #[test]
 fn new_task_opaque_identifiers_preserve_exact_hash_and_export_after_reopen() {
     let directory = tempdir().unwrap();

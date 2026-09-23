@@ -739,6 +739,8 @@ fn export_jsonl(
 /// creation commitment, and current state against the committed journal. It
 /// must not commit or mutate the journal. Task Manager's `export_provenance` is
 /// the normal Task-facing export API.
+/// A successful callback is trusted validation evidence supplied by the
+/// integration; a no-op callback violates this API contract.
 ///
 /// The callback-free fixture shortcut is intentionally unavailable to external
 /// callers:

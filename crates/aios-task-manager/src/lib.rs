@@ -2585,7 +2585,7 @@ impl TaskManager {
             &self.clock.now(),
         )?;
         let mismatched_streams = self.connection.query_row(
-            "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND stream_id<>?2",
+            "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND (stream_id IS NULL OR stream_id<>?2)",
             params![task_id, stream_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -2868,7 +2868,7 @@ fn verify_provenance_through(
         .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance verification sequence"))?;
     let stream_id = aios_provenance::stream_id(task_id)?;
     let mismatched_streams = connection.query_row(
-        "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND stream_id<>?2 AND (?3 IS NULL OR sequence<=?3)",
+        "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND (stream_id IS NULL OR stream_id<>?2) AND (?3 IS NULL OR sequence<=?3)",
         params![task_id, stream_id, through_sequence.map(|value| i64::try_from(value).unwrap_or(i64::MAX))],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3646,10 +3646,26 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         if has_v11
             && (!table_has_column(connection, "provenance_events", "schema_version")?
                 || !table_has_column(connection, "provenance_events", "hash_profile")?
+                || !table_column_not_null(connection, "provenance_events", "task_id")?
                 || !provenance_task_fk_is_current(connection)?)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "provenance service-boundary migration is incomplete",
+            ));
+        }
+        if has_v11
+            && connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provenance_events AS event
+                    LEFT JOIN tasks AS task ON task.task_id = event.task_id
+                    WHERE event.task_id IS NULL OR task.task_id IS NULL
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "provenance event has no owning Task",
             ));
         }
     }
@@ -3767,6 +3783,7 @@ fn migrate_task_manager_schema(
     let provenance_requires_rebuild =
         !table_has_column(connection, "provenance_events", "schema_version")?
             || !table_has_column(connection, "provenance_events", "hash_profile")?
+            || !table_column_not_null(connection, "provenance_events", "task_id")?
             || !provenance_task_fk_is_current(connection)?;
     let foreign_key_rebuild =
         transition_has_foreign_key || operations_require_rebuild || provenance_requires_rebuild;
