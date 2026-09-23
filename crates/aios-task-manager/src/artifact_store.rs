@@ -13600,24 +13600,24 @@ mod tests {
         clippy::too_many_lines,
         reason = "builds a complete provenance-authenticated running Task fixture"
     )]
-    fn authenticate_running_fixture_history(manager: &mut TaskManager) {
+    fn authenticate_running_fixture_history(manager: &mut TaskManager, task_id: &str) {
         manager
             .connection
             .execute(
                 "UPDATE tasks SET revision=1,state='CREATED',active_step_ids_json='[]',
                  state_reason_json=(SELECT event_json FROM provenance_events
-                    WHERE task_id='T-artifact' AND event_type='task.created' LIMIT 1)
-                 WHERE task_id='T-artifact'",
-                [],
+                    WHERE task_id=?1 AND event_type='task.created' LIMIT 1)
+                 WHERE task_id=?1",
+                [task_id],
             )
             .unwrap();
-        let (program_id, ir_version, semantic_hash, registry_snapshot_id, program_json) = manager
+        let active_program = manager
             .connection
             .query_row(
                 "SELECT program_id,ir_version,semantic_hash,registry_snapshot_id,program_json
                  FROM semantic_program_revisions
-                 WHERE task_id='T-artifact' AND program_revision=1",
-                [],
+                 WHERE task_id=?1 AND program_revision=1",
+                [task_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -13628,18 +13628,23 @@ mod tests {
                     ))
                 },
             )
+            .optional()
             .unwrap();
-        let active_program = json!({
-            "program_id": program_id,
-            "ir_version": ir_version,
-            "semantic_hash": semantic_hash,
-            "registry_snapshot_id": registry_snapshot_id,
-            "validation_result_id": null,
-            "validated_at": null,
-            "validator_id": null,
-            "validator_version": null,
-            "program_content_digest": super::super::program_content_digest(&program_json).unwrap(),
-        });
+        let active_program = active_program.map(
+            |(program_id, ir_version, semantic_hash, registry_snapshot_id, program_json)| {
+                json!({
+                    "program_id": program_id,
+                    "ir_version": ir_version,
+                    "semantic_hash": semantic_hash,
+                    "registry_snapshot_id": registry_snapshot_id,
+                    "validation_result_id": null,
+                    "validated_at": null,
+                    "validator_id": null,
+                    "validator_version": null,
+                    "program_content_digest": super::super::program_content_digest(&program_json).unwrap(),
+                })
+            },
+        );
         let transaction = manager.connection.transaction().unwrap();
         let mut from = crate::TaskState::Created;
         for (index, to) in [
@@ -13654,18 +13659,18 @@ mod tests {
             let new_revision = previous_revision + 1;
             let event = json!({
                 "schema_version": SCHEMA_VERSION,
-                "event_id": format!("event:fixture-running:{new_revision}"),
-                "task_id": "T-artifact",
+                "event_id": format!("event:fixture-running:{task_id}:{new_revision}"),
+                "task_id": task_id,
                 "event_type": "task.transitioned",
                 "timestamp": "2026-09-19T22:00:00Z",
                 "actor": {"kind":"system-service","id":"service:test"},
                 "status": "success",
-                "semantic_program_hash": active_program.get("semantic_hash"),
-                "ir_version": active_program.get("ir_version"),
-                "registry_snapshot_id": active_program.get("registry_snapshot_id"),
+                "semantic_program_hash": active_program.as_ref().and_then(|value| value.get("semantic_hash")),
+                "ir_version": active_program.as_ref().and_then(|value| value.get("ir_version")),
+                "registry_snapshot_id": active_program.as_ref().and_then(|value| value.get("registry_snapshot_id")),
                 "validation_result_id": null,
                 "task_transition": {
-                    "transition_id": format!("fixture-running:{new_revision}"),
+                    "transition_id": format!("fixture-running:{task_id}:{new_revision}"),
                     "previous_state": from,
                     "new_state": to,
                     "previous_revision": previous_revision,
@@ -13686,14 +13691,14 @@ mod tests {
                     "mutation_text_commitments": {"waiting_on":null,"failure_summary":null}
                 }
             });
-            let appended = append_event(&transaction, "T-artifact", &event).unwrap();
+            let appended = append_event(&transaction, task_id, &event).unwrap();
             transaction
                 .execute(
                     "UPDATE tasks SET revision=?2,state=?3,
                      active_step_ids_json='[\"compose_report\"]',updated_at=?4,
-                     state_reason_json=?5 WHERE task_id='T-artifact'",
+                     state_reason_json=?5 WHERE task_id=?1",
                     params![
-                        "T-artifact",
+                        task_id,
                         new_revision,
                         to.as_str(),
                         "2026-09-19T22:00:00Z",
@@ -15836,6 +15841,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -15998,6 +16004,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -18440,6 +18447,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -19645,13 +19653,7 @@ mod tests {
         let scope = manager
             .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact_id))
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         manager
             .artifact_store_dir
             .remove_file(safe_internal_ref(&storage_ref).unwrap())
@@ -19775,10 +19777,12 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
+        authenticate_running_fixture_history(&mut manager, "T-shared");
         manager
             .connection
             .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id IN ('T-artifact','T-shared','T-unrelated')",
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-unrelated'",
                 [],
             )
             .unwrap();
@@ -19808,7 +19812,8 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                expected_state
+                expected_state,
+                "unexpected recovery state for {task_id}"
             );
         }
         for (task_id, publication_id) in
@@ -19960,13 +19965,7 @@ mod tests {
         manager
             .reserve_publication(&pending, &canonical_json(&pending).unwrap())
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-shared'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-shared");
         let storage_ref: String = manager
             .connection
             .query_row(
@@ -20061,13 +20060,7 @@ mod tests {
         manager
             .reserve_publication(&other, &canonical_json(&other).unwrap())
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let storage_ref = manager
             .connection
             .query_row(
@@ -23861,13 +23854,7 @@ mod tests {
             .artifact_store_dir
             .remove_file(&storage_ref)
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 Err(TaskManagerError::Io(std::io::Error::other(
@@ -25404,13 +25391,7 @@ mod tests {
             manager
                 .reserve_publication(&pending, &canonical_json(&pending).unwrap())
                 .unwrap();
-            manager
-                .connection
-                .execute(
-                    "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                    [],
-                )
-                .unwrap();
+            authenticate_running_fixture_history(&mut manager, "T-artifact");
             for task_id in ["T-shared", "T-unrelated"] {
                 let allocation_id = format!("alloc-{task_id}-{fixture}");
                 let mut output = allocation(&allocation_id);
@@ -25422,11 +25403,11 @@ mod tests {
                     .reserve_publication(&pending, &canonical_json(&pending).unwrap())
                     .unwrap();
             }
+            authenticate_running_fixture_history(&mut manager, "T-shared");
             manager
                 .connection
                 .execute(
-                    "UPDATE tasks SET state='RUNNING'
-                     WHERE task_id IN ('T-shared','T-unrelated')",
+                    "UPDATE tasks SET state='RUNNING' WHERE task_id='T-unrelated'",
                     [],
                 )
                 .unwrap();
@@ -25565,7 +25546,7 @@ mod tests {
             std::slice::from_ref(&artifact.artifact_id),
             &[("artifact.read", "artifact", &artifact.artifact_id)],
         );
-        authenticate_running_fixture_history(&mut manager);
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = session_for_binding(&manager, "T-artifact", &binding_id);
         let scope = manager
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
@@ -25677,7 +25658,7 @@ mod tests {
             std::slice::from_ref(&artifact.artifact_id),
             &[("artifact.read", "artifact", &artifact.artifact_id)],
         );
-        authenticate_running_fixture_history(&mut manager);
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = session_for_binding(&manager, "T-artifact", &binding_id);
         let scope = manager
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))

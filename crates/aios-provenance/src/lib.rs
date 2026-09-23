@@ -1938,7 +1938,7 @@ fn validate_sequence_event_invariant(sequence: u64, event: &Value) -> Result<()>
 fn latest_task_revision_in_tx(
     transaction: &Transaction<'_>,
     stream_id: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, String)>> {
     let stored: Option<(String, String)> = transaction
         .query_row(
             "SELECT event_type,event_json FROM provenance_events WHERE stream_id=?1 AND event_type IN ('task.created','task.transitioned') ORDER BY sequence DESC LIMIT 1",
@@ -1955,16 +1955,24 @@ fn latest_task_revision_in_tx(
             "stored Task revision event conflicts with its index".to_owned(),
         ));
     }
+    validate_stored_event(&event)?;
     match event_type.as_str() {
-        "task.created" => Ok(event.pointer("/details/revision").and_then(Value::as_u64)),
-        "task.transitioned" => Ok(event
-            .pointer("/task_transition/new_revision")
-            .and_then(Value::as_u64)),
+        "task.created" => Ok(Some((1, "CREATED".to_owned()))),
+        "task.transitioned" => {
+            let transition = &event["task_transition"];
+            let revision = transition["new_revision"].as_u64().ok_or_else(|| {
+                Error::InvalidRecord("stored Task transition has no revision".to_owned())
+            })?;
+            let state = transition["new_state"].as_str().ok_or_else(|| {
+                Error::InvalidRecord("stored Task transition has no state".to_owned())
+            })?;
+            Ok(Some((revision, state.to_owned())))
+        }
         _ => unreachable!("query filters Task revision events"),
     }
 }
 
-fn advance_task_revision(latest: &mut Option<u64>, event: &Value) -> Result<()> {
+fn advance_task_revision(latest: &mut Option<(u64, String)>, event: &Value) -> Result<()> {
     match string_field(event, "event_type") {
         Some("task.created") => {
             if latest.is_some() {
@@ -1972,7 +1980,7 @@ fn advance_task_revision(latest: &mut Option<u64>, event: &Value) -> Result<()> 
                     "Task creation revision is not genesis".to_owned(),
                 ));
             }
-            *latest = Some(1);
+            *latest = Some((1, "CREATED".to_owned()));
         }
         Some("task.transitioned") => {
             let previous = event
@@ -1981,12 +1989,25 @@ fn advance_task_revision(latest: &mut Option<u64>, event: &Value) -> Result<()> 
             let next = event
                 .pointer("/task_transition/new_revision")
                 .and_then(Value::as_u64);
-            if previous != *latest || next.is_none() {
+            let previous_state = event
+                .pointer("/task_transition/previous_state")
+                .and_then(Value::as_str);
+            let next_state = event
+                .pointer("/task_transition/new_state")
+                .and_then(Value::as_str);
+            if previous != latest.as_ref().map(|(revision, _)| *revision)
+                || previous_state != latest.as_ref().map(|(_, state)| state.as_str())
+                || next.is_none()
+                || next_state.is_none()
+            {
                 return Err(Error::InvalidRecord(
-                    "Task transition revision is discontinuous".to_owned(),
+                    "Task transition revision or state is discontinuous".to_owned(),
                 ));
             }
-            *latest = next;
+            *latest = Some((
+                next.expect("checked above"),
+                next_state.expect("checked above").to_owned(),
+            ));
         }
         _ => {}
     }
@@ -3062,6 +3083,78 @@ mod tests {
         );
         let records = list_events(&connection, &stream, None, 5).unwrap().records;
         assert!(verify_records(&records, &stream, None, NOW).unwrap().valid);
+    }
+
+    #[test]
+    fn task_state_continuity_is_required_for_append_and_both_chain_verifiers() {
+        let task_id = "T-state-continuity";
+        let stream = stream_id(task_id).unwrap();
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_transition_event(task_id),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let mut next = typed_transition_event(task_id);
+        next["event_id"] = json!("event-state-discontinuity");
+        next["task_transition"]["previous_revision"] = json!(2);
+        next["task_transition"]["new_revision"] = json!(3);
+        next["task_transition"]["previous_state"] = json!("RUNNING");
+        next["task_transition"]["new_state"] = json!("COMPLETED");
+        assert!(append_in_tx(&transaction, task_id, &next, &ExpectedHead::Any).is_err());
+        transaction.commit().unwrap();
+
+        let mut records = list_events(&connection, &stream, None, 3).unwrap().records;
+        let forged_hash = hash_record(&stream, 3, Some(&records[1].event_hash), &next).unwrap();
+        records.push(JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 3,
+            previous_event_hash: Some(records[1].event_hash.clone()),
+            event: next.clone(),
+            event_hash: forged_hash.clone(),
+        });
+        assert!(!verify_records(&records, &stream, None, NOW).unwrap().valid);
+        connection.execute(
+            "INSERT INTO provenance_events (schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,event_type,status,previous_event_hash,event_hash,event_json) VALUES (?1,?2,?3,?4,?5,3,?6,'task.transitioned','success',?7,?8,?9)",
+            params![SCHEMA_VERSION,HASH_PROFILE,"event-state-discontinuity",task_id,stream,NOW,records[1].event_hash,forged_hash,next.to_string()],
+        ).unwrap();
+        assert!(
+            !verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[test]
+    fn historical_raw_intent_creation_is_not_portably_exportable() {
+        let task_id = "T-legacy-raw-intent";
+        let stream = stream_id(task_id).unwrap();
+        let connection = connection();
+        let mut legacy = typed_creation_event(task_id, 1);
+        legacy["details"]["creation"]["original_intent_ref"] = json!("synthetic private intent");
+        let hash = hash_record(&stream, 1, None, &legacy).unwrap();
+        connection.execute(
+            "INSERT INTO provenance_events (schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,event_type,status,previous_event_hash,event_hash,event_json) VALUES (?1,?2,?3,?4,?5,1,?6,'task.created','success',NULL,?7,?8)",
+            params![SCHEMA_VERSION,HASH_PROFILE,"event-typed-1",task_id,stream,NOW,hash,legacy.to_string()],
+        ).unwrap();
+        assert!(
+            !verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+        assert!(export_jsonl(&connection, &stream, NOW).is_err());
     }
 
     #[test]
@@ -4482,6 +4575,18 @@ mod tests {
         });
         let verdict =
             verify_jsonl_export(&forged.manifest_json, &forged.records_jsonl, NOW).unwrap();
+        assert!(!verdict.valid);
+        assert_eq!(verdict.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+        assert_eq!(verdict.diagnostics[0].sequence, Some(5));
+        let forged_state = rehash_projection(&export, |records| {
+            records[4].projected_event["task_transition"]["previous_state"] = json!("RUNNING");
+        });
+        let verdict = verify_jsonl_export(
+            &forged_state.manifest_json,
+            &forged_state.records_jsonl,
+            NOW,
+        )
+        .unwrap();
         assert!(!verdict.valid);
         assert_eq!(verdict.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
         assert_eq!(verdict.diagnostics[0].sequence, Some(5));

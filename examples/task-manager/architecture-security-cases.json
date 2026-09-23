@@ -16,7 +16,7 @@
       "expected": [
         "Task remains inspect-only",
         "scheduling and recovery mutation are denied",
-        "privacy-safe export is explicitly legacy-redacted"
+        "normal provenance export is denied while the Task is quarantined"
       ]
     },
     {

@@ -3648,7 +3648,8 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 || !table_has_column(connection, "provenance_events", "hash_profile")?
                 || !provenance_event_id_is_primary_key(connection)?
                 || !table_column_not_null(connection, "provenance_events", "task_id")?
-                || !provenance_foreign_keys_are_current(connection)?)
+                || !provenance_foreign_keys_are_current(connection)?
+                || !provenance_append_only_triggers_are_current(connection)?)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "provenance service-boundary migration is incomplete",
@@ -4594,6 +4595,35 @@ fn require_migration_tables(connection: &Connection, tables: &[&str]) -> Result<
         }
     }
     Ok(())
+}
+
+fn provenance_append_only_triggers_are_current(connection: &Connection) -> Result<bool> {
+    for (name, operation) in [
+        ("provenance_events_no_update", "UPDATE"),
+        ("provenance_events_no_delete", "DELETE"),
+    ] {
+        let sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name='provenance_events'",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(sql) = sql else {
+            return Ok(false);
+        };
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = format!(
+            "CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END"
+        );
+        if normalized != expected
+            && normalized
+                != expected.replacen("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn encode_optional<T: Serialize>(value: Option<&T>) -> Result<Option<String>> {
@@ -7704,7 +7734,10 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP TRIGGER provenance_events_no_update;
-                 UPDATE provenance_events SET event_id=NULL;",
+                 UPDATE provenance_events SET event_id=NULL;
+                 CREATE TRIGGER provenance_events_no_update
+                 BEFORE UPDATE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;",
             )
             .unwrap();
         assert!(provenance_event_id_is_primary_key(&manager.connection).unwrap());
@@ -7714,6 +7747,30 @@ mod tests {
                 "provenance event has no identity"
             ))
         ));
+    }
+
+    #[test]
+    fn stamped_provenance_rejects_same_name_noop_append_only_triggers() {
+        for (name, operation) in [
+            ("provenance_events_no_update", "UPDATE"),
+            ("provenance_events_no_delete", "DELETE"),
+        ] {
+            let manager = test_manager();
+            assert!(provenance_append_only_triggers_are_current(&manager.connection).unwrap());
+            manager
+                .connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            assert!(!provenance_append_only_triggers_are_current(&manager.connection).unwrap());
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "provenance service-boundary migration is incomplete"
+                ))
+            ));
+        }
     }
 
     #[test]

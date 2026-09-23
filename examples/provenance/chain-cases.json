@@ -165,10 +165,10 @@
       "expected_behavior": "the two v1 commitment values differ"
     },
     {
-      "name": "legacy-raw-intent-export-is-redacted-projection",
-      "mutation": "export a locally verified legacy stream whose immutable creation event contains raw synthetic intent",
-      "expected_valid": true,
-      "expected_behavior": "privacy-safe export contains only a v1 commitment, labels the manifest legacy-redacted, and does not claim that projected event bytes are the original hash preimage"
+      "name": "legacy-raw-intent-export-is-rejected",
+      "mutation": "attempt normal export of a legacy stream whose immutable creation event contains raw synthetic intent rather than the current typed commitment",
+      "expected_valid": false,
+      "expected_behavior": "typed verification rejects the original stream before projection; no portable export is emitted or silent rehash upgrade performed"
     },
     {
       "name": "creation-commitment-mismatch-quarantines-task",
