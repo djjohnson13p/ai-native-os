@@ -96,9 +96,11 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
         ),
         (MIGRATION_ID, MIGRATION_CHECKSUM),
         ("0013_provider_registry", "provider-registry-v0.1"),
+        ("0014_semantic_repair_fence", "semantic-repair-fence-v0.1"),
     ];
     let mut stamped = false;
     let mut baseline = false;
+    let mut repair_fence_stamped = false;
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;
     let mut rows = statement.query([])?;
@@ -117,6 +119,7 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
         }
         baseline |= id == "0001_v0_1_trusted_control_plane";
         stamped |= id == MIGRATION_ID;
+        repair_fence_stamped |= id == "0014_semantic_repair_fence";
     }
     if !baseline {
         return Err(RegistryStoreError::Conflict(
@@ -155,6 +158,107 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
         }
     }
     preflight_admission_guards(connection, &canonical, stamped)?;
+    if !repair_fence_stamped {
+        return Err(RegistryStoreError::Conflict(
+            "Task Manager fenced semantic repair migration is required",
+        ));
+    }
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+    ))?;
+    for (kind, name) in [
+        ("table", "semantic_repair_fences"),
+        ("table", "semantic_snapshot_reattestations"),
+        ("table", "semantic_terminal_admissions"),
+        ("table", "semantic_legacy_unprovable_admissions"),
+        ("table", "semantic_invalidated_activation_scopes"),
+        ("table", "semantic_activation_scope_history"),
+        ("table", "semantic_legacy_activation_quarantine"),
+        ("view", "semantic_current_usable_snapshots"),
+        ("trigger", "semantic_repair_fence_no_update"),
+        ("trigger", "semantic_repair_fence_no_delete"),
+        ("trigger", "semantic_repair_fence_no_duplicate_insert"),
+        ("trigger", "semantic_repair_fence_sequence"),
+        ("trigger", "semantic_terminal_admission_no_update"),
+        ("trigger", "semantic_terminal_admission_no_delete"),
+        ("trigger", "semantic_terminal_admission_no_duplicate_insert"),
+        ("trigger", "semantic_terminal_admission_insert"),
+        ("trigger", "semantic_terminal_admission_transition"),
+        ("trigger", "semantic_legacy_unprovable_no_update"),
+        ("trigger", "semantic_legacy_unprovable_no_delete"),
+        ("trigger", "semantic_legacy_unprovable_no_duplicate_insert"),
+        ("trigger", "semantic_invalidated_activation_no_update"),
+        ("trigger", "semantic_invalidated_activation_no_delete"),
+        (
+            "trigger",
+            "semantic_invalidated_activation_no_duplicate_insert",
+        ),
+        ("trigger", "semantic_activation_scope_history_no_update"),
+        ("trigger", "semantic_activation_scope_history_no_delete"),
+        (
+            "trigger",
+            "semantic_activation_scope_history_no_duplicate_insert",
+        ),
+        ("trigger", "semantic_activation_scope_history_insert"),
+        ("trigger", "semantic_activation_scope_history_key_update"),
+        ("trigger", "semantic_legacy_activation_quarantine_no_update"),
+        ("trigger", "semantic_legacy_activation_quarantine_no_delete"),
+        (
+            "trigger",
+            "semantic_legacy_activation_quarantine_no_duplicate_insert",
+        ),
+        ("trigger", "semantic_snapshot_reattestation_no_update"),
+        ("trigger", "semantic_snapshot_reattestation_no_delete"),
+        (
+            "trigger",
+            "semantic_snapshot_reattestation_no_duplicate_insert",
+        ),
+        ("trigger", "semantic_snapshot_reattestation_current_only"),
+        ("trigger", "semantic_repair_activation_insert"),
+        ("trigger", "semantic_repair_activation_update"),
+        ("trigger", "semantic_repair_registration_insert"),
+        ("trigger", "semantic_repair_registration_enable"),
+        ("trigger", "semantic_repair_binding_insert"),
+    ] {
+        let actual: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        let expected: String = canonical.query_row(
+            "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        if actual.split_whitespace().ne(expected.split_whitespace()) {
+            return Err(RegistryStoreError::Conflict(
+                "semantic repair fence schema definition mismatch",
+            ));
+        }
+    }
+    let fence_invalid: bool = connection.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM semantic_repair_fences WHERE generation=0 AND reason='BOOTSTRAP')
+          OR EXISTS(SELECT 1 FROM semantic_repair_fences f WHERE typeof(f.generation)<>'integer'
+                    OR (f.generation>0 AND (f.reason<>'GUARD_REPAIR' OR NOT EXISTS (
+                        SELECT 1 FROM semantic_repair_fences p WHERE p.generation=f.generation-1))))
+          OR EXISTS(SELECT 1 FROM semantic_snapshot_reattestations r
+                    WHERE r.verification_profile<>'strict-semantic-v0.1'
+                       OR r.decision_id='' OR r.decision_source='')
+          OR EXISTS(SELECT 1 FROM registry_snapshot_admissions a
+                    WHERE a.state IN ('QUARANTINED','REVOKED')
+                      AND NOT EXISTS(SELECT 1 FROM semantic_terminal_admissions t
+                                     WHERE t.snapshot_id=a.snapshot_id))
+          OR EXISTS(SELECT 1 FROM registry_activations a
+                    WHERE NOT EXISTS(SELECT 1 FROM semantic_activation_scope_history h
+                                     WHERE h.scope_kind=a.scope_kind AND h.scope_id=a.scope_id))",
+        [],
+        |row| row.get(0),
+    )?;
+    if fence_invalid {
+        return Err(RegistryStoreError::Conflict(
+            "semantic repair fence data mismatch",
+        ));
+    }
     let mut violations = connection.prepare("PRAGMA foreign_key_check")?;
     if violations.query([])?.next()?.is_some() {
         return Err(RegistryStoreError::Conflict(
@@ -896,6 +1000,22 @@ impl<'a> RegistryStore<'a> {
             ));
         }
         publish_admission(&transaction, &snapshot_id, already_admitted)?;
+        if !already_admitted {
+            let generation: i64 = transaction.query_row(
+                "SELECT MAX(generation) FROM semantic_repair_fences",
+                [],
+                |row| row.get(0),
+            )?;
+            if generation > 0 {
+                transaction.execute(
+                    "INSERT INTO semantic_snapshot_reattestations
+                     (snapshot_id,generation,decision_id,decision_source,verification_profile,verified_at)
+                     VALUES (?1,?2,?3,'stage1-local-writer','strict-semantic-v0.1',
+                             strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    params![snapshot_id, generation, format!("admission:{snapshot_id}:{generation}")],
+                )?;
+            }
+        }
         fence.verify(&transaction)?;
         transaction.commit()?;
         // Read back through the same strict builder; persisted records, rather
@@ -905,12 +1025,97 @@ impl<'a> RegistryStore<'a> {
     }
 
     /// Rebuilds and re-verifies a historical snapshot without source files/network.
+    pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SemanticRegistry> {
+        Self::open_snapshot_from_connection(self.connection, snapshot_id)
+    }
+
+    /// Records a new, prospective authority decision for a previously admitted
+    /// immutable snapshot after the current semantic repair fence. This does
+    /// not reconstruct historical admission transitions or revive terminal
+    /// QUARANTINED/REVOKED snapshots.
+    pub fn reattest_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        decision_id: &str,
+        decision_source: &str,
+    ) -> Result<()> {
+        let fence = self
+            .write_fence
+            .as_ref()
+            .ok_or(RegistryStoreError::Conflict(
+                "registry mutation requires Task Manager write authority",
+            ))?;
+        let valid_ref = |value: &str, limit: usize| {
+            !value.is_empty()
+                && value.len() <= limit
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'/' | b'-')
+                })
+        };
+        if !valid_ref(decision_id, 512) || !valid_ref(decision_source, 256) {
+            return Err(RegistryStoreError::Conflict(
+                "invalid re-attestation decision reference",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fence.verify(&transaction)?;
+        Self::open_snapshot_from_connection(&transaction, snapshot_id)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )?;
+        if !matches!(state.as_str(), "ADMITTED" | "DEPRECATED") {
+            return Err(RegistryStoreError::NotAdmitted);
+        }
+        let generation: i64 = transaction.query_row(
+            "SELECT MAX(generation) FROM semantic_repair_fences",
+            [],
+            |row| row.get(0),
+        )?;
+        if generation == 0 {
+            return Err(RegistryStoreError::Conflict(
+                "semantic repair fence has not advanced",
+            ));
+        }
+        let prior: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT decision_id,decision_source FROM semantic_snapshot_reattestations
+             WHERE snapshot_id=?1 AND generation=?2",
+                params![snapshot_id, generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            if prior.0 != decision_id || prior.1 != decision_source {
+                return Err(RegistryStoreError::Conflict(
+                    "semantic re-attestation decision changed",
+                ));
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO semantic_snapshot_reattestations
+                 (snapshot_id,generation,decision_id,decision_source,verification_profile,verified_at)
+                 VALUES (?1,?2,?3,?4,'strict-semantic-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![snapshot_id,generation,decision_id,decision_source],
+            )?;
+        }
+        fence.verify(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "keeps stored manifest and contract re-verification together"
     )]
-    pub fn open_snapshot(&self, snapshot_id: &str) -> Result<SemanticRegistry> {
-        let manifest_json: Option<String> = self.connection.query_row(
+    fn open_snapshot_from_connection(
+        connection: &Connection,
+        snapshot_id: &str,
+    ) -> Result<SemanticRegistry> {
+        let manifest_json: Option<String> = connection.query_row(
             "SELECT s.manifest_json FROM registry_snapshots s JOIN registry_snapshot_admissions a USING(snapshot_id) WHERE s.snapshot_id=?1",
             [snapshot_id], |row| row.get(0),
         ).optional()?;
@@ -939,7 +1144,7 @@ impl<'a> RegistryStore<'a> {
             .collect();
         let mut types = Vec::<TypeContract>::new();
         let mut capabilities = Vec::<CapabilityContract>::new();
-        let mut statement = self.connection.prepare(
+        let mut statement = connection.prepare(
             "SELECT e.contract_class,e.semantic_id,e.major,e.full_version,e.content_hash,
                     t.contract_json,c.contract_json FROM registry_snapshot_entries e
              LEFT JOIN semantic_type_contracts t ON e.contract_class='type' AND t.content_hash=e.content_hash
@@ -1100,7 +1305,7 @@ impl<'a> RegistryStore<'a> {
         fence.verify(&transaction)?;
         let state: Option<String> = transaction
             .query_row(
-                "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                "SELECT state FROM semantic_current_usable_snapshots WHERE snapshot_id=?1",
                 [snapshot_id],
                 |row| row.get(0),
             )
@@ -1195,12 +1400,26 @@ impl<'a> RegistryStore<'a> {
             return Ok(None);
         };
         after_pointer();
-        let snapshot_id = &activation.snapshot_id;
-        let state: String = self.connection.query_row(
-            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
-            [&snapshot_id],
+        let invalidated: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM semantic_legacy_activation_quarantine)
+                OR EXISTS(SELECT 1 FROM semantic_invalidated_activation_scopes
+                          WHERE scope_kind=?1 AND scope_id=?2)",
+            params![scope_kind, scope_id],
             |row| row.get(0),
         )?;
+        if invalidated {
+            return Ok(None);
+        }
+        let snapshot_id = &activation.snapshot_id;
+        let state: String = self
+            .connection
+            .query_row(
+                "SELECT state FROM semantic_current_usable_snapshots WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
         if state != "ADMITTED" {
             return Ok(None);
         }
@@ -1353,6 +1572,15 @@ mod tests {
         connection.execute(
             "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,'2026-09-19T00:00:00Z')",
             params![MIGRATION_ID, MIGRATION_CHECKSUM],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1','2026-09-19T00:00:00Z')",
+            [],
         ).unwrap();
     }
 

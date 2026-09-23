@@ -120,8 +120,8 @@ CREATE TRIGGER IF NOT EXISTS provider_registration_state_transition_clock
 BEFORE UPDATE OF state,updated_at ON provider_registrations
 WHEN NEW.state IS NOT OLD.state AND NOT EXISTS (
     WITH times AS (
-        SELECT COALESCE(CAST(strftime('%s', COALESCE(OLD.updated_at,OLD.registered_at)) AS INTEGER),CASE WHEN substr(COALESCE(OLD.updated_at,OLD.registered_at),-6,1) IN ('+','-') AND substr(COALESCE(OLD.updated_at,OLD.registered_at),-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(COALESCE(OLD.updated_at,OLD.registered_at),-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(COALESCE(OLD.updated_at,OLD.registered_at),1,length(COALESCE(OLD.updated_at,OLD.registered_at))-6)||'Z') AS INTEGER) - (CASE substr(COALESCE(OLD.updated_at,OLD.registered_at),-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(COALESCE(OLD.updated_at,OLD.registered_at),-5,2) AS INTEGER)*3600 + CAST(substr(COALESCE(OLD.updated_at,OLD.registered_at),-2,2) AS INTEGER)*60) END) AS old_second,
-               COALESCE(CAST(strftime('%s', NEW.updated_at) AS INTEGER),CASE WHEN substr(NEW.updated_at,-6,1) IN ('+','-') AND substr(NEW.updated_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.updated_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.updated_at,1,length(NEW.updated_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.updated_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.updated_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.updated_at,-2,2) AS INTEGER)*60) END) AS new_second,
+        SELECT CAST(strftime('%s', COALESCE(OLD.updated_at,OLD.registered_at)) AS INTEGER) AS old_second,
+               CAST(strftime('%s', NEW.updated_at) AS INTEGER) AS new_second,
                substr(CASE WHEN substr(COALESCE(OLD.updated_at,OLD.registered_at),20,1)='.' THEN
                    substr(COALESCE(OLD.updated_at,OLD.registered_at),21,
                        instr(replace(replace(replace(substr(COALESCE(OLD.updated_at,OLD.registered_at),21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -169,17 +169,13 @@ WHEN EXISTS (SELECT 1 FROM provider_state_epochs
 BEGIN SELECT RAISE(ABORT, 'provider state epoch cannot be replaced'); END;
 CREATE TRIGGER IF NOT EXISTS provider_state_epoch_event_insert_guard
 BEFORE INSERT ON provider_state_epochs
-WHEN NEW.revision >= 9223372036854775807 OR NOT EXISTS (
+WHEN NOT EXISTS (
     SELECT 1 FROM provider_registrations r
     WHERE r.registration_id=NEW.registration_id
       AND r.state=NEW.state
       AND COALESCE(r.updated_at,r.registered_at)=NEW.transitioned_at
-      AND NEW.revision=CASE
-          WHEN (SELECT MAX(revision) FROM provider_state_epochs
-                WHERE registration_id=NEW.registration_id) >= 9223372036854775806 THEN NULL
-          ELSE COALESCE((SELECT MAX(revision)+1 FROM provider_state_epochs
-                         WHERE registration_id=NEW.registration_id),0)
-          END
+      AND NEW.revision=COALESCE((SELECT MAX(revision)+1 FROM provider_state_epochs
+                                 WHERE registration_id=NEW.registration_id),0)
       AND NOT EXISTS (
           SELECT 1 FROM provider_state_epochs e
           WHERE e.registration_id=NEW.registration_id
@@ -197,12 +193,6 @@ CREATE TRIGGER IF NOT EXISTS provider_state_epoch_transition
 AFTER UPDATE OF state ON provider_registrations
 WHEN NEW.state IS NOT OLD.state
 BEGIN
-    SELECT CASE WHEN EXISTS (
-        SELECT 1 FROM provider_state_epochs
-        WHERE registration_id=NEW.registration_id
-          AND (typeof(revision)<>'integer' OR revision>=9223372036854775806
-               OR (NEW.state='registered' AND revision>=9223372036854775805))
-    ) THEN RAISE(ABORT, 'provider state epoch revision exhausted') END;
     INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
     VALUES (NEW.registration_id,
             COALESCE((SELECT MAX(revision)+1 FROM provider_state_epochs
@@ -330,42 +320,6 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'execution binding cannot be replaced'); END;
 
--- A binding consumes an attempt only for the exact admitted registration
--- identity. The public receipt's provider projection is required at INSERT,
--- before later launch-time consistency checks can run.
-CREATE TRIGGER IF NOT EXISTS execution_binding_provider_identity_at_insert
-BEFORE INSERT ON execution_bindings
-WHEN NOT EXISTS (
-    SELECT 1 FROM provider_registrations r
-    WHERE r.registration_id=NEW.provider_registration_id
-      AND NEW.provider_manifest_hash IS NOT NULL
-      AND NEW.provider_build_hash IS NOT NULL
-      AND r.manifest_hash IS NEW.provider_manifest_hash
-      AND r.package_content_hash IS NEW.provider_build_hash
-      AND r.provider_id IS NEW.provider_id
-      AND r.provider_version IS NEW.provider_version
-      AND json_valid(NEW.binding_json)
-      -- SQLite resolves duplicate object keys to the first occurrence while
-      -- serde_json resolves them to the last. Reject every duplicate so a
-      -- durable admission cannot disagree with the Rust receipt projection.
-      AND NOT EXISTS (
-          SELECT 1 FROM json_tree(NEW.binding_json) AS member
-          WHERE member.key IS NOT NULL
-          GROUP BY member.parent, member.key
-          HAVING COUNT(*) > 1
-      )
-      AND json_type(NEW.binding_json,'$.provider')='object'
-      AND json_type(NEW.binding_json,'$.provider.id')='text'
-      AND json_type(NEW.binding_json,'$.provider.version')='text'
-      AND json_type(NEW.binding_json,'$.provider.manifest_hash')='text'
-      AND json_type(NEW.binding_json,'$.provider.package_or_build_hash')='text'
-      AND json_extract(NEW.binding_json,'$.provider.id') IS NEW.provider_id
-      AND json_extract(NEW.binding_json,'$.provider.version') IS NEW.provider_version
-      AND json_extract(NEW.binding_json,'$.provider.manifest_hash') IS NEW.provider_manifest_hash
-      AND json_extract(NEW.binding_json,'$.provider.package_or_build_hash') IS NEW.provider_build_hash
-)
-BEGIN SELECT RAISE(ABORT, 'binding provider identity does not match registration'); END;
-
 -- The selected evidence must already be present when a binding is admitted.
 -- An old binding cannot become valid merely because a matching result is
 -- recorded later with a backdated executed_at claim.
@@ -401,8 +355,8 @@ WHEN NOT EXISTS (
         WHERE evidence_id=json_extract(NEW.binding_json, '$.conformance_evidence_id')
     ), times AS (
         SELECT
-            COALESCE(CAST(strftime('%s', tested_at) AS INTEGER),CASE WHEN substr(tested_at,-6,1) IN ('+','-') AND substr(tested_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(tested_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(tested_at,1,length(tested_at)-6)||'Z') AS INTEGER) - (CASE substr(tested_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(tested_at,-5,2) AS INTEGER)*3600 + CAST(substr(tested_at,-2,2) AS INTEGER)*60) END) AS tested_second,
-            COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
+            CAST(strftime('%s', tested_at) AS INTEGER) AS tested_second,
+            CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
             substr(CASE WHEN substr(tested_at,20,1)='.' THEN
                 substr(tested_at,21,
                     instr(replace(replace(replace(substr(tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -435,8 +389,8 @@ WHEN NOT EXISTS (
         FROM pin WHERE json_valid(evidence_json)
     ), times AS (
         SELECT expiry_type,
-               COALESCE(CAST(strftime('%s', expires_at) AS INTEGER),CASE WHEN substr(expires_at,-6,1) IN ('+','-') AND substr(expires_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(expires_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(expires_at,1,length(expires_at)-6)||'Z') AS INTEGER) - (CASE substr(expires_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(expires_at,-5,2) AS INTEGER)*3600 + CAST(substr(expires_at,-2,2) AS INTEGER)*60) END) AS expiry_second,
-               COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
+               CAST(strftime('%s', expires_at) AS INTEGER) AS expiry_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
                substr(CASE WHEN substr(expires_at,20,1)='.' THEN
                    substr(expires_at,21,
                        instr(replace(replace(replace(substr(expires_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -462,7 +416,7 @@ CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_latest_at_insert
 BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
     WITH clock AS (
-        SELECT COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS second,
+        SELECT CAST(strftime('%s', NEW.created_at) AS INTEGER) AS second,
                substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
                    substr(NEW.created_at,21,
                        instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -474,7 +428,7 @@ WHEN NOT EXISTS (
           AND suite_id IS NOT NULL AND suite_hash IS NOT NULL
     ), candidates AS (
         SELECT e.evidence_id,e.status,
-               COALESCE(CAST(strftime('%s', e.tested_at) AS INTEGER),CASE WHEN substr(e.tested_at,-6,1) IN ('+','-') AND substr(e.tested_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(e.tested_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(e.tested_at,1,length(e.tested_at)-6)||'Z') AS INTEGER) - (CASE substr(e.tested_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(e.tested_at,-5,2) AS INTEGER)*3600 + CAST(substr(e.tested_at,-2,2) AS INTEGER)*60) END) AS second,
+               CAST(strftime('%s', e.tested_at) AS INTEGER) AS second,
                substr(CASE WHEN substr(e.tested_at,20,1)='.' THEN
                    substr(e.tested_at,21,
                        instr(replace(replace(replace(substr(e.tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -524,13 +478,13 @@ BEGIN
         OR json_extract(NEW.binding_json,'$.provider_trust_source_id') IS NOT COALESCE(
             (SELECT a.admission_id FROM provider_trust_admissions a
              WHERE a.registration_id=NEW.provider_registration_id
-               AND COALESCE(CAST(strftime('%s', a.admitted_at) AS INTEGER),CASE WHEN substr(a.admitted_at,-6,1) IN ('+','-') AND substr(a.admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(a.admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(a.admitted_at,1,length(a.admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(a.admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(a.admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(a.admitted_at,-2,2) AS INTEGER)*60) END) IS NOT NULL
-               AND COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) IS NOT NULL
+               AND CAST(strftime('%s', a.admitted_at) AS INTEGER) IS NOT NULL
+               AND CAST(strftime('%s', NEW.created_at) AS INTEGER) IS NOT NULL
                AND (
-                   COALESCE(CAST(strftime('%s', a.admitted_at) AS INTEGER),CASE WHEN substr(a.admitted_at,-6,1) IN ('+','-') AND substr(a.admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(a.admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(a.admitted_at,1,length(a.admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(a.admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(a.admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(a.admitted_at,-2,2) AS INTEGER)*60) END)
-                       < COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END)
-                   OR (COALESCE(CAST(strftime('%s', a.admitted_at) AS INTEGER),CASE WHEN substr(a.admitted_at,-6,1) IN ('+','-') AND substr(a.admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(a.admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(a.admitted_at,1,length(a.admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(a.admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(a.admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(a.admitted_at,-2,2) AS INTEGER)*60) END)
-                           = COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END)
+                   CAST(strftime('%s', a.admitted_at) AS INTEGER)
+                       < CAST(strftime('%s', NEW.created_at) AS INTEGER)
+                   OR (CAST(strftime('%s', a.admitted_at) AS INTEGER)
+                           = CAST(strftime('%s', NEW.created_at) AS INTEGER)
                        AND substr(CASE WHEN substr(a.admitted_at,20,1)='.' THEN
                            substr(a.admitted_at,21,
                                instr(replace(replace(replace(substr(a.admitted_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -564,8 +518,8 @@ WHEN NOT EXISTS (
                AND registration_id=json_extract(NEW.binding_json,'$.provider_trust_source_id'))
         ) AS admitted_at
     ), times AS (
-        SELECT COALESCE(CAST(strftime('%s', admitted_at) AS INTEGER),CASE WHEN substr(admitted_at,-6,1) IN ('+','-') AND substr(admitted_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(admitted_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(admitted_at,1,length(admitted_at)-6)||'Z') AS INTEGER) - (CASE substr(admitted_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(admitted_at,-5,2) AS INTEGER)*3600 + CAST(substr(admitted_at,-2,2) AS INTEGER)*60) END) AS admitted_second,
-               COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
+        SELECT CAST(strftime('%s', admitted_at) AS INTEGER) AS admitted_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
                substr(CASE WHEN substr(admitted_at,20,1)='.' THEN
                    substr(admitted_at,21,
                        instr(replace(replace(replace(substr(admitted_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
@@ -590,8 +544,8 @@ CREATE TRIGGER IF NOT EXISTS execution_binding_provider_enablement_not_future
 BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
     WITH times AS (
-        SELECT COALESCE(CAST(strftime('%s', r.updated_at) AS INTEGER),CASE WHEN substr(r.updated_at,-6,1) IN ('+','-') AND substr(r.updated_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(r.updated_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(r.updated_at,1,length(r.updated_at)-6)||'Z') AS INTEGER) - (CASE substr(r.updated_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(r.updated_at,-5,2) AS INTEGER)*3600 + CAST(substr(r.updated_at,-2,2) AS INTEGER)*60) END) AS enabled_second,
-               COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
+        SELECT CAST(strftime('%s', r.updated_at) AS INTEGER) AS enabled_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
                substr(CASE WHEN substr(r.updated_at,20,1)='.' THEN
                    substr(r.updated_at,21,
                        instr(replace(replace(replace(substr(r.updated_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)

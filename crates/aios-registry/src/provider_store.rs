@@ -307,7 +307,7 @@ impl<'a> ProviderStore<'a> {
         // provider's immutable origin snapshot is recorded.
         let admitted: Option<String> = transaction
             .query_row(
-                "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                "SELECT state FROM semantic_current_usable_snapshots WHERE snapshot_id=?1",
                 [&registration.snapshot_id],
                 |row| row.get(0),
             )
@@ -734,7 +734,7 @@ impl<'a> ProviderStore<'a> {
         let result = (|| {
             let selected: bool = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM registry_snapshot_entries e
-             JOIN registry_snapshot_admissions a ON a.snapshot_id=e.snapshot_id
+             JOIN semantic_current_usable_snapshots a ON a.snapshot_id=e.snapshot_id
              WHERE e.snapshot_id=?1 AND a.state='ADMITTED' AND e.contract_class='capability'
                AND e.semantic_id=?2 AND e.major=?3 AND e.content_hash=?4)",
                 params![snapshot_id, semantic.id, major, contract_hash],
@@ -748,7 +748,7 @@ impl<'a> ProviderStore<'a> {
             let mut statement = self.connection.prepare(
                 "SELECT r.registration_id,r.updated_at FROM provider_registrations r
              JOIN provider_manifest_payloads m ON m.registration_id=r.registration_id
-             JOIN registry_snapshot_admissions a ON a.snapshot_id=r.registry_snapshot_id
+             JOIN semantic_current_usable_snapshots a ON a.snapshot_id=r.registry_snapshot_id
              WHERE r.state='registered' AND a.state IN ('ADMITTED','DEPRECATED')
              ORDER BY r.registration_id",
             )?;
@@ -897,7 +897,7 @@ impl<'a> ProviderStore<'a> {
             .connection
             .query_row(
                 "SELECT s.manifest_json FROM registry_snapshots s
-             JOIN registry_snapshot_admissions a USING(snapshot_id)
+             JOIN semantic_current_usable_snapshots a USING(snapshot_id)
              WHERE s.snapshot_id=?1 AND a.state='ADMITTED'",
                 [snapshot_id],
                 |row| row.get(0),
@@ -1324,6 +1324,7 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "provider_manifest_payload_no_duplicate_insert"),
         ("trigger", "provider_evidence_no_duplicate_insert"),
         ("trigger", "execution_binding_no_duplicate_insert"),
+        ("trigger", "execution_binding_provider_identity_at_insert"),
         ("trigger", "execution_binding_evidence_present_at_insert"),
         ("trigger", "execution_binding_evidence_not_future"),
         ("trigger", "execution_binding_evidence_unexpired_at_insert"),
@@ -1419,6 +1420,7 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
             "semantic-registry-store-v0.1",
         ),
         (MIGRATION_ID, MIGRATION_CHECKSUM),
+        ("0014_semantic_repair_fence", "semantic-repair-fence-v0.1"),
     ];
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;
@@ -1940,6 +1942,15 @@ mod tests {
         ).unwrap();
         connection
             .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1',?1)",
+            [NOW],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
                 "../../../specs/persistence-v0.1-0013-provider-registry.sql"
             ))
             .unwrap();
@@ -1951,6 +1962,109 @@ mod tests {
 
     fn setup() -> (Connection, SemanticRegistry) {
         setup_with_provider_migration(true)
+    }
+
+    #[test]
+    fn provider_enable_api_accepts_equivalent_plus_fifteen_offset() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store
+            .enable(&registration.registration_id, "2026-09-23T03:00:00+15:00")
+            .unwrap();
+        let contract_hash = registry
+            .capability_contract_hash("artifact.hash", 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    contract_hash.as_str(),
+                    registry.snapshot_id(),
+                    NOW,
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn existing_build_candidate_recovers_only_after_current_semantic_reattestation() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let registration = {
+            let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+            let registration = store
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            store
+                .record_evidence(
+                    &registration.registration_id,
+                    &bytes(&evidence(&manifest, BUILD_A, "pass")),
+                )
+                .unwrap();
+            store.enable(&registration.registration_id, NOW).unwrap();
+            registration
+        };
+        let hash = registry
+            .capability_contract_hash("artifact.hash", 1)
+            .unwrap();
+        let candidates = |connection: &mut Connection| {
+            ProviderStore::initialize_unfenced_fixture(connection)
+                .unwrap()
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash.as_str(),
+                    registry.snapshot_id(),
+                    NOW,
+                )
+                .unwrap()
+        };
+        assert_eq!(candidates(&mut connection).len(), 1);
+        connection
+            .execute(
+                "INSERT INTO semantic_repair_fences(generation,reason,created_at)
+             VALUES (1,'GUARD_REPAIR',?1)",
+                [NOW],
+            )
+            .unwrap();
+        assert!(candidates(&mut connection).is_empty());
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .reattest_snapshot(
+                registry.snapshot_id(),
+                "decision:candidate:1",
+                "local-authority",
+            )
+            .unwrap();
+        let recovered = candidates(&mut connection);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].registration.registration_id,
+            registration.registration_id
+        );
     }
 
     fn setup_with_provider_migration(migrate_provider: bool) -> (Connection, SemanticRegistry) {
@@ -1969,6 +2083,15 @@ mod tests {
             .unwrap();
         connection.execute(
             "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1',?1)",
+            [NOW],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1',?1)",
             [NOW],
         ).unwrap();
         let mut snapshot: RegistrySnapshot = serde_json::from_str(SNAPSHOT).unwrap();
@@ -2960,10 +3083,10 @@ mod tests {
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
                   ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
-                  provider_id,provider_version,attempt,policy_decision_refs_json,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,policy_decision_refs_json,
                   grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
                  VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?10,
+                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?10,
                          '[]','[]','synthetic-profile','{}',?8,?9)",
                 params![
                     format!("binding-{suffix}"),
@@ -2976,6 +3099,8 @@ mod tests {
                     binding_json,
                     created_at,
                     attempt,
+                    registration.manifest_hash,
+                    registration.build_hash,
                 ],
             )
         };
@@ -3007,7 +3132,9 @@ mod tests {
             .unwrap();
         assert_eq!(rejected, 0);
         let valid_pin = json!({"conformance_evidence_id": evidence_id,
-            "provider_trust_source_id": registration.registration_id})
+            "provider_trust_source_id": registration.registration_id,
+            "provider":{"id":registration.provider_id,"version":registration.provider_version,
+                "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash}})
         .to_string();
         assert!(insert(&connection, "valid", &valid_pin).is_err());
         let unadmitted: (i64, i64) = connection
@@ -3060,6 +3187,8 @@ mod tests {
             .is_err()
         );
         let reviewed_pin = json!({"conformance_evidence_id": evidence_id,
+            "provider":{"id":registration.provider_id,"version":registration.provider_version,
+                "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash},
             "provider_trust_source_id": future_id})
         .to_string();
         insert_at(
@@ -3113,16 +3242,19 @@ mod tests {
             "INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
               ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
-              provider_id,provider_version,attempt,policy_decision_refs_json,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,policy_decision_refs_json,
               grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
              VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                     ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?10,
+                     ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?10,
                      '[]','[]','synthetic-profile','{}',?8,?9)",
             params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                 manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                 registration.registration_id,registration.provider_id,registration.provider_version,
                 json!({"conformance_evidence_id":pin,
-                    "provider_trust_source_id":registration.registration_id}).to_string(),created_at,attempt])
+                    "provider_trust_source_id":registration.registration_id,
+                    "provider":{"id":registration.provider_id,"version":registration.provider_version,
+                        "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash}}).to_string(),
+                created_at,attempt,registration.manifest_hash,registration.build_hash])
         };
         assert!(insert("before", "2026-09-22T11:00:00.999999998Z", &evidence_id, 1).is_err());
         assert!(
@@ -3204,16 +3336,19 @@ mod tests {
                 "INSERT INTO execution_bindings
                  (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
                   ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
-                  provider_id,provider_version,attempt,policy_decision_refs_json,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,policy_decision_refs_json,
                   grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
                  VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?8,
+                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?11,?12,?8,
                          '[]','[]','synthetic-profile','{}',?9,?10)",
                 params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
                     manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
                     registration.registration_id,registration.provider_id,registration.provider_version,
                     attempt,json!({"conformance_evidence_id":evidence_id,
-                        "provider_trust_source_id":predicted}).to_string(),created_at],
+                        "provider_trust_source_id":predicted,
+                        "provider":{"id":registration.provider_id,"version":registration.provider_version,
+                            "manifest_hash":registration.manifest_hash,"package_or_build_hash":registration.build_hash}}).to_string(),
+                    created_at,registration.manifest_hash,registration.build_hash],
             )
         };
         assert!(insert(&connection, "before", 1, "predictable-future-decision", NOW).is_err());

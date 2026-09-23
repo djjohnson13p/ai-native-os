@@ -56,7 +56,7 @@
       "controlling_adrs": ["ADR-0013", "ADR-0034", "ADR-0038"],
       "fixture_paths": ["examples/aios-ir/", "examples/registry-lifecycle/"],
       "blocking_questions": [],
-      "notes": "Semantic meaning registry remains separate from implementation/provider availability. Missing stamped semantic guards require fenced quarantine of formerly usable admissions and existing binding markers before guard repair; immutable semantic identities and migration stamps remain unchanged."
+      "notes": "Semantic meaning registry remains separate from implementation/provider availability. Additive 0014 records an append-only repair generation, terminal admissions, historically unprovable legacy admissions, all activation scope identities since healthy bootstrap, and invalidated scopes. Missing stamped semantic guards fence executable use until explicit owner-bound strict re-attestation with a fresh local decision/source; old binding markers remain quarantined and terminal or unprovable admissions cannot be rehabilitated. If activation history was already unprovable before 0014 bootstrap, a durable global quarantine blocks all new activations pending future explicit migration. Immutable semantic identities and prior migration stamps remain unchanged. Issue #3 policy-engine decision integration is future work."
     },
     {
       "id": "authority-coordinator-v0.1",
@@ -89,7 +89,7 @@
       "controlling_adrs": ["ADR-0020", "ADR-0039", "ADR-0040", "ADR-0042"],
       "fixture_paths": ["examples/provider-runtime/"],
       "blocking_questions": [],
-      "notes": "Implementation should initially use one deterministic local fixture provider, not a general distributed runtime. Stage-1 spike tightened new binding receipts to require exact provider/build/contract identities, a conformance evidence pin, and an effective trust-source pin; earlier nullable or unpinned receipts remain historical and cannot launch through the stamped provider gate. The internal immutable enablement marker pins a monotonic state epoch across equal-time disable/re-enable; expiring evidence must outlive binding creation. Stamped ledger repair disables prior registered intervals and quarantines old bindings without changing public binding JSON or AIOS IR."
+      "notes": "Implementation should initially use one deterministic local fixture provider, not a general distributed runtime. Stage-1 spike tightened new binding receipts to require exact provider/build/contract identities, a conformance evidence pin, and an effective trust-source pin; earlier nullable or unpinned receipts remain historical and cannot launch through the stamped provider gate. A durable insert guard validates registration, manifest/build projection, and public provider fields before consuming an attempt. The internal immutable enablement marker pins a monotonic state epoch across equal-time disable/re-enable; expiring evidence must outlive binding creation. Full RFC 3339 offsets are compared as UTC instants, and exhausted epoch revisions fail closed. Stamped ledger repair disables prior registered intervals and quarantines old bindings without changing public binding JSON or AIOS IR."
     },
     {
       "id": "crash-recovery-v0.1",

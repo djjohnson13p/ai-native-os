@@ -502,6 +502,10 @@ fn provider_test_registry(authored: &SemanticRegistry) -> (SemanticRegistry, Str
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps semantic-hash invariance across provider inventory changes in one fixture"
+)]
 fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
     let authored =
         SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
@@ -537,6 +541,15 @@ fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
         .unwrap();
     connection.execute(
         "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1','2026-09-19T00:00:00Z')",
         [],
     ).unwrap();
     connection
