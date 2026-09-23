@@ -321,7 +321,7 @@ The goal is to prove an architecture that is meaningfully different from a norma
 the Issue #17 reference implementation of the deterministic AIOS IR v0.1 trust boundary. It is a
 validator and development CLI, not an execution runtime or authority system.
 
-The first serious implementation assignment remains **GitHub Issue #17**:
+The first implementation assignment, **GitHub Issue #17**, is complete:
 
 > deterministic AIOS IR parser/validator/normalizer/static-effect-summary/semantic-hash boundary.
 
@@ -360,7 +360,9 @@ All CLI responses are JSON. Exit status `0` means valid/successful, `2` means de
 rejection, and `1` means an operational or invocation error. Validation performs no model call,
 provider execution, authority grant, or network lookup.
 
-After #17, the project builds a deterministic operating spine before introducing AI planning:
+The Stage 1 runbook builds a deterministic operating spine before introducing AI planning. Use
+[Issue #38](https://github.com/djjohnson13p/ai-native-os/issues/38) and
+`docs/82-stage1-core-substrate-codex-runbook.md` for the current active issue and gate:
 
 ```text
 #17 validator
@@ -511,6 +513,10 @@ Important safety rules now include:
 
 **Stage 0 architecture is closed enough that further progress now depends more on executable evidence than on adding broader conceptual architecture.**
 
-The immediate next milestone is Issue #17. Independent adversarial review can run against `docs/83-pre-implementation-red-team-and-astra-review-packet.md` before or alongside early implementation review.
+Issue #17's validator is complete. Stage 1 trusted-core work follows
+`docs/82-stage1-core-substrate-codex-runbook.md` in order; Issue #38 records
+the current implementation milestone and exact review state. The Stage 0
+adversarial packet in `docs/83-pre-implementation-red-team-and-astra-review-packet.md`
+remains historical review context.
 
 No production-readiness or working-operating-system claim is made yet.
