@@ -41,7 +41,8 @@ Compatibility obligation:
 
 - if the spike reveals a required breaking change, update docs/schema/fixtures/tests together and document why.
 
-Issue #17 is the current reference `SPIKE_READY` workstream.
+Issue #17 was the initial reference `SPIKE_READY` workstream. It is closed;
+`SPIKE_READY` still describes contract maturity, not issue status.
 
 ### `PROTOTYPE`
 

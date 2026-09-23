@@ -101,9 +101,12 @@ A contribution is not done until it documents:
 - migration/compatibility impact if any;
 - follow-up issue/ADR required if the implementation exposed an architecture gap.
 
-## Current first implementation target
+## Choose the current implementation work
 
-The recommended first serious implementation work is Issue #17, guided by:
+Issue #17's deterministic validator is complete. Start with the active issue
+and gate recorded in [Issue #38](https://github.com/djjohnson13p/ai-native-os/issues/38),
+then follow `docs/82-stage1-core-substrate-codex-runbook.md` in stage order.
+The following documents remain useful background for the completed validator:
 
 - `docs/60-v0.1-rust-workspace-and-trusted-core-boundaries.md`
 - `docs/61-validator-test-fuzz-and-resource-limit-matrix.md`

@@ -33,9 +33,7 @@ Read:
 
 `SPIKE_READY` means a bounded prototype may rely on the contract under change-control rules. It does **not** mean third-party compatibility is frozen.
 
-The first implementation task remains **Issue #17**.
-
-After #17, follow `docs/82-stage1-core-substrate-codex-runbook.md`; do not jump directly to planner/model/GUI/cloud work.
+Issue #17 is complete. Follow `docs/82-stage1-core-substrate-codex-runbook.md` in stage order; use Issue #38 and the active issue/PR handoff for current state. Do not jump directly to planner/model/GUI/cloud work.
 
 ## Read before changing code/contracts
 
@@ -153,6 +151,14 @@ Use subagents proactively when work can be separated without weakening evidence:
 The root coordinator integrates the work and remains accountable for the final result. Subagent conclusions do not merge code by themselves.
 
 **Continuation rule:** a subagent returning is not a reason to stop. The root coordinator must consume the result, route any repair/re-review automatically, update the GitHub handoff, and continue until the issue reaches its defined gate or a genuine owner decision/tool limitation blocks progress.
+
+### Review efficiency
+
+Before implementing a substantial change, map its public contract, trust boundaries, migration/recovery paths, and likely adversarial cases with the implementer and test auditor. Prefer smaller reviewable increments where the roadmap permits, while retaining every issue requirement and stage gate.
+
+Collect local correctness, test-audit, and required Astra findings into one repair plan. Have the implementer apply substantive repairs and obtain required local re-review before pushing a stable candidate. Run every required exact-head check after changes. Request GitHub-native review on that candidate, then repair and re-review if it finds a substantive issue. Do not trigger duplicate reviews or repeatedly poll an active review when the scheduled review loop is already watching it.
+
+Record actionable findings by review source, head-changing review cycles, and available root/subagent usage in the durable handoff. Use measured completed-work quality and consumption to tune the workflow; do not infer savings from model labels or skip a required independent review.
 
 ### GitHub as the handoff bridge
 

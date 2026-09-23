@@ -1,5 +1,12 @@
 # 71 — Issue #17 Validator Spike Readiness Checklist
 
+Historical pre-implementation checklist. [Issue #17](https://github.com/djjohnson13p/ai-native-os/issues/17)
+closed after [PR #36](https://github.com/djjohnson13p/ai-native-os/pull/36)
+merged on 2026-09-20. The review-pending instructions below record the state
+on 2026-09-19; they are not current Stage 1 gates. Use
+[Issue #38](https://github.com/djjohnson13p/ai-native-os/issues/38), the active
+issue/PR, and `docs/82-stage1-core-substrate-codex-runbook.md` for live order.
+
 ## Purpose
 
 This is the short preflight status for the first serious Codex implementation assignment.
@@ -14,10 +21,11 @@ That means architecture/contracts/fixtures were sufficiently constrained to begi
 As of 2026-09-19, the Issue #17 implementation, generated hashes, fixture automation,
 property tests, and resource-limit tests are present on the dedicated implementation branch.
 
-The R17-01–05 review repairs are tracked in
-`docs/issue-17-review-repair-handoff.md`. The branch still requires a second
-independent read-only review before merge; implementation checks are not independent
-sign-off. No Stage-1 work or maturity promotion is included in this repair pass.
+The R17-01–05 review repairs were tracked in
+`docs/issue-17-review-repair-handoff.md`. At the time, the branch still required
+a second independent read-only review before merge; implementation checks were
+not independent sign-off. No Stage 1 work or maturity promotion was included
+in that repair pass.
 
 ## Closed decisions / repository migrations
 

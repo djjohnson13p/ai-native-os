@@ -1,7 +1,14 @@
 # Issue #17 — R17-01–05 repair handoff
 
-Status: repaired and locally verified; **second independent read-only review required**.
-Do not merge based solely on this implementation handoff. Issue #17 remains open.
+Historical handoff: this document records the Issue #17 repair and review sequence.
+[PR #36](https://github.com/djjohnson13p/ai-native-os/pull/36) merged and
+[Issue #17](https://github.com/djjohnson13p/ai-native-os/issues/17) closed on
+2026-09-20. Review instructions and open-status statements below describe the
+state at the time of that review; they are not current Stage 1 gates. Use
+[Issue #38](https://github.com/djjohnson13p/ai-native-os/issues/38) and the
+active issue/PR for current status.
+
+Status at the time: repaired and locally verified; second independent read-only review required.
 
 ## Reviewed baseline and scope
 

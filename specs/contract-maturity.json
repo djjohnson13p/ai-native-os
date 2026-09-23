@@ -12,7 +12,7 @@
       "controlling_adrs": ["ADR-0011", "ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015", "ADR-0029", "ADR-0030", "ADR-0031", "ADR-0032", "ADR-0033", "ADR-0034"],
       "fixture_paths": ["examples/aios-ir/"],
       "blocking_questions": [],
-      "notes": "Issue #17 implementation and R17-01–05 repair bundle exist on the review branch. Maturity remains SPIKE_READY pending second independent read-only review and merge; see docs/issue-17-review-repair-handoff.md."
+      "notes": "Issue #17 closed and PR #36 merged on 2026-09-20. The validator is implemented; SPIKE_READY still describes contract maturity, not issue status. docs/issue-17-review-repair-handoff.md is a historical review record."
     },
     {
       "id": "task-manager-v0.1",
