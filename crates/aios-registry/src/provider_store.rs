@@ -673,7 +673,7 @@ impl<'a> ProviderStore<'a> {
                 "provider lifecycle changed concurrently",
             ));
         }
-        if current_state == "revoked" && state == "revoked" {
+        if current_state == state {
             fence.verify(&transaction).map_err(|_| {
                 ProviderStoreError::Conflict("provider write rejected by stale ownership fence")
             })?;
@@ -699,6 +699,23 @@ impl<'a> ProviderStore<'a> {
         snapshot_id: &str,
         at: &str,
     ) -> Result<Vec<ProviderCandidate>> {
+        self.eligible_candidates_after_selection(
+            semantic_capability_ref,
+            contract_hash,
+            snapshot_id,
+            at,
+            || {},
+        )
+    }
+
+    fn eligible_candidates_after_selection(
+        &self,
+        semantic_capability_ref: &str,
+        contract_hash: &str,
+        snapshot_id: &str,
+        at: &str,
+        after_selection: impl FnOnce(),
+    ) -> Result<Vec<ProviderCandidate>> {
         let checked = parse_time(at)?;
         if !is_sha256_id(contract_hash) || !is_sha256_id(snapshot_id) {
             return Err(ProviderStoreError::Invalid(
@@ -709,73 +726,97 @@ impl<'a> ProviderStore<'a> {
             .map_err(|_| ProviderStoreError::Invalid("semantic capability reference is invalid"))?;
         let major = i64::try_from(semantic.major)
             .map_err(|_| ProviderStoreError::Invalid("semantic major exceeds SQLite range"))?;
-        let selected: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registry_snapshot_entries e
+        // A candidate is assembled from admission, registry, registration,
+        // trust and evidence rows. Keep all those reads on one SQLite snapshot.
+        // SAVEPOINT also works when the caller already owns a transaction.
+        self.connection
+            .execute_batch("SAVEPOINT aios_provider_candidate_read")?;
+        let result = (|| {
+            let selected: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registry_snapshot_entries e
              JOIN registry_snapshot_admissions a ON a.snapshot_id=e.snapshot_id
              WHERE e.snapshot_id=?1 AND a.state='ADMITTED' AND e.contract_class='capability'
                AND e.semantic_id=?2 AND e.major=?3 AND e.content_hash=?4)",
-            params![snapshot_id, semantic.id, major, contract_hash],
-            |row| row.get(0),
-        )?;
-        if !selected {
-            return Ok(Vec::new());
-        }
-        let requested_registry = self.reopen_selected_snapshot(snapshot_id)?;
-        let mut statement = self.connection.prepare(
-            "SELECT r.registration_id FROM provider_registrations r
+                params![snapshot_id, semantic.id, major, contract_hash],
+                |row| row.get(0),
+            )?;
+            after_selection();
+            if !selected {
+                return Ok(Vec::new());
+            }
+            let requested_registry = self.reopen_selected_snapshot(snapshot_id)?;
+            let mut statement = self.connection.prepare(
+                "SELECT r.registration_id,r.updated_at FROM provider_registrations r
              JOIN provider_manifest_payloads m ON m.registration_id=r.registration_id
              JOIN registry_snapshot_admissions a ON a.snapshot_id=r.registry_snapshot_id
              WHERE r.state='registered' AND a.state IN ('ADMITTED','DEPRECATED')
              ORDER BY r.registration_id",
-        )?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut candidates = Vec::new();
-        for id in ids {
-            let registration = self.load_registration(&id)?;
-            let mut manifest = self.verified_manifest(&registration)?;
-            if !verified_provider_effective_trust_at(self.connection, &registration, &manifest, at)
-                .is_ok_and(ProviderTrustStatus::permits_execution)
-            {
-                continue;
-            }
-            manifest.provides.retain(|claim| {
-                let major = claim.contract.version.split('.').next().unwrap_or("");
-                semantic_capability_ref == format!("{}@{major}", claim.contract.capability)
-                    && claim.contract.contract_hash.as_deref() == Some(contract_hash)
-            });
-            if manifest.provides.len() != 1 {
-                continue;
-            }
-            let report = validate_provider_manifest(
-                &requested_registry,
-                &manifest,
-                ProviderConformanceOptions::default(),
-            );
-            if !report.valid || report.bootstrap_contract_hash_bypass_used {
-                continue;
-            }
-            let matching = self.valid_passes(
-                &registration,
-                semantic_capability_ref,
-                contract_hash,
-                checked,
             )?;
-            if let [only] = matching.as_slice() {
-                let (evidence_id, suite_id, suite_hash) = only.clone();
-                candidates.push(ProviderCandidate {
-                    registration,
-                    requested_snapshot_id: snapshot_id.to_owned(),
-                    semantic_capability_ref: semantic_capability_ref.to_owned(),
-                    contract_hash: contract_hash.to_owned(),
-                    suite_id,
-                    suite_hash,
-                    evidence_id,
+            let ids = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut candidates = Vec::new();
+            for (id, enabled_at) in ids {
+                let Some(enabled_at) = enabled_at else {
+                    continue;
+                };
+                if !parse_time(&enabled_at).is_ok_and(|enabled| enabled <= checked) {
+                    continue;
+                }
+                let registration = self.load_registration(&id)?;
+                let mut manifest = self.verified_manifest(&registration)?;
+                if !verified_provider_effective_trust_at(
+                    self.connection,
+                    &registration,
+                    &manifest,
+                    at,
+                )
+                .is_ok_and(ProviderTrustStatus::permits_execution)
+                {
+                    continue;
+                }
+                manifest.provides.retain(|claim| {
+                    let major = claim.contract.version.split('.').next().unwrap_or("");
+                    semantic_capability_ref == format!("{}@{major}", claim.contract.capability)
+                        && claim.contract.contract_hash.as_deref() == Some(contract_hash)
                 });
+                if manifest.provides.len() != 1 {
+                    continue;
+                }
+                let report = validate_provider_manifest(
+                    &requested_registry,
+                    &manifest,
+                    ProviderConformanceOptions::default(),
+                );
+                if !report.valid || report.bootstrap_contract_hash_bypass_used {
+                    continue;
+                }
+                let matching = self.valid_passes(
+                    &registration,
+                    semantic_capability_ref,
+                    contract_hash,
+                    checked,
+                )?;
+                if let [only] = matching.as_slice() {
+                    let (evidence_id, suite_id, suite_hash) = only.clone();
+                    candidates.push(ProviderCandidate {
+                        registration,
+                        requested_snapshot_id: snapshot_id.to_owned(),
+                        semantic_capability_ref: semantic_capability_ref.to_owned(),
+                        contract_hash: contract_hash.to_owned(),
+                        suite_id,
+                        suite_hash,
+                        evidence_id,
+                    });
+                }
             }
-        }
-        Ok(candidates)
+            Ok(candidates)
+        })();
+        self.connection
+            .execute_batch("RELEASE aios_provider_candidate_read")?;
+        result
     }
 
     /// Ephemeral operational observation, intentionally absent from eligibility.
@@ -1257,6 +1298,12 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "provider_registration_identity_immutable"),
         ("trigger", "provider_registration_no_delete"),
         ("trigger", "provider_registration_revocation_terminal"),
+        ("trigger", "provider_registration_no_initial_enablement"),
+        ("trigger", "provider_registration_state_transition_clock"),
+        (
+            "trigger",
+            "provider_registration_updated_at_requires_transition",
+        ),
         ("trigger", "provider_evidence_immutable_update"),
         ("trigger", "provider_evidence_immutable_delete"),
         ("trigger", "provider_registration_no_duplicate_insert"),
@@ -1272,6 +1319,11 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "execution_binding_no_duplicate_insert"),
         ("trigger", "execution_binding_evidence_present_at_insert"),
         ("trigger", "execution_binding_evidence_not_future"),
+        ("trigger", "execution_binding_evidence_latest_at_insert"),
+        (
+            "trigger",
+            "execution_binding_provider_enablement_not_future",
+        ),
         ("trigger", "execution_binding_evidence_pin_required"),
         ("table", "execution_binding_admission_markers"),
         ("table", "execution_binding_trust_markers"),
@@ -2452,7 +2504,7 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE provider_registrations SET state='registered' WHERE registration_id=?1",
+                "UPDATE provider_registrations SET state='registered',updated_at='2026-09-22T12:00:01Z' WHERE registration_id=?1",
                 [&registration.registration_id],
             )
             .unwrap();
@@ -2517,6 +2569,65 @@ mod tests {
             .execute_batch("DROP TRIGGER provider_evidence_immutable_update")
             .unwrap();
         assert!(ProviderStore::initialize_unfenced_fixture(&mut connection).is_err());
+    }
+
+    #[test]
+    fn migration_preflight_authenticates_new_lifecycle_and_binding_guards() {
+        for (name, table, event) in [
+            (
+                "provider_registration_no_initial_enablement",
+                "provider_registrations",
+                "INSERT",
+            ),
+            (
+                "provider_registration_state_transition_clock",
+                "provider_registrations",
+                "UPDATE",
+            ),
+            (
+                "provider_registration_updated_at_requires_transition",
+                "provider_registrations",
+                "UPDATE",
+            ),
+            (
+                "execution_binding_evidence_latest_at_insert",
+                "execution_bindings",
+                "INSERT",
+            ),
+            (
+                "execution_binding_provider_enablement_not_future",
+                "execution_bindings",
+                "INSERT",
+            ),
+        ] {
+            let (mut connection, _) = setup();
+            connection
+                .execute_batch(&format!("DROP TRIGGER {name}"))
+                .unwrap();
+            assert!(
+                matches!(
+                    ProviderStore::initialize_unfenced_fixture(&mut connection),
+                    Err(ProviderStoreError::Conflict(
+                        "provider registry migration is incomplete"
+                    ))
+                ),
+                "missing {name}"
+            );
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER {name} BEFORE {event} ON {table} BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            assert!(
+                matches!(
+                    ProviderStore::initialize_unfenced_fixture(&mut connection),
+                    Err(ProviderStoreError::Conflict(
+                        "provider additive guard definition differs"
+                    ))
+                ),
+                "no-op {name}"
+            );
+        }
     }
 
     #[test]
@@ -2768,7 +2879,7 @@ mod tests {
         writer
             .connection
             .execute(
-                "UPDATE provider_registrations SET state='revoked' WHERE registration_id=?1",
+                "UPDATE provider_registrations SET state='revoked',updated_at='2026-09-22T12:00:01Z' WHERE registration_id=?1",
                 [&registration.registration_id],
             )
             .unwrap();
@@ -2971,7 +3082,12 @@ mod tests {
         let next_id = store
             .record_evidence(&registration.registration_id, &bytes(&next_result))
             .unwrap();
-        store.enable(&registration.registration_id, NOW).unwrap();
+        store
+            .enable(
+                &registration.registration_id,
+                "2026-09-22T11:00:00.999999999Z",
+            )
+            .unwrap();
         drop(store);
         connection
             .pragma_update(None, "foreign_keys", "OFF")
@@ -3021,7 +3137,16 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         insert("equal", "2026-09-22T11:00:00.999999999Z", &evidence_id, 1).unwrap();
-        insert("after", "2026-09-22T11:00:01.000000001Z", &evidence_id, 2).unwrap();
+        insert("after", "2026-09-22T11:00:01Z", &evidence_id, 2).unwrap();
+        assert!(
+            insert(
+                "stale-at-next",
+                "2026-09-22T11:00:01.000000001Z",
+                &evidence_id,
+                3
+            )
+            .is_err()
+        );
         insert("next-equal", "2026-09-22T11:00:01.000000001Z", &next_id, 3).unwrap();
     }
 
@@ -3102,13 +3227,13 @@ mod tests {
                 "2026-09-22T12:00:00.123456789Z",
             )
             .unwrap();
-        drop(store);
-        connection
+        store
+            .connection
             .pragma_update(None, "foreign_keys", "OFF")
             .unwrap();
         assert!(
             insert(
-                &connection,
+                &*store.connection,
                 "trust-too-early",
                 1,
                 &first,
@@ -3118,7 +3243,7 @@ mod tests {
         );
         assert!(
             insert(
-                &connection,
+                &*store.connection,
                 "wrong-trust-source",
                 1,
                 &registration.registration_id,
@@ -3127,19 +3252,21 @@ mod tests {
             .is_err()
         );
         insert(
-            &connection,
+            &*store.connection,
             "first",
             1,
             &first,
             "2026-09-22T12:00:00.123456789Z",
         )
         .unwrap();
-        let first_marker: String = connection.query_row(
+        let first_marker: String = store.connection.query_row(
             "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-first'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(first_marker, first);
-        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        // The synthetic binding has no Task fixture parent. Continue through
+        // this already initialized test handle rather than reopening a store
+        // whose startup integrity check correctly rejects the orphan.
         let second = store
             .admit_trust(
                 &registration.registration_id,
@@ -3149,25 +3276,25 @@ mod tests {
                 "2026-09-22T12:00:00.123456789Z",
             )
             .unwrap();
-        drop(store);
-        connection
+        store
+            .connection
             .pragma_update(None, "foreign_keys", "OFF")
             .unwrap();
         insert(
-            &connection,
+            &*store.connection,
             "second",
             2,
             &second,
             "2026-09-22T12:00:00.123456790Z",
         )
         .unwrap();
-        let second_marker: String = connection.query_row(
+        let second_marker: String = store.connection.query_row(
             "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-second'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(second_marker, second);
         assert_ne!(first_marker, second_marker);
-        assert!(connection.execute(
+        assert!(store.connection.execute(
             "UPDATE execution_binding_trust_markers SET trust_source_id=?1 WHERE binding_id='binding-first'",
             [&second],
         ).is_err());
@@ -4278,6 +4405,212 @@ mod tests {
                 NOW,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn candidate_reads_reject_impossible_revocation_enablement_interleaving() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("candidate-snapshot.db");
+        let (_, registry) = setup();
+        let manifest = manifest(&registry);
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut connection = Connection::open(&database).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        connection
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        seed_test_registry_schemas(&connection);
+        RegistryStore::initialize_unfenced_fixture(&mut connection)
+            .unwrap()
+            .admit_registry(&registry)
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let disabled_view = store
+            .eligible_candidates_after_selection(
+                "artifact.hash@1",
+                &hash,
+                registry.snapshot_id(),
+                "2026-09-22T12:00:01Z",
+                || {
+                    writer.execute(
+                        "UPDATE provider_registrations SET state='registered',updated_at='2026-09-22T12:00:01Z' WHERE registration_id=?1",
+                        [&registration.registration_id],
+                    ).unwrap();
+                },
+            )
+            .unwrap();
+        assert!(disabled_view.is_empty());
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    &hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T12:00:01Z",
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        writer.execute(
+            "UPDATE provider_registrations SET state='disabled',updated_at='2026-09-22T12:00:02Z' WHERE registration_id=?1",
+            [&registration.registration_id],
+        ).unwrap();
+        let visible = store
+            .eligible_candidates_after_selection(
+                "artifact.hash@1",
+                &hash,
+                registry.snapshot_id(),
+                "2026-09-22T12:00:03Z",
+                || {
+                    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    writer
+                        .execute(
+                            "UPDATE registry_snapshot_admissions SET state='REVOKED' WHERE snapshot_id=?1",
+                            [registry.snapshot_id()],
+                        )
+                        .unwrap();
+                    writer.execute(
+                        "UPDATE provider_registrations SET state='registered',updated_at='2026-09-22T12:00:03Z' WHERE registration_id=?1",
+                        [&registration.registration_id],
+                    ).unwrap();
+                    writer.execute_batch("COMMIT").unwrap();
+                },
+            )
+            .unwrap();
+        assert!(visible.is_empty());
+        assert!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    &hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T12:00:03Z",
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn repeated_provider_state_calls_preserve_transition_time() {
+        let (mut connection, registry) = setup();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let manifest = manifest(&registry);
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        store
+            .disable(&registration.registration_id, "2026-09-22T13:00:00Z")
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        store
+            .enable(&registration.registration_id, "2026-09-22T13:00:00Z")
+            .unwrap();
+        let updated: String = store
+            .connection
+            .query_row(
+                "SELECT updated_at FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, NOW);
+        store
+            .revoke(&registration.registration_id, "2026-09-22T13:00:00Z")
+            .unwrap();
+        store
+            .revoke(&registration.registration_id, "2026-09-22T14:00:00Z")
+            .unwrap();
+        let revoked_at: String = store
+            .connection
+            .query_row(
+                "SELECT updated_at FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked_at, "2026-09-22T13:00:00Z");
+    }
+
+    #[test]
+    fn candidate_cannot_precede_provider_enablement_time() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                "2026-09-22T10:00:00Z",
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        assert!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T13:30:00+02:00",
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T13:00:00+01:00",
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

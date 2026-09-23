@@ -44,6 +44,10 @@ const STORE_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "immutable_registry_snapshot_admissions_delete"),
 ];
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticates migration stamps, full schema definitions and foreign-key integrity as one startup gate"
+)]
 fn preflight_store_migration(connection: &Connection) -> Result<()> {
     let known: &[(&str, &str)] = &[
         (
@@ -119,29 +123,54 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
             "trusted control-plane baseline is required",
         ));
     }
-    for (kind, name) in STORE_OBJECTS {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
-            params![kind, name],
-            |row| row.get(0),
-        )?;
-        if present != stamped {
-            return Err(RegistryStoreError::Conflict(
-                "semantic registry migration is incomplete or unstamped",
-            ));
-        }
-    }
-    preflight_admission_guards(connection, stamped)
-}
-
-fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<()> {
-    // Older stamped stores can be upgraded only by Task Manager while its
-    // identity-bound lock and durable ownership lease are held.
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
     canonical.execute_batch(include_str!(
         "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
     ))?;
+    for (kind, name) in STORE_OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.is_some() != stamped {
+            return Err(RegistryStoreError::Conflict(
+                "semantic registry migration is incomplete or unstamped",
+            ));
+        }
+        if let Some(actual) = actual {
+            let expected: String = canonical.query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if actual.split_whitespace().ne(expected.split_whitespace()) {
+                return Err(RegistryStoreError::Conflict(
+                    "semantic registry schema definition mismatch",
+                ));
+            }
+        }
+    }
+    preflight_admission_guards(connection, &canonical, stamped)?;
+    let mut violations = connection.prepare("PRAGMA foreign_key_check")?;
+    if violations.query([])?.next()?.is_some() {
+        return Err(RegistryStoreError::Conflict(
+            "control-plane foreign key integrity violation",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_admission_guards(
+    connection: &Connection,
+    canonical: &Connection,
+    stamped: bool,
+) -> Result<()> {
+    // Older stamped stores can be upgraded only by Task Manager while its
+    // identity-bound lock and durable ownership lease are held.
     for (guard, _additive) in [
         ("immutable_admitted_registry_snapshots_update", false),
         ("immutable_admitted_registry_snapshots_delete", false),
@@ -2205,7 +2234,7 @@ mod tests {
         assert!(matches!(
             RegistryStore::initialize_unfenced_fixture(&mut connection),
             Err(RegistryStoreError::Conflict(
-                "semantic registry admission guard definition mismatch"
+                "semantic registry schema definition mismatch"
             ))
         ));
         connection
@@ -2501,6 +2530,37 @@ mod tests {
             ).unwrap();
             assert_eq!(present, mutation != "missing-trigger", "{mutation}");
         }
+    }
+
+    #[test]
+    fn migration_preflight_rejects_changed_table_ddl_and_orphaned_rows() {
+        let mut changed = Connection::open_in_memory().unwrap();
+        baseline(&changed);
+        changed
+            .execute_batch("ALTER TABLE registry_activations ADD COLUMN bypass TEXT")
+            .unwrap();
+        assert!(matches!(
+            RegistryStore::initialize_unfenced_fixture(&mut changed),
+            Err(RegistryStoreError::Conflict(
+                "semantic registry schema definition mismatch"
+            ))
+        ));
+
+        let mut orphaned = Connection::open_in_memory().unwrap();
+        baseline(&orphaned);
+        orphaned.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        orphaned
+            .execute(
+                "INSERT INTO registry_snapshot_admissions(snapshot_id,state) VALUES ('missing','ADMITTED')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            RegistryStore::initialize_unfenced_fixture(&mut orphaned),
+            Err(RegistryStoreError::Conflict(
+                "control-plane foreign key integrity violation"
+            ))
+        ));
     }
 
     #[test]

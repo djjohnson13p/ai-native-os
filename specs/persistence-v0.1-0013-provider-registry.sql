@@ -109,6 +109,38 @@ BEFORE UPDATE OF state ON provider_registrations
 WHEN OLD.state = 'revoked' AND NEW.state <> 'revoked'
 BEGIN SELECT RAISE(ABORT, 'provider revocation is terminal'); END;
 
+-- Registration creates a disabled candidate. An enabled interval must have
+-- its own transition time. Equal-time transitions preserve insertion order;
+-- the effective clock cannot move backward.
+CREATE TRIGGER IF NOT EXISTS provider_registration_no_initial_enablement
+BEFORE INSERT ON provider_registrations
+WHEN NEW.state='registered'
+BEGIN SELECT RAISE(ABORT, 'provider cannot be enabled at registration'); END;
+CREATE TRIGGER IF NOT EXISTS provider_registration_state_transition_clock
+BEFORE UPDATE OF state,updated_at ON provider_registrations
+WHEN NEW.state IS NOT OLD.state AND NOT EXISTS (
+    WITH times AS (
+        SELECT CAST(strftime('%s', COALESCE(OLD.updated_at,OLD.registered_at)) AS INTEGER) AS old_second,
+               CAST(strftime('%s', NEW.updated_at) AS INTEGER) AS new_second,
+               substr(CASE WHEN substr(COALESCE(OLD.updated_at,OLD.registered_at),20,1)='.' THEN
+                   substr(COALESCE(OLD.updated_at,OLD.registered_at),21,
+                       instr(replace(replace(replace(substr(COALESCE(OLD.updated_at,OLD.registered_at),21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS old_fraction,
+               substr(CASE WHEN substr(NEW.updated_at,20,1)='.' THEN
+                   substr(NEW.updated_at,21,
+                       instr(replace(replace(replace(substr(NEW.updated_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS new_fraction
+    )
+    SELECT 1 FROM times WHERE old_second IS NOT NULL AND new_second IS NOT NULL
+      AND (new_second>old_second OR
+           (new_second=old_second AND new_fraction>=old_fraction))
+)
+BEGIN SELECT RAISE(ABORT, 'provider state transition requires a later time'); END;
+CREATE TRIGGER IF NOT EXISTS provider_registration_updated_at_requires_transition
+BEFORE UPDATE OF state,updated_at ON provider_registrations
+WHEN NEW.state IS OLD.state AND NEW.updated_at IS NOT OLD.updated_at
+BEGIN SELECT RAISE(ABORT, 'provider state time requires a transition'); END;
+
 CREATE TRIGGER IF NOT EXISTS provider_evidence_immutable_update
 BEFORE UPDATE ON provider_conformance_evidence
 BEGIN SELECT RAISE(ABORT, 'provider conformance evidence is immutable'); END;
@@ -244,6 +276,53 @@ WHEN NOT EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'binding predates pinned conformance evidence'); END;
 
+-- A pass that was current when tested is not enough: a later exact-suite
+-- result effective by binding creation supersedes it, including a failure.
+-- Equal timestamps are ambiguous, so neither result may consume an attempt.
+CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_latest_at_insert
+BEFORE INSERT ON execution_bindings
+WHEN NOT EXISTS (
+    WITH clock AS (
+        SELECT CAST(strftime('%s', NEW.created_at) AS INTEGER) AS second,
+               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                   substr(NEW.created_at,21,
+                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS fraction
+    ), pin AS (
+        SELECT registration_id,capability,contract_hash,suite_id,suite_hash
+        FROM provider_conformance_evidence
+        WHERE evidence_id=json_extract(NEW.binding_json,'$.conformance_evidence_id')
+          AND suite_id IS NOT NULL AND suite_hash IS NOT NULL
+    ), candidates AS (
+        SELECT e.evidence_id,e.status,
+               CAST(strftime('%s', e.tested_at) AS INTEGER) AS second,
+               substr(CASE WHEN substr(e.tested_at,20,1)='.' THEN
+                   substr(e.tested_at,21,
+                       instr(replace(replace(replace(substr(e.tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS fraction
+        FROM provider_conformance_evidence e JOIN pin p
+          ON e.registration_id=p.registration_id AND e.capability=p.capability
+         AND e.contract_hash=p.contract_hash AND e.suite_id=p.suite_id
+         AND e.suite_hash=p.suite_hash
+    ), eligible AS (
+        SELECT c.* FROM candidates c, clock t
+        WHERE c.second IS NOT NULL AND t.second IS NOT NULL
+          AND (c.second<t.second OR
+               (c.second=t.second AND c.fraction<=t.fraction))
+    )
+    SELECT 1 FROM eligible selected
+    WHERE selected.evidence_id=json_extract(NEW.binding_json,'$.conformance_evidence_id')
+      AND selected.status='pass'
+      AND NOT EXISTS (SELECT 1 FROM candidates WHERE second IS NULL)
+      AND NOT EXISTS (
+          SELECT 1 FROM eligible other
+          WHERE other.evidence_id<>selected.evidence_id
+            AND (other.second>selected.second OR
+                 (other.second=selected.second AND other.fraction>=selected.fraction))
+      )
+)
+BEGIN SELECT RAISE(ABORT, 'binding conformance evidence is not latest'); END;
+
 -- A binding can use only a trust decision already present at INSERT time.
 -- The marker's source is the immutable original registration receipt for an
 -- initially trusted build, or the latest appended trust decision receipt.
@@ -324,6 +403,33 @@ WHEN NOT EXISTS (
            (admitted_second=created_second AND admitted_fraction<=created_fraction))
 )
 BEGIN SELECT RAISE(ABORT, 'binding predates provider trust admission'); END;
+
+-- The registration starts disabled. The current registered interval began at
+-- the last state transition, which must already have taken effect by the
+-- binding's declared creation time.
+CREATE TRIGGER IF NOT EXISTS execution_binding_provider_enablement_not_future
+BEFORE INSERT ON execution_bindings
+WHEN NOT EXISTS (
+    WITH times AS (
+        SELECT CAST(strftime('%s', r.updated_at) AS INTEGER) AS enabled_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
+               substr(CASE WHEN substr(r.updated_at,20,1)='.' THEN
+                   substr(r.updated_at,21,
+                       instr(replace(replace(replace(substr(r.updated_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS enabled_fraction,
+               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                   substr(NEW.created_at,21,
+                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS created_fraction
+        FROM provider_registrations r
+        WHERE r.registration_id=NEW.provider_registration_id AND r.state='registered'
+    )
+    SELECT 1 FROM times
+    WHERE enabled_second IS NOT NULL AND created_second IS NOT NULL
+      AND (enabled_second<created_second OR
+           (enabled_second=created_second AND enabled_fraction<=created_fraction))
+)
+BEGIN SELECT RAISE(ABORT, 'binding predates provider enablement'); END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_admission_marker_insert
 BEFORE INSERT ON execution_bindings

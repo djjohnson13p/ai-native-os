@@ -792,7 +792,12 @@ impl TaskManager {
         let store_owner = StoreOwner::claim(&connection, store_lock.clone(), &acquired_at)?;
         let lease_owner = store_owner.owner().to_owned();
         let lease_epoch = store_owner.epoch();
-        upgrade_stamped_registry_guards_fenced(&mut connection, &lease_owner, lease_epoch)?;
+        upgrade_stamped_registry_guards_fenced(
+            &mut connection,
+            &lease_owner,
+            lease_epoch,
+            &acquired_at,
+        )?;
         preflight_migration_state(&connection)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
@@ -3431,12 +3436,17 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "execution_binding_marker_no_delete",
     "provider_registration_trust_receipt_insert",
     "provider_registration_trust_immutable_update",
+    "provider_registration_no_initial_enablement",
+    "provider_registration_state_transition_clock",
+    "provider_registration_updated_at_requires_transition",
     "provider_trust_admission_no_update",
     "provider_trust_admission_no_delete",
     "provider_trust_admission_no_duplicate_insert",
     "provider_trust_admission_receipt_insert",
     "execution_binding_evidence_pin_required",
     "execution_binding_evidence_not_future",
+    "execution_binding_evidence_latest_at_insert",
+    "execution_binding_provider_enablement_not_future",
     "execution_binding_trust_marker_no_update",
     "execution_binding_trust_marker_no_delete",
     "execution_binding_trust_marker_no_duplicate_insert",
@@ -3480,6 +3490,7 @@ fn upgrade_stamped_registry_guards_fenced(
     connection: &mut Connection,
     owner: &str,
     epoch: i64,
+    upgraded_at: &str,
 ) -> Result<()> {
     let has_migrations: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
@@ -3517,7 +3528,14 @@ fn upgrade_stamped_registry_guards_fenced(
         ))?;
     }
     if upgrade_provider {
-        let mut replaced_historical_trust_guard = false;
+        let had_enablement_guards = !missing_additive_guard(
+            &transaction,
+            &[
+                "provider_registration_no_initial_enablement",
+                "provider_registration_state_transition_clock",
+                "provider_registration_updated_at_requires_transition",
+            ],
+        )?;
         for name in PRIOR_PROVIDER_TRUST_GUARDS {
             let actual: Option<String> = transaction
                 .query_row(
@@ -3532,7 +3550,6 @@ fn upgrade_stamped_registry_guards_fenced(
                 .transpose()?
                 .unwrap_or(false)
             {
-                replaced_historical_trust_guard = true;
                 transaction.execute_batch(match *name {
                     "execution_binding_trust_marker_insert" => {
                         "DROP TRIGGER execution_binding_trust_marker_insert"
@@ -3541,16 +3558,36 @@ fn upgrade_stamped_registry_guards_fenced(
                 })?;
             }
         }
+        if !had_enablement_guards {
+            // Older stamped stores cannot prove when an active registration
+            // became enabled. End that interval while still under the lease,
+            // before installing the new clock guard: legacy updated_at may
+            // itself be untrusted or later than the current clock. A partial
+            // upgrade may already have installed that exact guard.
+            transaction.execute_batch(
+                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock",
+            )?;
+            transaction.execute(
+                "UPDATE provider_registrations SET state='disabled',updated_at=?1
+                 WHERE state='registered'",
+                [upgraded_at],
+            )?;
+        }
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
         ))?;
-        if replaced_historical_trust_guard {
-            transaction.execute(
-                "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
-                 SELECT binding_id FROM execution_binding_trust_markers",
-                [],
-            )?;
-        }
+        // Any repaired provider guard means historical binding admission was
+        // not fully proven. Preserve immutable markers for audit and deny
+        // their execution, including a store missing only one binding guard.
+        transaction.execute(
+            "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
+                 SELECT m.binding_id FROM execution_binding_trust_markers m
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM execution_binding_legacy_trust_quarantine q
+                     WHERE q.binding_id=m.binding_id
+                 )",
+            [],
+        )?;
     }
     preflight_migration_state(&transaction)?;
     assert_manager_lease(&transaction, owner, epoch)?;
@@ -6531,15 +6568,15 @@ fn latest_conformance_evidence_id(
             // retained for audit but cannot participate in Stage-1 selection.
             continue;
         };
-        let Some(raw_time) = row.get::<_, Option<String>>(1)? else {
-            return Ok(None);
-        };
         let suite_hash: Option<String> = row.get(3)?;
         if claimed_suite.as_ref().is_some_and(|(id, hash)| {
             id != &suite_id || Some(hash.as_str()) != suite_hash.as_deref()
         }) {
             continue;
         }
+        let Some(raw_time) = row.get::<_, Option<String>>(1)? else {
+            return Ok(None);
+        };
         let Ok(time) = OffsetDateTime::parse(&raw_time, &Rfc3339) else {
             return Ok(None);
         };
@@ -9152,12 +9189,21 @@ mod tests {
         assert_eq!(stamp, after);
     }
 
-    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "exercises the full file-backed historical schema upgrade and audit preservation"
     )]
-    fn file_backed_reopen_replaces_only_exact_5eb3b71_trust_guards() {
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "each flag selects an independent historical fixture defect"
+    )]
+    fn assert_file_backed_reopen_quarantines_legacy_bindings(
+        missing_prior_guards: bool,
+        existing_quarantine_table: bool,
+        future_legacy_clock: bool,
+        partial_binding_guard_only: bool,
+        partial_clock_guard: bool,
+    ) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("old-trust-guard.sqlite3");
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
@@ -9181,12 +9227,23 @@ mod tests {
         manager
             .connection
             .execute_batch(
-                "DROP TRIGGER execution_binding_legacy_trust_quarantine_no_update;
-             DROP TRIGGER execution_binding_legacy_trust_quarantine_no_delete;
-             DROP TRIGGER execution_binding_legacy_trust_quarantine_no_duplicate_insert;
-             DROP TABLE execution_binding_legacy_trust_quarantine;",
+                "DROP TRIGGER provider_registration_state_transition_clock;
+             DROP TRIGGER provider_registration_updated_at_requires_transition;
+             DROP TRIGGER execution_binding_provider_enablement_not_future;
+             DROP TRIGGER execution_binding_evidence_latest_at_insert;",
             )
             .unwrap();
+        if !existing_quarantine_table {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER execution_binding_legacy_trust_quarantine_no_update;
+                     DROP TRIGGER execution_binding_legacy_trust_quarantine_no_delete;
+                     DROP TRIGGER execution_binding_legacy_trust_quarantine_no_duplicate_insert;
+                     DROP TABLE execution_binding_legacy_trust_quarantine;",
+                )
+                .unwrap();
+        }
         manager.connection.execute_batch(
             "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
              VALUES ('legacy-snapshot','{}','2026-09-19T00:00:00Z');
@@ -9196,6 +9253,9 @@ mod tests {
              VALUES ('legacy-provider','legacy-provider','1.0.0','legacy-build',
                      'legacy-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations
+             SET state='registered',updated_at='2026-09-18T00:00:00Z'
+             WHERE registration_id='legacy-provider';
              INSERT INTO provider_conformance_evidence
              (evidence_id,registration_id,capability,contract_hash,status,evidence_json,tested_at)
              VALUES ('legacy-evidence','legacy-provider','artifact.hash@1','legacy-contract',
@@ -9218,6 +9278,48 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(old_marker, "legacy-provider");
+        if future_legacy_clock {
+            manager
+                .connection
+                .execute(
+                    "UPDATE provider_registrations SET updated_at='2026-09-20T00:00:00Z'
+                 WHERE registration_id='legacy-provider'",
+                    [],
+                )
+                .unwrap();
+        }
+        if missing_prior_guards {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER execution_binding_trust_marker_insert;
+                     DROP TRIGGER execution_binding_trust_not_future;",
+                )
+                .unwrap();
+        }
+        if partial_binding_guard_only || partial_clock_guard {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS execution_binding_trust_marker_insert;
+                 DROP TRIGGER IF EXISTS execution_binding_trust_not_future;",
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(if partial_binding_guard_only {
+                    "DROP TRIGGER execution_binding_provider_enablement_not_future;"
+                } else {
+                    "DROP TRIGGER provider_registration_updated_at_requires_transition;"
+                })
+                .unwrap();
+        }
         drop(manager);
 
         let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
@@ -9227,6 +9329,15 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?)),
         ).unwrap();
         assert_eq!(after, stamp);
+        let upgraded_state: (String, String) = reopened.connection.query_row(
+            "SELECT state,updated_at FROM provider_registrations WHERE registration_id='legacy-provider'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        if partial_binding_guard_only {
+            assert_eq!(upgraded_state.0, "registered");
+        } else {
+            assert_eq!(upgraded_state, ("disabled".to_owned(), T0.to_owned()));
+        }
         for table in [
             "tasks",
             "provider_registrations",
@@ -9279,6 +9390,36 @@ mod tests {
                 .unwrap();
             assert!(!legacy_provider_trust_guard_matches(name, &actual).unwrap());
         }
+    }
+
+    #[test]
+    fn file_backed_reopen_replaces_only_exact_5eb3b71_trust_guards() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, false, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_old_markers_with_both_guards_missing() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(true, false, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_old_markers_with_existing_table() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_only_missing_binding_guard() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, false, true, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_disables_future_dated_legacy_enablement() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, true, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_disables_future_legacy_row_with_partial_clock_guard() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, true, false, true);
     }
 
     #[test]

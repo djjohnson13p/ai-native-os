@@ -1037,6 +1037,22 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     );
     transaction.rollback().unwrap();
     let pinned = json!({"conformance_evidence_id":"cross-snapshot-pass"});
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES ('unrelated-legacy-null-time',?1,?2,?3,'suite:unrelated',?4,
+                     'pass','{}',NULL)",
+            params![
+                binding.provider_registration_id.as_deref().unwrap(),
+                binding.capability,
+                binding.contract_hash.as_deref().unwrap(),
+                SUITE_HASH,
+            ],
+        )
+        .unwrap();
     assert!(conformance_pin_matches(
         &pinned,
         "cross-snapshot-pass",
@@ -1065,6 +1081,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         .unwrap()
         .unwrap()
     };
+    assert_eq!(latest(&mut manager), "cross-snapshot-pass");
     evidence["result_id"] = "renewed-pass".into();
     evidence["executed_at"] = "2026-09-19T00:00:00.500000Z".into();
     manager
@@ -1440,6 +1457,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         .execute_batch(
             "DROP TRIGGER execution_binding_evidence_present_at_insert;
          DROP TRIGGER execution_binding_evidence_not_future;
+         DROP TRIGGER execution_binding_evidence_latest_at_insert;
          DROP TRIGGER execution_binding_admission_marker_insert;
          DROP TABLE execution_binding_admission_markers;",
         )
@@ -1487,6 +1505,68 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         "attempt-real-2",
         "2026-09-19T00:00:00.750Z"
     ));
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .disable(&registration.registration_id, "2026-09-19T00:00:00.200Z")
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    let backdated_enablement = manager.connection.execute(
+        "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-backdated','attempt-backdated',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,4,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+           json_set(binding_json,'$.binding_id','binding-backdated',
+                    '$.attempt_id','attempt-backdated','$.attempt',4,
+                    '$.created_at','2026-09-19T00:00:00.400Z'),
+           '2026-09-19T00:00:00.400Z'
+         FROM execution_bindings WHERE binding_id=?1",
+        [&first],
+    );
+    assert!(
+        backdated_enablement
+            .unwrap_err()
+            .to_string()
+            .contains("binding predates provider enablement"),
+        "a provider enabled at T2 cannot accept a binding claiming T1"
+    );
+    let stale = manager.connection.execute(
+        "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-real-3','attempt-real-3',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+           json_set(binding_json,'$.binding_id','binding-real-3',
+                    '$.attempt_id','attempt-real-3','$.attempt',3,
+                    '$.created_at','2026-09-19T00:00:00.600Z'),
+           '2026-09-19T00:00:00.600Z'
+         FROM execution_bindings WHERE binding_id=?1",
+        [&first],
+    );
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("binding conformance evidence is not latest"),
+        "a superseded pass cannot consume a new attempt identity"
+    );
     let second = insert(&manager, 3, "E2");
     assert!(valid(
         &mut manager,
