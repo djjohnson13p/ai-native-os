@@ -13,6 +13,9 @@
     {"code": "PROVENANCE_HASH_ALGORITHM_UNSUPPORTED", "severity": "error", "meaning": "record/checkpoint names an unsupported hash algorithm"},
     {"code": "PROVENANCE_CHECKPOINT_SIGNATURE_INVALID", "severity": "error", "meaning": "signed checkpoint cryptographic verification failed"},
     {"code": "PROVENANCE_CHECKPOINT_SIGNER_UNTRUSTED", "severity": "warning", "meaning": "checkpoint signature may be cryptographically valid but signer is not trusted for the requested policy context"},
-    {"code": "PROVENANCE_DIAGNOSTICS_TRUNCATED", "severity": "warning", "meaning": "additional verification diagnostics were suppressed after configured maximum"}
+    {"code": "PROVENANCE_DIAGNOSTICS_TRUNCATED", "severity": "warning", "meaning": "additional verification diagnostics were suppressed after configured maximum"},
+    {"code": "PROJECTION_RECORD_INVALID", "severity": "error", "meaning": "privacy-redacted projection record shape, sequence, predecessor, alias, or closed field vocabulary is invalid"},
+    {"code": "PROJECTION_HASH_MISMATCH", "severity": "error", "meaning": "recomputed privacy-redacted projection hash does not match the projected record"},
+    {"code": "PROJECTION_MANIFEST_MISMATCH", "severity": "error", "meaning": "privacy-redacted projection manifest does not match the exported JSONL record set"}
   ]
 }

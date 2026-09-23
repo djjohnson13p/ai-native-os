@@ -13600,24 +13600,24 @@ mod tests {
         clippy::too_many_lines,
         reason = "builds a complete provenance-authenticated running Task fixture"
     )]
-    fn authenticate_running_fixture_history(manager: &mut TaskManager) {
+    fn authenticate_running_fixture_history(manager: &mut TaskManager, task_id: &str) {
         manager
             .connection
             .execute(
                 "UPDATE tasks SET revision=1,state='CREATED',active_step_ids_json='[]',
                  state_reason_json=(SELECT event_json FROM provenance_events
-                    WHERE task_id='T-artifact' AND event_type='task.created' LIMIT 1)
-                 WHERE task_id='T-artifact'",
-                [],
+                    WHERE task_id=?1 AND event_type='task.created' LIMIT 1)
+                 WHERE task_id=?1",
+                [task_id],
             )
             .unwrap();
-        let (program_id, ir_version, semantic_hash, registry_snapshot_id, program_json) = manager
+        let active_program = manager
             .connection
             .query_row(
                 "SELECT program_id,ir_version,semantic_hash,registry_snapshot_id,program_json
                  FROM semantic_program_revisions
-                 WHERE task_id='T-artifact' AND program_revision=1",
-                [],
+                 WHERE task_id=?1 AND program_revision=1",
+                [task_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -13628,18 +13628,23 @@ mod tests {
                     ))
                 },
             )
+            .optional()
             .unwrap();
-        let active_program = json!({
-            "program_id": program_id,
-            "ir_version": ir_version,
-            "semantic_hash": semantic_hash,
-            "registry_snapshot_id": registry_snapshot_id,
-            "validation_result_id": null,
-            "validated_at": null,
-            "validator_id": null,
-            "validator_version": null,
-            "program_content_digest": super::super::program_content_digest(&program_json).unwrap(),
-        });
+        let active_program = active_program.map(
+            |(program_id, ir_version, semantic_hash, registry_snapshot_id, program_json)| {
+                json!({
+                    "program_id": program_id,
+                    "ir_version": ir_version,
+                    "semantic_hash": semantic_hash,
+                    "registry_snapshot_id": registry_snapshot_id,
+                    "validation_result_id": null,
+                    "validated_at": null,
+                    "validator_id": null,
+                    "validator_version": null,
+                    "program_content_digest": super::super::program_content_digest(&program_json).unwrap(),
+                })
+            },
+        );
         let transaction = manager.connection.transaction().unwrap();
         let mut from = crate::TaskState::Created;
         for (index, to) in [
@@ -13654,18 +13659,18 @@ mod tests {
             let new_revision = previous_revision + 1;
             let event = json!({
                 "schema_version": SCHEMA_VERSION,
-                "event_id": format!("event:fixture-running:{new_revision}"),
-                "task_id": "T-artifact",
+                "event_id": format!("event:fixture-running:{task_id}:{new_revision}"),
+                "task_id": task_id,
                 "event_type": "task.transitioned",
                 "timestamp": "2026-09-19T22:00:00Z",
                 "actor": {"kind":"system-service","id":"service:test"},
                 "status": "success",
-                "semantic_program_hash": active_program.get("semantic_hash"),
-                "ir_version": active_program.get("ir_version"),
-                "registry_snapshot_id": active_program.get("registry_snapshot_id"),
+                "semantic_program_hash": active_program.as_ref().and_then(|value| value.get("semantic_hash")),
+                "ir_version": active_program.as_ref().and_then(|value| value.get("ir_version")),
+                "registry_snapshot_id": active_program.as_ref().and_then(|value| value.get("registry_snapshot_id")),
                 "validation_result_id": null,
                 "task_transition": {
-                    "transition_id": format!("fixture-running:{new_revision}"),
+                    "transition_id": format!("fixture-running:{task_id}:{new_revision}"),
                     "previous_state": from,
                     "new_state": to,
                     "previous_revision": previous_revision,
@@ -13686,14 +13691,14 @@ mod tests {
                     "mutation_text_commitments": {"waiting_on":null,"failure_summary":null}
                 }
             });
-            let appended = append_event(&transaction, "T-artifact", &event).unwrap();
+            let appended = append_event(&transaction, task_id, &event).unwrap();
             transaction
                 .execute(
                     "UPDATE tasks SET revision=?2,state=?3,
                      active_step_ids_json='[\"compose_report\"]',updated_at=?4,
-                     state_reason_json=?5 WHERE task_id='T-artifact'",
+                     state_reason_json=?5 WHERE task_id=?1",
                     params![
-                        "T-artifact",
+                        task_id,
                         new_revision,
                         to.as_str(),
                         "2026-09-19T22:00:00Z",
@@ -14238,6 +14243,167 @@ mod tests {
                 .artifact_id,
             first.artifact_id
         );
+    }
+
+    #[test]
+    fn opaque_import_id_with_whitespace_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let mut request = import_request();
+        request.import_id = Some("import replay 1".to_owned());
+        let first = manager
+            .import_artifact(&request, &mut Cursor::new(b"opaque import".as_slice()))
+            .unwrap();
+        let replay = manager
+            .import_artifact(&request, &mut Cursor::new(b"opaque import".as_slice()))
+            .unwrap();
+        assert_eq!(first.artifact_id, replay.artifact_id);
+        let event_json: String = manager.connection.query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-artifact' AND event_type='artifact.imported'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/import_id"),
+            Some(&json!("import replay 1"))
+        );
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+    }
+
+    #[test]
+    fn opaque_owner_export_operation_id_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"owner export".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "owner export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            12
+        );
+        let mut replay = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "owner export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut replay)
+                .unwrap(),
+            12
+        );
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='artifact.exported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/operation_id"),
+            Some(&json!("owner export 1"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+        for invalid in ["control\u{0001}id".to_owned(), "x".repeat(257)] {
+            assert!(
+                manager
+                    .issue_owned_artifact_export_destination(
+                        &scope,
+                        &invalid,
+                        &artifact.artifact_id,
+                        "user-selected-file",
+                        1_024,
+                        deferred(Vec::new()),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_bound_export_operation_id_commits() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"bound export".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "opaque-export",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[
+                ("artifact.read", "artifact", &artifact.artifact_id),
+                ("data.egress", "destination", "user-selected-file"),
+            ],
+        );
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let mut destination = manager
+            .issue_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "bound export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            12
+        );
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='artifact.exported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/operation_id"),
+            Some(&json!("bound export 1"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
     }
 
     #[test]
@@ -15675,6 +15841,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -15837,6 +16004,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -17243,6 +17411,60 @@ mod tests {
     }
 
     #[test]
+    fn opaque_trusted_export_reconciliation_ids_commit() {
+        let temp = TempDir::new().unwrap();
+        let mut verifier = export_no_effect_verifier("user-selected-file", "evidence one", 'a');
+        verifier.verifier_id = "verifier one";
+        let mut manager = manager_with_export_verifiers(&temp, vec![Arc::new(verifier)]);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"reconcile export".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", &[artifact.artifact_id.clone()])
+            .unwrap();
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "reconcile export 1",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(FinalizeFailureWriter::default()),
+            )
+            .unwrap();
+        assert!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .is_err()
+        );
+        manager
+            .reconcile_unknown_artifact_export_no_effect("reconcile export 1")
+            .unwrap();
+        let event_json: String = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE event_type='execution.completed' AND json_extract(event_json,'$.details.export_reconciliation') IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/export_reconciliation/verifier_id"),
+            Some(&json!("verifier one"))
+        );
+        assert_eq!(
+            event.pointer("/details/export_reconciliation/evidence_ref"),
+            Some(&json!("evidence one"))
+        );
+        assert_matches_schema("provenance-event.schema.json", &event);
+        assert!(manager.verify_provenance("T-artifact").unwrap());
+    }
+
+    #[test]
     fn export_reconciliation_rejects_cross_challenge_replay() {
         let temp = TempDir::new().unwrap();
         let verifier = Arc::new(export_no_effect_verifier(
@@ -18225,6 +18447,7 @@ mod tests {
                 ("data.egress", "destination", "user-selected-file"),
             ],
         );
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = manager
             .issue_provider_artifact_session("T-artifact", &binding_id)
             .unwrap();
@@ -19430,13 +19653,7 @@ mod tests {
         let scope = manager
             .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact_id))
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         manager
             .artifact_store_dir
             .remove_file(safe_internal_ref(&storage_ref).unwrap())
@@ -19560,10 +19777,12 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
+        authenticate_running_fixture_history(&mut manager, "T-shared");
         manager
             .connection
             .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id IN ('T-artifact','T-shared','T-unrelated')",
+                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-unrelated'",
                 [],
             )
             .unwrap();
@@ -19593,7 +19812,8 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                expected_state
+                expected_state,
+                "unexpected recovery state for {task_id}"
             );
         }
         for (task_id, publication_id) in
@@ -19745,13 +19965,7 @@ mod tests {
         manager
             .reserve_publication(&pending, &canonical_json(&pending).unwrap())
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-shared'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-shared");
         let storage_ref: String = manager
             .connection
             .query_row(
@@ -19846,13 +20060,7 @@ mod tests {
         manager
             .reserve_publication(&other, &canonical_json(&other).unwrap())
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let storage_ref = manager
             .connection
             .query_row(
@@ -20654,6 +20862,29 @@ mod tests {
                 .unwrap();
             assert_eq!(grants, [(1, "ACTIVE".to_owned()), (1, "ACTIVE".to_owned())]);
         }
+    }
+
+    #[test]
+    fn opaque_publication_id_with_whitespace_commits_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let (allocation_id, _) =
+            finish_bound_output(&mut manager, "opaque-publication", "ONE_SHOT");
+        let request = publication("publication replay 1", &allocation_id);
+        let first = publish_bound(&mut manager, &request).unwrap();
+        assert!(first.published);
+        assert_eq!(publish_bound(&mut manager, &request).unwrap(), first);
+        let event_json: String = manager.connection.query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-artifact' AND event_type='artifact.created'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event.pointer("/details/publication_id"),
+            Some(&json!("publication replay 1"))
+        );
+        assert!(manager.verify_provenance("T-artifact").unwrap());
     }
 
     #[test]
@@ -23623,13 +23854,7 @@ mod tests {
             .artifact_store_dir
             .remove_file(&storage_ref)
             .unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                [],
-            )
-            .unwrap();
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         CONTENT_HASH_HANDOFF_TEST_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 Err(TaskManagerError::Io(std::io::Error::other(
@@ -25166,13 +25391,7 @@ mod tests {
             manager
                 .reserve_publication(&pending, &canonical_json(&pending).unwrap())
                 .unwrap();
-            manager
-                .connection
-                .execute(
-                    "UPDATE tasks SET state='RUNNING' WHERE task_id='T-artifact'",
-                    [],
-                )
-                .unwrap();
+            authenticate_running_fixture_history(&mut manager, "T-artifact");
             for task_id in ["T-shared", "T-unrelated"] {
                 let allocation_id = format!("alloc-{task_id}-{fixture}");
                 let mut output = allocation(&allocation_id);
@@ -25184,11 +25403,11 @@ mod tests {
                     .reserve_publication(&pending, &canonical_json(&pending).unwrap())
                     .unwrap();
             }
+            authenticate_running_fixture_history(&mut manager, "T-shared");
             manager
                 .connection
                 .execute(
-                    "UPDATE tasks SET state='RUNNING'
-                     WHERE task_id IN ('T-shared','T-unrelated')",
+                    "UPDATE tasks SET state='RUNNING' WHERE task_id='T-unrelated'",
                     [],
                 )
                 .unwrap();
@@ -25327,7 +25546,7 @@ mod tests {
             std::slice::from_ref(&artifact.artifact_id),
             &[("artifact.read", "artifact", &artifact.artifact_id)],
         );
-        authenticate_running_fixture_history(&mut manager);
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = session_for_binding(&manager, "T-artifact", &binding_id);
         let scope = manager
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
@@ -25439,7 +25658,7 @@ mod tests {
             std::slice::from_ref(&artifact.artifact_id),
             &[("artifact.read", "artifact", &artifact.artifact_id)],
         );
-        authenticate_running_fixture_history(&mut manager);
+        authenticate_running_fixture_history(&mut manager, "T-artifact");
         let session = session_for_binding(&manager, "T-artifact", &binding_id);
         let scope = manager
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))

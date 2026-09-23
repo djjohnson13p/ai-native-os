@@ -622,6 +622,8 @@ CREATE TABLE IF NOT EXISTS operations (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS provenance_events (
+    schema_version           TEXT NOT NULL CHECK (schema_version = '0.1'),
+    hash_profile             TEXT NOT NULL CHECK (hash_profile = 'aios-provenance-event-v0.1'),
     event_id                 TEXT PRIMARY KEY,
     task_id                  TEXT NOT NULL,
     stream_id                TEXT NOT NULL,
@@ -638,7 +640,7 @@ CREATE TABLE IF NOT EXISTS provenance_events (
     previous_event_hash      TEXT,
     event_hash               TEXT NOT NULL,
     event_json               TEXT NOT NULL,
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id),
     FOREIGN KEY (registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),
     FOREIGN KEY (execution_binding_id) REFERENCES execution_bindings(binding_id),
     UNIQUE (task_id, sequence),

@@ -1,0 +1,20 @@
+{
+  "schema_version": "0.1",
+  "scope": "exported-projection",
+  "valid": false,
+  "original_chain_verified_offline": false,
+  "original_chain_linkage_proven": false,
+  "bundle_id": "bundle:v1:9bb3d3c4d617a706ac55b43a8a89af4d80ecc3b08119f17903177204aa271ed2",
+  "from_sequence": 1,
+  "to_sequence": 2,
+  "computed_projection_head_hash": "sha256:512c398ab5b51963b5ca9334d8574d725e6c72924db7d39c8f1a0036d946afdf",
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "PROJECTION_RECORD_INVALID",
+      "message": "projected record shape, order, or predecessor is invalid",
+      "sequence": 2
+    }
+  ],
+  "verified_at": "2026-09-22T00:00:00Z"
+}

@@ -1,15 +1,12 @@
 [package]
-name = "aios-task-manager"
+name = "aios-provenance"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-aios-ir.workspace = true
-aios-provenance.workspace = true
-cap-std.workspace = true
-fs2.workspace = true
+getrandom = "=0.3.4"
 jsonschema.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -17,12 +14,6 @@ serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 time.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["fs"] }
-
-[target.'cfg(windows)'.dependencies]
-winx.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23.0"

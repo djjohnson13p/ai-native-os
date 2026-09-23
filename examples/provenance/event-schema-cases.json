@@ -1,0 +1,747 @@
+{
+  "description": "Draft 2020-12 provenance event payload schema cases. Journal envelope hashes are outside event payloads.",
+  "cases": [
+    {
+      "name": "authorization-details-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:1",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "actions": [
+            "read"
+          ],
+          "resource": "artifact:one",
+          "resources": [
+            "artifact:one"
+          ]
+        }
+      }
+    },
+    {
+      "name": "authorization-plan-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:2",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "plan_id": "plan:one"
+        }
+      }
+    },
+    {
+      "name": "plan-details-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:3",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "plan_id": "plan:one",
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "plan-revision-safe-json-maximum",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:safe-maximum",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740991}
+      }
+    },
+    {
+      "name": "plan-revision-rounded-even-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:rounded-even",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740992}
+      }
+    },
+    {
+      "name": "plan-revision-rounded-odd-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:rounded-odd",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740993}
+      }
+    },
+    {
+      "name": "plan-resource-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:4",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "resource": "artifact:one"
+        }
+      }
+    },
+    {
+      "name": "event-without-detail-vocabulary-accepts-empty",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:5",
+        "task_id": "task:fixture",
+        "event_type": "task.paused",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {}
+      }
+    },
+    {
+      "name": "event-without-detail-vocabulary-rejects-known-key",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:6",
+        "task_id": "task:fixture",
+        "event_type": "task.paused",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "journal-hash-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:7",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "event_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "journal-previous-hash-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:8",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "previous_event_hash": null
+      }
+    },
+    {
+      "name": "artifact-array-bound-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:9",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [
+          "artifact:two"
+        ]
+      }
+    },
+    {
+      "name": "export-data-refs-allowed",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:10",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "op:one",
+          "size_bytes": 1
+        }
+      }
+    },
+    {
+      "name": "export-plan-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:11",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "plan_id": "plan:one"
+        }
+      }
+    },
+    {
+      "name": "opaque-import-id-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:12",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "import replay 1"
+        }
+      }
+    },
+    {
+      "name": "artifact-import-id-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:13",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "import\u0001id"
+        }
+      }
+    },
+    {
+      "name": "artifact-import-id-over-bound-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:14",
+        "task_id": "task:fixture",
+        "event_type": "artifact.imported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "import_id": "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+        }
+      }
+    },
+    {
+      "name": "opaque-publication-ids-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:15",
+        "task_id": "task:fixture",
+        "event_type": "artifact.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "allocation_id": "allocation 1",
+          "publication_id": "publication 1"
+        }
+      }
+    },
+    {
+      "name": "artifact-publication-id-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:16",
+        "task_id": "task:fixture",
+        "event_type": "artifact.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "allocation_id": "allocation 1",
+          "publication_id": "publication\u0001id"
+        }
+      }
+    },
+    {
+      "name": "opaque-attempt-and-binding-ids-with-spaces-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:17",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "attempt 1",
+          "binding_id": "binding 1",
+          "node_id": "node 1"
+        }
+      }
+    },
+    {
+      "name": "max-length-attempt-id-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:18",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "over-bound-attempt-id-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:19",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "attempt_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "prefixed-max-length-attempt-inventory-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:20",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "attempt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "over-bound-recovery-inventory-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:21",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "authorization-resource-whitespace-still-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:22",
+        "task_id": "task:fixture",
+        "event_type": "authorization.granted",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "resource": "artifact one"
+        }
+      }
+    },
+    {
+      "name": "max-derived-provider-invocation-inventory-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:23",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "inventory_id": "provider-invocation:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "opaque-export-operation-id-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:24",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "export replay 1",
+          "size_bytes": 1
+        }
+      }
+    },
+    {
+      "name": "export-operation-id-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:25",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "export\u0001id",
+          "size_bytes": 1
+        }
+      }
+    },
+    {
+      "name": "export-operation-id-over-bound-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:26",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "input_artifacts": [
+          "artifact:one"
+        ],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "local",
+          "data_refs": [
+            "artifact:one"
+          ]
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "size_bytes": 1
+        }
+      }
+    },
+    {
+      "name": "execution-started-opaque-export-operation-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:27",
+        "task_id": "task:fixture",
+        "event_type": "execution.started",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "operation_id": "export replay 1",
+          "phase": "pre-destination-admission"
+        }
+      }
+    },
+    {
+      "name": "execution-failed-opaque-export-operation-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:28",
+        "task_id": "task:fixture",
+        "event_type": "execution.failed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "operation_id": "export replay 1"
+        }
+      }
+    },
+    {
+      "name": "reconciliation-opaque-verifier-and-evidence-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:29",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "operation_id": "export replay 1",
+          "export_reconciliation": {
+            "verifier_id": "verifier one",
+            "evidence_ref": "evidence one",
+            "proof_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "challenge": "challenge:one",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "subject_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "recovery_ref": "recovery:one"
+          }
+        }
+      }
+    },
+    {
+      "name": "reconciliation-verifier-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:30",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "export_reconciliation": {
+            "verifier_id": "verifier\u0001id",
+            "evidence_ref": "evidence one",
+            "proof_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "challenge": "challenge:one",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "subject_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "recovery_ref": "recovery:one"
+          }
+        }
+      }
+    },
+    {
+      "name": "reconciliation-evidence-control-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:31",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "export_reconciliation": {
+            "verifier_id": "verifier one",
+            "evidence_ref": "evidence\u0001id",
+            "proof_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "challenge": "challenge:one",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "subject_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "recovery_ref": "recovery:one"
+          }
+        }
+      }
+    },
+    {
+      "name": "reconciliation-verifier-over-bound-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:32",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "export_reconciliation": {
+            "verifier_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "evidence_ref": "evidence one",
+            "proof_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "challenge": "challenge:one",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "subject_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "recovery_ref": "recovery:one"
+          }
+        }
+      }
+    },
+    {
+      "name": "reconciliation-evidence-over-bound-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:33",
+        "task_id": "task:fixture",
+        "event_type": "execution.completed",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {
+          "kind": "system-service",
+          "id": "authority"
+        },
+        "details": {
+          "export_reconciliation": {
+            "verifier_id": "verifier one",
+            "evidence_ref": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "proof_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "challenge": "challenge:one",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "subject_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "recovery_ref": "recovery:one"
+          }
+        }
+      }
+    }
+  ]
+}

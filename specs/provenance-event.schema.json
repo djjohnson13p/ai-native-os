@@ -7,9 +7,9 @@
   "required": ["schema_version", "event_id", "task_id", "event_type", "timestamp", "actor"],
   "properties": {
     "schema_version": {"type": "string", "const": "0.1"},
-    "event_id": {"type": "string", "minLength": 1},
-    "task_id": {"type": "string", "minLength": 1},
-    "step_id": {"type": ["string", "null"]},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "step_id": {"type": ["string", "null"], "maxLength": 4096},
     "event_type": {
       "type": "string",
       "enum": [
@@ -62,7 +62,7 @@
         "skill.invalidated"
       ]
     },
-    "timestamp": {"type": "string", "format": "date-time"},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 4096},
     "actor": {
       "type": "object",
       "additionalProperties": false,
@@ -72,7 +72,7 @@
           "type": "string",
           "enum": ["user", "agent", "provider", "model-provider", "system-service", "legacy-app", "policy-engine", "validator", "peer-node"]
         },
-        "id": {"type": "string", "minLength": 1}
+        "id": {"type": "string", "minLength": 1, "maxLength": 256}
       }
     },
     "task_transition": {
@@ -90,8 +90,8 @@
         "transition_id": {"type": "string", "minLength": 1, "maxLength": 256},
         "previous_state": {"$ref": "#/$defs/taskState"},
         "new_state": {"$ref": "#/$defs/taskState"},
-        "previous_revision": {"type": "integer", "minimum": 1},
-        "new_revision": {"type": "integer", "minimum": 2},
+        "previous_revision": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "new_revision": {"type": "integer", "minimum": 2, "maximum": 9007199254740991},
         "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"}
       }
     },
@@ -107,7 +107,7 @@
           "required": ["plan_id", "revision"],
           "properties": {
             "plan_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "revision": {"type": "integer", "minimum": 1}
+            "revision": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
           }
         },
         "active_step_ids": {
@@ -168,41 +168,45 @@
     },
     "semantic_program_hash": {
       "type": ["string", "null"],
+      "maxLength": 4096,
       "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
     },
-    "ir_version": {"type": ["string", "null"]},
-    "registry_snapshot_id": {"type": ["string", "null"]},
-    "validation_result_id": {"type": ["string", "null"]},
-    "execution_binding_id": {"type": ["string", "null"]},
-    "provider_id": {"type": ["string", "null"]},
-    "provider_version": {"type": ["string", "null"]},
-    "capability": {"type": ["string", "null"]},
+    "ir_version": {"type": ["string", "null"], "maxLength": 4096},
+    "registry_snapshot_id": {"type": ["string", "null"], "maxLength": 4096},
+    "validation_result_id": {"type": ["string", "null"], "maxLength": 4096},
+    "execution_binding_id": {"type": ["string", "null"], "maxLength": 4096},
+    "provider_id": {"type": ["string", "null"], "maxLength": 4096},
+    "provider_version": {"type": ["string", "null"], "maxLength": 4096},
+    "capability": {"type": ["string", "null"], "maxLength": 4096},
     "capability_contract_hash": {
       "type": ["string", "null"],
+      "maxLength": 4096,
       "pattern": "^(?:[a-z0-9_-]+:[A-Fa-f0-9]+)?$"
     },
-    "authority_token_id": {"type": ["string", "null"]},
-    "policy_decision_id": {"type": ["string", "null"]},
-    "approval_id": {"type": ["string", "null"]},
+    "authority_token_id": {"type": ["string", "null"], "maxLength": 4096},
+    "policy_decision_id": {"type": ["string", "null"], "maxLength": 4096},
+    "approval_id": {"type": ["string", "null"], "maxLength": 4096},
     "skill": {
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["id", "version"],
       "properties": {
-        "id": {"type": "string", "minLength": 1},
-        "version": {"type": "string", "minLength": 1},
-        "manifest_hash": {"type": ["string", "null"]},
-        "compiled_target_id": {"type": ["string", "null"]}
+        "id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "version": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "manifest_hash": {"type": ["string", "null"], "maxLength": 4096},
+        "compiled_target_id": {"type": ["string", "null"], "maxLength": 4096}
       }
     },
     "input_artifacts": {
       "type": "array",
-      "items": {"type": "string"},
+      "maxItems": 512,
+      "items": {"type": "string", "maxLength": 4096},
       "uniqueItems": true
     },
     "output_artifacts": {
       "type": "array",
-      "items": {"type": "string"},
+      "maxItems": 512,
+      "items": {"type": "string", "maxLength": 4096},
       "uniqueItems": true
     },
     "external_transfer": {
@@ -210,14 +214,15 @@
       "additionalProperties": false,
       "required": ["destination", "data_refs"],
       "properties": {
-        "destination": {"type": "string", "minLength": 1},
+        "destination": {"type": "string", "minLength": 1, "maxLength": 4096},
         "data_refs": {
           "type": "array",
-          "items": {"type": "string"},
+          "maxItems": 512,
+          "items": {"type": "string", "maxLength": 4096},
           "minItems": 1,
           "uniqueItems": true
         },
-        "purpose": {"type": ["string", "null"]}
+        "purpose": {"type": ["string", "null"], "maxLength": 4096}
       }
     },
     "status": {
@@ -226,13 +231,183 @@
     },
     "details": {
       "type": "object",
-      "description": "Diagnostic details only. Security-relevant identity should use dedicated typed fields above.",
+      "description": "Privacy-safe typed projection only. Detail names are a closed v0.1 vocabulary and are further restricted by event_type below; implementations reject unknown nested object fields.",
+      "propertyNames": {
+        "enum": [
+          "revision", "creation", "active_plan", "active_step_ids", "waiting_on", "failure", "recovery", "fixture",
+          "related_ids", "reason_message_ref", "active_program", "mutation_text_commitments",
+          "actions", "resource", "resources", "plan_id", "locality", "isolation_class",
+          "attempt_id", "binding_id", "node_id", "operation_id", "phase", "intent_hash", "admission_event_id", "admission_event_hash", "execution_profile",
+          "outcome_certainty", "effect_boundary", "certainty", "export_reconciliation", "recovery_ref", "inventory_id", "safe_action", "reason_code", "attempt", "duration_ms",
+          "content_hash", "size_bytes", "blob_reused", "import_id", "request_digest", "source",
+          "allocation_id", "publication_id", "type", "observation_ordinal", "previous_durability_state", "durability_state", "resulted_at",
+          "index", "verified_claims", "failed_claims", "external_egress", "verified"
+        ]
+      },
+      "properties": {
+        "revision": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "fixture": {"type": "boolean"},
+        "creation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["principal", "workspace_id", "original_intent_ref", "normalized_intent_ref", "constraints", "created_at"],
+          "properties": {
+            "principal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "id"],
+              "properties": {
+                "kind": {"enum": ["user", "system-service"]},
+                "id": {"$ref": "#/$defs/taskOpaqueIdentifier"}
+              }
+            },
+            "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskOpaqueIdentifier"}]},
+            "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
+            "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
+            "constraints": {"type": "null"},
+            "created_at": {"type": "string", "format": "date-time", "maxLength": 4096}
+          }
+        },
+        "active_plan": {"type": "null"},
+        "active_step_ids": {"type": "array", "maxItems": 512, "uniqueItems": true, "items": {"$ref": "#/$defs/taskOpaqueStepIdentifier"}},
+        "waiting_on": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id"],
+            "properties": {
+              "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"$ref": "#/$defs/taskOpaqueIdentifier"}
+            }
+          }
+        },
+        "failure": {"type": "null"},
+        "recovery": {"type": "null"},
+        "related_ids": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/taskOpaqueRelatedIdentifier"}},
+        "reason_message_ref": {"$ref": "#/$defs/reasonMessageRef"},
+        "active_program": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/activeProgramDetails"}]},
+        "mutation_text_commitments": {"$ref": "#/$defs/mutationTextCommitments"},
+        "actions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "resource": {"$ref": "#/$defs/safeIdentifier"},
+        "resources": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/safeIdentifier"}},
+        "plan_id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
+        "locality": {"enum": ["local", "remote", "peer", "cloud"]},
+        "isolation_class": {"enum": ["P0", "P1", "P2", "P3"]},
+        "attempt_id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
+        "binding_id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
+        "node_id": {"$ref": "#/$defs/taskOpaqueStepIdentifier"},
+        "operation_id": {"$ref": "#/$defs/artifactOpaqueIdentifier"},
+        "phase": {"enum": ["admitted", "delivered", "pre-destination-admission", "effect-boundary-armed"]},
+        "intent_hash": {"$ref": "#/$defs/sha256Digest"},
+        "admission_event_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "admission_event_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256Digest"}]},
+        "execution_profile": {"$ref": "#/$defs/safeIdentifier"},
+        "outcome_certainty": {"$ref": "#/$defs/outcomeCertainty"},
+        "effect_boundary": {"const": "destination-not-invoked"},
+        "certainty": {"$ref": "#/$defs/outcomeCertainty"},
+        "export_reconciliation": {"$ref": "#/$defs/exportReconciliationDetails"},
+        "recovery_ref": {"$ref": "#/$defs/safeIdentifier"},
+        "inventory_id": {"$ref": "#/$defs/recoveryInventoryIdentifier"},
+        "safe_action": {"enum": ["CREATE_NEW_ATTEMPT", "RECONCILE_STATE", "MARK_ATTEMPT_FAILED", "REQUIRE_EXTERNAL_RECONCILIATION", "FAIL_TASK", "NO_ACTION", "CLEAN_STAGING"]},
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z][A-Z0-9_]*$"},
+        "attempt": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "duration_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "content_hash": {"$ref": "#/$defs/sha256Digest"},
+        "size_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "blob_reused": {"type": "boolean"},
+        "import_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/artifactOpaqueIdentifier"}]},
+        "request_digest": {"$ref": "#/$defs/sha256Digest"},
+        "source": {"const": "user-selected"},
+        "allocation_id": {"$ref": "#/$defs/artifactOpaqueIdentifier"},
+        "publication_id": {"$ref": "#/$defs/artifactOpaqueIdentifier"},
+        "type": {"$ref": "#/$defs/safeIdentifier"},
+        "observation_ordinal": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "previous_durability_state": {"enum": [null, "STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
+        "durability_state": {"enum": ["STAGED", "DURABLE", "ORPHANED", "CORRUPT", "MISSING"]},
+        "resulted_at": {"type": "string", "format": "date-time", "maxLength": 4096},
+        "index": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "verified_claims": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "failed_claims": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "external_egress": {"type": "boolean"},
+        "verified": {"type": "boolean"}
+      },
       "additionalProperties": true
-    },
-    "previous_event_hash": {"type": ["string", "null"]},
-    "event_hash": {"type": ["string", "null"]}
+    }
   },
   "allOf": [
+    {
+      "if": {"properties": {"event_type": {"const":"task.created"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["revision","creation","active_plan","active_step_ids","waiting_on","failure","recovery","fixture"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"task.transitioned"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["related_ids","reason_message_ref","active_program","mutation_text_commitments"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"authorization.granted"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["actions","resource","resources"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["plan.created","plan.revised"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["plan_id","revision"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["provider.selected","placement.selected"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["locality","isolation_class"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"execution.started"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["attempt_id","binding_id","node_id","operation_id","phase","intent_hash","admission_event_id","admission_event_hash","execution_profile"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["execution.completed","execution.failed"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","outcome_certainty","effect_boundary","certainty","export_reconciliation","recovery_ref","inventory_id","safe_action","reason_code","phase","admission_event_id","admission_event_hash","attempt","duration_ms"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.imported"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["content_hash","size_bytes","blob_reused","import_id","request_digest","source"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.created"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["allocation_id","publication_id","content_hash","size_bytes","blob_reused","type"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.exported"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","size_bytes"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"artifact.integrity-failed"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["content_hash","observation_ordinal","previous_durability_state","durability_state","publication_id","allocation_id","request_digest","reason_code","resulted_at"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum":["verification.started","verification.completed","verification.failed"]}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["index","verified_claims","failed_claims"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"const":"task.completed"}}},
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["revision","external_egress","verified"]}}}}
+    },
+    {
+      "if": {"properties": {"event_type": {"enum": ["task.created","task.transitioned","authorization.granted","plan.created","plan.revised","provider.selected","placement.selected","execution.started","execution.completed","execution.failed","artifact.imported","artifact.created","artifact.exported","artifact.integrity-failed","verification.started","verification.completed","verification.failed","task.completed"]}}},
+      "else": {"properties": {"details": {"maxProperties": 0}}}
+    },
+    {
+      "if": {
+        "properties": {"event_type": {"const": "task.created"}},
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["details"],
+        "properties": {
+          "details": {
+            "required": ["revision", "creation", "active_plan", "active_step_ids", "waiting_on", "failure", "recovery"],
+            "properties": {"revision": {"const": 1}}
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {"event_type": {"const": "task.transitioned"}},
@@ -269,6 +444,147 @@
     }
   ],
   "$defs": {
+    "safeIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\s]+$"
+    },
+    "taskOpaqueIdentifier": {
+      "description": "Opaque Task-origin identifier. Bounds count Unicode scalar values; punctuation and whitespace are preserved for compatibility with the Task contract.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "taskOpaqueStepIdentifier": {
+      "description": "Opaque Task step identifier copied without normalization.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "artifactOpaqueIdentifier": {
+      "description": "Artifact-origin identifier copied without normalization; whitespace is allowed, but control characters are forbidden by the Artifact Store contract.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+    },
+    "recoveryInventoryIdentifier": {
+      "description": "Opaque recovery subject identity. The longest current prefix is provider-invocation: (20 scalars) plus a 256-scalar upstream ID.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 276
+    },
+    "taskOpaqueRelatedIdentifier": {
+      "description": "Opaque transition reason reference copied without normalization; the Task transition contract permits an empty value.",
+      "type": "string",
+      "maxLength": 512
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "outcomeCertainty": {
+      "enum": ["NOT_STARTED", "STARTED_NO_EFFECT", "COMPLETED", "FAILED_NO_EFFECT", "FAILED_PARTIAL_EFFECT", "OUTCOME_UNKNOWN"]
+    },
+    "fieldCommitment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "algorithm", "field", "commitment"],
+      "properties": {
+        "kind": {"const": "task-field-commitment"},
+        "version": {"const": "v1"},
+        "algorithm": {"const": "sha256-keyed-prefix"},
+        "field": {"enum": ["original_intent", "normalized_intent", "reason_message", "waiting_message", "failure_summary"]},
+        "commitment": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "originalIntentCommitment": {
+      "allOf": [
+        {"$ref": "#/$defs/fieldCommitment"},
+        {"properties": {"field": {"const": "original_intent"}}}
+      ]
+    },
+    "normalizedIntentCommitment": {
+      "allOf": [
+        {"$ref": "#/$defs/fieldCommitment"},
+        {"properties": {"field": {"const": "normalized_intent"}}}
+      ]
+    },
+    "waitingMessageRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "waiting_message"}}}
+          ]
+        }
+      ]
+    },
+    "failureSummaryRef": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "failure_summary"}}}
+          ]
+        }
+      ]
+    },
+    "activeProgramDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program_id", "ir_version", "semantic_hash", "registry_snapshot_id", "validation_result_id", "validated_at", "validator_id", "validator_version", "program_content_digest"],
+      "properties": {
+        "program_id": {"$ref": "#/$defs/safeIdentifier"},
+        "ir_version": {"$ref": "#/$defs/safeIdentifier"},
+        "semantic_hash": {"$ref": "#/$defs/sha256Digest"},
+        "registry_snapshot_id": {"$ref": "#/$defs/safeIdentifier"},
+        "validation_result_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "validated_at": {"type": ["string", "null"], "format": "date-time", "maxLength": 4096},
+        "validator_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "validator_version": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/safeIdentifier"}]},
+        "program_content_digest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "mutationTextCommitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["waiting_on", "failure_summary"],
+      "properties": {
+        "waiting_on": {
+          "type": ["array", "null"],
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "id", "message_ref"],
+            "properties": {
+              "kind": {"enum": ["input", "approval", "resource", "provider", "validation"]},
+              "id": {"$ref": "#/$defs/taskOpaqueIdentifier"},
+              "message_ref": {"$ref": "#/$defs/waitingMessageRef"}
+            }
+          }
+        },
+        "failure_summary": {"$ref": "#/$defs/failureSummaryRef"}
+      }
+    },
+    "exportReconciliationDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifier_id", "evidence_ref", "proof_hash", "challenge", "observed_at", "subject_hash", "recovery_ref"],
+      "properties": {
+        "verifier_id": {"$ref": "#/$defs/artifactOpaqueIdentifier"},
+        "evidence_ref": {"$ref": "#/$defs/artifactOpaqueIdentifier"},
+        "proof_hash": {"$ref": "#/$defs/sha256Digest"},
+        "challenge": {"$ref": "#/$defs/safeIdentifier"},
+        "observed_at": {"type": "string", "format": "date-time", "maxLength": 4096},
+        "subject_hash": {"$ref": "#/$defs/sha256Digest"},
+        "recovery_ref": {"$ref": "#/$defs/safeIdentifier"}
+      }
+    },
     "taskState": {
       "type": "string",
       "enum": [
@@ -281,16 +597,10 @@
       "oneOf": [
         {"type": "null"},
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "version", "algorithm", "field", "commitment"],
-          "properties": {
-            "kind": {"const": "task-field-commitment"},
-            "version": {"const": "v1"},
-            "algorithm": {"const": "sha256-keyed-prefix"},
-            "field": {"const": "reason_message"},
-            "commitment": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-          }
+          "allOf": [
+            {"$ref": "#/$defs/fieldCommitment"},
+            {"properties": {"field": {"const": "reason_message"}}}
+          ]
         }
       ]
     }

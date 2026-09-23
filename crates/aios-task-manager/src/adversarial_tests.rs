@@ -35,6 +35,25 @@ fn create(task_id: &str) -> CreateTask {
     }
 }
 
+fn compatibility_create(task_id: &str) -> CreateTask {
+    CreateTask {
+        task_id: task_id.to_owned(),
+        principal: Actor {
+            kind: "user".to_owned(),
+            id: "user:Alice Smith=👩\u{200d}💻e\u{301}".to_owned(),
+        },
+        workspace_id: Some("My Workspace=🧪e\u{301}".to_owned()),
+        original_intent: "Exercise opaque Task identifier compatibility.".to_owned(),
+        normalized_intent: None,
+        active_step_ids: vec![
+            "step one".to_owned(),
+            "step=two".to_owned(),
+            "step 👣".to_owned(),
+            "step-e\u{301}".to_owned(),
+        ],
+    }
+}
+
 fn request(
     id: &str,
     task_id: &str,
@@ -131,6 +150,58 @@ fn seed_nonterminal_history(manager: &mut TaskManager, task_id: &str, final_stat
         revision = next_revision;
     }
     transaction.commit().unwrap();
+}
+
+fn seed_recovering_history(manager: &mut TaskManager, task_id: &str) -> u64 {
+    seed_nonterminal_history(manager, task_id, TaskState::Running);
+    let previous_revision = 4_u64;
+    let new_revision = previous_revision + 1;
+    let transaction = manager.connection.transaction().unwrap();
+    let event = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": format!("event:seed:{task_id}:recovering"),
+        "task_id": task_id,
+        "event_type": "task.transitioned",
+        "timestamp": TEST_TIME,
+        "actor": {"kind":"system-service","id":"service:test"},
+        "status": "success",
+        "task_transition": {
+            "transition_id": format!("seed:{task_id}:recovering"),
+            "previous_state": TaskState::Running,
+            "new_state": TaskState::Recovering,
+            "previous_revision": previous_revision,
+            "new_revision": new_revision,
+            "reason_code": "STARTUP_RECOVERY_REQUIRED"
+        },
+        "committed_mutation": {
+            "active_plan": null,
+            "active_step_ids": null,
+            "waiting_on": null,
+            "failure": null,
+            "recovery": null
+        },
+        "details": {"reason_message_ref": null, "active_program": null}
+    });
+    let appended = append_event(&transaction, task_id, &event).unwrap();
+    transaction
+        .execute(
+            "UPDATE tasks
+             SET state='RECOVERING', revision=?2, state_reason_json=?3
+             WHERE task_id=?1",
+            rusqlite::params![
+                task_id,
+                i64::try_from(new_revision).unwrap(),
+                serde_json::json!({
+                    "code": "STARTUP_RECOVERY_REQUIRED",
+                    "message": null,
+                    "provenance_event_id": appended.event_id
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    new_revision
 }
 
 #[test]
@@ -471,8 +542,998 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        9
+        10
     );
+}
+
+fn downgrade_provenance_before_0011(connection: &Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         DROP INDEX IF EXISTS ix_provenance_task_sequence;
+         DROP TRIGGER IF EXISTS provenance_events_no_update;
+         DROP TRIGGER IF EXISTS provenance_events_no_delete;
+         ALTER TABLE provenance_events RENAME TO provenance_events_modern;
+         CREATE TABLE provenance_events (
+             event_id TEXT PRIMARY KEY,
+             task_id TEXT NOT NULL,
+             stream_id TEXT NOT NULL,
+             sequence INTEGER NOT NULL CHECK(sequence>=1),
+             timestamp TEXT NOT NULL,
+             event_type TEXT NOT NULL,
+             semantic_program_hash TEXT,
+             ir_version TEXT,
+             registry_snapshot_id TEXT,
+             node_id TEXT,
+             execution_binding_id TEXT,
+             provider_id TEXT,
+             status TEXT,
+             previous_event_hash TEXT,
+             event_hash TEXT NOT NULL,
+             event_json TEXT NOT NULL,
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+             FOREIGN KEY(registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),
+             FOREIGN KEY(execution_binding_id) REFERENCES execution_bindings(binding_id),
+             UNIQUE(task_id,sequence), UNIQUE(stream_id,sequence)
+         );
+         INSERT INTO provenance_events
+         SELECT event_id,task_id,stream_id,sequence,timestamp,event_type,semantic_program_hash,
+                ir_version,registry_snapshot_id,node_id,execution_binding_id,provider_id,status,
+                previous_event_hash,event_hash,event_json
+         FROM provenance_events_modern;
+         DROP TABLE provenance_events_modern;
+         CREATE INDEX ix_provenance_task_sequence ON provenance_events(task_id,sequence);
+         CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+         BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;
+         CREATE TRIGGER provenance_events_no_delete BEFORE DELETE ON provenance_events
+         BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;
+         DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';",
+        )
+        .unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the legacy table shape and survival assertions together"
+)]
+fn provenance_service_migration_preserves_task_artifact_rows_and_event_hashes() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("provenance-migration.sqlite3");
+    let task_id = "任务-迁移-é";
+    let original_records = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&compatibility_create(task_id)).unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        for index in 2..=3 {
+            append_event(
+                &transaction,
+                task_id,
+                &serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "event_id": format!("event:legacy-unicode:{index}"),
+                    "task_id": task_id,
+                    "event_type": "verification.started",
+                    "timestamp": TEST_TIME,
+                    "actor": {"kind":"system-service","id":"service:test"},
+                    "status": "success",
+                    "details": {"index": index}
+                }),
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        manager.connection.execute(
+            "INSERT INTO artifacts (artifact_id,uri,semantic_type,media_type,sensitivity,retention_class,origin_kind,origin_task_id,integrity_state,created_at)
+             VALUES (?1,?2,'artifact.test@1','application/octet-stream','local','task','task',?3,'unknown',?4)",
+            rusqlite::params![
+                format!("artifact:v1:sha256:{}", "a".repeat(64)),
+                format!("artifact://artifact:v1:sha256:{}", "a".repeat(64)),
+                task_id,
+                TEST_TIME,
+            ],
+        ).unwrap();
+        let mut statement = manager
+            .connection
+            .prepare(
+                "SELECT sequence,previous_event_hash,event_hash,event_json
+                 FROM provenance_events WHERE task_id=?1 ORDER BY sequence",
+            )
+            .unwrap();
+        statement
+            .query_map([task_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    downgrade_provenance_before_0011(&connection);
+    drop(connection);
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(manager.get_task(task_id).unwrap().is_some());
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE origin_task_id=?1",
+                [task_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let mut statement = manager
+        .connection
+        .prepare(
+            "SELECT sequence,previous_event_hash,event_hash,event_json
+             FROM provenance_events WHERE task_id=?1 ORDER BY sequence",
+        )
+        .unwrap();
+    let migrated_records = statement
+        .query_map([task_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(migrated_records.len(), 3);
+    assert_eq!(migrated_records, original_records);
+    assert!(manager.verify_provenance(task_id).unwrap());
+    let task = manager.get_task(task_id).unwrap().unwrap();
+    assert_eq!(task.principal.id, "user:Alice Smith=👩\u{200d}💻e\u{301}");
+    assert_eq!(
+        task.workspace_id.as_deref(),
+        Some("My Workspace=🧪e\u{301}")
+    );
+    assert_eq!(
+        task.active_step_ids,
+        ["step one", "step=two", "step 👣", "step-e\u{301}"]
+    );
+    let export = manager.export_provenance(task_id).unwrap();
+    assert!(!export.records_jsonl.contains("Alice Smith"));
+    assert!(!export.records_jsonl.contains("My Workspace"));
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(
+        manager.connection.query_row("SELECT schema_version || ':' || hash_profile FROM provenance_events WHERE task_id=?1", [task_id], |row| row.get::<_, String>(0)).unwrap(),
+        "0.1:aios-provenance-event-v0.1"
+    );
+    assert!(provenance_task_fk_is_current(&manager.connection).unwrap());
+}
+
+#[test]
+fn stamped_provenance_table_without_task_fk_rejects_orphan_stream() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("stamped-missing-provenance-fk.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-fk-original")).unwrap();
+        assert!(provenance_task_fk_is_current(&manager.connection).unwrap());
+    }
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER provenance_events_no_update;
+         DROP TRIGGER provenance_events_no_delete;
+         CREATE TABLE provenance_events_without_fk AS SELECT * FROM provenance_events;
+         DROP TABLE provenance_events;
+         ALTER TABLE provenance_events_without_fk RENAME TO provenance_events;",
+        )
+        .unwrap();
+    let raw: String = connection
+        .query_row(
+            "SELECT event_json FROM provenance_events WHERE task_id='T-fk-original'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut orphan: Value = serde_json::from_str(&raw).unwrap();
+    orphan["task_id"] = serde_json::json!("T-fk-orphan");
+    orphan["event_id"] = serde_json::json!("event:fk-orphan");
+    let orphan_stream = aios_provenance::stream_id("T-fk-orphan").unwrap();
+    let orphan_hash = aios_provenance::hash_record(&orphan_stream, 1, None, &orphan).unwrap();
+    connection.execute(
+        "UPDATE provenance_events SET task_id='T-fk-orphan',stream_id=?1,event_id='event:fk-orphan',event_hash=?2,event_json=?3",
+        rusqlite::params![orphan_stream, orphan_hash, orphan.to_string()],
+    ).unwrap();
+    assert!(!provenance_task_fk_is_current(&connection).unwrap());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id='T-fk-orphan'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    assert!(matches!(
+        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+        Err(TaskManagerError::InvalidRecord(
+            "provenance service-boundary migration is incomplete"
+        ))
+    ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers both auxiliary foreign keys across stamped rejection and unstamped rebuild"
+)]
+fn provenance_requires_all_declared_foreign_keys_in_stamped_and_unstamped_stores() {
+    for (missing_fk, name) in [
+        (
+            "FOREIGN KEY (registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),",
+            "registry-snapshot",
+        ),
+        (
+            "FOREIGN KEY (execution_binding_id) REFERENCES execution_bindings(binding_id),",
+            "execution-binding",
+        ),
+    ] {
+        for stamped in [true, false] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join(format!("missing-{name}-fk.sqlite3"));
+            let task_id = "T-missing-provenance-fk";
+            let original_hash = {
+                let mut manager =
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                manager.create_task(&create(task_id)).unwrap();
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash
+            };
+            let connection = Connection::open(&path).unwrap();
+            let schema: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let malformed = schema
+                .replacen(
+                    "CREATE TABLE provenance_events",
+                    "CREATE TABLE provenance_events_without_fk",
+                    1,
+                )
+                .replacen(missing_fk, "", 1);
+            assert_ne!(malformed, schema, "{name} FK must be present in fixture");
+            assert!(!malformed.contains(missing_fk));
+            let clear_stamp = if stamped {
+                ""
+            } else {
+                "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';"
+            };
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys=OFF;
+                     DROP TRIGGER provenance_events_no_update;
+                     DROP TRIGGER provenance_events_no_delete;
+                     {malformed};
+                     INSERT INTO provenance_events_without_fk SELECT * FROM provenance_events;
+                     DROP TABLE provenance_events;
+                     ALTER TABLE provenance_events_without_fk RENAME TO provenance_events;
+                     {clear_stamp}"
+                ))
+                .unwrap();
+            assert!(provenance_task_fk_is_current(&connection).unwrap());
+            assert!(!provenance_foreign_keys_are_current(&connection).unwrap());
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert!(
+                aios_provenance::verify_stream(
+                    &connection,
+                    &provenance_stream_id(task_id),
+                    None,
+                    None,
+                    TEST_TIME,
+                )
+                .unwrap()
+                .valid
+            );
+            drop(connection);
+
+            if stamped {
+                assert!(matches!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                    Err(TaskManagerError::InvalidRecord(
+                        "provenance service-boundary migration is incomplete"
+                    ))
+                ));
+            } else {
+                let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                assert!(provenance_foreign_keys_are_current(&manager.connection).unwrap());
+                assert!(manager.verify_provenance(task_id).unwrap());
+                assert_eq!(
+                    manager
+                        .provenance_head(task_id)
+                        .unwrap()
+                        .unwrap()
+                        .event_hash,
+                    original_hash
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn provenance_task_fk_rejects_extra_cascading_constraint() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+         CREATE TABLE provenance_events(
+             task_id TEXT NOT NULL,
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+             FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+         );",
+        )
+        .unwrap();
+    assert!(!provenance_task_fk_is_current(&connection).unwrap());
+}
+
+fn duplicate_provenance_row(
+    connection: &Connection,
+    original_task_id: &str,
+    event_id: &str,
+    task_id: Option<&str>,
+    stream_id: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO provenance_events
+         SELECT schema_version,hash_profile,?2,?3,?4,2,timestamp,event_type,
+                semantic_program_hash,ir_version,registry_snapshot_id,node_id,
+                execution_binding_id,provider_id,status,previous_event_hash,event_hash,event_json
+         FROM provenance_events WHERE task_id=?1 AND sequence=1",
+            rusqlite::params![original_task_id, event_id, task_id, stream_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn stamped_nullable_provenance_task_id_rejects_null_orphan() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("stamped-null-provenance-task.sqlite3");
+    let task_id = "T-null-provenance-owner";
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create(task_id)).unwrap();
+    }
+    let connection = Connection::open(&path).unwrap();
+    let schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let nullable_schema = schema
+        .replacen(
+            "CREATE TABLE provenance_events",
+            "CREATE TABLE provenance_events_nullable_task",
+            1,
+        )
+        .replacen(
+            "task_id                  TEXT NOT NULL",
+            "task_id                  TEXT",
+            1,
+        );
+    assert!(nullable_schema.contains("task_id                  TEXT,"));
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF;
+         DROP TRIGGER provenance_events_no_update;
+         DROP TRIGGER provenance_events_no_delete;
+         {nullable_schema};
+         INSERT INTO provenance_events_nullable_task SELECT * FROM provenance_events;
+         DROP TABLE provenance_events;
+         ALTER TABLE provenance_events_nullable_task RENAME TO provenance_events;"
+        ))
+        .unwrap();
+    assert!(provenance_task_fk_is_current(&connection).unwrap());
+    assert!(!table_column_not_null(&connection, "provenance_events", "task_id").unwrap());
+    duplicate_provenance_row(
+        &connection,
+        task_id,
+        "event:null-provenance-owner",
+        None,
+        "stream:v1:null-provenance-owner",
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    assert!(matches!(
+        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+        Err(TaskManagerError::InvalidRecord(
+            "provenance service-boundary migration is incomplete"
+        ))
+    ));
+}
+
+#[test]
+fn stamped_provenance_rejects_unowned_or_wrong_stream_extra_rows() {
+    for (event_id, owner, stream_id, expected_error) in [
+        (
+            "event:unowned-extra",
+            "T-provenance-owner-missing",
+            "stream:v1:unowned-extra",
+            "provenance event has no owning Task",
+        ),
+        (
+            "event:wrong-stream-extra",
+            "T-provenance-owner",
+            "stream:v1:wrong-stream-extra",
+            "Task provenance chain is missing or invalid before startup reconciliation",
+        ),
+    ] {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("stamped-extra-provenance-row.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create("T-provenance-owner")).unwrap();
+        drop(manager);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        assert!(provenance_task_fk_is_current(&connection).unwrap());
+        duplicate_provenance_row(
+            &connection,
+            "T-provenance-owner",
+            event_id,
+            Some(owner),
+            stream_id,
+        );
+        let foreign_key_violations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            foreign_key_violations,
+            i64::from(owner != "T-provenance-owner")
+        );
+        drop(connection);
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(message)) if message == expected_error
+        ));
+    }
+}
+
+#[test]
+fn new_task_opaque_identifiers_preserve_exact_hash_and_export_after_reopen() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("opaque-task-identifiers.sqlite3");
+    let task_id = "Task = 🧭 e\u{301}";
+    let original = compatibility_create(task_id);
+    let original_head = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let task = manager.create_task(&original).unwrap();
+        assert_eq!(task.principal, original.principal);
+        assert_eq!(task.workspace_id, original.workspace_id);
+        assert_eq!(task.active_step_ids, original.active_step_ids);
+        let mut planning = request(
+            "transition = 🧭 e\u{301}",
+            task_id,
+            1,
+            TaskState::Created,
+            TaskState::Planning,
+        );
+        planning.requested_by = original.principal.clone();
+        planning.reason.related_ids = vec![String::new(), "related = 🧷 e\u{301}".to_owned()];
+        assert!(manager.transition(&planning).unwrap().applied);
+        let mut waiting = request(
+            "waiting = 🧭 e\u{301}",
+            task_id,
+            2,
+            TaskState::Planning,
+            TaskState::WaitingForInput,
+        );
+        waiting.requested_by = original.principal.clone();
+        waiting.mutation.waiting_on = Some(vec![WaitingOn {
+            kind: WaitingKind::Input,
+            id: "input = 🧩 e\u{301}".to_owned(),
+            message: None,
+        }]);
+        assert!(manager.transition(&waiting).unwrap().applied);
+        aios_provenance::get_head(
+            &manager.connection,
+            &aios_provenance::stream_id(task_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+
+    let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    let reopened_head = aios_provenance::get_head(
+        &manager.connection,
+        &aios_provenance::stream_id(task_id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(reopened_head, original_head);
+    assert!(manager.verify_provenance(task_id).unwrap());
+    let export = manager.export_provenance(task_id).unwrap();
+    assert!(!export.records_jsonl.contains("user:Alice Smith="));
+    assert!(!export.records_jsonl.contains("My Workspace="));
+    assert!(!export.records_jsonl.contains("step one"));
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.scope, "exported-projection");
+    assert!(!verification.original_chain_verified_offline);
+    assert!(!verification.original_chain_linkage_proven);
+    let unchanged_head = aios_provenance::get_head(
+        &manager.connection,
+        &aios_provenance::stream_id(task_id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(unchanged_head, original_head);
+}
+
+#[test]
+fn provenance_migration_rolls_back_when_legacy_details_are_not_privacy_safe() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("provenance-invalid-migration.sqlite3");
+    let task_id = "T-invalid-legacy-details";
+    let (mut event, stream_id) = {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.create_task(&create(task_id)).unwrap();
+        let event_json = manager
+            .connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        (
+            serde_json::from_str::<serde_json::Value>(&event_json).unwrap(),
+            aios_provenance::stream_id(task_id).unwrap(),
+        )
+    };
+    event["details"]["apiKey"] = serde_json::json!("private-legacy-value");
+    let forged_hash = aios_provenance::hash_record(&stream_id, 1, None, &event).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    downgrade_provenance_before_0011(&connection);
+    connection
+        .execute_batch("DROP TRIGGER provenance_events_no_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE provenance_events SET event_json=?2,event_hash=?3 WHERE task_id=?1",
+            rusqlite::params![task_id, event.to_string(), forged_hash],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+             BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+    let connection = Connection::open(&path).unwrap();
+    assert!(!table_has_column(&connection, "provenance_events", "schema_version").unwrap());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations
+                 WHERE migration_id='0011_provenance_service_boundary'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        event.to_string()
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "checks each legacy provenance reference and its rollback invariants"
+)]
+fn provenance_migration_rejects_orphaned_legacy_references_without_changing_hashes() {
+    for (name, orphan_id) in [
+        ("task", "T-missing-parent"),
+        ("snapshot", "snapshot:missing-parent"),
+        ("binding", "binding:missing-parent"),
+    ] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(format!("orphan-{name}.sqlite3"));
+        let original_task_id = format!("T-legacy-{name}");
+        {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(&original_task_id)).unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_provenance_before_0011(&connection);
+        let mut event: serde_json::Value = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE sequence=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|json| serde_json::from_str(&json).unwrap())
+            .unwrap();
+        let task_id = if name == "task" {
+            event["task_id"] = serde_json::json!(orphan_id);
+            orphan_id
+        } else {
+            original_task_id.as_str()
+        };
+        let snapshot_id = (name == "snapshot").then_some(orphan_id);
+        let binding_id = (name == "binding").then_some(orphan_id);
+        if let Some(snapshot_id) = snapshot_id {
+            event["registry_snapshot_id"] = serde_json::json!(snapshot_id);
+        }
+        if let Some(binding_id) = binding_id {
+            event["execution_binding_id"] = serde_json::json!(binding_id);
+        }
+        let stream_id = aios_provenance::stream_id(task_id).unwrap();
+        let event_hash = aios_provenance::hash_record(&stream_id, 1, None, &event).unwrap();
+        let event_json = event.to_string();
+        connection
+            .execute_batch("DROP TRIGGER provenance_events_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_events SET task_id=?1,stream_id=?2,registry_snapshot_id=?3,
+                 execution_binding_id=?4,event_hash=?5,event_json=?6 WHERE sequence=1",
+                rusqlite::params![
+                    task_id,
+                    stream_id,
+                    snapshot_id,
+                    binding_id,
+                    event_hash,
+                    event_json
+                ],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER provenance_events_no_update BEFORE UPDATE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT,'provenance_events are append-only'); END;",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "{name}"
+        );
+        drop(connection);
+
+        let result = TaskManager::open_with_clock(&path, Box::new(FixedClock));
+        assert!(
+            matches!(
+                result,
+                Err(TaskManagerError::InvalidRecord(
+                    "persistence migration produced invalid foreign-key references"
+                ))
+            ),
+            "{name}"
+        );
+        let connection = Connection::open(&path).unwrap();
+        assert!(!table_has_column(&connection, "provenance_events", "schema_version").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations
+                     WHERE migration_id='0011_provenance_service_boundary'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "{name}"
+        );
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT event_hash,event_json FROM provenance_events WHERE sequence=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (event_hash, event_json), "{name}");
+    }
+}
+
+#[test]
+fn portable_provenance_export_is_private_and_reverifies_without_task_storage() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let create_request = create("T-portable-provenance");
+    let private_intent = create_request.original_intent.clone();
+    manager.create_task(&create_request).unwrap();
+    assert!(
+        manager
+            .transition(&request(
+                "tr-portable-provenance",
+                "T-portable-provenance",
+                1,
+                TaskState::Created,
+                TaskState::Planning,
+            ))
+            .unwrap()
+            .applied
+    );
+    let export = manager.export_provenance("T-portable-provenance").unwrap();
+    assert!(!export.records_jsonl.contains(&private_intent));
+    assert!(!export.records_jsonl.contains("intent_commitment_nonce"));
+    assert!(export.records_jsonl.contains("original_intent_ref"));
+    let verification = aios_provenance::verify_jsonl_export(
+        &export.manifest_json,
+        &export.records_jsonl,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.scope, "exported-projection");
+    assert!(!verification.original_chain_verified_offline);
+    assert!(!verification.original_chain_linkage_proven);
+}
+
+#[test]
+fn portable_export_rejects_private_task_and_journal_disagreement() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    for (task_id, tamper) in [
+        (
+            "T-export-bad-nonce",
+            "UPDATE tasks SET intent_commitment_nonce = zeroblob(1) WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-intent",
+            "UPDATE tasks SET original_intent = 'changed' WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-normalized-intent",
+            "UPDATE tasks SET normalized_intent_json = '{}' WHERE task_id = ?1",
+        ),
+        (
+            "T-export-bad-state",
+            "UPDATE tasks SET state = 'PLANNING' WHERE task_id = ?1",
+        ),
+    ] {
+        manager.create_task(&create(task_id)).unwrap();
+        assert!(manager.export_provenance(task_id).is_ok());
+        manager.connection.execute(tamper, [task_id]).unwrap();
+        let error = manager.export_provenance(task_id).unwrap_err();
+        assert!(
+            matches!(error, TaskManagerError::InvalidRecord(_)),
+            "{task_id}: {error}"
+        );
+    }
+
+    let task_id = "T-export-terminal-bad-nonce";
+    manager.create_task(&create(task_id)).unwrap();
+    let cancelled = manager
+        .transition(&request(
+            "tr-export-terminal",
+            task_id,
+            1,
+            TaskState::Created,
+            TaskState::Cancelled,
+        ))
+        .unwrap();
+    assert!(cancelled.applied);
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET intent_commitment_nonce = zeroblob(1) WHERE task_id = ?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(task_id).is_err());
+}
+
+#[test]
+fn portable_export_preserves_storage_failure_from_task_validation() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-export-storage-fault";
+    manager.create_task(&create(task_id)).unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute_batch("DROP TABLE task_artifacts")
+        .unwrap();
+    let error = manager.export_provenance(task_id).unwrap_err();
+    assert!(matches!(error, TaskManagerError::Storage(_)), "{error}");
+}
+
+#[test]
+fn portable_export_preserves_storage_failure_from_task_row_read() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-export-row-read-fault";
+    manager.create_task(&create(task_id)).unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE tasks")
+        .unwrap();
+    let error = manager.export_provenance(task_id).unwrap_err();
+    assert!(matches!(error, TaskManagerError::Storage(_)), "{error}");
+}
+
+#[test]
+fn provenance_export_and_replay_bind_completed_at_to_completion_transition() {
+    let task_id = "T-completed-at-export";
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_nonterminal_history(&mut manager, task_id, TaskState::Verifying);
+    let transaction = manager.connection.transaction().unwrap();
+    let completion = serde_json::json!({
+        "schema_version":SCHEMA_VERSION,
+        "event_id":"event:completed-at:completion",
+        "task_id":task_id,
+        "event_type":"task.transitioned",
+        "timestamp":TEST_TIME,
+        "actor":{"kind":"system-service","id":"service:test"},
+        "status":"success",
+        "task_transition":{
+            "transition_id":"transition:completed-at:completion",
+            "previous_state":"VERIFYING",
+            "new_state":"COMPLETED",
+            "previous_revision":5,
+            "new_revision":6,
+            "reason_code":"STATE_CHANGE_REQUESTED"
+        },
+        "committed_mutation":{
+            "active_plan":null,
+            "active_step_ids":null,
+            "waiting_on":null,
+            "failure":null,
+            "recovery":null
+        },
+        "details":{"reason_message_ref":null,"active_program":null}
+    });
+    let appended = append_event(&transaction, task_id, &completion).unwrap();
+    transaction.execute(
+        "UPDATE tasks SET revision=6,state='COMPLETED',state_reason_json=?2,updated_at=?3,completed_at=?3 WHERE task_id=?1",
+        rusqlite::params![task_id, serde_json::json!({"code":"STATE_CHANGE_REQUESTED","message":null,"provenance_event_id":appended.event_id}).to_string(), TEST_TIME],
+    ).unwrap();
+    transaction.commit().unwrap();
+    assert!(manager.export_provenance(task_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at='2026-09-20T00:00:00Z' WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.verify_provenance(task_id).unwrap());
+    assert!(manager.export_provenance(task_id).is_err());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at=NULL WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(task_id).is_err());
+
+    let cancelled_id = "T-noncompleted-at-export";
+    manager.create_task(&create(cancelled_id)).unwrap();
+    assert!(
+        manager
+            .transition(&request(
+                "tr-noncompleted-at",
+                cancelled_id,
+                1,
+                TaskState::Created,
+                TaskState::Cancelled
+            ))
+            .unwrap()
+            .applied
+    );
+    assert!(manager.export_provenance(cancelled_id).is_ok());
+    manager
+        .connection
+        .execute(
+            "UPDATE tasks SET completed_at=?2 WHERE task_id=?1",
+            rusqlite::params![cancelled_id, TEST_TIME],
+        )
+        .unwrap();
+    assert!(manager.export_provenance(cancelled_id).is_err());
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("completed-at-replay.sqlite3");
+    {
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager
+            .create_task(&create("T-completed-at-replay"))
+            .unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=?1 WHERE task_id='T-completed-at-replay'",
+            [TEST_TIME],
+        )
+        .unwrap();
+    assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
 }
 
 #[test]
@@ -987,6 +2048,52 @@ fn seed_completion_fixture_with_identity(
              WHERE task_id = 'T-completion';",
         )
         .unwrap();
+    // This fixture condenses a completed execution into revision 2 so the
+    // completion guards can be tested without building the whole lifecycle.
+    // The synthetic CREATED -> VERIFYING jump still needs an authentic typed
+    // transition in the hash chain before later test transitions can append.
+    let transaction = manager.connection.transaction().unwrap();
+    let verifying_event = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": "event:seed:completion-verifying",
+        "task_id": "T-completion",
+        "event_type": "task.transitioned",
+        "timestamp": TEST_TIME,
+        "actor": {"kind":"system-service","id":"service:test"},
+        "status": "success",
+        "task_transition": {
+            "transition_id": "transition:seed:completion-verifying",
+            "previous_state": "CREATED",
+            "new_state": "VERIFYING",
+            "previous_revision": 1,
+            "new_revision": 2,
+            "reason_code": "STATE_CHANGE_REQUESTED"
+        },
+        "committed_mutation": {
+            "active_plan": null,
+            "active_step_ids": null,
+            "waiting_on": null,
+            "failure": null,
+            "recovery": null
+        },
+        "details": {"reason_message_ref": null, "active_program": null}
+    });
+    let appended = append_event(&transaction, "T-completion", &verifying_event).unwrap();
+    transaction
+        .execute(
+            "UPDATE tasks SET state_reason_json=?2 WHERE task_id=?1",
+            rusqlite::params![
+                "T-completion",
+                serde_json::json!({
+                    "code":"STATE_CHANGE_REQUESTED",
+                    "message":null,
+                    "provenance_event_id":appended.event_id
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
     let publication_request = ArtifactPublicationRequest {
         schema_version: SCHEMA_VERSION.to_owned(),
         publication_id: "publication-completion".to_owned(),
@@ -1102,6 +2209,89 @@ fn seed_completion_fixture_with_identity(
         "status": "success"
     });
     append_event(&transaction, "T-completion", &verification).unwrap();
+    transaction.commit().unwrap();
+}
+
+fn align_completion_fixture_state(manager: &mut TaskManager, state: TaskState) {
+    let transaction = manager.connection.transaction().unwrap();
+    transaction
+        .execute_batch("DROP TRIGGER provenance_events_no_update")
+        .unwrap();
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT sequence,event_id,event_json FROM provenance_events
+                 WHERE task_id='T-completion' ORDER BY sequence",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+    };
+    let mut previous_hash = None;
+    for (sequence, event_id, raw_event) in rows {
+        let mut event: Value = serde_json::from_str(&raw_event).unwrap();
+        if event_id == "event:seed:completion-verifying" {
+            event["task_transition"]["new_state"] = serde_json::json!(state);
+        }
+        let sequence = u64::try_from(sequence).unwrap();
+        let event_hash =
+            provenance_hash("T-completion", sequence, previous_hash.as_deref(), &event).unwrap();
+        transaction
+            .execute(
+                "UPDATE provenance_events
+                 SET previous_event_hash=?3,event_hash=?4,event_json=?5
+                 WHERE task_id='T-completion' AND sequence=?1 AND event_id=?2",
+                rusqlite::params![
+                    i64::try_from(sequence).unwrap(),
+                    event_id,
+                    previous_hash,
+                    event_hash,
+                    canonical_json(&event).unwrap()
+                ],
+            )
+            .unwrap();
+        let publication = transaction
+            .query_row(
+                "SELECT publication_id,result_json FROM artifact_publications
+                 WHERE json_extract(result_json,'$.provenance_event_id')=?1",
+                [&event_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((publication_id, raw_result)) = publication {
+            let mut result: Value = serde_json::from_str(&raw_result).unwrap();
+            result["provenance_event_hash"] = serde_json::json!(event_hash);
+            transaction
+                .execute(
+                    "UPDATE artifact_publications SET result_json=?2 WHERE publication_id=?1",
+                    rusqlite::params![publication_id, canonical_json(&result).unwrap()],
+                )
+                .unwrap();
+        }
+        previous_hash = Some(event_hash);
+    }
+    transaction
+        .execute(
+            "UPDATE tasks SET state=?1 WHERE task_id='T-completion'",
+            [state.as_str()],
+        )
+        .unwrap();
+    transaction
+        .execute_batch(
+            "CREATE TRIGGER provenance_events_no_update
+             BEFORE UPDATE ON provenance_events
+             BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;",
+        )
+        .unwrap();
     transaction.commit().unwrap();
 }
 
@@ -2600,6 +3790,7 @@ fn event_id_namespaces_are_bounded_and_disjoint_for_maximum_contract_ids() {
 fn runnable_readiness_uses_each_active_nodes_latest_attempt_once() {
     let mut stale = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut stale, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut stale, TaskState::Planning);
     stale.connection.execute_batch(
         "UPDATE tasks SET state = 'PLANNING' WHERE task_id = 'T-completion';
          INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-old', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
@@ -2621,6 +3812,7 @@ fn runnable_readiness_uses_each_active_nodes_latest_attempt_once() {
 
     let mut compensated = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut compensated, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut compensated, TaskState::Planning);
     compensated.connection.execute_batch(
         "UPDATE tasks SET state = 'PLANNING', active_step_ids_json = '[\"node-completion\",\"node-missing\"]' WHERE task_id = 'T-completion';
          INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, attempt_number, revision, state, outcome_certainty, input_artifacts_json, output_artifacts_json, created_at, updated_at) VALUES ('attempt-ready-2', 'T-completion', 'sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50', 'snapshot-completion', 'node-completion', 2, 1, 'READY', 'NOT_STARTED', '[]', '[]', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');
@@ -4538,21 +5730,21 @@ fn recovering_cannot_escape_unknown_assessment_but_resolved_evidence_can_advance
         ("resolved-paused", true, TaskState::Paused, true),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-        manager.create_task(&create("T-recovery-exit")).unwrap();
-        manager
-            .connection
-            .execute(
-                "UPDATE tasks SET state='RECOVERING', revision=1 WHERE task_id='T-recovery-exit'",
-                [],
-            )
-            .unwrap();
+        let revision = seed_recovering_history(&mut manager, "T-recovery-exit");
         if seed_assessment {
             if applies {
-                seed_resolved_empty_recovery(&mut manager, "T-recovery-exit", 1);
+                seed_resolved_empty_recovery(&mut manager, "T-recovery-exit", revision);
             } else {
-                let recovery_ref = recovery_operations_ref("T-recovery-exit", 1, &[]).unwrap();
+                let recovery_ref =
+                    recovery_operations_ref("T-recovery-exit", revision, &[]).unwrap();
                 manager
-                    .persist_recovery_inventory(&recovery_ref, "T-recovery-exit", 1, &[], TEST_TIME)
+                    .persist_recovery_inventory(
+                        &recovery_ref,
+                        "T-recovery-exit",
+                        revision,
+                        &[],
+                        TEST_TIME,
+                    )
                     .unwrap();
                 manager
                     .connection
@@ -4574,7 +5766,7 @@ fn recovering_cannot_escape_unknown_assessment_but_resolved_evidence_can_advance
             .transition(&request(
                 &format!("tr-recovery-exit-{name}"),
                 "T-recovery-exit",
-                1,
+                revision,
                 TaskState::Recovering,
                 target,
             ))
@@ -4622,6 +5814,7 @@ fn actual_running_admission_requires_complete_current_output_allocations() {
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        align_completion_fixture_state(&mut manager, TaskState::Recovering);
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
@@ -5193,6 +6386,7 @@ fn forged_terminal_credential_result_enters_startup_recovery_and_blocks_exit() {
 fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut manager, TaskState::Runnable);
     manager.connection.execute_batch(
         r"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
            UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
@@ -5264,9 +6458,172 @@ fn ready_frontier_admits_only_eligible_attempt_and_records_exact_provenance() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds a second immutable attempt with opaque IDs and checks public admission"
+)]
+fn ready_frontier_accepts_opaque_attempt_id_with_whitespace() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut manager, TaskState::Runnable);
+    manager
+        .connection
+        .execute_batch(
+            r#"UPDATE tasks SET state='RUNNABLE' WHERE task_id='T-completion';
+           INSERT INTO execution_bindings (
+               binding_id, attempt_id, task_id, semantic_program_hash,
+               registry_snapshot_id, ir_version, node_id, capability,
+               capability_contract_hash, provider_registration_id,
+               provider_id, provider_version, provider_manifest_hash,
+               provider_build_hash, attempt, policy_decision_refs_json,
+               grant_refs_json, execution_profile_ref, placement_json,
+               binding_json, created_at
+           )
+           SELECT 'binding opaque 1', 'attempt 1', task_id, semantic_program_hash,
+                  registry_snapshot_id, ir_version, node_id, capability,
+                  capability_contract_hash, provider_registration_id,
+                  provider_id, provider_version, provider_manifest_hash,
+                  provider_build_hash, 2, policy_decision_refs_json,
+                  grant_refs_json, execution_profile_ref, placement_json,
+                  replace(replace(replace(replace(binding_json,
+                      'attempt-completion', 'attempt 1'),
+                      'binding-completion', 'binding opaque 1'),
+                      'allocation-completion', 'allocation-opaque'),
+                      '"attempt":1', '"attempt":2'),
+                  created_at
+           FROM execution_bindings WHERE binding_id='binding-completion';
+           INSERT INTO step_executions (
+               attempt_id, task_id, semantic_program_hash, registry_snapshot_id,
+               node_id, binding_id, provider_id, provider_version, attempt_number,
+               revision, state, outcome_certainty, input_artifacts_json,
+               output_artifacts_json, created_at, updated_at
+           )
+           SELECT 'attempt 1', task_id, semantic_program_hash, registry_snapshot_id,
+                  node_id, 'binding opaque 1', provider_id, provider_version, 2,
+                  1, 'READY', 'NOT_STARTED', '[]', '[]', created_at, updated_at
+           FROM step_executions WHERE attempt_id='attempt-completion';
+           INSERT INTO artifact_output_allocations (
+               allocation_id, task_id, semantic_program_hash, node_id,
+               binding_id, attempt_id, output_port, expected_semantic_type,
+               sensitivity, retention, state, created_at, expires_at
+           )
+           SELECT 'allocation-opaque', task_id, semantic_program_hash, node_id,
+                  'binding opaque 1', 'attempt 1', output_port, expected_semantic_type,
+                  sensitivity, retention, 'ALLOCATED', created_at, expires_at
+           FROM artifact_output_allocations WHERE allocation_id='allocation-completion';"#,
+        )
+        .unwrap();
+
+    let check_tx = manager.connection.transaction().unwrap();
+    assert_eq!(
+        count_active_steps(
+            &check_tx,
+            "T-completion",
+            &["node-completion".to_owned()],
+            "READY"
+        )
+        .unwrap(),
+        1
+    );
+    let binding_check = BindingGrantCheck {
+        task_id: "T-completion",
+        semantic_hash: HASH,
+        node_id: "node-completion",
+        binding_id: "binding opaque 1",
+        attempt_id: "attempt 1",
+        grant_refs_json: "[]",
+        checked_at: TEST_TIME,
+    };
+    assert!(
+        binding_grants_valid(&check_tx, &binding_check).unwrap(),
+        "binding grants"
+    );
+    assert!(
+        output_allocations_ready(&check_tx, &binding_check).unwrap(),
+        "allocations"
+    );
+    assert_eq!(
+        count_bound_active_steps(
+            &check_tx,
+            "T-completion",
+            &["node-completion".to_owned()],
+            &["READY"],
+            TEST_TIME
+        )
+        .unwrap(),
+        1
+    );
+    check_tx.rollback().unwrap();
+
+    let result = manager
+        .transition(&request(
+            "tr-opaque-attempt-running",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert!(result.applied, "{result:?}");
+    assert_eq!(
+        manager
+            .get_step_execution("attempt 1")
+            .unwrap()
+            .unwrap()
+            .state,
+        StepState::Running
+    );
+    let event_json: String = manager.connection.query_row(
+        "SELECT event_json FROM provenance_events WHERE task_id='T-completion' AND event_type='execution.started'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    let event: Value = serde_json::from_str(&event_json).unwrap();
+    assert_eq!(
+        event.pointer("/details/attempt_id"),
+        Some(&json!("attempt 1"))
+    );
+    assert!(manager.verify_provenance("T-completion").unwrap());
+}
+
+#[test]
+fn recovery_inventory_provenance_accepts_prefixed_maximum_attempt_id() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.create_task(&create("T-opaque-recovery")).unwrap();
+    let full_attempt = "a".repeat(256);
+    let inventory_id = recovery_subject_inventory_id("attempt", &full_attempt).unwrap();
+    assert_eq!(inventory_id.chars().count(), 264);
+
+    let event = json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": "event:opaque-recovery",
+        "task_id": "T-opaque-recovery",
+        "event_type": "execution.completed",
+        "timestamp": TEST_TIME,
+        "actor": {"kind": "system-service", "id": "service:recovery"},
+        "status": "success",
+        "details": {"inventory_id": inventory_id}
+    });
+    let transaction = manager.connection.transaction().unwrap();
+    append_event(&transaction, "T-opaque-recovery", &event).unwrap();
+    transaction.commit().unwrap();
+    assert!(manager.verify_provenance("T-opaque-recovery").unwrap());
+
+    let mut over_bound = event.clone();
+    over_bound["event_id"] = json!("event:over-bound-recovery");
+    over_bound["details"]["inventory_id"] =
+        json!("provider-invocation:".to_owned() + &"a".repeat(257));
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(append_event(&transaction, "T-opaque-recovery", &over_bound).is_err());
+    transaction.rollback().unwrap();
+    assert_eq!(manager.provenance_count("T-opaque-recovery").unwrap(), 2);
+}
+
+#[test]
 fn historical_recovery_inventory_can_exit_only_after_affirmative_resolution() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut manager, TaskState::Running);
     manager.connection.execute_batch(
         "UPDATE tasks SET state='RUNNING' WHERE task_id='T-completion';
          INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at,started_at) VALUES ('operation-resolve','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','NETWORK','STARTED','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z','2026-09-19T00:00:00Z');",
@@ -5332,6 +6689,7 @@ fn verifying_requires_exact_durable_candidate_outputs_for_every_active_port() {
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        align_completion_fixture_state(&mut manager, TaskState::Running);
         manager
             .connection
             .execute(
@@ -5368,6 +6726,7 @@ fn verifying_requires_exact_durable_candidate_outputs_for_every_active_port() {
 
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut manager, TaskState::Running);
     manager.connection.execute_batch(
         r#"UPDATE semantic_program_revisions SET program_json='{"nodes":[{"id":"node-completion","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"report":"artifact.report@1"},"authority_requests":[]},{"id":"node-later","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"later":"artifact.report@1"},"authority_requests":[]}]}' WHERE task_id='T-completion';
            UPDATE tasks SET state='RUNNING', active_step_ids_json='["node-completion","node-later"]' WHERE task_id='T-completion';
@@ -5394,6 +6753,7 @@ fn queued_not_started_attempts_do_not_prevent_pausing_or_replanning() {
     for state in ["PENDING", "BLOCKED", "READY"] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        align_completion_fixture_state(&mut manager, TaskState::Paused);
         manager
             .connection
             .execute(
@@ -5861,6 +7221,7 @@ fn export_reconciliation_challenge_migration_is_ordered_and_fail_closed() {
 fn proposed_active_steps_scope_initial_waiting_for_auth_lookup() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    align_completion_fixture_state(&mut manager, TaskState::Planning);
     manager.connection.execute_batch(
         "UPDATE tasks SET state='PLANNING', active_step_ids_json='[]' WHERE task_id='T-completion';
          INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,request_json,requested_at) VALUES ('authority-proposed','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-completion','test.complete@1','user','user:adversarial','test.approve','artifact','artifact:one','{}','2026-09-19T00:00:00Z');
@@ -6031,14 +7392,20 @@ fn prepared_operations_have_typed_collision_free_recovery_subjects() {
 )]
 fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    manager.create_task(&create("T-recovery-auth")).unwrap();
+    let revision = seed_recovering_history(&mut manager, "T-recovery-auth");
     manager.connection.execute_batch(
         "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at) VALUES ('op','T-recovery-auth','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node','NETWORK','UNKNOWN','OUTCOME_UNKNOWN','2026-09-19T00:00:00Z');",
     ).unwrap();
     let inventory = unresolved_execution_ids(&manager.connection, "T-recovery-auth").unwrap();
-    let recovery_ref = recovery_operations_ref("T-recovery-auth", 1, &inventory).unwrap();
+    let recovery_ref = recovery_operations_ref("T-recovery-auth", revision, &inventory).unwrap();
     manager
-        .persist_recovery_inventory(&recovery_ref, "T-recovery-auth", 1, &inventory, TEST_TIME)
+        .persist_recovery_inventory(
+            &recovery_ref,
+            "T-recovery-auth",
+            revision,
+            &inventory,
+            TEST_TIME,
+        )
         .unwrap();
     manager.connection.execute(
         "UPDATE tasks SET state='RECOVERING', recovery_json=?2 WHERE task_id=?1",
@@ -6053,7 +7420,7 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
             .transition(&request(
                 "tr-untrusted-resolution",
                 "T-recovery-auth",
-                1,
+                revision,
                 TaskState::Recovering,
                 TaskState::Planning
             ))
@@ -6128,13 +7495,54 @@ fn recovery_exit_requires_a_provenance_backed_resolution_assessment() {
             .transition(&request(
                 "tr-trusted-resolution",
                 "T-recovery-auth",
-                1,
+                revision,
                 TaskState::Recovering,
                 TaskState::Planning
             ))
             .unwrap()
             .applied
     );
+}
+
+#[test]
+fn recovery_resolution_reader_rejects_duplicate_stored_event_keys() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    let task_id = "T-duplicate-recovery-event";
+    manager.create_task(&create(task_id)).unwrap();
+    let (event_id, event_json): (String, String) = manager
+        .connection
+        .query_row(
+            "SELECT event_id,event_json FROM provenance_events WHERE task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let duplicate_json = event_json.replacen('{', "{\"task_id\":\"T-shadow\",", 1);
+    assert!(serde_json::from_str::<Value>(&duplicate_json).is_ok());
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER provenance_events_no_update")
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE provenance_events SET event_type='execution.completed',event_json=?1 WHERE event_id=?2",
+            rusqlite::params![duplicate_json, event_id],
+        )
+        .unwrap();
+
+    let transaction = manager.connection.transaction().unwrap();
+    let assessment = serde_json::json!({"evidence":[{"ref":event_id}]});
+    let error = authenticated_recovery_resolution(
+        &transaction,
+        task_id,
+        "recovery:test",
+        "operation:test",
+        &assessment,
+    )
+    .unwrap_err();
+    assert!(matches!(&error, TaskManagerError::Provenance(_)));
+    assert!(error.to_string().contains("duplicate"));
 }
 
 #[test]
@@ -6161,7 +7569,7 @@ fn completion_checks_semantic_types_and_the_current_provenance_head() {
     let transaction = corrupt_suffix.connection.transaction().unwrap();
     append_event(&transaction, "T-completion", &serde_json::json!({
         "schema_version":SCHEMA_VERSION,"event_id":"event:suffix","task_id":"T-completion",
-        "event_type":"artifact.published","timestamp":TEST_TIME,"actor":{"kind":"system-service","id":"service:test"},"status":"success"
+        "event_type":"artifact.created","timestamp":TEST_TIME,"actor":{"kind":"system-service","id":"service:test"},"status":"success"
     })).unwrap();
     transaction.commit().unwrap();
     corrupt_suffix.connection.execute_batch("DROP TRIGGER provenance_events_no_update; UPDATE provenance_events SET event_hash='sha256:corrupt' WHERE event_id='event:suffix';").unwrap();
@@ -7104,16 +8512,16 @@ fn reconciled_operation_preserves_not_started_and_failed_no_effect_dispositions(
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-        manager.create_task(&create(&format!("T-{name}"))).unwrap();
+        let task_id = format!("T-{name}");
+        let revision = seed_recovering_history(&mut manager, &task_id);
         manager.connection.execute(
             "INSERT INTO operations(operation_id,task_id,semantic_program_hash,node_id,effect_class,state,outcome_certainty,prepared_at) VALUES ('op',?1,?2,'node','NETWORK',?3,CASE WHEN ?3='PREPARED' THEN NULL ELSE 'OUTCOME_UNKNOWN' END,?4)",
-            rusqlite::params![format!("T-{name}"), HASH, initial_state, TEST_TIME],
+            rusqlite::params![task_id, HASH, initial_state, TEST_TIME],
         ).unwrap();
-        let task_id = format!("T-{name}");
         let inventory = unresolved_execution_ids(&manager.connection, &task_id).unwrap();
-        let recovery_ref = recovery_operations_ref(&task_id, 1, &inventory).unwrap();
+        let recovery_ref = recovery_operations_ref(&task_id, revision, &inventory).unwrap();
         manager
-            .persist_recovery_inventory(&recovery_ref, &task_id, 1, &inventory, TEST_TIME)
+            .persist_recovery_inventory(&recovery_ref, &task_id, revision, &inventory, TEST_TIME)
             .unwrap();
         manager.connection.execute(
             "UPDATE tasks SET state='RECOVERING',recovery_json=?2 WHERE task_id=?1",
@@ -7156,7 +8564,7 @@ fn reconciled_operation_preserves_not_started_and_failed_no_effect_dispositions(
             .transition(&request(
                 &format!("tr-{name}-exit"),
                 &task_id,
-                1,
+                revision,
                 TaskState::Recovering,
                 TaskState::Planning,
             ))

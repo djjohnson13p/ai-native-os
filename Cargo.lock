@@ -60,6 +60,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aios-provenance"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "jsonschema",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "tempfile",
+ "time",
+]
+
+[[package]]
 name = "aios-registry"
 version = "0.1.0"
 dependencies = [
@@ -78,6 +93,7 @@ name = "aios-task-manager"
 version = "0.1.0"
 dependencies = [
  "aios-ir",
+ "aios-provenance",
  "cap-std",
  "fs2",
  "jsonschema",

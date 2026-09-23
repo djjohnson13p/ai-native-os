@@ -14,6 +14,12 @@
 
 mod artifact_store;
 
+pub use aios_provenance::{
+    CheckpointExpectation as ProvenanceCheckpointExpectation,
+    JournalRecord as ProvenanceJournalRecord, ProjectionPortableExport as ProvenancePortableExport,
+    RecordPage as ProvenanceRecordPage, StreamHead as ProvenanceStreamHead,
+    VerificationResult as ProvenanceVerificationResult,
+};
 pub use artifact_store::{
     ArtifactAllocationState, ArtifactExpectedState, ArtifactExportDestination,
     ArtifactExportOutcomeVerifier, ArtifactExportReconciliationSubject, ArtifactExportWriter,
@@ -42,8 +48,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const SCHEMA_VERSION: &str = "0.1";
-const HASH_PROFILE: &str = "aios-provenance-event-v0.1";
-const HASH_DOMAIN: &[u8] = b"AIOS-PROVENANCE-EVENT\0v0.1\0";
 const MIGRATION: &str = include_str!("../../../specs/persistence-v0.1.sql");
 
 #[derive(Debug)]
@@ -52,6 +56,7 @@ pub enum TaskManagerError {
     Io(std::io::Error),
     Serialization(serde_json::Error),
     Canonicalization(String),
+    Provenance(aios_provenance::Error),
     InvalidRecord(&'static str),
 }
 
@@ -64,6 +69,7 @@ impl fmt::Display for TaskManagerError {
             Self::Canonicalization(error) => {
                 write!(formatter, "provenance canonicalization failure: {error}")
             }
+            Self::Provenance(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
         }
     }
@@ -86,6 +92,12 @@ impl From<std::io::Error> for TaskManagerError {
 impl From<serde_json::Error> for TaskManagerError {
     fn from(error: serde_json::Error) -> Self {
         Self::Serialization(error)
+    }
+}
+
+impl From<aios_provenance::Error> for TaskManagerError {
+    fn from(error: aios_provenance::Error) -> Self {
+        Self::Provenance(error)
     }
 }
 
@@ -1983,191 +1995,197 @@ impl TaskManager {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for (task_id, revision, state) in tasks {
-            if !self.verify_provenance(&task_id)? {
-                return Err(TaskManagerError::InvalidRecord(
-                    "nonterminal Task provenance chain is missing or invalid",
-                ));
-            }
-            let mut statement = self.connection.prepare(
+            self.verify_task_head(&task_id, revision, &state)?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps full provenance replay and materialized security-view comparison auditable"
+    )]
+    fn verify_task_head(&self, task_id: &str, revision: i64, state: &str) -> Result<()> {
+        if !self.verify_provenance(task_id)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task provenance chain is missing or invalid",
+            ));
+        }
+        let mut statement = self.connection.prepare(
                 "SELECT event_json FROM provenance_events WHERE task_id = ?1 AND event_type IN ('task.created', 'task.transitioned') ORDER BY sequence",
             )?;
-            let rows = statement.query_map([&task_id], |row| row.get::<_, String>(0))?;
-            let mut material_revision = 0_i64;
-            let mut material_state: Option<TaskState> = None;
-            let mut material_creation: Option<Value> = None;
-            let mut material_active_plan: Option<ActivePlan> = None;
-            let mut material_active_program: Option<Value> = None;
-            let mut material_active_program_digest: Option<String> = None;
-            let mut material_steps = Vec::<String>::new();
-            let mut material_waiting = json!([]);
-            let mut material_waiting_commitments = json!([]);
-            let mut material_failure: Option<Value> = None;
-            let mut material_failure_commitment: Option<Value> = None;
-            let mut material_recovery: Option<Value> = None;
-            let mut material_state_reason: Option<Value> = None;
-            let mut material_reason_message_ref: Option<Value> = None;
-            let mut material_updated_at: Option<String> = None;
-            for row in rows {
-                let event: Value = serde_json::from_str(&row?)?;
-                if event.get("event_type").and_then(Value::as_str) == Some("task.created") {
-                    let creation = event.pointer("/details/creation").cloned().ok_or(
-                        TaskManagerError::InvalidRecord(
-                            "Task provenance creation payload is missing",
-                        ),
-                    )?;
-                    if material_revision != 0
-                        || event.pointer("/details/revision").and_then(Value::as_i64) != Some(1)
-                        || event.get("actor") != creation.get("principal")
-                        || event.get("timestamp") != creation.get("created_at")
-                    {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "Task provenance has an invalid creation event",
-                        ));
-                    }
-                    material_revision = 1;
-                    material_state = Some(TaskState::Created);
-                    material_creation = Some(creation);
-                    material_updated_at = event
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    material_steps = serde_json::from_value(
-                        event
-                            .pointer("/details/active_step_ids")
-                            .cloned()
-                            .unwrap_or_else(|| json!([])),
-                    )?;
-                    material_state_reason = Some(json!({
-                        "code": "TASK_CREATED",
-                        "provenance_event_id": event_string(&event, "event_id")
-                    }));
-                    continue;
-                }
-                let previous_revision = event
-                    .pointer("/task_transition/previous_revision")
-                    .and_then(Value::as_i64);
-                let new_revision = event
-                    .pointer("/task_transition/new_revision")
-                    .and_then(Value::as_i64);
-                let previous_state = event
-                    .pointer("/task_transition/previous_state")
-                    .and_then(Value::as_str)
-                    .map(TaskState::parse)
-                    .transpose()?;
-                let new_state = event
-                    .pointer("/task_transition/new_state")
-                    .and_then(Value::as_str)
-                    .map(TaskState::parse)
-                    .transpose()?;
-                if previous_revision != Some(material_revision)
-                    || new_revision != material_revision.checked_add(1)
-                    || previous_state != material_state
-                    || !previous_state
-                        .zip(new_state)
-                        .is_some_and(|(from, to)| allowed_transition(from, to))
+        let rows = statement.query_map([&task_id], |row| row.get::<_, String>(0))?;
+        let mut material_revision = 0_i64;
+        let mut material_state: Option<TaskState> = None;
+        let mut material_creation: Option<Value> = None;
+        let mut material_active_plan: Option<ActivePlan> = None;
+        let mut material_active_program: Option<Value> = None;
+        let mut material_active_program_digest: Option<String> = None;
+        let mut material_steps = Vec::<String>::new();
+        let mut material_waiting = json!([]);
+        let mut material_waiting_commitments = json!([]);
+        let mut material_failure: Option<Value> = None;
+        let mut material_failure_commitment: Option<Value> = None;
+        let mut material_recovery: Option<Value> = None;
+        let mut material_state_reason: Option<Value> = None;
+        let mut material_reason_message_ref: Option<Value> = None;
+        let mut material_updated_at: Option<String> = None;
+        for row in rows {
+            let event = aios_provenance::parse_unique_json(&row?)?;
+            if event.get("event_type").and_then(Value::as_str) == Some("task.created") {
+                let creation = event.pointer("/details/creation").cloned().ok_or(
+                    TaskManagerError::InvalidRecord("Task provenance creation payload is missing"),
+                )?;
+                if material_revision != 0
+                    || event.pointer("/details/revision").and_then(Value::as_i64) != Some(1)
+                    || event.get("actor") != creation.get("principal")
+                    || event.get("timestamp") != creation.get("created_at")
                 {
                     return Err(TaskManagerError::InvalidRecord(
-                        "Task provenance state history is discontinuous",
+                        "Task provenance has an invalid creation event",
                     ));
                 }
-                material_revision += 1;
-                material_state = new_state;
+                material_revision = 1;
+                material_state = Some(TaskState::Created);
+                material_creation = Some(creation);
                 material_updated_at = event
                     .get("timestamp")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let mutation =
+                material_steps = serde_json::from_value(
                     event
-                        .get("committed_mutation")
-                        .ok_or(TaskManagerError::InvalidRecord(
-                            "Task transition provenance has no committed mutation",
-                        ))?;
-                if let Some(value) = mutation.get("active_plan").filter(|value| !value.is_null()) {
-                    material_active_plan = Some(serde_json::from_value(value.clone())?);
-                }
-                if let Some(value) = mutation
-                    .get("active_step_ids")
-                    .filter(|value| !value.is_null())
-                {
-                    material_steps = serde_json::from_value(value.clone())?;
-                }
-                if let Some(value) = mutation.get("waiting_on").filter(|value| !value.is_null()) {
-                    material_waiting = value.clone();
-                    material_waiting_commitments = event
-                        .pointer("/details/mutation_text_commitments/waiting_on")
+                        .pointer("/details/active_step_ids")
                         .cloned()
-                        .ok_or(TaskManagerError::InvalidRecord(
-                            "waiting message commitments are missing",
-                        ))?;
-                }
-                if let Some(value) = mutation.get("failure").filter(|value| !value.is_null()) {
-                    material_failure = Some(value.clone());
-                    material_failure_commitment = event
-                        .pointer("/details/mutation_text_commitments/failure_summary")
-                        .cloned();
-                    if material_failure_commitment.is_none() {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "failure summary commitment is missing",
-                        ));
-                    }
-                }
-                if let Some(value) = mutation.get("recovery").filter(|value| !value.is_null()) {
-                    material_recovery = Some(value.clone());
-                }
+                        .unwrap_or_else(|| json!([])),
+                )?;
                 material_state_reason = Some(json!({
-                    "code": event.pointer("/task_transition/reason_code"),
+                    "code": "TASK_CREATED",
                     "provenance_event_id": event_string(&event, "event_id")
                 }));
-                material_reason_message_ref = event.pointer("/details/reason_message_ref").cloned();
-                if let Some(value) = event
-                    .pointer("/details/active_program")
-                    .filter(|value| !value.is_null())
-                {
-                    let mut identity = value.clone();
-                    material_active_program_digest = identity
-                        .get("program_content_digest")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    let Some(identity) = identity.as_object_mut() else {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "Task provenance active program is malformed",
-                        ));
-                    };
-                    identity.remove("program_content_digest");
-                    material_active_program = Some(Value::Object(identity.clone()));
-                }
+                continue;
             }
-            if material_revision != revision
-                || material_state.map(TaskState::as_str) != Some(state.as_str())
+            let previous_revision = event
+                .pointer("/task_transition/previous_revision")
+                .and_then(Value::as_i64);
+            let new_revision = event
+                .pointer("/task_transition/new_revision")
+                .and_then(Value::as_i64);
+            let previous_state = event
+                .pointer("/task_transition/previous_state")
+                .and_then(Value::as_str)
+                .map(TaskState::parse)
+                .transpose()?;
+            let new_state = event
+                .pointer("/task_transition/new_state")
+                .and_then(Value::as_str)
+                .map(TaskState::parse)
+                .transpose()?;
+            if previous_revision != Some(material_revision)
+                || new_revision != material_revision.checked_add(1)
+                || previous_state != material_state
+                || !previous_state
+                    .zip(new_state)
+                    .is_some_and(|(from, to)| allowed_transition(from, to))
             {
                 return Err(TaskManagerError::InvalidRecord(
-                    "nonterminal Task state does not match provenance head",
+                    "Task provenance state history is discontinuous",
                 ));
             }
-            let task = self
-                .get_task(&task_id)?
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "provenance-backed Task disappeared during startup verification",
-                ))?;
-            let intent_nonce = self.connection.query_row(
-                "SELECT intent_commitment_nonce FROM tasks WHERE task_id = ?1",
-                [&task_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            if intent_nonce.len() != 32 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "Task intent commitment nonce is invalid",
-                ));
+            material_revision += 1;
+            material_state = new_state;
+            material_updated_at = event
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let mutation =
+                event
+                    .get("committed_mutation")
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "Task transition provenance has no committed mutation",
+                    ))?;
+            if let Some(value) = mutation.get("active_plan").filter(|value| !value.is_null()) {
+                material_active_plan = Some(serde_json::from_value(value.clone())?);
             }
-            let expected_creation = json!({
-                "principal": task.principal,
-                "workspace_id": task.workspace_id,
-                "original_intent_ref": task_field_commitment(&intent_nonce, "original_intent", task.original_intent.as_bytes()),
-                "normalized_intent_ref": task.normalized_intent.as_ref().map(|value| canonical_json(value).map(|canonical| task_field_commitment(&intent_nonce, "normalized_intent", canonical.as_bytes()))).transpose()?,
-                "constraints": task.constraints,
-                "created_at": task.created_at,
-            });
-            let active_program_digest = self
+            if let Some(value) = mutation
+                .get("active_step_ids")
+                .filter(|value| !value.is_null())
+            {
+                material_steps = serde_json::from_value(value.clone())?;
+            }
+            if let Some(value) = mutation.get("waiting_on").filter(|value| !value.is_null()) {
+                material_waiting = value.clone();
+                material_waiting_commitments = event
+                    .pointer("/details/mutation_text_commitments/waiting_on")
+                    .cloned()
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "waiting message commitments are missing",
+                    ))?;
+            }
+            if let Some(value) = mutation.get("failure").filter(|value| !value.is_null()) {
+                material_failure = Some(value.clone());
+                material_failure_commitment = event
+                    .pointer("/details/mutation_text_commitments/failure_summary")
+                    .cloned();
+                if material_failure_commitment.is_none() {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "failure summary commitment is missing",
+                    ));
+                }
+            }
+            if let Some(value) = mutation.get("recovery").filter(|value| !value.is_null()) {
+                material_recovery = Some(value.clone());
+            }
+            material_state_reason = Some(json!({
+                "code": event.pointer("/task_transition/reason_code"),
+                "provenance_event_id": event_string(&event, "event_id")
+            }));
+            material_reason_message_ref = event.pointer("/details/reason_message_ref").cloned();
+            if let Some(value) = event
+                .pointer("/details/active_program")
+                .filter(|value| !value.is_null())
+            {
+                let mut identity = value.clone();
+                material_active_program_digest = identity
+                    .get("program_content_digest")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let Some(identity) = identity.as_object_mut() else {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "Task provenance active program is malformed",
+                    ));
+                };
+                identity.remove("program_content_digest");
+                material_active_program = Some(Value::Object(identity.clone()));
+            }
+        }
+        if material_revision != revision || material_state.map(TaskState::as_str) != Some(state) {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task state does not match provenance head",
+            ));
+        }
+        let task = self
+            .get_task(task_id)?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "provenance-backed Task disappeared during startup verification",
+            ))?;
+        let intent_nonce = self.connection.query_row(
+            "SELECT intent_commitment_nonce FROM tasks WHERE task_id = ?1",
+            [&task_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        if intent_nonce.len() != 32 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task intent commitment nonce is invalid",
+            ));
+        }
+        let expected_creation = json!({
+            "principal": task.principal,
+            "workspace_id": task.workspace_id,
+            "original_intent_ref": task_field_commitment(&intent_nonce, "original_intent", task.original_intent.as_bytes()),
+            "normalized_intent_ref": task.normalized_intent.as_ref().map(|value| canonical_json(value).map(|canonical| task_field_commitment(&intent_nonce, "normalized_intent", canonical.as_bytes()))).transpose()?,
+            "constraints": task.constraints,
+            "created_at": task.created_at,
+        });
+        let active_program_digest = self
                 .connection
                 .query_row(
                     "SELECT p.program_json FROM tasks t JOIN semantic_program_revisions p ON p.task_id = t.task_id AND p.program_revision = t.active_program_revision AND p.status = 'active' WHERE t.task_id = ?1",
@@ -2177,45 +2195,50 @@ impl TaskManager {
                 .optional()?
                 .map(|program_json| program_content_digest(&program_json))
                 .transpose()?;
-            let expected_waiting = provenance_waiting_on(&task.waiting_on);
-            let expected_waiting_commitments =
-                provenance_waiting_commitments(&task.waiting_on, &intent_nonce);
-            let expected_failure = task.failure.as_ref().map(provenance_failure);
-            let expected_failure_commitment = task
-                .failure
-                .as_ref()
-                .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
-            let task_reason_without_message = task.state_reason.as_ref().map(|reason| {
-                json!({
-                    "code": reason.get("code"),
-                    "provenance_event_id": reason.get("provenance_event_id"),
+        let expected_waiting = provenance_waiting_on(&task.waiting_on);
+        let expected_waiting_commitments =
+            provenance_waiting_commitments(&task.waiting_on, &intent_nonce);
+        let expected_failure = task.failure.as_ref().map(provenance_failure);
+        let expected_failure_commitment = task
+            .failure
+            .as_ref()
+            .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
+        let task_reason_without_message = task.state_reason.as_ref().map(|reason| {
+            json!({
+                "code": reason.get("code"),
+                "provenance_event_id": reason.get("provenance_event_id"),
+            })
+        });
+        let expected_reason_message_ref = task.state_reason.as_ref().and_then(|reason| {
+            reason.get("message").map(|message| {
+                message.as_str().map_or(Value::Null, |message| {
+                    task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
                 })
-            });
-            let expected_reason_message_ref = task.state_reason.as_ref().and_then(|reason| {
-                reason.get("message").map(|message| {
-                    message.as_str().map_or(Value::Null, |message| {
-                        task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
-                    })
-                })
-            });
-            if material_creation.as_ref() != Some(&expected_creation)
-                || task.updated_at != material_updated_at.unwrap_or_default()
-                || task.active_plan != material_active_plan
-                || task.active_program != material_active_program
-                || active_program_digest != material_active_program_digest
-                || task.active_step_ids != material_steps
-                || expected_waiting != material_waiting
-                || expected_waiting_commitments != material_waiting_commitments
-                || expected_failure != material_failure
-                || expected_failure_commitment != material_failure_commitment
-                || task.recovery != material_recovery
-                || task_reason_without_message != material_state_reason
-                || expected_reason_message_ref != material_reason_message_ref
-            {
-                return Err(TaskManagerError::InvalidRecord(
-                    "Task security state does not match committed provenance",
-                ));
-            }
+            })
+        });
+        let replayed_completed_at = if material_state == Some(TaskState::Completed) {
+            material_updated_at.clone()
+        } else {
+            None
+        };
+        if material_creation.as_ref() != Some(&expected_creation)
+            || task.updated_at != material_updated_at.unwrap_or_default()
+            || task.completed_at != replayed_completed_at
+            || task.active_plan != material_active_plan
+            || task.active_program != material_active_program
+            || active_program_digest != material_active_program_digest
+            || task.active_step_ids != material_steps
+            || expected_waiting != material_waiting
+            || expected_waiting_commitments != material_waiting_commitments
+            || expected_failure != material_failure
+            || expected_failure_commitment != material_failure_commitment
+            || task.recovery != material_recovery
+            || task_reason_without_message != material_state_reason
+            || expected_reason_message_ref != material_reason_message_ref
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task security state does not match committed provenance",
+            ));
         }
         Ok(())
     }
@@ -2544,6 +2567,111 @@ impl TaskManager {
         verify_provenance_through(&self.connection, task_id, None)
     }
 
+    /// Returns structured, reason-coded verification diagnostics for a Task stream.
+    ///
+    /// # Errors
+    /// Returns an error when the stream identity is invalid or storage cannot be read.
+    pub fn verify_provenance_detailed(
+        &self,
+        task_id: &str,
+        checkpoint: Option<&ProvenanceCheckpointExpectation>,
+    ) -> Result<ProvenanceVerificationResult> {
+        let stream_id = aios_provenance::stream_id(task_id)?;
+        let mut result = aios_provenance::verify_stream(
+            &self.connection,
+            &stream_id,
+            None,
+            checkpoint,
+            &self.clock.now(),
+        )?;
+        let mismatched_streams = self.connection.query_row(
+            "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND (stream_id IS NULL OR stream_id<>?2)",
+            params![task_id, stream_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if result.valid && mismatched_streams != 0 {
+            result.valid = false;
+            result
+                .diagnostics
+                .push(aios_provenance::VerificationDiagnostic {
+                    severity: aios_provenance::Severity::Error,
+                    code: "PROVENANCE_STREAM_ID_MISMATCH".to_owned(),
+                    message: "Task provenance rows do not share the expected stream".to_owned(),
+                    sequence: None,
+                    event_id: None,
+                    related: Vec::new(),
+                });
+        }
+        Ok(result)
+    }
+
+    /// Returns the current provenance head, if the Task has a journal stream.
+    ///
+    /// # Errors
+    /// Returns an error when the stream identity is invalid or storage cannot be read.
+    pub fn provenance_head(&self, task_id: &str) -> Result<Option<ProvenanceStreamHead>> {
+        let stream_id = aios_provenance::stream_id(task_id)?;
+        Ok(aios_provenance::get_head(&self.connection, &stream_id)?)
+    }
+
+    /// Lists one bounded page of provenance journal records.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, malformed stored records, or storage failure.
+    pub fn list_provenance(
+        &self,
+        task_id: &str,
+        after_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<ProvenanceRecordPage> {
+        let stream_id = aios_provenance::stream_id(task_id)?;
+        Ok(aios_provenance::list_events(
+            &self.connection,
+            &stream_id,
+            after_sequence,
+            limit,
+        )?)
+    }
+
+    /// Exports a privacy-redacted projection after checking its Task record and journal.
+    ///
+    /// # Errors
+    /// Returns an error when the stream is invalid, unsafe to export, or cannot be read.
+    pub fn export_provenance(&self, task_id: &str) -> Result<ProvenancePortableExport> {
+        let stream_id = aios_provenance::stream_id(task_id)?;
+        let mut validation_error = None;
+        let export = aios_provenance::export_jsonl_with_validation(
+            &self.connection,
+            &stream_id,
+            &self.clock.now(),
+            |connection| {
+                let (revision, state): (i64, String) = connection
+                    .query_row(
+                        "SELECT revision, state FROM tasks WHERE task_id = ?1",
+                        [task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| {
+                        validation_error = Some(TaskManagerError::Storage(error));
+                        aios_provenance::Error::InvalidRecord(
+                            "Task security state cannot be read".to_owned(),
+                        )
+                    })?;
+                self.verify_task_head(task_id, revision, &state)
+                    .map_err(|error| {
+                        validation_error = Some(error);
+                        aios_provenance::Error::InvalidRecord(
+                            "Task security state does not match committed provenance".to_owned(),
+                        )
+                    })
+            },
+        );
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        Ok(export?)
+    }
+
     fn verify_all_provenance_chains(&self) -> Result<()> {
         let task_ids = {
             let mut statement = self
@@ -2574,24 +2702,6 @@ impl TaskManager {
 struct AppendedEvent {
     event_id: String,
     event_hash: String,
-}
-
-struct ProvenanceRow {
-    event_id: String,
-    stream_id: String,
-    sequence: i64,
-    timestamp: String,
-    event_type: String,
-    semantic_program_hash: Option<String>,
-    ir_version: Option<String>,
-    registry_snapshot_id: Option<String>,
-    node_id: Option<String>,
-    execution_binding_id: Option<String>,
-    provider_id: Option<String>,
-    status: Option<String>,
-    previous_event_hash: Option<String>,
-    event_hash: String,
-    event_json: String,
 }
 
 #[allow(
@@ -2679,7 +2789,7 @@ pub(crate) fn reconcile_recovery_subject_in_transaction(
         }
     });
     let resolution_event_id = if let Some((stored, _)) = existing_event {
-        let stored: Value = serde_json::from_str(&stored)?;
+        let stored = aios_provenance::parse_unique_json(&stored)?;
         if stored != event || !verify_provenance_through(transaction, &task_id, None)? {
             return Err(TaskManagerError::InvalidRecord(
                 "recovery resolution event identity conflicts with durable provenance",
@@ -2752,67 +2862,27 @@ fn verify_provenance_through(
     task_id: &str,
     through_sequence: Option<i64>,
 ) -> Result<bool> {
-    let mut statement = connection.prepare("SELECT event_id, stream_id, sequence, timestamp, event_type, semantic_program_hash, ir_version, registry_snapshot_id, node_id, execution_binding_id, provider_id, status, previous_event_hash, event_hash, event_json FROM provenance_events WHERE task_id = ?1 AND (?2 IS NULL OR sequence <= ?2) ORDER BY sequence")?;
-    let rows = statement.query_map(params![task_id, through_sequence], |row| {
-        Ok(ProvenanceRow {
-            event_id: row.get(0)?,
-            stream_id: row.get(1)?,
-            sequence: row.get(2)?,
-            timestamp: row.get(3)?,
-            event_type: row.get(4)?,
-            semantic_program_hash: row.get(5)?,
-            ir_version: row.get(6)?,
-            registry_snapshot_id: row.get(7)?,
-            node_id: row.get(8)?,
-            execution_binding_id: row.get(9)?,
-            provider_id: row.get(10)?,
-            status: row.get(11)?,
-            previous_event_hash: row.get(12)?,
-            event_hash: row.get(13)?,
-            event_json: row.get(14)?,
-        })
-    })?;
-    let mut expected_sequence = 1_i64;
-    let mut previous: Option<String> = None;
-    for row in rows {
-        let row = row?;
-        if row.sequence != expected_sequence || row.previous_event_hash != previous {
-            return Ok(false);
-        }
-        let event: Value = serde_json::from_str(&row.event_json)?;
-        if (expected_sequence == 1 && row.event_type != "task.created")
-            || !valid_transition_shape(&event)
-            || row.event_id != event_string(&event, "event_id").unwrap_or_default()
-            || row.stream_id != provenance_stream_id(task_id)
-            || event_string(&event, "task_id") != Some(task_id)
-            || row.timestamp != event_string(&event, "timestamp").unwrap_or_default()
-            || row.event_type != event_string(&event, "event_type").unwrap_or_default()
-            || row.semantic_program_hash.as_deref() != event_string(&event, "semantic_program_hash")
-            || row.ir_version.as_deref() != event_string(&event, "ir_version")
-            || row.registry_snapshot_id.as_deref() != event_string(&event, "registry_snapshot_id")
-            || row.node_id.as_deref() != event_string(&event, "step_id")
-            || row.execution_binding_id.as_deref() != event_string(&event, "execution_binding_id")
-            || row.provider_id.as_deref() != event_string(&event, "provider_id")
-            || row.status.as_deref() != event_string(&event, "status")
-        {
-            return Ok(false);
-        }
-        let computed = provenance_hash(
-            task_id,
-            u64::try_from(row.sequence).unwrap_or(0),
-            row.previous_event_hash.as_deref(),
-            &event,
-        )?;
-        if computed != row.event_hash {
-            return Ok(false);
-        }
-        previous = Some(row.event_hash);
-        expected_sequence += 1;
+    let through_sequence = through_sequence
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance verification sequence"))?;
+    let stream_id = aios_provenance::stream_id(task_id)?;
+    let mismatched_streams = connection.query_row(
+        "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND (stream_id IS NULL OR stream_id<>?2) AND (?3 IS NULL OR sequence<=?3)",
+        params![task_id, stream_id, through_sequence.map(|value| i64::try_from(value).unwrap_or(i64::MAX))],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if mismatched_streams != 0 {
+        return Ok(false);
     }
-    Ok(match through_sequence {
-        Some(sequence) => expected_sequence == sequence.saturating_add(1),
-        None => expected_sequence > 1,
-    })
+    Ok(aios_provenance::verify_stream(
+        connection,
+        &stream_id,
+        through_sequence,
+        None,
+        "1970-01-01T00:00:00Z",
+    )?
+    .valid)
 }
 
 fn event_string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
@@ -2824,37 +2894,18 @@ fn append_event(
     task_id: &str,
     event: &Value,
 ) -> Result<AppendedEvent> {
-    if !valid_transition_shape(event) {
-        return Err(TaskManagerError::InvalidRecord(
-            "invalid typed Task transition provenance",
-        ));
-    }
-    let (last_sequence, previous): (i64, Option<String>) = transaction.query_row(
-        "SELECT COALESCE(MAX(sequence), 0), (SELECT event_hash FROM provenance_events WHERE task_id = ?1 ORDER BY sequence DESC LIMIT 1) FROM provenance_events WHERE task_id = ?1",
-        [task_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    let record = aios_provenance::append_in_tx(
+        transaction,
+        task_id,
+        event,
+        &aios_provenance::ExpectedHead::Any,
     )?;
-    let sequence = u64::try_from(last_sequence)
-        .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance sequence"))?
-        .checked_add(1)
-        .ok_or(TaskManagerError::InvalidRecord(
-            "provenance sequence overflow",
-        ))?;
-    let event_hash = provenance_hash(task_id, sequence, previous.as_deref(), event)?;
-    let event_id = event
-        .get("event_id")
-        .and_then(Value::as_str)
-        .ok_or(TaskManagerError::InvalidRecord(
-            "provenance event has no ID",
-        ))?
+    let event_id = event_string(&record.event, "event_id")
+        .expect("validated provenance event has an ID")
         .to_owned();
-    let stream_id = provenance_stream_id(task_id);
-    transaction.execute(
-        "INSERT INTO provenance_events (event_id, task_id, stream_id, sequence, timestamp, event_type, semantic_program_hash, ir_version, registry_snapshot_id, node_id, execution_binding_id, provider_id, status, previous_event_hash, event_hash, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![event_id, task_id, stream_id, i64::try_from(sequence).map_err(|_| TaskManagerError::InvalidRecord("provenance sequence exceeds SQLite range"))?, event_string(event, "timestamp"), event_string(event, "event_type"), event_string(event, "semantic_program_hash"), event_string(event, "ir_version"), event_string(event, "registry_snapshot_id"), event_string(event, "step_id"), event_string(event, "execution_binding_id"), event_string(event, "provider_id"), event_string(event, "status"), previous, event_hash, serde_json::to_string(event)?],
-    )?;
     Ok(AppendedEvent {
         event_id,
-        event_hash,
+        event_hash: record.event_hash,
     })
 }
 
@@ -2864,31 +2915,12 @@ fn provenance_hash(
     previous: Option<&str>,
     event: &Value,
 ) -> Result<String> {
-    let view = json!({"schema_version":SCHEMA_VERSION,"hash_profile":HASH_PROFILE,"stream_id":provenance_stream_id(task_id),"sequence":sequence,"previous_event_hash":previous,"event":event});
-    let canonical = serde_json_canonicalizer::to_vec(&view)
-        .map_err(|error| TaskManagerError::Canonicalization(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_DOMAIN);
-    hasher.update(canonical);
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(format!("sha256:{hex}"))
-}
-
-fn valid_transition_shape(event: &Value) -> bool {
-    if event.get("event_type").and_then(Value::as_str) != Some("task.transitioned") {
-        return event.get("task_transition").is_none();
-    }
-    let Some(transition) = event.get("task_transition") else {
-        return false;
-    };
-    let Some(previous) = transition.get("previous_revision").and_then(Value::as_u64) else {
-        return false;
-    };
-    transition.get("new_revision").and_then(Value::as_u64) == previous.checked_add(1)
+    Ok(aios_provenance::hash_record(
+        &provenance_stream_id(task_id),
+        sequence,
+        previous,
+        event,
+    )?)
 }
 
 fn canonical_json<T: Serialize>(value: &T) -> Result<String> {
@@ -3367,11 +3399,7 @@ fn task_created_event_id(task_id: &str) -> String {
 }
 
 fn provenance_stream_id(task_id: &str) -> String {
-    hashed_event_id(
-        "task:v1:sha256:",
-        b"AIOS-TASK-PROVENANCE-STREAM-ID\0v1\0",
-        task_id,
-    )
+    aios_provenance::stream_id(task_id).expect("validated Task ID forms a provenance stream")
 }
 
 #[allow(
@@ -3404,7 +3432,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3462,6 +3490,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0010_keyed_import_causal_receipts",
         "keyed-import-causal-receipts-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0011_provenance_service_boundary",
+        "provenance-service-boundary-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3605,6 +3638,49 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 "artifact writer session fencing migration is incomplete",
             ));
         }
+        let has_v11 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_v11
+            && (!table_has_column(connection, "provenance_events", "schema_version")?
+                || !table_has_column(connection, "provenance_events", "hash_profile")?
+                || !provenance_event_id_is_primary_key(connection)?
+                || !table_column_not_null(connection, "provenance_events", "task_id")?
+                || !provenance_foreign_keys_are_current(connection)?
+                || !provenance_append_only_triggers_are_current(connection)?)
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "provenance service-boundary migration is incomplete",
+            ));
+        }
+        if has_v11
+            && connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "provenance event has no identity",
+            ));
+        }
+        if has_v11
+            && connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provenance_events AS event
+                    LEFT JOIN tasks AS task ON task.task_id = event.task_id
+                    WHERE event.task_id IS NULL OR task.task_id IS NULL
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "provenance event has no owning Task",
+            ));
+        }
     }
     let has_steps = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'step_executions')",
@@ -3695,6 +3771,11 @@ fn migrate_task_manager_schema(
         "0010_keyed_import_causal_receipts",
         "keyed-import-causal-receipts-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0011_provenance_service_boundary",
+        "provenance-service-boundary-v0.1",
+    )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
@@ -3712,7 +3793,14 @@ fn migrate_task_manager_schema(
         [],
         |row| row.get::<_, bool>(0),
     )?;
-    let foreign_key_rebuild = transition_has_foreign_key || operations_require_rebuild;
+    let provenance_requires_rebuild =
+        !table_has_column(connection, "provenance_events", "schema_version")?
+            || !table_has_column(connection, "provenance_events", "hash_profile")?
+            || !provenance_event_id_is_primary_key(connection)?
+            || !table_column_not_null(connection, "provenance_events", "task_id")?
+            || !provenance_foreign_keys_are_current(connection)?;
+    let foreign_key_rebuild =
+        transition_has_foreign_key || operations_require_rebuild || provenance_requires_rebuild;
     let foreign_keys_enabled =
         connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))?;
     if foreign_key_rebuild {
@@ -3754,6 +3842,78 @@ fn migrate_task_manager_schema(
                  DROP TABLE task_transitions_legacy;
                  CREATE INDEX ix_task_transitions_task ON task_transitions(task_id, requested_at);",
             )?;
+        }
+        if provenance_requires_rebuild {
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS ix_provenance_task_sequence;
+                 DROP TRIGGER IF EXISTS provenance_events_no_update;
+                 DROP TRIGGER IF EXISTS provenance_events_no_delete;
+                 ALTER TABLE provenance_events RENAME TO provenance_events_legacy;
+                 CREATE TABLE provenance_events (
+                     schema_version TEXT NOT NULL CHECK (schema_version = '0.1'),
+                     hash_profile TEXT NOT NULL CHECK (hash_profile = 'aios-provenance-event-v0.1'),
+                     event_id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     stream_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL CHECK (sequence >= 1),
+                     timestamp TEXT NOT NULL,
+                     event_type TEXT NOT NULL,
+                     semantic_program_hash TEXT,
+                     ir_version TEXT,
+                     registry_snapshot_id TEXT,
+                     node_id TEXT,
+                     execution_binding_id TEXT,
+                     provider_id TEXT,
+                     status TEXT,
+                     previous_event_hash TEXT,
+                     event_hash TEXT NOT NULL,
+                     event_json TEXT NOT NULL,
+                     FOREIGN KEY (task_id) REFERENCES tasks(task_id),
+                     FOREIGN KEY (registry_snapshot_id) REFERENCES registry_snapshots(snapshot_id),
+                     FOREIGN KEY (execution_binding_id) REFERENCES execution_bindings(binding_id),
+                     UNIQUE (task_id, sequence),
+                     UNIQUE (stream_id, sequence)
+                 );
+                 INSERT INTO provenance_events (
+                     schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,
+                     event_type,semantic_program_hash,ir_version,registry_snapshot_id,node_id,
+                     execution_binding_id,provider_id,status,previous_event_hash,event_hash,event_json
+                 )
+                 SELECT '0.1','aios-provenance-event-v0.1',event_id,task_id,stream_id,sequence,
+                     timestamp,event_type,semantic_program_hash,ir_version,registry_snapshot_id,
+                     node_id,execution_binding_id,provider_id,status,previous_event_hash,event_hash,event_json
+                 FROM provenance_events_legacy ORDER BY stream_id,sequence;
+                 DROP TABLE provenance_events_legacy;
+                 CREATE INDEX ix_provenance_task_sequence ON provenance_events(task_id,sequence);
+                 CREATE TRIGGER provenance_events_no_update
+                 BEFORE UPDATE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;
+                 CREATE TRIGGER provenance_events_no_delete
+                 BEFORE DELETE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;",
+            )?;
+            let stream_ids = {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT stream_id FROM provenance_events ORDER BY stream_id",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for stream_id in stream_ids {
+                if !aios_provenance::verify_stream(
+                    connection,
+                    &stream_id,
+                    None,
+                    None,
+                    "1970-01-01T00:00:00Z",
+                )?
+                .valid
+                {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "legacy provenance failed verification during migration",
+                    ));
+                }
+            }
         }
         for (column, declaration) in [
             ("active_plan_revision", "INTEGER"),
@@ -3960,7 +4120,8 @@ fn migrate_task_manager_schema(
             [],
         )?;
         let foreign_key_failures = connection.query_row(
-            "SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges')",
+            "SELECT (SELECT COUNT(*) FROM pragma_foreign_key_check('provenance_events'))
+                  + (SELECT COUNT(*) FROM pragma_foreign_key_check('artifact_export_reconciliation_challenges'))",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -3969,6 +4130,25 @@ fn migrate_task_manager_schema(
                 "persistence migration produced invalid foreign-key references",
             ));
         }
+        let missing_event_id = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if missing_event_id {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration found a provenance event without identity",
+            ));
+        }
+        if !provenance_append_only_triggers_are_current(connection)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration found invalid provenance append-only triggers",
+            ));
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
+            [],
+        )?;
         Ok(())
     })();
     let result = match migration {
@@ -4128,7 +4308,7 @@ fn reconstruct_committed_transition(
         .ok_or(TaskManagerError::InvalidRecord(
             "committed transition result cannot be reconstructed from provenance",
         ))?;
-    let event: Value = serde_json::from_str(&event_row.3)?;
+    let event = aios_provenance::parse_unique_json(&event_row.3)?;
     let request_json = connection.query_row(
         "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
         [transition_id],
@@ -4202,8 +4382,7 @@ fn reconstruct_committed_transition(
         event_row.1.as_deref(),
         &event,
     )?;
-    if !valid_transition_shape(&event)
-        || event_row.2 != computed_hash
+    if event_row.2 != computed_hash
         || event_row.5 != task_id
         || event_row.6 != "task.transitioned"
         || event_string(&event, "event_id") != Some(event_id)
@@ -4303,6 +4482,94 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
     Ok(false)
 }
 
+fn provenance_event_id_is_primary_key(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(provenance_events)")?;
+    let columns = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+    })?;
+    let primary_key_columns = columns
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, position)| *position != 0)
+        .collect::<Vec<_>>();
+    Ok(matches!(primary_key_columns.as_slice(), [(name, 1)] if name == "event_id"))
+}
+
+fn provenance_task_fk_is_current(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_list(provenance_events)")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let foreign_keys = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(foreign_keys
+        .iter()
+        .filter(|(_, _, table, from, ..)| table == "tasks" || from == "task_id")
+        .count()
+        == 1
+        && foreign_keys
+            .iter()
+            .any(|(id, sequence, table, from, to, on_update, on_delete)| {
+                *sequence == 0
+                    && table == "tasks"
+                    && from == "task_id"
+                    && to == "task_id"
+                    && on_update.eq_ignore_ascii_case("NO ACTION")
+                    && on_delete.eq_ignore_ascii_case("NO ACTION")
+                    && foreign_keys
+                        .iter()
+                        .filter(|(other_id, ..)| other_id == id)
+                        .count()
+                        == 1
+            }))
+}
+
+fn provenance_foreign_keys_are_current(connection: &Connection) -> Result<bool> {
+    if !provenance_task_fk_is_current(connection)? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare("PRAGMA foreign_key_list(provenance_events)")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let foreign_keys = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        ("tasks", "task_id", "task_id"),
+        ("registry_snapshots", "registry_snapshot_id", "snapshot_id"),
+        ("execution_bindings", "execution_binding_id", "binding_id"),
+    ];
+    Ok(foreign_keys.len() == expected.len()
+        && expected.iter().all(|(target, source, key)| {
+            foreign_keys
+                .iter()
+                .filter(|(_, sequence, table, from, to, on_update, on_delete)| {
+                    *sequence == 0
+                        && table == target
+                        && from == source
+                        && to == key
+                        && on_update.eq_ignore_ascii_case("NO ACTION")
+                        && on_delete.eq_ignore_ascii_case("NO ACTION")
+                })
+                .count()
+                == 1
+        }))
+}
+
 fn table_column_not_null(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement.query_map([], |row| {
@@ -4333,6 +4600,35 @@ fn require_migration_tables(connection: &Connection, tables: &[&str]) -> Result<
         }
     }
     Ok(())
+}
+
+fn provenance_append_only_triggers_are_current(connection: &Connection) -> Result<bool> {
+    for (name, operation) in [
+        ("provenance_events_no_update", "UPDATE"),
+        ("provenance_events_no_delete", "DELETE"),
+    ] {
+        let sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name='provenance_events'",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(sql) = sql else {
+            return Ok(false);
+        };
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = format!(
+            "CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END"
+        );
+        if normalized != expected
+            && normalized
+                != expected.replacen("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn encode_optional<T: Serialize>(value: Option<&T>) -> Result<Option<String>> {
@@ -5059,7 +5355,7 @@ fn authenticated_transition_result(
                 ))?;
             let sequence = u64::try_from(event_row.0)
                 .map_err(|_| TaskManagerError::InvalidRecord("invalid provenance sequence"))?;
-            let event: Value = serde_json::from_str(&event_row.3)?;
+            let event = aios_provenance::parse_unique_json(&event_row.3)?;
             if !result.applied
                 || result.reason_code != "TASK_TRANSITION_APPLIED"
                 || result.previous_revision != Some(expected_revision)
@@ -6353,7 +6649,7 @@ fn has_current_verification(
         let Ok(sequence) = u64::try_from(sequence) else {
             return Ok(false);
         };
-        let event: Value = serde_json::from_str(&event_json)?;
+        let event = aios_provenance::parse_unique_json(&event_json)?;
         if status != "success"
             || event_string(&event, "event_id") != Some(event_id.as_str())
             || event_string(&event, "task_id") != Some(task_id)
@@ -6857,7 +7153,7 @@ fn authenticated_recovery_resolution(
     let Some(event_json) = event_json else {
         return Ok(false);
     };
-    let event: Value = serde_json::from_str(&event_json)?;
+    let event = aios_provenance::parse_unique_json(&event_json)?;
     Ok(event
         .pointer("/details/recovery_ref")
         .and_then(Value::as_str)
@@ -7370,6 +7666,398 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provenance_event_id_key_shape_rejects_unique_and_composite_substitutes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE provenance_events(event_id TEXT UNIQUE, task_id TEXT)")
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        connection
+            .execute_batch(
+                "DROP TABLE provenance_events;
+                 CREATE TABLE provenance_events(
+                     event_id TEXT, task_id TEXT, PRIMARY KEY(event_id, task_id)
+                 );",
+            )
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        connection
+            .execute_batch(
+                "DROP TABLE provenance_events;
+                 CREATE TABLE provenance_events(event_id TEXT PRIMARY KEY, task_id TEXT) WITHOUT ROWID;",
+            )
+            .unwrap();
+        assert!(provenance_event_id_is_primary_key(&connection).unwrap());
+    }
+
+    #[test]
+    fn provenance_foreign_key_shape_rejects_misbound_and_cascading_evidence_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+                 CREATE TABLE registry_snapshots(snapshot_id TEXT PRIMARY KEY);
+                 CREATE TABLE execution_bindings(binding_id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        for (registry_target, binding_delete, expected) in [
+            ("snapshot_id", "", true),
+            ("wrong_snapshot_id", "", false),
+            ("snapshot_id", "ON DELETE CASCADE", false),
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE provenance_events(
+                         task_id TEXT,
+                         registry_snapshot_id TEXT,
+                         execution_binding_id TEXT,
+                         FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+                         FOREIGN KEY(registry_snapshot_id) REFERENCES registry_snapshots({registry_target}),
+                         FOREIGN KEY(execution_binding_id) REFERENCES execution_bindings(binding_id) {binding_delete}
+                     );"
+                ))
+                .unwrap();
+            assert_eq!(
+                provenance_foreign_keys_are_current(&connection).unwrap(),
+                expected,
+                "registry target {registry_target}, binding delete {binding_delete}"
+            );
+            connection
+                .execute_batch("DROP TABLE provenance_events")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn stamped_provenance_rejects_null_event_id_despite_sqlite_primary_key() {
+        let mut manager = test_manager();
+        manager
+            .create_task(&create("T-null-event-identity"))
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provenance_events_no_update;
+                 UPDATE provenance_events SET event_id=NULL;
+                 CREATE TRIGGER provenance_events_no_update
+                 BEFORE UPDATE ON provenance_events
+                 BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;",
+            )
+            .unwrap();
+        assert!(provenance_event_id_is_primary_key(&manager.connection).unwrap());
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance event has no identity"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stamped_provenance_rejects_same_name_noop_append_only_triggers() {
+        for (name, operation) in [
+            ("provenance_events_no_update", "UPDATE"),
+            ("provenance_events_no_delete", "DELETE"),
+        ] {
+            let manager = test_manager();
+            assert!(provenance_append_only_triggers_are_current(&manager.connection).unwrap());
+            manager
+                .connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            assert!(!provenance_append_only_triggers_are_current(&manager.connection).unwrap());
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "provenance service-boundary migration is incomplete"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn unstamped_provenance_refuses_noop_triggers_before_v11_stamp() {
+        for (name, operation) in [
+            ("provenance_events_no_update", "UPDATE"),
+            ("provenance_events_no_delete", "DELETE"),
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory
+                .path()
+                .join(format!("unstamped-noop-{operation}.sqlite3"));
+            let task_id = "T-unstamped-noop-trigger";
+            let original_hash = {
+                let mut manager =
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                manager.create_task(&create(task_id)).unwrap();
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash
+            };
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';
+                     DROP TRIGGER {name};
+                     CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            drop(connection);
+
+            assert!(matches!(
+                TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                Err(TaskManagerError::InvalidRecord(
+                    "persistence migration found invalid provenance append-only triggers"
+                ))
+            ));
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert!(!provenance_append_only_triggers_are_current(&connection).unwrap());
+            connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {name};
+                     CREATE TRIGGER {name} BEFORE {operation} ON provenance_events
+                     BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;"
+                ))
+                .unwrap();
+            drop(connection);
+            let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert!(manager.verify_provenance(task_id).unwrap());
+            assert_eq!(
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash,
+                original_hash
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks hash-valid duplicate identities and atomic rollback on both migration paths"
+    )]
+    fn stamped_provenance_requires_event_id_single_column_primary_key() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("duplicate-provenance-event-ids.sqlite3");
+        let first_task = "T-duplicate-event-first";
+        let second_task = "T-duplicate-event-second";
+        {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(first_task)).unwrap();
+            manager.create_task(&create(second_task)).unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let without_primary_key = schema
+            .replacen(
+                "CREATE TABLE provenance_events",
+                "CREATE TABLE provenance_events_without_pk",
+                1,
+            )
+            .replacen(
+                "event_id                 TEXT PRIMARY KEY",
+                "event_id                 TEXT",
+                1,
+            );
+        assert_ne!(without_primary_key, schema);
+        assert!(without_primary_key.contains("event_id                 TEXT,"));
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TRIGGER provenance_events_no_update;
+                 DROP TRIGGER provenance_events_no_delete;
+                 {without_primary_key};
+                 INSERT INTO provenance_events_without_pk SELECT * FROM provenance_events;
+                 DROP TABLE provenance_events;
+                 ALTER TABLE provenance_events_without_pk RENAME TO provenance_events;"
+            ))
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        assert!(provenance_task_fk_is_current(&connection).unwrap());
+
+        let first_event_id: String = connection
+            .query_row(
+                "SELECT event_id FROM provenance_events WHERE task_id=?1",
+                [first_task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_stream = provenance_stream_id(second_task);
+        let second_json: String = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [second_task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut second_event: Value = serde_json::from_str(&second_json).unwrap();
+        second_event["event_id"] = serde_json::json!(first_event_id);
+        let second_hash =
+            aios_provenance::hash_record(&second_stream, 1, None, &second_event).unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_id=?1,event_hash=?2,event_json=?3 WHERE task_id=?4",
+                params![first_event_id, second_hash, second_event.to_string(), second_task],
+            )
+            .unwrap();
+        for task_id in [first_task, second_task] {
+            let result = aios_provenance::verify_stream(
+                &connection,
+                &provenance_stream_id(task_id),
+                None,
+                None,
+                T0,
+            )
+            .unwrap();
+            assert!(result.valid, "{task_id}: {result:?}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [&first_event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            preflight_migration_state(&connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance service-boundary migration is incomplete"
+            ))
+        ));
+        drop(connection);
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance service-boundary migration is incomplete"
+            ))
+        ));
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [&first_event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unstamped_provenance_rebuild_restores_event_id_primary_key() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("unstamped-provenance-without-pk.sqlite3");
+        let task_id = "T-rebuild-provenance-key";
+        let original_hash = {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(task_id)).unwrap();
+            manager
+                .provenance_head(task_id)
+                .unwrap()
+                .unwrap()
+                .event_hash
+        };
+        let connection = Connection::open(&path).unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let without_primary_key = schema
+            .replacen(
+                "CREATE TABLE provenance_events",
+                "CREATE TABLE provenance_events_without_pk",
+                1,
+            )
+            .replacen(
+                "event_id                 TEXT PRIMARY KEY",
+                "event_id                 TEXT",
+                1,
+            );
+        assert!(without_primary_key.contains("event_id                 TEXT,"));
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TRIGGER provenance_events_no_update;
+                 DROP TRIGGER provenance_events_no_delete;
+                 {without_primary_key};
+                 INSERT INTO provenance_events_without_pk SELECT * FROM provenance_events;
+                 DROP TABLE provenance_events;
+                 ALTER TABLE provenance_events_without_pk RENAME TO provenance_events;
+                 DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';"
+            ))
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        drop(connection);
+
+        let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(provenance_event_id_is_primary_key(&manager.connection).unwrap());
+        assert!(manager.verify_provenance(task_id).unwrap());
+        assert_eq!(
+            manager
+                .provenance_head(task_id)
+                .unwrap()
+                .unwrap()
+                .event_hash,
+            original_hash
+        );
+    }
+
     fn request(
         id: &str,
         task: &str,
@@ -7423,6 +8111,9 @@ mod tests {
             .unwrap();
         assert!(applied.applied);
         assert_eq!(applied.current_revision, Some(2));
+        let before_stale = manager.get_task("T-1").unwrap().unwrap();
+        let count_before_stale = manager.provenance_count("T-1").unwrap();
+        let head_before_stale = manager.provenance_head("T-1").unwrap();
         let stale = manager
             .transition(&request(
                 "tr-stale",
@@ -7433,6 +8124,22 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(stale.reason_code, "TASK_REVISION_CONFLICT");
+        assert!(!stale.applied);
+        assert!(stale.provenance_event_id.is_none());
+        assert!(stale.provenance_event_hash.is_none());
+        let after_stale = manager.get_task("T-1").unwrap().unwrap();
+        assert_eq!(after_stale.state, before_stale.state);
+        assert_eq!(after_stale.revision, before_stale.revision);
+        assert_eq!(manager.provenance_count("T-1").unwrap(), count_before_stale);
+        assert_eq!(manager.provenance_head("T-1").unwrap(), head_before_stale);
+        assert_eq!(
+            manager.connection.query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE json_extract(event_json,'$.task_transition.transition_id')='tr-stale'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            0
+        );
         let cancel = manager
             .transition(&request(
                 "tr-cancel",

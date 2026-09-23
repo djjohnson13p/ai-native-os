@@ -15,7 +15,11 @@ A plain mutable event table also makes accidental/history-tampering harder to de
 
 For v0.1:
 
-1. Each Task has an append-oriented provenance stream identified by `task:<task_id>`.
+1. Each Task has an append-oriented provenance stream identified by
+   `task:<task-stream-key>`, where the v0.1 key is the lowercase SHA-256 digest
+   of `"AIOS-TASK-PROVENANCE-STREAM-ID\0v1\0" || task_id UTF-8`, prefixed with
+   `v1:sha256:`. This deterministic opaque identity preserves already committed
+   Stage-1 chain hashes; the typed event payload continues to carry `task_id`.
 2. Journal records carry a monotonically increasing per-stream sequence beginning at 1.
 3. Each journal record links to the previous record hash; the first record uses a null previous hash.
 4. Record hashes use a canonical, domain-separated profile over the typed record content excluding the record's own hash and detached signatures.
@@ -94,11 +98,88 @@ Artifact/Object IDs, content hashes, provider/package IDs, semantic program/node
 
 The provenance subsystem is part of correctness for consequential effects. It is not an authorization engine, and a valid event/hash does not grant permission.
 
-Secret/private payloads must not be copied into `details` merely for convenience.
+`details` uses a closed event-specific vocabulary. Append, verification,
+migration, and export reject unknown top-level or nested detail fields; extending
+the vocabulary or a field's bounded type requires a deliberate schema and
+validator revision. Allowed fields accept only their path-specific integer,
+boolean, enum, identifier, timestamp, digest, collection, or exact commitment
+shape. Commitment references bind their exact field discriminator and v1
+profile. This keeps secret/private payloads and unreviewed diagnostic dumps out
+of portable provenance rather than relying on names alone.
+
+Identifier validation is field-specific. Machine-owned IDs retain their
+restricted grammar. Opaque Task-origin IDs (`principal.id`, `workspace_id`,
+step IDs, waiting IDs, plan IDs, and reason-related IDs) preserve the Task
+contract's nonempty/nullable and Unicode-scalar length rules, including spaces,
+punctuation, emoji, and canonically distinct Unicode. Provenance does not
+normalize those values because that would change the event and chain identity.
+
+Normal portable export uses the separately typed
+`privacy-redacted-projection-v1` profile. The exporter validates the original
+chain and projects one consistent database snapshot, but exports neither its
+stream identity nor original hashes. All arbitrary string channels become
+secret-keyed bundle-local aliases with path namespaces and no exported mapping;
+only reviewed fixed enums, timestamps, numeric/boolean/null values, and validated
+private commitments remain literal. Projection descriptor and record hashes use
+domains separate from the journal hash. Offline verification is explicitly
+limited to `scope=exported-projection` and proves neither original-chain validity
+nor linkage to the authoritative journal.
+
+Normal Task-facing export must also validate the private Task row, nonce,
+creation commitment, and current state against that journal in the same
+snapshot. The provenance library's callback-based exporter is a trusted
+integration primitive; it does not infer Task security state on its own.
+There is no public callback-free export shortcut.
+
+The projection validator is path- and event-specific: it checks required
+non-null fields, exact nested keys, fixed enums and scalar types, commitment
+field discriminators, and the namespace of every alias, including approval
+attribution. A projected event has a 524,288-byte cap so a valid Task creation
+can expand its simultaneous 512-step and three 512-item Artifact/reference
+collections into aliases; the record envelope and complete JSONL
+bundle remain separately bounded, and the exporter validates each generated
+record before release.
 
 ## Compatibility impact
 
-The existing `provenance-event.schema.json` remains the event payload contract. v0.1 journal ordering/integrity is represented by a separate envelope schema so the change is additive at the architecture level.
+`provenance-event.schema.json` remains the event payload contract, and v0.1
+journal ordering/integrity uses a separate envelope schema. The payload schema
+now states the already enforced 512-item collection bounds and event-specific
+detail-key mapping, and forbids journal-envelope hash fields inside the event.
+This tightens schema-only validation to match the trusted runtime: previously
+conforming stored events and their canonical hashes do not change, while a
+producer relying on the former permissive schema must correct any event the
+runtime already rejected. The positive chain fixture uses the opaque derived
+stream ID required by the existing runtime; its Task ID and semantic payload
+remain unchanged.
+The former public callback-free `export_jsonl` shortcut is internal to tests;
+integrations must provide same-snapshot Task validation through the trusted
+callback exporter or use `TaskManager::export_provenance`.
+Stamped stores with a nullable provenance Task key or any unowned journal row
+are rejected at startup rather than treated as a valid migrated store; existing
+valid records and hashes are unaffected.
+Stamped stores also require `event_id` as the journal table's sole primary-key
+column and reject null event IDs. Otherwise duplicate IDs across separately
+valid streams make receipt lookup ambiguous, and SQLite ordinary rowid tables
+can accept null values in a `TEXT PRIMARY KEY`. This rejects malformed stamped
+stores without rewriting valid rows.
+Stamped stores also require all three exact provenance foreign keys to Task,
+Registry Snapshot, and Execution Binding. A foreign-key check cannot detect an
+undeclared constraint, so accepting only the Task key could silently admit
+orphaned security-evidence references. Unstamped stores rebuild the declared
+shape transactionally or reject invalid references.
+Integers in the canonical hash view are limited in magnitude to
+`9007199254740991` before RFC 8785 serialization; v0.1 typed event and
+envelope integer fields are also nonnegative. Out-of-range values were
+previously accepted by some validators but could collide in the canonical
+bytes; they now fail append or stored-row verification. Existing in-range
+event bytes and hashes remain unchanged.
+The separately hashed portable projection and manifest apply the same exact
+integer bound before canonicalization.
+The `task.created` genesis establishes Task revision 1. Every later
+`task.transitioned` record must consume the latest committed Task revision
+and advance it by one, including when other event types intervene. Append and
+verification reject an otherwise hash-valid but discontinuous Task history.
 
 ## Related
 

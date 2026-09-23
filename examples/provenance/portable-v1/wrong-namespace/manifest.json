@@ -1,0 +1,10 @@
+{
+  "schema_version": "0.1",
+  "export_profile": "privacy-redacted-projection-v1",
+  "projection_hash_profile": "aios-provenance-redacted-projection-v1",
+  "bundle_id": "bundle:v1:9bb3d3c4d617a706ac55b43a8a89af4d80ecc3b08119f17903177204aa271ed2",
+  "record_count": 2,
+  "head_sequence": 2,
+  "head_projection_hash": "sha256:a950502b3564861058a7b620a46eb1e23589778d23c7be55c513cace873e8823",
+  "descriptor_hash": "sha256:fe4a400445f2410a9438b37e627c3baa6749c4fee443275075360ee526a845d6"
+}

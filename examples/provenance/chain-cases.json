@@ -3,7 +3,7 @@
   "hashes": "GENERATE_AT_TEST_TIME",
   "description": "Synthetic provenance journal cases. The implementation must generate canonical event hashes; these cases specify relationships and expected verification outcomes rather than trusted precomputed digests.",
   "base_stream": {
-    "stream_id": "task:T-provenance-fixture-1",
+    "stream_id": "task:v1:sha256:d5aa05557f9a91d49506656e869269d74c3d1e945a5853765a2243605176540b",
     "events": [
       {
         "sequence": 1,
@@ -19,6 +19,8 @@
           "details": {
             "revision": 1,
             "creation": {
+              "principal": {"kind": "user", "id": "user:fixture"},
+              "workspace_id": null,
               "original_intent_ref": {
                 "kind": "task-field-commitment",
                 "version": "v1",
@@ -26,8 +28,15 @@
                 "field": "original_intent",
                 "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               },
-              "normalized_intent_ref": null
+              "normalized_intent_ref": null,
+              "constraints": null,
+              "created_at": "2026-09-15T22:00:00Z"
             },
+            "active_plan": null,
+            "active_step_ids": [],
+            "waiting_on": [],
+            "failure": null,
+            "recovery": null,
             "fixture": true
           }
         }
@@ -156,10 +165,10 @@
       "expected_behavior": "the two v1 commitment values differ"
     },
     {
-      "name": "legacy-raw-intent-export-is-redacted-projection",
-      "mutation": "export a locally verified legacy stream whose immutable creation event contains raw synthetic intent",
-      "expected_valid": true,
-      "expected_behavior": "privacy-safe export contains only a v1 commitment, labels the manifest legacy-redacted, and does not claim that projected event bytes are the original hash preimage"
+      "name": "legacy-raw-intent-export-is-rejected",
+      "mutation": "attempt normal export of a legacy stream whose immutable creation event contains raw synthetic intent rather than the current typed commitment",
+      "expected_valid": false,
+      "expected_behavior": "typed verification rejects the original stream before projection; no portable export is emitted or silent rehash upgrade performed"
     },
     {
       "name": "creation-commitment-mismatch-quarantines-task",
