@@ -9,7 +9,7 @@ use aios_contracts::{
 use aios_ir::{ValidationLimits, ValidationReport, Validator};
 use aios_registry::{
     HashVerificationMode, ProviderStore, ProviderTrustStatus, RegistryBuildOptions,
-    RegistryLoadOptions, RegistryStore, SemanticRegistry,
+    RegistryLoadOptions, RegistryStore, SemanticRegistry, SnapshotHashEntry,
 };
 use jsonschema::Resource;
 use proptest::prelude::*;
@@ -416,17 +416,74 @@ fn downstream_examples_reference_generated_semantic_identities() {
     }
 }
 
+const PROVIDER_TEST_SUITE_HASH: &str =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn provider_test_registry(authored: &SemanticRegistry) -> (SemanticRegistry, String) {
+    let mut snapshot = authored.snapshot().clone();
+    let types = authored.type_contracts().cloned().collect::<Vec<_>>();
+    let mut capabilities = authored.capability_contracts().cloned().collect::<Vec<_>>();
+    let hash_contract = capabilities
+        .iter_mut()
+        .find(|contract| contract.capability == "artifact.hash")
+        .unwrap();
+    hash_contract.conformance.suite_hash = Some(PROVIDER_TEST_SUITE_HASH.into());
+    let hash = aios_registry::capability_contract_hash(hash_contract)
+        .unwrap()
+        .to_string();
+    let hash_entry = snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "artifact.hash")
+        .unwrap();
+    hash_entry.content_hash.clone_from(&hash);
+    let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+        id: entry.id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    };
+    snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &snapshot.schema_version,
+        &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+        &snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let registry = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    assert!(registry.is_strictly_verified());
+    (registry, hash)
+}
+
 #[test]
 fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
-    let registry =
+    let authored =
         SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+    let (registry, hash) = provider_test_registry(&authored);
     let program = fixture_value("canonicalization-cases.json")["cases"][1]["left"].clone();
+    let authored_hash = validate(
+        &Validator::new(authored, ValidationLimits::default()),
+        &program,
+    )
+    .output
+    .validation
+    .semantic_hash;
     let baseline = validate(
         &Validator::new(registry.clone(), ValidationLimits::default()),
         &program,
     );
     assert!(baseline.output.validation.valid);
     let expected_hash = baseline.output.validation.semantic_hash.clone();
+    assert_eq!(expected_hash, authored_hash);
 
     let mut connection = Connection::open_in_memory().unwrap();
     connection
@@ -442,6 +499,8 @@ fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
         .unwrap();
     let mut providers = ProviderStore::initialize(&mut connection).unwrap();
     let mut manifest = fixture_value("provider-conformance-cases.json")[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["contract_hash"] = hash.into();
+    manifest["provides"][0]["conformance"]["suite_hash"] = PROVIDER_TEST_SUITE_HASH.into();
     for (id, build) in [
         (
             "org.ainative.fixture.artifact-hash-a",

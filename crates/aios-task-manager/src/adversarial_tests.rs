@@ -887,6 +887,330 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         .as_deref(),
         Some("cross-snapshot-pass")
     );
+    transaction.rollback().unwrap();
+    let pinned = json!({"conformance_evidence_id":"cross-snapshot-pass"});
+    assert!(conformance_pin_matches(
+        &pinned,
+        "cross-snapshot-pass",
+        true
+    ));
+    assert!(!conformance_pin_matches(
+        &json!({}),
+        "cross-snapshot-pass",
+        true
+    ));
+    let latest = |manager: &mut TaskManager| {
+        let transaction = manager.connection.transaction().unwrap();
+        latest_conformance_evidence_id(
+            &transaction,
+            &BindingGrantCheck {
+                task_id: "T-real-receipt",
+                semantic_hash: HASH,
+                node_id: "node-real",
+                binding_id: "binding-real-receipt",
+                attempt_id: "attempt-real-receipt",
+                grant_refs_json: "[]",
+                checked_at: "2026-09-19T00:00:01Z",
+            },
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    evidence["result_id"] = "renewed-pass".into();
+    evidence["executed_at"] = "2026-09-19T00:00:00.500000Z".into();
+    ProviderStore::initialize(&mut manager.connection)
+        .unwrap()
+        .record_evidence(
+            binding.provider_registration_id.as_deref().unwrap(),
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(latest(&mut manager), "renewed-pass");
+    assert!(!conformance_pin_matches(
+        &pinned,
+        &latest(&mut manager),
+        true
+    ));
+    evidence["result_id"] = "later-failure".into();
+    evidence["result"] = "fail".into();
+    evidence["tests_passed"] = 1.into();
+    evidence["tests_failed"] = 1.into();
+    evidence["executed_at"] = "2026-09-19T00:00:00.750000Z".into();
+    ProviderStore::initialize(&mut manager.connection)
+        .unwrap()
+        .record_evidence(
+            binding.provider_registration_id.as_deref().unwrap(),
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(latest(&mut manager), "later-failure");
+    assert!(!conformance_pin_matches(
+        &pinned,
+        &latest(&mut manager),
+        true
+    ));
+    binding.registry_snapshot_id = second.snapshot_id().into();
+    for (state, permitted) in [
+        (aios_registry::SnapshotState::Deprecated, true),
+        (aios_registry::SnapshotState::Quarantined, false),
+        (aios_registry::SnapshotState::Revoked, false),
+    ] {
+        RegistryStore::initialize(&mut manager.connection)
+            .unwrap()
+            .set_snapshot_state(first.snapshot_id(), state)
+            .unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        assert_eq!(
+            verified_provider_admission(&transaction, &binding).unwrap(),
+            permitted
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn immutable_binding_pins_real_provider_evidence_across_retests() {
+    use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+    use aios_registry::{
+        ProviderStore, ProviderTrustStatus, RegistryBuildOptions, RegistryStore, SemanticRegistry,
+        SnapshotHashEntry,
+    };
+
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/registry-snapshot.json"
+    ))
+    .unwrap();
+    let types: Vec<TypeContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/type-contracts.json"
+    ))
+    .unwrap();
+    let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/capability-contracts.json"
+    ))
+    .unwrap();
+    let mut completion = capabilities
+        .iter()
+        .find(|contract| contract.capability == "document.compose")
+        .unwrap()
+        .clone();
+    completion.capability = "test.complete".into();
+    completion.inputs.clear();
+    completion.required_effect_classes.clear();
+    completion.allowed_effect_classes = vec![aios_contracts::EffectClass::Pure];
+    completion.required_authority_classes.clear();
+    completion.allowed_authority_classes.clear();
+    completion.conformance.suite_id = "suite:test".into();
+    completion.conformance.suite_hash = Some(SUITE_HASH.into());
+    let contract_hash = aios_registry::capability_contract_hash(&completion)
+        .unwrap()
+        .to_string();
+    snapshot
+        .capability_contracts
+        .push(aios_contracts::ContractRef {
+            id: completion.capability.clone(),
+            version: completion.version.clone(),
+            content_hash: contract_hash.clone(),
+            source: None,
+        });
+    capabilities.push(completion);
+    let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+        id: entry.id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    };
+    snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &snapshot.schema_version,
+        &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+        &snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let registry = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    RegistryStore::initialize(&mut manager.connection)
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/provider-conformance-cases.json"
+    ))
+    .unwrap();
+    let mut manifest = cases[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["capability"] = "test.complete".into();
+    manifest["provides"][0]["contract"]["version"] = "1.0".into();
+    manifest["provides"][0]["contract"]["contract_hash"] = contract_hash.clone().into();
+    manifest["provides"][0]["conformance"]["suite"] = "suite:test".into();
+    manifest["provides"][0]["conformance"]["suite_hash"] = SUITE_HASH.into();
+    manifest["provides"][0]["effect_classes"] = json!(["PURE"]);
+    manifest["provides"][0]["authority"]["actions"] = json!([]);
+    manifest["provides"][0]["authority"]["resource_classes"] = json!([]);
+    let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let registration = ProviderStore::initialize(&mut manager.connection)
+        .unwrap()
+        .register(
+            &registry,
+            &serde_json::to_vec(&manifest).unwrap(),
+            build,
+            ProviderTrustStatus::LocallyTrusted,
+            TEST_TIME,
+        )
+        .unwrap();
+    let evidence = |id: &str, result: &str, at: &str| {
+        json!({
+            "schema_version": "0.1", "result_id": id,
+            "provider_id": registration.provider_id, "provider_version": registration.provider_version,
+            "provider_build_identity": {"kind": "build_hash", "value": build},
+            "semantic_capability_ref": "test.complete@1", "semantic_contract_version": "1.0",
+            "semantic_contract_hash": contract_hash,
+            "conformance_suite": {"id": "suite:test", "version": "0.1", "hash": SUITE_HASH},
+            "harness": {"id": "fixture-harness", "version": "1"},
+            "result": result, "tests_total": 2,
+            "tests_passed": if result == "pass" {2} else {1},
+            "tests_failed": i32::from(result != "pass"),
+            "executed_at": at, "expires_at": "2026-09-20T00:00:00Z"
+        })
+    };
+    let record = |manager: &mut TaskManager, id, result, at| {
+        ProviderStore::initialize(&mut manager.connection)
+            .unwrap()
+            .record_evidence(
+                &registration.registration_id,
+                &serde_json::to_vec(&evidence(id, result, at)).unwrap(),
+            )
+            .unwrap();
+    };
+    record(&mut manager, "E1", "pass", TEST_TIME);
+    ProviderStore::initialize(&mut manager.connection)
+        .unwrap()
+        .enable(&registration.registration_id, TEST_TIME)
+        .unwrap();
+    let mut validation: Value = serde_json::from_str(&manager.connection.query_row(
+        "SELECT result_json FROM validation_results WHERE validation_result_id='validation-completion'",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap()).unwrap();
+    validation["registry_snapshot_id"] = registry.snapshot_id().into();
+    manager.connection.execute("UPDATE validation_results SET registry_snapshot_id=?1,result_json=?2 WHERE validation_result_id='validation-completion'",
+        params![registry.snapshot_id(), canonical_json(&validation).unwrap()]).unwrap();
+    manager.connection.execute("UPDATE semantic_program_revisions SET registry_snapshot_id=?1 WHERE program_id='program-completion'",
+        [registry.snapshot_id()]).unwrap();
+    let base: Value = serde_json::from_str(
+        &manager
+            .connection
+            .query_row(
+                "SELECT binding_json FROM execution_bindings WHERE binding_id='binding-completion'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let insert = |manager: &TaskManager, attempt: i64, pinned: &str| {
+        let binding_id = format!("binding-real-{attempt}");
+        let attempt_id = format!("attempt-real-{attempt}");
+        let allocation_id = format!("allocation-real-{attempt}");
+        let mut receipt = base.clone();
+        receipt["binding_id"] = binding_id.clone().into();
+        receipt["attempt_id"] = attempt_id.clone().into();
+        receipt["attempt"] = attempt.into();
+        receipt["registry_snapshot_id"] = registry.snapshot_id().into();
+        receipt["capability_contract_hash"] = contract_hash.clone().into();
+        receipt["conformance_evidence_id"] = pinned.into();
+        receipt["provider"]["id"] = registration.provider_id.clone().into();
+        receipt["provider"]["version"] = registration.provider_version.clone().into();
+        receipt["provider"]["manifest_hash"] = registration.manifest_hash.clone().into();
+        receipt["provider"]["package_or_build_hash"] = registration.build_hash.clone().into();
+        receipt["outputs"]["report"]["allocation_ref"] = allocation_id.clone().into();
+        manager.connection.execute(
+            "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
+             registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+             provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+             provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+             execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES (?1,?2,'T-completion',?3,?4,'0.1','node-completion','test.complete@1',
+             ?5,?6,?7,?8,?9,?10,?11,'[]','[]','profile:test','{\"locality\":\"local\"}',?12,?13)",
+            params![binding_id,attempt_id,HASH,registry.snapshot_id(),contract_hash,
+                registration.registration_id,registration.provider_id,registration.provider_version,
+                registration.manifest_hash,registration.build_hash,attempt,canonical_json(&receipt).unwrap(),TEST_TIME],
+        ).unwrap();
+        manager.connection.execute(
+            "INSERT INTO artifact_output_allocations(allocation_id,task_id,semantic_program_hash,node_id,
+             binding_id,attempt_id,output_port,expected_semantic_type,sensitivity,retention,state,created_at,expires_at)
+             VALUES (?1,'T-completion',?2,'node-completion',?3,?4,'report','artifact.report@1',
+             'local','task','ALLOCATED',?5,'2026-09-20T00:00:00Z')",
+            params![allocation_id,HASH,binding_id,attempt_id,TEST_TIME],
+        ).unwrap();
+        binding_id
+    };
+    let valid =
+        |manager: &mut TaskManager, binding_id: &str, attempt_id: &str, checked_at: &str| {
+            let transaction = manager.connection.transaction().unwrap();
+            binding_grants_valid(
+                &transaction,
+                &BindingGrantCheck {
+                    task_id: "T-completion",
+                    semantic_hash: HASH,
+                    node_id: "node-completion",
+                    binding_id,
+                    attempt_id,
+                    grant_refs_json: "[]",
+                    checked_at,
+                },
+            )
+            .unwrap()
+        };
+    let first = insert(&manager, 2, "E1");
+    assert!(valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.250Z"
+    ));
+    record(&mut manager, "E2", "pass", "2026-09-19T00:00:00.500Z");
+    assert!(!valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    let second = insert(&manager, 3, "E2");
+    assert!(valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    record(&mut manager, "E3", "fail", "2026-09-19T00:00:00.875Z");
+    assert!(!valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.900Z"
+    ));
+    let stored: String = manager
+        .connection
+        .query_row(
+            "SELECT binding_json FROM execution_bindings WHERE binding_id=?1",
+            [&first],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap()["conformance_evidence_id"],
+        "E1"
+    );
 }
 
 #[test]

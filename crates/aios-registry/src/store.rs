@@ -504,12 +504,15 @@ impl<'a> RegistryStore<'a> {
 
     pub fn set_snapshot_state(&mut self, snapshot_id: &str, state: SnapshotState) -> Result<()> {
         // State changes never delete historical content or rewrite Task evidence.
-        self.open_snapshot(snapshot_id)?;
-        let current: String = self.connection.query_row(
-            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
-            [snapshot_id],
-            |row| row.get(0),
-        )?;
+        let current: String = self
+            .connection
+            .query_row(
+                "SELECT a.state FROM registry_snapshot_admissions a JOIN registry_snapshots s USING(snapshot_id) WHERE a.snapshot_id=?1",
+                [snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(RegistryStoreError::NotAdmitted)?;
         let allowed = match current.as_str() {
             "ADMITTED" => true,
             "DEPRECATED" => matches!(
@@ -524,6 +527,11 @@ impl<'a> RegistryStore<'a> {
             return Err(RegistryStoreError::Conflict(
                 "snapshot state transition would reverse restriction",
             ));
+        }
+        // A corrupt admission must still be containable. Only states eligible
+        // for ordinary use require a successful strict reopen before changing.
+        if matches!(state, SnapshotState::Admitted | SnapshotState::Deprecated) {
+            self.open_snapshot(snapshot_id)?;
         }
         let affected = self.connection.execute(
             "UPDATE registry_snapshot_admissions SET state=?2 WHERE snapshot_id=?1 AND state=?3",
@@ -1012,6 +1020,98 @@ mod tests {
             [],
         ).unwrap();
         assert!(store.open_snapshot(&id).is_err());
+    }
+
+    #[test]
+    fn corrupt_admission_can_be_contained_without_rewriting_history() {
+        for containment in [SnapshotState::Quarantined, SnapshotState::Revoked] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            baseline(&connection);
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let id = store.admit_registry(&fixture_registry()).unwrap();
+            let original_manifest: String = store
+                .connection
+                .query_row(
+                    "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let activation = store.activate_default("user", "u1", None, &id).unwrap();
+            store
+                .connection
+                .execute_batch("DROP TRIGGER immutable_semantic_capability_contracts_update")
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE semantic_capability_contracts SET contract_json='{}' WHERE semantic_id='artifact.hash'",
+                    [],
+                )
+                .unwrap();
+
+            assert!(store.open_snapshot(&id).is_err());
+            assert!(
+                store
+                    .set_snapshot_state(&id, SnapshotState::Deprecated)
+                    .is_err()
+            );
+            assert!(store.activate_default("user", "u2", None, &id).is_err());
+            let state: String = store
+                .connection
+                .query_row(
+                    "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "ADMITTED");
+
+            store.set_snapshot_state(&id, containment).unwrap();
+            assert!(store.default_snapshot("user", "u1").unwrap().is_none());
+            assert_eq!(
+                store.activation_pointer("user", "u1").unwrap(),
+                Some(activation)
+            );
+            assert!(store.open_snapshot(&id).is_err());
+            let retained: (String, String, String) = store
+                .connection
+                .query_row(
+                    "SELECT s.manifest_json, a.state, c.contract_json FROM registry_snapshots s JOIN registry_snapshot_admissions a USING(snapshot_id) JOIN registry_snapshot_entries e USING(snapshot_id) JOIN semantic_capability_contracts c ON c.content_hash=e.content_hash WHERE s.snapshot_id=?1 AND e.semantic_id='artifact.hash'",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                retained,
+                (
+                    original_manifest,
+                    containment.as_str().to_owned(),
+                    "{}".to_owned()
+                )
+            );
+            if containment == SnapshotState::Quarantined {
+                store
+                    .set_snapshot_state(&id, SnapshotState::Revoked)
+                    .unwrap();
+                assert!(
+                    store
+                        .set_snapshot_state(&id, SnapshotState::Admitted)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cannot_contain_unadmitted_snapshot() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        baseline(&connection);
+        let mut store = RegistryStore::initialize(&mut connection).unwrap();
+        assert!(matches!(
+            store.set_snapshot_state("missing", SnapshotState::Revoked),
+            Err(RegistryStoreError::NotAdmitted)
+        ));
     }
 
     #[test]

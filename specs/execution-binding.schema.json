@@ -36,6 +36,7 @@
     "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*@(?:0|[1-9][0-9]*)$"},
     "capability_contract_hash": {"type": ["string", "null"], "pattern": "^(?:sha256:[a-f0-9]{64})?$"},
+    "conformance_evidence_id": {"type": "string", "minLength": 1, "maxLength": 256},
     "provider": {
       "type": "object",
       "additionalProperties": false,

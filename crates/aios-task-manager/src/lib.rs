@@ -6383,6 +6383,16 @@ fn verified_provider_admission(
     if binding_claim_matches != 1 {
         return Ok(false);
     }
+    let origin_state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+            [&snapshot_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !matches!(origin_state.as_deref(), Some("ADMITTED" | "DEPRECATED")) {
+        return Ok(false);
+    }
     let Some(origin_registry) = load_admitted_semantic_registry(transaction, &snapshot_id)? else {
         return Ok(false);
     };
@@ -6504,7 +6514,19 @@ fn admitted_suite_version(
     Ok(contract.conformance.suite_version.clone())
 }
 
-fn binding_json_matches(binding: &BindingEvidence, check: &BindingGrantCheck<'_>) -> Result<bool> {
+fn conformance_pin_matches(value: &Value, latest_id: &str, required: bool) -> bool {
+    match value.get("conformance_evidence_id") {
+        Some(Value::String(pinned)) => pinned == latest_id,
+        None => !required,
+        _ => false,
+    }
+}
+
+fn binding_json_matches(
+    binding: &BindingEvidence,
+    check: &BindingGrantCheck<'_>,
+    require_pin: bool,
+) -> Result<bool> {
     let value: Value = serde_json::from_str(&binding.binding_json)?;
     if canonical_json(&value)? != binding.binding_json {
         return Ok(false);
@@ -6513,7 +6535,8 @@ fn binding_json_matches(binding: &BindingEvidence, check: &BindingGrantCheck<'_>
     let grant_refs: Value = serde_json::from_str(&binding.grant_refs_json)?;
     let placement: Value = serde_json::from_str(&binding.placement_json)?;
     Ok(
-        value.get("schema_version").and_then(Value::as_str) == Some(SCHEMA_VERSION)
+        conformance_pin_matches(&value, &binding.conformance_evidence_id, require_pin)
+            && value.get("schema_version").and_then(Value::as_str) == Some(SCHEMA_VERSION)
             && value.get("binding_id").and_then(Value::as_str) == Some(check.binding_id)
             && value.get("attempt_id").and_then(Value::as_str) == Some(check.attempt_id)
             && value.get("task_id").and_then(Value::as_str) == Some(check.task_id)
@@ -6731,7 +6754,7 @@ fn binding_grants_valid(
     };
     if binding.provider_registration_id.is_none()
         || binding.grant_refs_json != check.grant_refs_json
-        || !binding_json_matches(&binding, check)?
+        || !binding_json_matches(&binding, check, has_provider_store)?
         || (has_provider_store && !verified_provider_admission(transaction, &binding)?)
     {
         return Ok(false);

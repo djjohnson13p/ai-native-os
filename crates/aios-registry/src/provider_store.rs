@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use aios_contracts::{CapabilityContract, CapabilityManifest, RegistrySnapshot, TypeContract};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -188,6 +188,33 @@ impl<'a> ProviderStore<'a> {
             validate_provider_manifest(registry, &manifest, ProviderConformanceOptions::default());
         if !report.valid || report.bootstrap_contract_hash_bypass_used {
             return Err(ProviderStoreError::StaticCompatibility(report));
+        }
+        // A static declaration can match a contract whose optional suite
+        // identity is incomplete. Such a claim can never produce schema-valid,
+        // exact conformance evidence, so do not admit the build.
+        for claim in &manifest.provides {
+            let major = crate::FullVersion::parse(&claim.contract.version)
+                .map_err(|_| ProviderStoreError::Invalid("provider contract version is invalid"))?
+                .major;
+            let contract = registry
+                .capability_contract(&claim.contract.capability, major)
+                .ok_or(ProviderStoreError::Invalid("provider contract is absent"))?;
+            if contract
+                .conformance
+                .suite_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+                || contract
+                    .conformance
+                    .suite_hash
+                    .as_deref()
+                    .is_none_or(|hash| !is_sha256_id(hash))
+                || claim.conformance.suite_hash != contract.conformance.suite_hash
+            {
+                return Err(ProviderStoreError::Invalid(
+                    "complete suite version and hash are required for registration",
+                ));
+            }
         }
         let manifest_json = canonical_text(&value)?;
         let manifest_hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", manifest_json.as_bytes());
@@ -445,7 +472,7 @@ impl<'a> ProviderStore<'a> {
             "SELECT r.registration_id FROM provider_registrations r
              JOIN provider_manifest_payloads m ON m.registration_id=r.registration_id
              JOIN registry_snapshot_admissions a ON a.snapshot_id=r.registry_snapshot_id
-             WHERE r.state='registered'
+             WHERE r.state='registered' AND a.state IN ('ADMITTED','DEPRECATED')
                AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')
              ORDER BY r.registration_id",
         )?;
@@ -508,8 +535,13 @@ impl<'a> ProviderStore<'a> {
         {
             return Err(ProviderStoreError::Invalid("invalid health observation"));
         }
-        let old: Option<String> = self
+        // BEGIN IMMEDIATE holds the SQLite write lock across the read and
+        // update. OffsetDateTime compares full nanosecond precision even when
+        // callers use different RFC 3339 timezone offsets.
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: Option<String> = transaction
             .query_row(
                 "SELECT checked_at FROM provider_health_observations WHERE registration_id=?1",
                 [registration_id],
@@ -518,11 +550,13 @@ impl<'a> ProviderStore<'a> {
             .optional()?;
         if old
             .as_deref()
-            .is_some_and(|old| parse_time(old).is_ok_and(|time| time > checked))
+            .map(parse_time)
+            .transpose()?
+            .is_some_and(|time| time > checked)
         {
             return Ok(());
         }
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO provider_health_observations(registration_id,status,checked_at,reason)
              VALUES (?1,?2,?3,?4) ON CONFLICT(registration_id) DO UPDATE SET
              status=excluded.status,checked_at=excluded.checked_at,reason=excluded.reason",
@@ -533,6 +567,7 @@ impl<'a> ProviderStore<'a> {
                 health.reason
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn health(&self, registration_id: &str) -> Result<Option<ProviderHealth>> {
@@ -1362,6 +1397,56 @@ mod tests {
         )
         .unwrap()
     }
+    fn missing_suite_identity(first: &SemanticRegistry, missing_version: bool) -> SemanticRegistry {
+        let mut snapshot = first.snapshot().clone();
+        let types = first.type_contracts().cloned().collect::<Vec<_>>();
+        let mut capabilities = first.capability_contracts().cloned().collect::<Vec<_>>();
+        let contract = capabilities
+            .iter_mut()
+            .find(|contract| contract.capability == "artifact.hash")
+            .unwrap();
+        if missing_version {
+            contract.conformance.suite_version = None;
+        } else {
+            contract.conformance.suite_hash = None;
+        }
+        let hash = crate::capability_contract_hash(contract)
+            .unwrap()
+            .to_string();
+        snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == "artifact.hash")
+            .unwrap()
+            .content_hash = hash;
+        let entry_view = |entry: &aios_contracts::ContractRef| crate::SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        snapshot.snapshot_id = crate::registry_snapshot_id(
+            &snapshot.schema_version,
+            &snapshot
+                .type_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+            &snapshot
+                .capability_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+        SemanticRegistry::from_records(
+            snapshot,
+            types,
+            capabilities,
+            RegistryBuildOptions::default(),
+        )
+        .unwrap()
+    }
     fn evidence(manifest: &Value, build: &str, result: &str) -> Value {
         let claim = &manifest["provides"][0];
         json!({
@@ -1723,6 +1808,100 @@ mod tests {
     }
 
     #[test]
+    fn registration_rejects_contracts_without_evidence_ready_suite_identity() {
+        let (mut connection, first) = setup();
+        for missing_version in [false, true] {
+            let incomplete = missing_suite_identity(&first, missing_version);
+            RegistryStore::initialize(&mut connection)
+                .unwrap()
+                .admit_registry(&incomplete)
+                .unwrap();
+            let mut manifest = manifest(&incomplete);
+            if !missing_version {
+                manifest["provides"][0]["conformance"]["suite_hash"] = Value::Null;
+            }
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            assert!(matches!(
+                store.register(
+                    &incomplete,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW
+                ),
+                Err(ProviderStoreError::Invalid(
+                    "complete suite version and hash are required for registration"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn concurrent_health_writes_keep_latest_instant_at_nanosecond_precision() {
+        use std::sync::{Arc, Barrier};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("provider-health.db");
+        let (_, registry) = setup();
+        let registration_id = {
+            let mut connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+                .unwrap();
+            RegistryStore::initialize(&mut connection)
+                .unwrap()
+                .admit_registry(&registry)
+                .unwrap();
+            ProviderStore::initialize(&mut connection)
+                .unwrap()
+                .register(
+                    &registry,
+                    &bytes(&manifest(&registry)),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap()
+                .registration_id
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for (status, checked_at) in [
+            ("degraded", "2026-09-22T12:00:00.123456788Z"),
+            ("ready", "2026-09-22T05:00:00.123456789-07:00"),
+        ] {
+            let barrier = Arc::clone(&barrier);
+            let database = database.clone();
+            let registration_id = registration_id.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut connection = Connection::open(database).unwrap();
+                let mut store = ProviderStore::initialize(&mut connection).unwrap();
+                barrier.wait();
+                store
+                    .observe_health(
+                        &registration_id,
+                        &ProviderHealth {
+                            status: status.into(),
+                            checked_at: checked_at.into(),
+                            reason: None,
+                        },
+                    )
+                    .unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut connection = Connection::open(&database).unwrap();
+        let store = ProviderStore::initialize(&mut connection).unwrap();
+        assert_eq!(
+            store.health(&registration_id).unwrap().unwrap().status,
+            "ready"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn same_build_is_reused_across_snapshots_with_unchanged_claimed_contract() {
         let (mut connection, first) = setup();
         let second = snapshot_change(&first, "table.normalize");
@@ -1800,25 +1979,33 @@ mod tests {
             );
             original
         };
-        RegistryStore::initialize(&mut connection)
-            .unwrap()
-            .set_snapshot_state(first.snapshot_id(), SnapshotState::Revoked)
-            .unwrap();
-        let mut store = ProviderStore::initialize(&mut connection).unwrap();
-        assert_eq!(
-            store
-                .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+        for (state, visible) in [
+            (SnapshotState::Deprecated, 1),
+            (SnapshotState::Quarantined, 0),
+            (SnapshotState::Revoked, 0),
+        ] {
+            RegistryStore::initialize(&mut connection)
                 .unwrap()
-                .len(),
-            1
-        );
-        store.revoke(&original.registration_id, NOW).unwrap();
-        assert!(
-            store
-                .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
-                .unwrap()
-                .is_empty()
-        );
+                .set_snapshot_state(first.snapshot_id(), state)
+                .unwrap();
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            assert_eq!(
+                store
+                    .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+                    .unwrap()
+                    .len(),
+                visible
+            );
+            if state == SnapshotState::Revoked {
+                store.revoke(&original.registration_id, NOW).unwrap();
+                assert!(
+                    store
+                        .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[test]
