@@ -68,3 +68,68 @@ BEGIN SELECT RAISE(ABORT, 'registry snapshot entry is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS immutable_registry_snapshot_admissions_delete
 BEFORE DELETE ON registry_snapshot_admissions
 BEGIN SELECT RAISE(ABORT, 'registry admission cannot be deleted'); END;
+
+-- Admission can become more restrictive, but containment cannot be undone by
+-- direct SQL. Same-state writes are harmless; snapshot identity is immutable.
+CREATE TRIGGER IF NOT EXISTS one_way_registry_snapshot_admissions_update
+BEFORE UPDATE ON registry_snapshot_admissions
+WHEN NEW.snapshot_id IS NOT OLD.snapshot_id OR NOT (
+    NEW.state = OLD.state
+    OR OLD.state = 'ADMITTED'
+    OR (OLD.state = 'DEPRECATED' AND NEW.state IN ('QUARANTINED','REVOKED'))
+    OR (OLD.state = 'QUARANTINED' AND NEW.state = 'REVOKED')
+)
+BEGIN SELECT RAISE(ABORT, 'registry admission restriction cannot be reversed'); END;
+
+-- REPLACE is a DELETE+INSERT in SQLite, and DELETE triggers need not fire for
+-- that conflict action. Do not permit a second INSERT for an admitted identity.
+CREATE TRIGGER IF NOT EXISTS immutable_registry_snapshot_admissions_reinsert
+BEFORE INSERT ON registry_snapshot_admissions
+WHEN EXISTS (
+    SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
+)
+BEGIN SELECT RAISE(ABORT, 'registry admission cannot be replaced'); END;
+
+-- SQLite REPLACE need not fire DELETE triggers. Protect every immutable row
+-- against a duplicate identity INSERT before conflict handling can replace it.
+CREATE TRIGGER IF NOT EXISTS immutable_admitted_registry_snapshots_reinsert
+BEFORE INSERT ON registry_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM registry_snapshots s
+    JOIN registry_snapshot_admissions a USING(snapshot_id)
+    WHERE s.snapshot_id IS NEW.snapshot_id
+)
+BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot cannot be replaced'); END;
+
+-- An unadmitted row also cannot use UPDATE OR REPLACE to take an admitted ID.
+CREATE TRIGGER IF NOT EXISTS immutable_admitted_registry_snapshots_target_update
+BEFORE UPDATE ON registry_snapshots
+WHEN NEW.snapshot_id IS NOT OLD.snapshot_id AND EXISTS (
+    SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
+)
+BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot cannot be replaced'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_semantic_type_contracts_reinsert
+BEFORE INSERT ON semantic_type_contracts
+WHEN EXISTS (
+    SELECT 1 FROM semantic_type_contracts WHERE content_hash IS NEW.content_hash
+)
+BEGIN SELECT RAISE(ABORT, 'semantic type contract cannot be replaced'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_semantic_capability_contracts_reinsert
+BEFORE INSERT ON semantic_capability_contracts
+WHEN EXISTS (
+    SELECT 1 FROM semantic_capability_contracts WHERE content_hash IS NEW.content_hash
+)
+BEGIN SELECT RAISE(ABORT, 'semantic capability contract cannot be replaced'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_registry_snapshot_entries_reinsert
+BEFORE INSERT ON registry_snapshot_entries
+WHEN EXISTS (
+    SELECT 1 FROM registry_snapshot_entries WHERE
+        snapshot_id IS NEW.snapshot_id
+        AND contract_class IS NEW.contract_class
+        AND semantic_id IS NEW.semantic_id
+        AND major IS NEW.major
+)
+BEGIN SELECT RAISE(ABORT, 'registry snapshot entry cannot be replaced'); END;

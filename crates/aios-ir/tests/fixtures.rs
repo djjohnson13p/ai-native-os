@@ -416,6 +416,28 @@ fn downstream_examples_reference_generated_semantic_identities() {
     }
 }
 
+#[test]
+fn stage1_binding_schema_requires_conformance_evidence_pin() {
+    let specs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../specs");
+    let schema: Value =
+        serde_json::from_slice(&fs::read(specs.join("execution-binding.schema.json")).unwrap())
+            .unwrap();
+    let compiled = jsonschema::validator_for(&schema).unwrap();
+    let binding = fixture_value("execution-binding-import-table.json");
+    assert!(compiled.is_valid(&binding));
+
+    let mut unpinned = binding.clone();
+    unpinned
+        .as_object_mut()
+        .unwrap()
+        .remove("conformance_evidence_id");
+    assert!(!compiled.is_valid(&unpinned));
+
+    let mut empty_pin = binding;
+    empty_pin["conformance_evidence_id"] = "".into();
+    assert!(!compiled.is_valid(&empty_pin));
+}
+
 const PROVIDER_TEST_SUITE_HASH: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 

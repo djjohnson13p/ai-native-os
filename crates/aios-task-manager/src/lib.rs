@@ -814,6 +814,8 @@ impl TaskManager {
         export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        upgrade_stamped_semantic_registry_guard(&mut connection)?;
+        upgrade_stamped_provider_registry_guards(&mut connection)?;
         preflight_migration_state(&connection)?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS task_manager_lease (
@@ -3402,6 +3404,78 @@ fn provenance_stream_id(task_id: &str) -> String {
     aios_provenance::stream_id(task_id).expect("validated Task ID forms a provenance stream")
 }
 
+fn upgrade_stamped_semantic_registry_guard(connection: &mut Connection) -> Result<()> {
+    let has_migrations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !stamped {
+        return Ok(());
+    }
+    let guarded: bool = connection.query_row(
+        "SELECT COUNT(*)=7 FROM sqlite_master WHERE type='trigger' AND name IN ('one_way_registry_snapshot_admissions_update','immutable_registry_snapshot_admissions_reinsert','immutable_admitted_registry_snapshots_reinsert','immutable_admitted_registry_snapshots_target_update','immutable_semantic_type_contracts_reinsert','immutable_semantic_capability_contracts_reinsert','immutable_registry_snapshot_entries_reinsert')",
+        [],
+        |row| row.get(0),
+    )?;
+    if guarded {
+        return Ok(());
+    }
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(TaskManagerError::InvalidRecord(
+            "stamped persistence store failed SQLite integrity verification",
+        ));
+    }
+    aios_registry::RegistryStore::initialize(connection)
+        .map_err(|_| TaskManagerError::InvalidRecord("semantic registry guard upgrade failed"))?;
+    Ok(())
+}
+
+fn upgrade_stamped_provider_registry_guards(connection: &mut Connection) -> Result<()> {
+    let has_migrations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !stamped {
+        return Ok(());
+    }
+    let guarded: bool = connection.query_row(
+        "SELECT COUNT(*)=3 FROM sqlite_master WHERE type='trigger' AND name IN ('provider_registration_no_duplicate_insert','provider_manifest_payload_no_duplicate_insert','provider_evidence_no_duplicate_insert')",
+        [],
+        |row| row.get(0),
+    )?;
+    if guarded {
+        return Ok(());
+    }
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(TaskManagerError::InvalidRecord(
+            "stamped persistence store failed SQLite integrity verification",
+        ));
+    }
+    aios_registry::ProviderStore::initialize(connection)
+        .map_err(|_| TaskManagerError::InvalidRecord("provider registry guard upgrade failed"))?;
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
@@ -3691,6 +3765,13 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 "immutable_registry_snapshot_entries_update",
                 "immutable_registry_snapshot_entries_delete",
                 "immutable_registry_snapshot_admissions_delete",
+                "one_way_registry_snapshot_admissions_update",
+                "immutable_registry_snapshot_admissions_reinsert",
+                "immutable_admitted_registry_snapshots_reinsert",
+                "immutable_admitted_registry_snapshots_target_update",
+                "immutable_semantic_type_contracts_reinsert",
+                "immutable_semantic_capability_contracts_reinsert",
+                "immutable_registry_snapshot_entries_reinsert",
             ] {
                 let present = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
@@ -3710,6 +3791,11 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
             |row| row.get::<_, bool>(0),
         )?;
         if has_provider_registry {
+            if !has_semantic_registry_store {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider registry requires semantic registry migration",
+                ));
+            }
             require_migration_tables(
                 connection,
                 &["provider_health_observations", "provider_manifest_payloads"],
@@ -3722,6 +3808,9 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 ("trigger", "provider_registration_revocation_terminal"),
                 ("trigger", "provider_evidence_immutable_update"),
                 ("trigger", "provider_evidence_immutable_delete"),
+                ("trigger", "provider_registration_no_duplicate_insert"),
+                ("trigger", "provider_manifest_payload_no_duplicate_insert"),
+                ("trigger", "provider_evidence_no_duplicate_insert"),
                 ("index", "ix_provider_conformance_latest"),
             ] {
                 let present = connection.query_row(
@@ -8341,6 +8430,189 @@ mod tests {
                 "provenance event has no identity"
             ))
         ));
+    }
+
+    #[test]
+    fn stamped_semantic_registry_requires_terminal_state_guard() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1','2026-09-19T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+        for trigger in [
+            "one_way_registry_snapshot_admissions_update",
+            "immutable_registry_snapshot_admissions_reinsert",
+            "immutable_admitted_registry_snapshots_reinsert",
+            "immutable_admitted_registry_snapshots_target_update",
+            "immutable_semantic_type_contracts_reinsert",
+            "immutable_semantic_capability_contracts_reinsert",
+            "immutable_registry_snapshot_entries_reinsert",
+        ] {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "semantic registry migration is incomplete"
+                ))
+            ));
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_upgrades_old_stamped_registry_guard() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-stamped-registry.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER one_way_registry_snapshot_admissions_update;
+                 DROP TRIGGER immutable_registry_snapshot_admissions_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_target_update;
+                 DROP TRIGGER immutable_semantic_type_contracts_reinsert;
+                 DROP TRIGGER immutable_semantic_capability_contracts_reinsert;
+                 DROP TRIGGER immutable_registry_snapshot_entries_reinsert;",
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        let restored: bool = reopened.connection.query_row(
+            "SELECT COUNT(*)=7 FROM sqlite_master WHERE type='trigger' AND name IN ('one_way_registry_snapshot_admissions_update','immutable_registry_snapshot_admissions_reinsert','immutable_admitted_registry_snapshots_reinsert','immutable_admitted_registry_snapshots_target_update','immutable_semantic_type_contracts_reinsert','immutable_semantic_capability_contracts_reinsert','immutable_registry_snapshot_entries_reinsert')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(restored);
+        let after: (String, String) = reopened
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, after);
+    }
+
+    #[test]
+    fn stamped_provider_registry_requires_semantic_registry_stamp() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1','2026-09-19T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provider registry requires semantic registry migration"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stamped_provider_registry_requires_duplicate_insert_guards() {
+        let mut manager = test_manager();
+        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
+        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        for trigger in [
+            "provider_registration_no_duplicate_insert",
+            "provider_manifest_payload_no_duplicate_insert",
+            "provider_evidence_no_duplicate_insert",
+        ] {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "provider registry migration is incomplete"
+                ))
+            ));
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_upgrades_old_stamped_provider_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-stamped-provider.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
+        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provider_registration_no_duplicate_insert;
+                 DROP TRIGGER provider_manifest_payload_no_duplicate_insert;
+                 DROP TRIGGER provider_evidence_no_duplicate_insert;",
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        let restored: bool = reopened.connection.query_row(
+            "SELECT COUNT(*)=3 FROM sqlite_master WHERE type='trigger' AND name IN ('provider_registration_no_duplicate_insert','provider_manifest_payload_no_duplicate_insert','provider_evidence_no_duplicate_insert')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(restored);
+        let after: (String, String) = reopened
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, after);
     }
 
     #[test]

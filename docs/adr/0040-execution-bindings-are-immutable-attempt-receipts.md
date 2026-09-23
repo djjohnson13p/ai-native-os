@@ -17,6 +17,8 @@ For v0.1, an Execution Binding is an immutable attempt-specific record.
 
 Once an attempt begins, its binding's provider, input/output refs, authority-grant refs, execution profile, placement, and attempt identity are not rewritten.
 
+For Stage-1 provider admission, the binding also records the selected conformance evidence ID. The v0.1 Stage-1 schema requires this pin so a schema-valid new receipt cannot omit the evidence that launch checks. Refreshing conformance evidence requires a new attempt and binding.
+
 A material runtime change requires:
 
 ```text
@@ -54,6 +56,8 @@ A new provider cannot inherit an old provider's binding/grant merely because it 
 ## Compatibility impact
 
 This affects only pre-v1 runtime contracts. It does not alter AIOS IR semantic identity.
+
+Earlier unpinned receipts are historical data for unstamped stores; they cannot be newly admitted under the Stage-1 binding schema. The fixture and schema are tightened together because the Stage-1 spike exposed the mismatch between schema validity and launch eligibility.
 
 ## Related
 

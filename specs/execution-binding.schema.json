@@ -15,6 +15,7 @@
     "ir_version",
     "node_id",
     "capability",
+    "conformance_evidence_id",
     "provider",
     "inputs",
     "outputs",

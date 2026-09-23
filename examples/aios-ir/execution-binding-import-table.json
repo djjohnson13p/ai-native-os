@@ -9,6 +9,7 @@
   "node_id": "import_table",
   "capability": "table.import@1",
   "capability_contract_hash": "sha256:b6ab9313d952be9ee69e1fa240f17032a7a71b2e15c5d413077ce106570710c6",
+  "conformance_evidence_id": "evidence-demo-table-import-attempt-1",
   "provider": {
     "id": "org.ainative.provider.table-import",
     "version": "0.1.0",

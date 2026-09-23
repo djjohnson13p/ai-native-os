@@ -21,6 +21,8 @@ use crate::{
 };
 
 const MIGRATION_ID: &str = "0012_semantic_registry_store";
+// This is a draft migration stamp, not a digest of the SQL file. Keep it stable
+// while adding the admission guard to existing Issue #2 databases.
 const MIGRATION_CHECKSUM: &str = "semantic-registry-store-v0.1";
 const STORE_OBJECTS: &[(&str, &str)] = &[
     ("table", "semantic_type_contracts"),
@@ -121,6 +123,32 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
             |row| row.get(0),
         )?;
         if present != stamped {
+            return Err(RegistryStoreError::Conflict(
+                "semantic registry migration is incomplete or unstamped",
+            ));
+        }
+    }
+    preflight_admission_guards(connection, stamped)
+}
+
+fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<()> {
+    // Older stores have the 0012 stamp but predate the admission guards.
+    // Their absence is upgraded below; a guard without the stamp is incomplete.
+    for guard in [
+        "one_way_registry_snapshot_admissions_update",
+        "immutable_registry_snapshot_admissions_reinsert",
+        "immutable_admitted_registry_snapshots_reinsert",
+        "immutable_admitted_registry_snapshots_target_update",
+        "immutable_semantic_type_contracts_reinsert",
+        "immutable_semantic_capability_contracts_reinsert",
+        "immutable_registry_snapshot_entries_reinsert",
+    ] {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+            [guard],
+            |row| row.get(0),
+        )?;
+        if present && !stamped {
             return Err(RegistryStoreError::Conflict(
                 "semantic registry migration is incomplete or unstamped",
             ));
@@ -257,10 +285,12 @@ impl<'a> RegistryStore<'a> {
                 |row| row.get(0),
             )
             .optional()?;
+        // CREATE IF NOT EXISTS upgrades already-stamped 0012 stores with the
+        // admission guards while preserving all rows and identities.
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))?;
         if existing.is_none() {
-            transaction.execute_batch(include_str!(
-                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
-            ))?;
             transaction.execute(
                 "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 params![MIGRATION_ID, MIGRATION_CHECKSUM],
@@ -306,7 +336,7 @@ impl<'a> RegistryStore<'a> {
             )?;
         }
         transaction.execute(
-            "INSERT OR IGNORE INTO registry_snapshot_admissions(snapshot_id,state) VALUES (?1,'ADMITTED')",
+            "INSERT INTO registry_snapshot_admissions(snapshot_id,state) SELECT ?1,'ADMITTED' WHERE NOT EXISTS (SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id=?1)",
             [&snapshot_id],
         )?;
         for contract in registry.type_contracts() {
@@ -646,10 +676,10 @@ fn insert_contract(
 ) -> Result<()> {
     let sql = match table {
         "semantic_type_contracts" => {
-            "INSERT OR IGNORE INTO semantic_type_contracts(content_hash,semantic_id,full_version,contract_json) VALUES (?1,?2,?3,?4)"
+            "INSERT INTO semantic_type_contracts(content_hash,semantic_id,full_version,contract_json) SELECT ?1,?2,?3,?4 WHERE NOT EXISTS (SELECT 1 FROM semantic_type_contracts WHERE content_hash=?1)"
         }
         "semantic_capability_contracts" => {
-            "INSERT OR IGNORE INTO semantic_capability_contracts(content_hash,semantic_id,full_version,contract_json) VALUES (?1,?2,?3,?4)"
+            "INSERT INTO semantic_capability_contracts(content_hash,semantic_id,full_version,contract_json) SELECT ?1,?2,?3,?4 WHERE NOT EXISTS (SELECT 1 FROM semantic_capability_contracts WHERE content_hash=?1)"
         }
         _ => return Err(RegistryStoreError::Conflict("unknown contract table")),
     };
@@ -706,7 +736,7 @@ fn insert_entry(
     let major = i64::try_from(major)
         .map_err(|_| RegistryStoreError::Conflict("semantic major exceeds SQLite integer range"))?;
     transaction.execute(
-        "INSERT OR IGNORE INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) VALUES (?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) SELECT ?1,?2,?3,?4,?5,?6 WHERE NOT EXISTS (SELECT 1 FROM registry_snapshot_entries WHERE snapshot_id=?1 AND contract_class=?2 AND semantic_id=?3 AND major=?4)",
         params![snapshot_id,class,id,major,version,hash],
     )?;
     let stored: (String,String) = transaction.query_row(
@@ -883,6 +913,146 @@ mod tests {
     }
 
     #[test]
+    fn direct_sql_cannot_reverse_containment_or_restore_a_default_after_reopen() {
+        for contained_state in [SnapshotState::Quarantined, SnapshotState::Revoked] {
+            let temp = tempfile::tempdir().unwrap();
+            let database = temp.path().join("control.db");
+            let (id, activation) = {
+                let mut connection = Connection::open(&database).unwrap();
+                baseline(&connection);
+                let mut store = RegistryStore::initialize(&mut connection).unwrap();
+                let id = store.admit_registry(&fixture_registry()).unwrap();
+                let activation = store.activate_default("user", "u1", None, &id).unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE registry_snapshot_admissions SET state=?2 WHERE snapshot_id=?1",
+                        params![id, contained_state.as_str()],
+                    )
+                    .unwrap();
+                for attempted_state in ["ADMITTED", "DEPRECATED"] {
+                    assert!(store.connection.execute(
+                        "UPDATE registry_snapshot_admissions SET state=?2 WHERE snapshot_id=?1",
+                        params![id, attempted_state],
+                    ).is_err(), "{contained_state:?} -> {attempted_state}");
+                    assert!(store.connection.execute(
+                        "INSERT OR REPLACE INTO registry_snapshot_admissions(snapshot_id,state) VALUES (?1,?2)",
+                        params![id, attempted_state],
+                    ).is_err(), "REPLACE {contained_state:?} -> {attempted_state}");
+                }
+                assert!(store.default_snapshot("user", "u1").unwrap().is_none());
+                (id, activation)
+            };
+
+            let mut connection = Connection::open(&database).unwrap();
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            assert_eq!(
+                store.activation_pointer("user", "u1").unwrap(),
+                Some(activation.clone())
+            );
+            assert!(store.default_snapshot("user", "u1").unwrap().is_none());
+            assert_eq!(store.open_snapshot(&id).unwrap().snapshot_id(), id);
+            assert!(matches!(
+                store.activate_default("user", "u1", Some(activation.revision), &id),
+                Err(RegistryStoreError::NotActivatable)
+            ));
+            let state: String = store
+                .connection
+                .query_row(
+                    "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, contained_state.as_str());
+        }
+    }
+
+    #[test]
+    fn upgrades_stamped_0012_store_with_missing_guards_without_rewriting_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let id = {
+            let mut connection = Connection::open(&database).unwrap();
+            baseline(&connection);
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let id = store.admit_registry(&fixture_registry()).unwrap();
+            store
+                .set_snapshot_state(&id, SnapshotState::Quarantined)
+                .unwrap();
+            store
+                .connection
+                .execute_batch("DROP TRIGGER one_way_registry_snapshot_admissions_update")
+                .unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER immutable_registry_snapshot_admissions_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_target_update;
+                 DROP TRIGGER immutable_semantic_type_contracts_reinsert;
+                 DROP TRIGGER immutable_semantic_capability_contracts_reinsert;
+                 DROP TRIGGER immutable_registry_snapshot_entries_reinsert;",
+                )
+                .unwrap();
+            id
+        };
+
+        let mut connection = Connection::open(&database).unwrap();
+        let store = RegistryStore::initialize(&mut connection).unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE registry_snapshot_admissions SET state='ADMITTED' WHERE snapshot_id=?1",
+                    [&id],
+                )
+                .is_err()
+        );
+        assert!(store.connection.execute(
+            "INSERT OR REPLACE INTO registry_snapshot_admissions(snapshot_id,state) VALUES (?1,'ADMITTED')",
+            [&id],
+        ).is_err());
+        let original_manifest: String = store
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(store.connection.execute(
+            "INSERT OR REPLACE INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES (?1,'{}','2026-09-19T00:00:00Z')",
+            [&id],
+        ).is_err());
+        let retained_manifest: String = store
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_manifest, original_manifest);
+        let retained: (String, String) = store.connection.query_row(
+            "SELECT s.snapshot_id,a.state FROM registry_snapshots s JOIN registry_snapshot_admissions a USING(snapshot_id) WHERE s.snapshot_id=?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(retained, (id.clone(), "QUARANTINED".to_owned()));
+        assert_eq!(store.open_snapshot(&id).unwrap().snapshot_id(), id);
+        let (count, checksum): (i64, String) = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*),MIN(checksum) FROM schema_migrations WHERE migration_id=?1",
+                [MIGRATION_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, checksum.as_str()), (1, MIGRATION_CHECKSUM));
+    }
+
+    #[test]
     fn same_semantic_identity_accepts_excluded_metadata_without_overwrite() {
         let mut connection = Connection::open_in_memory().unwrap();
         baseline(&connection);
@@ -1003,6 +1173,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks each immutable row before and after direct SQL replacement attempts"
+    )]
+    fn direct_sql_replace_cannot_rewrite_immutable_registry_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let id = {
+            let mut connection = Connection::open(&database).unwrap();
+            baseline(&connection);
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let id = store.admit_registry(&fixture_registry()).unwrap();
+            let snapshot: (String, String) = store
+                .connection
+                .query_row(
+                    "SELECT snapshot_id,manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let type_contract: (String, String, String, String) = store.connection.query_row(
+                "SELECT content_hash,semantic_id,full_version,contract_json FROM semantic_type_contracts ORDER BY content_hash LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            let capability_contract: (String, String, String, String) = store.connection.query_row(
+                "SELECT content_hash,semantic_id,full_version,contract_json FROM semantic_capability_contracts ORDER BY content_hash LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            let entry: (String, String, String, i64, String, String) = store.connection.query_row(
+                "SELECT snapshot_id,contract_class,semantic_id,major,full_version,content_hash FROM registry_snapshot_entries WHERE snapshot_id=?1 ORDER BY contract_class,semantic_id LIMIT 1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).unwrap();
+            let entry_major = entry.3.to_string();
+
+            store.connection.execute(
+                "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES ('unadmitted-update-source','{}','2026-09-19T00:00:00Z')",
+                [],
+            ).unwrap();
+            let update_error = store.connection.execute(
+                "UPDATE OR REPLACE registry_snapshots SET snapshot_id=?1 WHERE snapshot_id='unadmitted-update-source'",
+                [&id],
+            ).unwrap_err();
+            assert!(
+                update_error
+                    .to_string()
+                    .contains("admitted registry snapshot cannot be replaced")
+            );
+
+            for (sql, parameters, reason) in [
+                (
+                    "INSERT OR REPLACE INTO registry_snapshots(snapshot_id,manifest_json,created_at) VALUES (?1,'{}','2026-09-19T00:00:00Z')",
+                    vec![id.as_str()],
+                    "admitted registry snapshot cannot be replaced",
+                ),
+                (
+                    "INSERT OR REPLACE INTO semantic_type_contracts(content_hash,semantic_id,full_version,contract_json) VALUES (?1,?2,'9.9','{}')",
+                    vec![type_contract.0.as_str(), type_contract.1.as_str()],
+                    "semantic type contract cannot be replaced",
+                ),
+                (
+                    "INSERT OR REPLACE INTO semantic_capability_contracts(content_hash,semantic_id,full_version,contract_json) VALUES (?1,?2,'9.9','{}')",
+                    vec![
+                        capability_contract.0.as_str(),
+                        capability_contract.1.as_str(),
+                    ],
+                    "semantic capability contract cannot be replaced",
+                ),
+                (
+                    "INSERT OR REPLACE INTO registry_snapshot_entries(snapshot_id,contract_class,semantic_id,major,full_version,content_hash) VALUES (?1,?2,?3,?4,'9.9',?5)",
+                    vec![
+                        entry.0.as_str(),
+                        entry.1.as_str(),
+                        entry.2.as_str(),
+                        entry_major.as_str(),
+                        entry.5.as_str(),
+                    ],
+                    "registry snapshot entry cannot be replaced",
+                ),
+            ] {
+                let error = store
+                    .connection
+                    .execute(sql, rusqlite::params_from_iter(parameters))
+                    .unwrap_err();
+                assert!(error.to_string().contains(reason), "{error}");
+            }
+            assert_eq!(store.connection.query_row(
+                "SELECT snapshot_id,manifest_json FROM registry_snapshots WHERE snapshot_id=?1", [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap(), snapshot);
+            assert_eq!(store.connection.query_row(
+                "SELECT content_hash,semantic_id,full_version,contract_json FROM semantic_type_contracts WHERE content_hash=?1", [&type_contract.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap(), type_contract);
+            assert_eq!(store.connection.query_row(
+                "SELECT content_hash,semantic_id,full_version,contract_json FROM semantic_capability_contracts WHERE content_hash=?1", [&capability_contract.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap(), capability_contract);
+            assert_eq!(store.connection.query_row(
+                "SELECT snapshot_id,contract_class,semantic_id,major,full_version,content_hash FROM registry_snapshot_entries WHERE snapshot_id=?1 AND contract_class=?2 AND semantic_id=?3 AND major=?4",
+                params![&entry.0, &entry.1, &entry.2, entry.3],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).unwrap(), entry);
+            id
+        };
+
+        let mut connection = Connection::open(&database).unwrap();
+        let store = RegistryStore::initialize(&mut connection).unwrap();
+        assert_eq!(store.open_snapshot(&id).unwrap().snapshot_id(), id);
     }
 
     #[test]

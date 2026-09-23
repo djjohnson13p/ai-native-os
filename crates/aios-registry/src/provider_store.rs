@@ -30,6 +30,8 @@ const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 256 * 1024;
 static MANIFEST_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
     OnceLock::new();
+static REGISTRATION_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+    OnceLock::new();
 static EVIDENCE_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
     OnceLock::new();
 
@@ -108,6 +110,18 @@ pub struct ProviderCandidate {
     pub evidence_id: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct EvidenceProjection {
+    registration_id: String,
+    capability: String,
+    contract_hash: Option<String>,
+    suite_id: Option<String>,
+    suite_hash: Option<String>,
+    status: String,
+    evidence_json: String,
+    tested_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderHealth {
     pub status: String,
@@ -134,6 +148,11 @@ impl<'a> ProviderStore<'a> {
             ));
         }
         preflight_migrations(connection)?;
+        // The provider migration is layered on a complete, stamped semantic
+        // registry. Validate it before any 0013 DDL can be applied.
+        crate::RegistryStore::initialize(connection).map_err(|_| {
+            ProviderStoreError::Conflict("semantic registry migration is incomplete")
+        })?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(include_str!(
             "../../../specs/persistence-v0.1-0013-provider-registry.sql"
@@ -250,25 +269,10 @@ impl<'a> ProviderStore<'a> {
         }
         let registration_json = registration_record(&registration, &manifest, trust, registered_at);
         let registration_json = canonical_text(&registration_json)?;
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO provider_registrations
-             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
-              registry_snapshot_id,state,trust_status,registration_json,registered_at)
-             VALUES (?1,?2,?3,?4,?5,?6,'disabled',?7,?8,?9)",
-            params![
-                registration.registration_id,
-                registration.provider_id,
-                registration.provider_version,
-                registration.manifest_hash,
-                registration.build_hash,
-                registration.snapshot_id,
-                trust.as_str(),
-                registration_json,
-                registered_at
-            ],
-        )?;
-        let stored: ProviderRegistration = transaction.query_row(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<ProviderRegistration> = transaction.query_row(
             "SELECT registration_id,provider_id,provider_version,manifest_hash,package_content_hash,registry_snapshot_id
              FROM provider_registrations WHERE provider_id=?1 AND provider_version=?2 AND package_content_hash=?3",
             params![registration.provider_id,registration.provider_version,registration.build_hash],
@@ -276,7 +280,27 @@ impl<'a> ProviderStore<'a> {
                 registration_id: row.get(0)?,provider_id: row.get(1)?,provider_version: row.get(2)?,
                 manifest_hash: row.get(3)?,build_hash: row.get(4)?,snapshot_id: row.get(5)?,
             }),
-        )?;
+        ).optional()?;
+        if existing.is_none() {
+            transaction.execute(
+                "INSERT INTO provider_registrations
+                 (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+                  registry_snapshot_id,state,trust_status,registration_json,registered_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,'disabled',?7,?8,?9)",
+                params![
+                    registration.registration_id,
+                    registration.provider_id,
+                    registration.provider_version,
+                    registration.manifest_hash,
+                    registration.build_hash,
+                    registration.snapshot_id,
+                    trust.as_str(),
+                    registration_json,
+                    registered_at
+                ],
+            )?;
+        }
+        let stored = existing.unwrap_or_else(|| registration.clone());
         if stored.registration_id != registration.registration_id
             || stored.manifest_hash != registration.manifest_hash
         {
@@ -284,20 +308,28 @@ impl<'a> ProviderStore<'a> {
                 "provider version and build already map to a different manifest",
             ));
         }
-        transaction.execute(
-            "INSERT OR IGNORE INTO provider_manifest_payloads(registration_id,manifest_json) VALUES (?1,?2)",
-            params![stored.registration_id,manifest_json],
-        )?;
-        let stored_manifest: String = transaction.query_row(
-            "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
-            [&stored.registration_id],
-            |row| row.get(0),
-        )?;
-        if stored_manifest != manifest_json {
+        let stored_manifest: Option<String> = transaction
+            .query_row(
+                "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&stored.registration_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored_manifest
+            .as_deref()
+            .is_some_and(|payload| payload != manifest_json)
+        {
             return Err(ProviderStoreError::Conflict(
                 "registration manifest payload differs",
             ));
         }
+        if stored_manifest.is_none() {
+            transaction.execute(
+                "INSERT INTO provider_manifest_payloads(registration_id,manifest_json) VALUES (?1,?2)",
+                params![stored.registration_id,manifest_json],
+            )?;
+        }
+        verify_stored_registration_receipt(&transaction, &stored, &manifest)?;
         transaction.commit()?;
         Ok(stored)
     }
@@ -374,22 +406,26 @@ impl<'a> ProviderStore<'a> {
             }
         }
         let canonical = canonical_text(&evidence)?;
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO provider_conformance_evidence
-             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![id,registration_id,semantic_ref,contract_hash,suite_id,suite_hash,result,canonical,tested_at],
-        )?;
-        let stored: (String,String) = transaction.query_row(
-            "SELECT registration_id,evidence_json FROM provider_conformance_evidence WHERE evidence_id=?1",
-            [&id],
-            |row| Ok((row.get(0)?,row.get(1)?)),
-        )?;
-        if stored != (registration_id.to_owned(), canonical) {
-            return Err(ProviderStoreError::Conflict(
-                "evidence ID already maps to different evidence",
-            ));
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected = EvidenceProjection {
+            registration_id: registration_id.to_owned(),
+            capability: semantic_ref.to_owned(),
+            contract_hash: Some(contract_hash.to_owned()),
+            suite_id: Some(suite_id.to_owned()),
+            suite_hash: Some(suite_hash.to_owned()),
+            status: result.to_owned(),
+            evidence_json: canonical.clone(),
+            tested_at: Some(tested_at.to_owned()),
+        };
+        if !existing_evidence_matches(&transaction, &id, &expected)? {
+            transaction.execute(
+                "INSERT INTO provider_conformance_evidence
+                 (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![id,registration_id,semantic_ref,contract_hash,suite_id,suite_hash,result,canonical,tested_at],
+            )?;
         }
         transaction.commit()?;
         Ok(id)
@@ -975,6 +1011,10 @@ impl<'a> ProviderStore<'a> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps migration stamps and required schema objects in one fail-closed preflight"
+)]
 fn preflight_migrations(connection: &Connection) -> Result<()> {
     const KNOWN: &[(&str, &str)] = &[
         (
@@ -1035,6 +1075,7 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut stamped = false;
+    let mut semantic_registry_stamped = false;
     for (id, checksum) in migrations {
         let Some((_, expected)) = KNOWN.iter().find(|(known, _)| *known == id) else {
             return Err(ProviderStoreError::Conflict(
@@ -1047,6 +1088,12 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
             ));
         }
         stamped |= id == MIGRATION_ID;
+        semantic_registry_stamped |= id == "0012_semantic_registry_store";
+    }
+    if !semantic_registry_stamped {
+        return Err(ProviderStoreError::Conflict(
+            "semantic registry migration must precede provider registry",
+        ));
     }
     for (kind, name) in [
         ("table", "provider_manifest_payloads"),
@@ -1068,6 +1115,22 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         if present != stamped {
             return Err(ProviderStoreError::Conflict(
                 "provider schema objects and migration stamp disagree",
+            ));
+        }
+    }
+    for guard in [
+        "provider_registration_no_duplicate_insert",
+        "provider_manifest_payload_no_duplicate_insert",
+        "provider_evidence_no_duplicate_insert",
+    ] {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+            [guard],
+            |row| row.get(0),
+        )?;
+        if present && !stamped {
+            return Err(ProviderStoreError::Conflict(
+                "provider guard exists without migration stamp",
             ));
         }
     }
@@ -1189,6 +1252,81 @@ fn registration_record(
         "state": "disabled",
         "registered_at": registered_at,
     })
+}
+
+fn verify_stored_registration_receipt(
+    connection: &Connection,
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+) -> Result<()> {
+    let (receipt_json, registered_at): (String, String) = connection.query_row(
+        "SELECT registration_json,registered_at FROM provider_registrations WHERE registration_id=?1",
+        [&registration.registration_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    parse_time(&registered_at)?;
+    let receipt = parse_document(
+        receipt_json.as_bytes(),
+        MAX_MANIFEST_BYTES,
+        &REGISTRATION_SCHEMA,
+        include_str!("../../../specs/provider-registration.schema.json"),
+    )?;
+    let trust = match receipt.pointer("/trust/status").and_then(Value::as_str) {
+        Some("unverified") => ProviderTrustStatus::Unverified,
+        Some("locally-trusted") => ProviderTrustStatus::LocallyTrusted,
+        Some("project-reviewed") => ProviderTrustStatus::ProjectReviewed,
+        Some("organization-approved") => ProviderTrustStatus::OrganizationApproved,
+        Some("denied") => ProviderTrustStatus::Denied,
+        Some("revoked") => ProviderTrustStatus::Revoked,
+        _ => {
+            return Err(ProviderStoreError::Conflict(
+                "stored registration trust is invalid",
+            ));
+        }
+    };
+    let expected = canonical_text(&registration_record(
+        registration,
+        manifest,
+        trust,
+        &registered_at,
+    ))?;
+    if receipt_json != expected {
+        return Err(ProviderStoreError::Conflict(
+            "stored registration receipt differs from its admitted manifest and identity",
+        ));
+    }
+    Ok(())
+}
+
+fn existing_evidence_matches(
+    connection: &Connection,
+    evidence_id: &str,
+    expected: &EvidenceProjection,
+) -> Result<bool> {
+    let stored: Option<EvidenceProjection> = connection
+        .query_row(
+            "SELECT registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at FROM provider_conformance_evidence WHERE evidence_id=?1",
+            [evidence_id],
+            |row| {
+                Ok(EvidenceProjection {
+                    registration_id: row.get(0)?,
+                    capability: row.get(1)?,
+                    contract_hash: row.get(2)?,
+                    suite_id: row.get(3)?,
+                    suite_hash: row.get(4)?,
+                    status: row.get(5)?,
+                    evidence_json: row.get(6)?,
+                    tested_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    if stored.as_ref().is_some_and(|entry| entry != expected) {
+        return Err(ProviderStoreError::Conflict(
+            "evidence ID already maps to different evidence or projections",
+        ));
+    }
+    Ok(stored.is_some())
 }
 
 #[cfg(test)]
@@ -1805,6 +1943,459 @@ mod tests {
             .execute_batch("DROP TRIGGER provider_evidence_immutable_update")
             .unwrap();
         assert!(ProviderStore::initialize(&mut connection).is_err());
+    }
+
+    #[test]
+    fn provider_migration_requires_complete_stamped_semantic_registry_first() {
+        for stamp_provider in [false, true] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+                .unwrap();
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM',?1)",
+                [NOW],
+            ).unwrap();
+            if stamp_provider {
+                connection
+                    .execute_batch(include_str!(
+                        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                    ))
+                    .unwrap();
+                connection.execute(
+                    "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,?3)",
+                    params![MIGRATION_ID,MIGRATION_CHECKSUM,NOW],
+                ).unwrap();
+            }
+            assert!(matches!(
+                ProviderStore::initialize(&mut connection),
+                Err(ProviderStoreError::Conflict(_))
+            ));
+            let semantic_stamp: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0012_semantic_registry_store'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(semantic_stamp, 0);
+            if !stamp_provider {
+                let provider_stamp: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id=?1",
+                        [MIGRATION_ID],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(provider_stamp, 0);
+            }
+        }
+        let (mut incomplete, _) = setup();
+        incomplete
+            .execute_batch("DROP TRIGGER immutable_registry_snapshot_entries_delete")
+            .unwrap();
+        assert!(matches!(
+            ProviderStore::initialize(&mut incomplete),
+            Err(ProviderStoreError::Conflict(
+                "semantic registry migration is incomplete"
+            ))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn replace_cannot_reset_revocation_or_rewrite_manifest_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("immutable-registration.db");
+        let (_, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&registry)
+            .unwrap();
+        let registration = {
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let registration = store
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .register(
+                        &registry,
+                        &bytes(&manifest),
+                        BUILD_A,
+                        ProviderTrustStatus::LocallyTrusted,
+                        NOW,
+                    )
+                    .unwrap()
+                    .registration_id,
+                registration.registration_id
+            );
+            store.revoke(&registration.registration_id, NOW).unwrap();
+            registration
+        };
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF")
+            .unwrap();
+        let id = &registration.registration_id;
+        let replace = "INSERT OR REPLACE INTO provider_registrations
+            SELECT ?2,provider_id,provider_version,manifest_hash,package_content_hash,
+                   registry_snapshot_id,'disabled',trust_status,registration_json,registered_at
+            FROM provider_registrations WHERE registration_id=?1";
+        assert!(connection.execute(replace, params![id, id]).is_err());
+        let alternate_id =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        assert!(
+            connection
+                .execute(replace, params![id, alternate_id])
+                .is_err()
+        );
+        assert!(connection.execute(
+            "INSERT OR REPLACE INTO provider_manifest_payloads(registration_id,manifest_json)
+             VALUES (?1,'{}')",
+            [id],
+        ).is_err());
+        drop(connection);
+        let mut connection = Connection::open(&database).unwrap();
+        let store = ProviderStore::initialize(&mut connection).unwrap();
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "revoked");
+        assert_eq!(store.connection.query_row(
+            "SELECT COUNT(*) FROM provider_registrations WHERE provider_id=?1 AND provider_version=?2 AND package_content_hash=?3",
+            params![registration.provider_id,registration.provider_version,registration.build_hash],
+            |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+        let payload: String = store
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, canonical_text(&manifest).unwrap());
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn replace_cannot_change_failed_evidence_into_a_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("immutable-evidence.db");
+        let (_, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&registry)
+            .unwrap();
+        let registration = {
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let registration = store
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            let failed = evidence(&manifest, BUILD_A, "fail");
+            store
+                .record_evidence(&registration.registration_id, &bytes(&failed))
+                .unwrap();
+            assert_eq!(
+                store
+                    .record_evidence(&registration.registration_id, &bytes(&failed))
+                    .unwrap(),
+                "evidence-a"
+            );
+            registration
+        };
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF")
+            .unwrap();
+        let passing = evidence(&manifest, BUILD_A, "pass");
+        assert!(
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO provider_conformance_evidence
+             SELECT evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+                    'pass',?2,tested_at
+             FROM provider_conformance_evidence WHERE evidence_id=?1",
+                    params!["evidence-a", canonical_text(&passing).unwrap()],
+                )
+                .is_err()
+        );
+        drop(connection);
+        let mut connection = Connection::open(&database).unwrap();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let (status, payload): (String, String) = store.connection.query_row(
+            "SELECT status,evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-a'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "fail");
+        assert_eq!(
+            payload,
+            canonical_text(&evidence(&manifest, BUILD_A, "fail")).unwrap()
+        );
+        assert!(store.enable(&registration.registration_id, NOW).is_err());
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unstamped_provider_duplicate_guard_is_not_silently_adopted() {
+        for (name, table) in [
+            (
+                "provider_registration_no_duplicate_insert",
+                "provider_registrations",
+            ),
+            (
+                "provider_evidence_no_duplicate_insert",
+                "provider_conformance_evidence",
+            ),
+        ] {
+            let (mut connection, _) = setup();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER {name} BEFORE INSERT ON {table} BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            assert!(matches!(
+                ProviderStore::initialize(&mut connection),
+                Err(ProviderStoreError::Conflict(
+                    "provider guard exists without migration stamp"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn same_evidence_id_rejects_corrupt_legacy_projection() {
+        for (column, changed) in [
+            ("capability", "table.normalize@1"),
+            ("contract_hash", BUILD_B),
+            ("suite_id", "conformance://wrong/1"),
+            ("suite_hash", BUILD_B),
+            ("status", "fail"),
+            ("tested_at", "2026-09-22T11:00:00.500Z"),
+        ] {
+            let (mut connection, registry) = setup();
+            let manifest = manifest(&registry);
+            let result = evidence(&manifest, BUILD_A, "pass");
+            let (registration, id) = {
+                let mut store = ProviderStore::initialize(&mut connection).unwrap();
+                let registration = store
+                    .register(
+                        &registry,
+                        &bytes(&manifest),
+                        BUILD_A,
+                        ProviderTrustStatus::LocallyTrusted,
+                        NOW,
+                    )
+                    .unwrap();
+                let id = store
+                    .record_evidence(&registration.registration_id, &bytes(&result))
+                    .unwrap();
+                (registration, id)
+            };
+            connection
+                .execute_batch("DROP TRIGGER provider_evidence_immutable_update")
+                .unwrap();
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE provider_conformance_evidence SET {column}=?2 WHERE evidence_id=?1"
+                    ),
+                    params![id, changed],
+                )
+                .unwrap();
+            connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            let mut reopened = ProviderStore::initialize(&mut connection).unwrap();
+            assert!(
+                matches!(
+                    reopened.record_evidence(&registration.registration_id, &bytes(&result)),
+                    Err(ProviderStoreError::Conflict(_))
+                ),
+                "{column}"
+            );
+            let retained: String = reopened
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT {column} FROM provider_conformance_evidence WHERE evidence_id=?1"
+                    ),
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, changed, "{column}");
+        }
+    }
+
+    #[test]
+    fn reused_registration_rejects_corrupt_immutable_receipt() {
+        for malformed in [true, false] {
+            let (mut connection, registry) = setup();
+            let manifest = manifest(&registry);
+            let registration = ProviderStore::initialize(&mut connection)
+                .unwrap()
+                .register(
+                    &registry,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            let original: String = connection
+                .query_row(
+                    "SELECT registration_json FROM provider_registrations WHERE registration_id=?1",
+                    [&registration.registration_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let corrupted = if malformed {
+                "{}".to_owned()
+            } else {
+                let mut receipt: Value = serde_json::from_str(&original).unwrap();
+                receipt["capabilities"][0]["contract_hash"] = BUILD_B.into();
+                canonical_text(&receipt).unwrap()
+            };
+            // Model a legacy damaged row, then restore the 0013 immutability
+            // trigger before reopening and attempting same-build reuse.
+            connection
+                .execute_batch("DROP TRIGGER provider_registration_identity_immutable")
+                .unwrap();
+            connection.execute(
+                "UPDATE provider_registrations SET registration_json=?2 WHERE registration_id=?1",
+                params![registration.registration_id,corrupted],
+            ).unwrap();
+            connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            assert!(
+                store
+                    .register(
+                        &registry,
+                        &bytes(&manifest),
+                        BUILD_A,
+                        ProviderTrustStatus::LocallyTrusted,
+                        NOW,
+                    )
+                    .is_err()
+            );
+            let count: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_registrations WHERE registration_id=?1",
+                    [&registration.registration_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn legacy_same_build_retry_rolls_back_new_payload_when_receipt_is_corrupt() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let registration = ProviderStore::initialize(&mut connection)
+            .unwrap()
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        // Model a legacy registration row before 0013 acquired a manifest
+        // payload, with a corrupted immutable admission receipt.
+        connection
+            .execute_batch(
+                "DROP TRIGGER provider_manifest_payload_immutable_delete;
+             DROP TRIGGER provider_registration_identity_immutable;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&registration.registration_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE provider_registrations SET registration_json='{}' WHERE registration_id=?1",
+                [&registration.registration_id],
+            )
+            .unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        assert!(matches!(
+            store.register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            ),
+            Err(ProviderStoreError::Json(_) | ProviderStoreError::Conflict(_))
+        ));
+        let payloads: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payloads, 0, "failed reuse must roll back the new payload");
     }
 
     #[test]

@@ -20,6 +20,10 @@ BEGIN SELECT RAISE(ABORT, 'provider manifest payload is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS provider_manifest_payload_immutable_delete
 BEFORE DELETE ON provider_manifest_payloads
 BEGIN SELECT RAISE(ABORT, 'provider manifest payload cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS provider_manifest_payload_no_duplicate_insert
+BEFORE INSERT ON provider_manifest_payloads
+WHEN EXISTS (SELECT 1 FROM provider_manifest_payloads WHERE registration_id=NEW.registration_id)
+BEGIN SELECT RAISE(ABORT, 'provider manifest payload cannot be replaced'); END;
 
 CREATE TRIGGER IF NOT EXISTS provider_registration_identity_immutable
 BEFORE UPDATE OF registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
@@ -29,6 +33,15 @@ BEGIN SELECT RAISE(ABORT, 'provider registration identity is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS provider_registration_no_delete
 BEFORE DELETE ON provider_registrations
 BEGIN SELECT RAISE(ABORT, 'provider registration cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS provider_registration_no_duplicate_insert
+BEFORE INSERT ON provider_registrations
+WHEN EXISTS (
+    SELECT 1 FROM provider_registrations
+    WHERE registration_id=NEW.registration_id
+       OR (provider_id=NEW.provider_id AND provider_version=NEW.provider_version
+           AND package_content_hash=NEW.package_content_hash)
+)
+BEGIN SELECT RAISE(ABORT, 'provider registration cannot be replaced'); END;
 
 CREATE TRIGGER IF NOT EXISTS provider_registration_revocation_terminal
 BEFORE UPDATE OF state ON provider_registrations
@@ -42,6 +55,10 @@ BEGIN SELECT RAISE(ABORT, 'provider conformance evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS provider_evidence_immutable_delete
 BEFORE DELETE ON provider_conformance_evidence
 BEGIN SELECT RAISE(ABORT, 'provider conformance evidence cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS provider_evidence_no_duplicate_insert
+BEFORE INSERT ON provider_conformance_evidence
+WHEN EXISTS (SELECT 1 FROM provider_conformance_evidence WHERE evidence_id=NEW.evidence_id)
+BEGIN SELECT RAISE(ABORT, 'provider conformance evidence cannot be replaced'); END;
 
 CREATE INDEX IF NOT EXISTS ix_provider_conformance_latest
 ON provider_conformance_evidence(registration_id,capability,contract_hash,suite_id,suite_hash,tested_at);
