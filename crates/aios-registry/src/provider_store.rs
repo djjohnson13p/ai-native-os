@@ -1,0 +1,2065 @@
+//! Durable provider declarations and exact, immutable conformance evidence.
+//!
+//! This control-plane catalog only reports eligible candidates. It does not
+//! execute provider code, choose a provider for a Task, or grant authority.
+//! The immutable `registration_json` is the admission receipt; current lifecycle
+//! state and trust are the separate `provider_registrations` columns.
+
+#![allow(clippy::missing_errors_doc)]
+
+use std::collections::BTreeSet;
+use std::fmt::Write;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use aios_contracts::{CapabilityContract, CapabilityManifest, RegistrySnapshot, TypeContract};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+use crate::{
+    ProviderConformanceOptions, SemanticRegistry, StrictJsonLimits, canonicalize, is_sha256_id,
+    parse_strict_value, validate_provider_manifest,
+};
+
+const MIGRATION_ID: &str = "0013_provider_registry";
+const MIGRATION_CHECKSUM: &str = "provider-registry-v0.1";
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_EVIDENCE_BYTES: usize = 256 * 1024;
+static MANIFEST_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+    OnceLock::new();
+static EVIDENCE_SCHEMA: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+    OnceLock::new();
+
+#[derive(Debug)]
+pub enum ProviderStoreError {
+    Database(rusqlite::Error),
+    Json(String),
+    Invalid(&'static str),
+    StaticCompatibility(crate::ProviderConformanceReport),
+    NotFound,
+    Conflict(&'static str),
+}
+
+impl std::fmt::Display for ProviderStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "provider registry database error: {error}"),
+            Self::Json(error) => write!(f, "provider registry JSON error: {error}"),
+            Self::Invalid(message) => write!(f, "invalid provider registry input: {message}"),
+            Self::StaticCompatibility(_) => {
+                f.write_str("provider manifest is incompatible with the semantic snapshot")
+            }
+            Self::NotFound => f.write_str("provider registration not found"),
+            Self::Conflict(message) => write!(f, "provider registry conflict: {message}"),
+        }
+    }
+}
+impl std::error::Error for ProviderStoreError {}
+impl From<rusqlite::Error> for ProviderStoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+type Result<T> = std::result::Result<T, ProviderStoreError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTrustStatus {
+    Unverified,
+    LocallyTrusted,
+    ProjectReviewed,
+    OrganizationApproved,
+    Denied,
+    Revoked,
+}
+impl ProviderTrustStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::LocallyTrusted => "locally-trusted",
+            Self::ProjectReviewed => "project-reviewed",
+            Self::OrganizationApproved => "organization-approved",
+            Self::Denied => "denied",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRegistration {
+    pub registration_id: String,
+    pub provider_id: String,
+    pub provider_version: String,
+    pub manifest_hash: String,
+    pub build_hash: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCandidate {
+    pub registration: ProviderRegistration,
+    pub requested_snapshot_id: String,
+    pub semantic_capability_ref: String,
+    pub contract_hash: String,
+    pub suite_id: String,
+    pub suite_hash: String,
+    pub evidence_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHealth {
+    pub status: String,
+    pub checked_at: String,
+    pub reason: Option<String>,
+}
+
+pub struct ProviderStore<'a> {
+    connection: &'a mut Connection,
+}
+
+impl<'a> ProviderStore<'a> {
+    /// Open the additive provider schema on an already initialized control-plane DB.
+    pub fn initialize(connection: &'a mut Connection) -> Result<Self> {
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let baseline: Option<String> = connection.query_row(
+            "SELECT checksum FROM schema_migrations WHERE migration_id='0001_v0_1_trusted_control_plane'",
+            [], |row| row.get(0),
+        ).optional()?;
+        if baseline.as_deref() != Some("UNGENERATED-DRAFT-CHECKSUM") {
+            return Err(ProviderStoreError::Conflict(
+                "trusted control-plane baseline is required",
+            ));
+        }
+        preflight_migrations(connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))?;
+        let old: Option<String> = transaction
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE migration_id=?1",
+                [MIGRATION_ID],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if old
+            .as_deref()
+            .is_some_and(|value| value != MIGRATION_CHECKSUM)
+        {
+            return Err(ProviderStoreError::Conflict(
+                "provider registry migration checksum mismatch",
+            ));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![MIGRATION_ID, MIGRATION_CHECKSUM],
+        )?;
+        transaction.commit()?;
+        Ok(Self { connection })
+    }
+
+    /// Register one exact build against one already admitted, strictly verified snapshot.
+    /// Registration starts disabled until exact passing suite evidence is recorded.
+    #[allow(clippy::too_many_lines)]
+    pub fn register(
+        &mut self,
+        registry: &SemanticRegistry,
+        raw_manifest: &[u8],
+        build_hash: &str,
+        trust: ProviderTrustStatus,
+        registered_at: &str,
+    ) -> Result<ProviderRegistration> {
+        if !registry.is_strictly_verified() {
+            return Err(ProviderStoreError::Invalid(
+                "semantic snapshot is not strictly verified",
+            ));
+        }
+        if !is_sha256_id(build_hash) {
+            return Err(ProviderStoreError::Invalid(
+                "build identity must be a sha256 digest",
+            ));
+        }
+        parse_time(registered_at)?;
+        let (value, manifest) = parse_manifest(raw_manifest)?;
+        let report =
+            validate_provider_manifest(registry, &manifest, ProviderConformanceOptions::default());
+        if !report.valid || report.bootstrap_contract_hash_bypass_used {
+            return Err(ProviderStoreError::StaticCompatibility(report));
+        }
+        let manifest_json = canonical_text(&value)?;
+        let manifest_hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", manifest_json.as_bytes());
+        let snapshot_id = registry.snapshot_id().to_owned();
+        let registration_id = digest(
+            b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+            format!(
+                "{}\0{}\0{}\0{}",
+                manifest.id, manifest.version, manifest_hash, build_hash
+            )
+            .as_bytes(),
+        );
+        let registration = ProviderRegistration {
+            registration_id,
+            provider_id: manifest.id.clone(),
+            provider_version: manifest.version.clone(),
+            manifest_hash,
+            build_hash: build_hash.to_owned(),
+            snapshot_id,
+        };
+        let admitted: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                [&registration.snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if admitted.as_deref() != Some("ADMITTED") {
+            return Err(ProviderStoreError::Invalid(
+                "semantic snapshot has not been admitted",
+            ));
+        }
+        let registration_json = registration_record(&registration, &manifest, trust, registered_at);
+        let registration_json = canonical_text(&registration_json)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'disabled',?7,?8,?9)",
+            params![
+                registration.registration_id,
+                registration.provider_id,
+                registration.provider_version,
+                registration.manifest_hash,
+                registration.build_hash,
+                registration.snapshot_id,
+                trust.as_str(),
+                registration_json,
+                registered_at
+            ],
+        )?;
+        let stored: ProviderRegistration = transaction.query_row(
+            "SELECT registration_id,provider_id,provider_version,manifest_hash,package_content_hash,registry_snapshot_id
+             FROM provider_registrations WHERE provider_id=?1 AND provider_version=?2 AND package_content_hash=?3",
+            params![registration.provider_id,registration.provider_version,registration.build_hash],
+            |row| Ok(ProviderRegistration {
+                registration_id: row.get(0)?,provider_id: row.get(1)?,provider_version: row.get(2)?,
+                manifest_hash: row.get(3)?,build_hash: row.get(4)?,snapshot_id: row.get(5)?,
+            }),
+        )?;
+        if stored.registration_id != registration.registration_id
+            || stored.manifest_hash != registration.manifest_hash
+        {
+            return Err(ProviderStoreError::Conflict(
+                "provider version and build already map to a different manifest",
+            ));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO provider_manifest_payloads(registration_id,manifest_json) VALUES (?1,?2)",
+            params![stored.registration_id,manifest_json],
+        )?;
+        let stored_manifest: String = transaction.query_row(
+            "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+            [&stored.registration_id],
+            |row| row.get(0),
+        )?;
+        if stored_manifest != manifest_json {
+            return Err(ProviderStoreError::Conflict(
+                "registration manifest payload differs",
+            ));
+        }
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// Store independently produced, schema-valid suite evidence for this exact build.
+    /// The caller must authenticate the harness/source before calling this trusted
+    /// control-plane boundary. This store checks identity and consistency; it
+    /// never executes provider code or treats a manifest's declared status as proof.
+    pub fn record_evidence(
+        &mut self,
+        registration_id: &str,
+        raw_evidence: &[u8],
+    ) -> Result<String> {
+        let evidence = parse_document(
+            raw_evidence,
+            MAX_EVIDENCE_BYTES,
+            &EVIDENCE_SCHEMA,
+            include_str!("../../../specs/provider-conformance-result.schema.json"),
+        )?;
+        let id = string_at(&evidence, "/result_id")?.to_owned();
+        let registration = self.load_registration(registration_id)?;
+        if string_at(&evidence, "/provider_id")? != registration.provider_id
+            || string_at(&evidence, "/provider_version")? != registration.provider_version
+            || string_at(&evidence, "/provider_build_identity/value")? != registration.build_hash
+        {
+            return Err(ProviderStoreError::Invalid(
+                "evidence does not identify this exact provider build",
+            ));
+        }
+        let semantic_ref = string_at(&evidence, "/semantic_capability_ref")?;
+        let contract_hash = string_at(&evidence, "/semantic_contract_hash")?;
+        let suite_id = string_at(&evidence, "/conformance_suite/id")?;
+        let suite_hash = string_at(&evidence, "/conformance_suite/hash")?;
+        let suite_version = string_at(&evidence, "/conformance_suite/version")?;
+        let tested_at = string_at(&evidence, "/executed_at")?;
+        let tested = parse_time(tested_at)?;
+        if let Some(expires) = evidence.pointer("/expires_at").and_then(Value::as_str) {
+            if parse_time(expires)? <= tested {
+                return Err(ProviderStoreError::Invalid(
+                    "evidence expiry must follow execution",
+                ));
+            }
+        }
+        let manifest = self.verified_manifest(&registration)?;
+        let claim = manifest
+            .provides
+            .iter()
+            .find(|claim| {
+                let major = claim.contract.version.split('.').next().unwrap_or("");
+                semantic_ref == format!("{}@{major}", claim.contract.capability)
+            })
+            .ok_or(ProviderStoreError::Invalid(
+                "evidence capability is not claimed by the manifest",
+            ))?;
+        if claim.contract.version != string_at(&evidence, "/semantic_contract_version")?
+            || claim.contract.contract_hash.as_deref() != Some(contract_hash)
+            || claim.conformance.suite != suite_id
+            || claim.conformance.suite_hash.as_deref() != Some(suite_hash)
+            || self.contract_suite_version(contract_hash)?.as_deref() != Some(suite_version)
+        {
+            return Err(ProviderStoreError::Invalid(
+                "evidence contract or suite differs from the manifest",
+            ));
+        }
+        let result = string_at(&evidence, "/result")?;
+        if result == "pass" {
+            let total = evidence.get("tests_total").and_then(Value::as_u64);
+            let passed = evidence.get("tests_passed").and_then(Value::as_u64);
+            let failed = evidence.get("tests_failed").and_then(Value::as_u64);
+            if total.is_none() || total != passed || failed != Some(0) || total == Some(0) {
+                return Err(ProviderStoreError::Invalid(
+                    "passing evidence needs nonzero, complete test counts",
+                ));
+            }
+        }
+        let canonical = canonical_text(&evidence)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id,registration_id,semantic_ref,contract_hash,suite_id,suite_hash,result,canonical,tested_at],
+        )?;
+        let stored: (String,String) = transaction.query_row(
+            "SELECT registration_id,evidence_json FROM provider_conformance_evidence WHERE evidence_id=?1",
+            [&id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        if stored != (registration_id.to_owned(), canonical) {
+            return Err(ProviderStoreError::Conflict(
+                "evidence ID already maps to different evidence",
+            ));
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn enable(&mut self, registration_id: &str, now: &str) -> Result<()> {
+        self.set_state(registration_id, "registered", now)
+    }
+    pub fn disable(&mut self, registration_id: &str, now: &str) -> Result<()> {
+        self.set_state(registration_id, "disabled", now)
+    }
+    pub fn revoke(&mut self, registration_id: &str, now: &str) -> Result<()> {
+        self.set_state(registration_id, "revoked", now)
+    }
+
+    fn set_state(&mut self, registration_id: &str, state: &str, now: &str) -> Result<()> {
+        let at = parse_time(now)?;
+        let registration = self.load_registration(registration_id)?;
+        let old: (String, String) = self.connection.query_row(
+            "SELECT state,trust_status FROM provider_registrations WHERE registration_id=?1",
+            [registration_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if old.0 == "revoked" {
+            return Err(ProviderStoreError::Conflict("revocation is terminal"));
+        }
+        if state == "registered" {
+            if !matches!(
+                old.1.as_str(),
+                "locally-trusted" | "project-reviewed" | "organization-approved"
+            ) {
+                return Err(ProviderStoreError::Invalid(
+                    "trust status does not permit enablement",
+                ));
+            }
+            if !self.has_live_evidence(&registration, at)? {
+                return Err(ProviderStoreError::Invalid(
+                    "no exact, current passing evidence for every claim",
+                ));
+            }
+        }
+        self.connection.execute(
+            "UPDATE provider_registrations SET state=?2,updated_at=?3 WHERE registration_id=?1",
+            params![registration_id, state, now],
+        )?;
+        Ok(())
+    }
+
+    /// Candidate metadata only; the Task binding gate and grants remain authoritative.
+    pub fn eligible_candidates(
+        &self,
+        semantic_capability_ref: &str,
+        contract_hash: &str,
+        snapshot_id: &str,
+        at: &str,
+    ) -> Result<Vec<ProviderCandidate>> {
+        let checked = parse_time(at)?;
+        if !is_sha256_id(contract_hash) || !is_sha256_id(snapshot_id) {
+            return Err(ProviderStoreError::Invalid(
+                "contract and snapshot IDs must be sha256 digests",
+            ));
+        }
+        let semantic = crate::SemanticRef::parse(semantic_capability_ref)
+            .map_err(|_| ProviderStoreError::Invalid("semantic capability reference is invalid"))?;
+        let major = i64::try_from(semantic.major)
+            .map_err(|_| ProviderStoreError::Invalid("semantic major exceeds SQLite range"))?;
+        let selected: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registry_snapshot_entries e
+             JOIN registry_snapshot_admissions a ON a.snapshot_id=e.snapshot_id
+             WHERE e.snapshot_id=?1 AND a.state='ADMITTED' AND e.contract_class='capability'
+               AND e.semantic_id=?2 AND e.major=?3 AND e.content_hash=?4)",
+            params![snapshot_id, semantic.id, major, contract_hash],
+            |row| row.get(0),
+        )?;
+        if !selected {
+            return Ok(Vec::new());
+        }
+        let requested_registry = self.reopen_selected_snapshot(snapshot_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT r.registration_id FROM provider_registrations r
+             JOIN provider_manifest_payloads m ON m.registration_id=r.registration_id
+             JOIN registry_snapshot_admissions a ON a.snapshot_id=r.registry_snapshot_id
+             WHERE r.state='registered'
+               AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')
+             ORDER BY r.registration_id",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut candidates = Vec::new();
+        for id in ids {
+            let registration = self.load_registration(&id)?;
+            let mut manifest = self.verified_manifest(&registration)?;
+            manifest.provides.retain(|claim| {
+                let major = claim.contract.version.split('.').next().unwrap_or("");
+                semantic_capability_ref == format!("{}@{major}", claim.contract.capability)
+                    && claim.contract.contract_hash.as_deref() == Some(contract_hash)
+            });
+            if manifest.provides.len() != 1 {
+                continue;
+            }
+            let report = validate_provider_manifest(
+                &requested_registry,
+                &manifest,
+                ProviderConformanceOptions::default(),
+            );
+            if !report.valid || report.bootstrap_contract_hash_bypass_used {
+                continue;
+            }
+            let matching = self.valid_passes(
+                &registration,
+                semantic_capability_ref,
+                contract_hash,
+                checked,
+            )?;
+            if let [only] = matching.as_slice() {
+                let (evidence_id, suite_id, suite_hash) = only.clone();
+                candidates.push(ProviderCandidate {
+                    registration,
+                    requested_snapshot_id: snapshot_id.to_owned(),
+                    semantic_capability_ref: semantic_capability_ref.to_owned(),
+                    contract_hash: contract_hash.to_owned(),
+                    suite_id,
+                    suite_hash,
+                    evidence_id,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Ephemeral operational observation, intentionally absent from eligibility.
+    pub fn observe_health(&mut self, registration_id: &str, health: &ProviderHealth) -> Result<()> {
+        self.load_registration(registration_id)?;
+        let checked = parse_time(&health.checked_at)?;
+        if !matches!(
+            health.status.as_str(),
+            "unknown" | "ready" | "degraded" | "unavailable" | "blocked"
+        ) || health
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.len() > 512)
+        {
+            return Err(ProviderStoreError::Invalid("invalid health observation"));
+        }
+        let old: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checked_at FROM provider_health_observations WHERE registration_id=?1",
+                [registration_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if old
+            .as_deref()
+            .is_some_and(|old| parse_time(old).is_ok_and(|time| time > checked))
+        {
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT INTO provider_health_observations(registration_id,status,checked_at,reason)
+             VALUES (?1,?2,?3,?4) ON CONFLICT(registration_id) DO UPDATE SET
+             status=excluded.status,checked_at=excluded.checked_at,reason=excluded.reason",
+            params![
+                registration_id,
+                health.status,
+                health.checked_at,
+                health.reason
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn health(&self, registration_id: &str) -> Result<Option<ProviderHealth>> {
+        self.load_registration(registration_id)?;
+        self.connection.query_row(
+            "SELECT status,checked_at,reason FROM provider_health_observations WHERE registration_id=?1",
+            [registration_id],
+            |row| Ok(ProviderHealth { status: row.get(0)?,checked_at: row.get(1)?,reason: row.get(2)? }),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Rebuild the selected registry from immutable DB records so static provider
+    /// checks also see the selected snapshot's referenced type contracts.
+    #[allow(clippy::too_many_lines)]
+    fn reopen_selected_snapshot(&self, snapshot_id: &str) -> Result<SemanticRegistry> {
+        let raw: String = self
+            .connection
+            .query_row(
+                "SELECT s.manifest_json FROM registry_snapshots s
+             JOIN registry_snapshot_admissions a USING(snapshot_id)
+             WHERE s.snapshot_id=?1 AND a.state='ADMITTED'",
+                [snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ProviderStoreError::Invalid(
+                "selected snapshot is not admitted",
+            ))?;
+        let snapshot: RegistrySnapshot = crate::schema::decode_with_record_limit(
+            raw.as_bytes(),
+            StrictJsonLimits::default(),
+            crate::schema::RecordKind::Snapshot,
+            false,
+            None,
+        )
+        .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+        let mut expected: BTreeSet<(String, String, String, String)> = snapshot
+            .type_contracts
+            .iter()
+            .map(|entry| {
+                (
+                    "type".to_owned(),
+                    entry.id.clone(),
+                    entry.version.clone(),
+                    entry.content_hash.clone(),
+                )
+            })
+            .chain(snapshot.capability_contracts.iter().map(|entry| {
+                (
+                    "capability".to_owned(),
+                    entry.id.clone(),
+                    entry.version.clone(),
+                    entry.content_hash.clone(),
+                )
+            }))
+            .collect();
+        let mut types = Vec::new();
+        let mut capabilities = Vec::new();
+        let mut statement = self.connection.prepare(
+            "SELECT e.contract_class,e.semantic_id,e.major,e.full_version,e.content_hash,
+                    t.contract_json,c.contract_json FROM registry_snapshot_entries e
+             LEFT JOIN semantic_type_contracts t ON e.contract_class='type' AND t.content_hash=e.content_hash
+             LEFT JOIN semantic_capability_contracts c ON e.contract_class='capability' AND c.content_hash=e.content_hash
+             WHERE e.snapshot_id=?1 ORDER BY e.contract_class,e.semantic_id,e.major",
+        )?;
+        let mut rows = statement.query([snapshot_id])?;
+        while let Some(row) = rows.next()? {
+            let class: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let major: i64 = row.get(2)?;
+            let version: String = row.get(3)?;
+            let hash: String = row.get(4)?;
+            if !expected.remove(&(class.clone(), id.clone(), version.clone(), hash.clone()))
+                || crate::FullVersion::parse(&version)
+                    .map_err(|error| ProviderStoreError::Json(error.to_string()))?
+                    .major
+                    != u64::try_from(major)
+                        .map_err(|_| ProviderStoreError::Conflict("negative stored major"))?
+            {
+                return Err(ProviderStoreError::Conflict(
+                    "selected snapshot entries do not match manifest",
+                ));
+            }
+            match class.as_str() {
+                "type" => {
+                    let raw: String =
+                        row.get::<_, Option<String>>(5)?
+                            .ok_or(ProviderStoreError::Conflict(
+                                "selected snapshot is missing type bytes",
+                            ))?;
+                    let contract: TypeContract = crate::schema::decode_with_record_limit(
+                        raw.as_bytes(),
+                        StrictJsonLimits::default(),
+                        crate::schema::RecordKind::Type,
+                        false,
+                        None,
+                    )
+                    .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+                    if contract.type_id != id
+                        || contract.version != version
+                        || crate::type_contract_hash(&contract)
+                            .map_err(|error| ProviderStoreError::Json(error.to_string()))?
+                            .as_str()
+                            != hash
+                    {
+                        return Err(ProviderStoreError::Conflict(
+                            "selected type contract identity mismatch",
+                        ));
+                    }
+                    types.push(contract);
+                }
+                "capability" => {
+                    let raw: String =
+                        row.get::<_, Option<String>>(6)?
+                            .ok_or(ProviderStoreError::Conflict(
+                                "selected snapshot is missing capability bytes",
+                            ))?;
+                    let contract: CapabilityContract = crate::schema::decode_with_record_limit(
+                        raw.as_bytes(),
+                        StrictJsonLimits::default(),
+                        crate::schema::RecordKind::Capability,
+                        false,
+                        None,
+                    )
+                    .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+                    if contract.capability != id
+                        || contract.version != version
+                        || crate::capability_contract_hash(&contract)
+                            .map_err(|error| ProviderStoreError::Json(error.to_string()))?
+                            .as_str()
+                            != hash
+                    {
+                        return Err(ProviderStoreError::Conflict(
+                            "selected capability contract identity mismatch",
+                        ));
+                    }
+                    capabilities.push(contract);
+                }
+                _ => {
+                    return Err(ProviderStoreError::Conflict(
+                        "unknown selected contract class",
+                    ));
+                }
+            }
+        }
+        if !expected.is_empty() {
+            return Err(ProviderStoreError::Conflict(
+                "selected snapshot is missing entries",
+            ));
+        }
+        let registry = SemanticRegistry::from_records(
+            snapshot,
+            types,
+            capabilities,
+            crate::RegistryBuildOptions::default(),
+        )
+        .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+        if registry.snapshot_id() != snapshot_id {
+            return Err(ProviderStoreError::Conflict(
+                "selected snapshot identity mismatch",
+            ));
+        }
+        Ok(registry)
+    }
+
+    fn load_registration(&self, id: &str) -> Result<ProviderRegistration> {
+        self.connection.query_row(
+            "SELECT registration_id,provider_id,provider_version,manifest_hash,package_content_hash,registry_snapshot_id
+             FROM provider_registrations WHERE registration_id=?1",
+            [id], |row| Ok(ProviderRegistration {
+                registration_id: row.get(0)?,provider_id: row.get(1)?,provider_version: row.get(2)?,
+                manifest_hash: row.get(3)?,build_hash: row.get(4)?,snapshot_id: row.get(5)?,
+            }),
+        ).optional()?.ok_or(ProviderStoreError::NotFound)
+    }
+
+    fn contract_suite_version(&self, contract_hash: &str) -> Result<Option<String>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT contract_json FROM semantic_capability_contracts WHERE content_hash=?1",
+                [contract_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(None) };
+        let contract: aios_contracts::CapabilityContract = serde_json::from_str(&raw)
+            .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+        if crate::capability_contract_hash(&contract)
+            .map_err(|error| ProviderStoreError::Json(error.to_string()))?
+            .as_str()
+            != contract_hash
+        {
+            return Err(ProviderStoreError::Conflict(
+                "stored semantic contract hash mismatch",
+            ));
+        }
+        Ok(contract.conformance.suite_version)
+    }
+
+    fn has_live_evidence(
+        &self,
+        registration: &ProviderRegistration,
+        at: OffsetDateTime,
+    ) -> Result<bool> {
+        // Enablement opens the registration for consideration when at least one
+        // claim is proven. Candidate lookup still checks the requested claim's
+        // own static compatibility and latest evidence, so another claim cannot
+        // rescue a failed or changed one.
+        let manifest = self.verified_manifest(registration)?;
+        for claim in &manifest.provides {
+            let major = claim.contract.version.split('.').next().unwrap_or("");
+            let semantic_ref = format!("{}@{major}", claim.contract.capability);
+            let Some(hash) = claim.contract.contract_hash.as_deref() else {
+                continue;
+            };
+            if self
+                .valid_passes(registration, &semantic_ref, hash, at)?
+                .len()
+                == 1
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn valid_passes(
+        &self,
+        registration: &ProviderRegistration,
+        semantic_ref: &str,
+        contract_hash: &str,
+        at: OffsetDateTime,
+    ) -> Result<Vec<(String, String, String)>> {
+        let manifest = self.verified_manifest(registration)?;
+        let matching_claim = manifest.provides.iter().find(|claim| {
+            let major = claim.contract.version.split('.').next().unwrap_or("");
+            semantic_ref == format!("{}@{major}", claim.contract.capability)
+                && claim.contract.contract_hash.as_deref() == Some(contract_hash)
+        });
+        let Some(claim) = matching_claim else {
+            return Ok(Vec::new());
+        };
+        let suite_id = &claim.conformance.suite;
+        let Some(suite_hash) = claim.conformance.suite_hash.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(suite_version) = self.contract_suite_version(contract_hash)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT evidence_id,status,evidence_json,tested_at
+             FROM provider_conformance_evidence
+             WHERE registration_id=?1 AND capability=?2 AND contract_hash=?3
+               AND suite_id=?4 AND suite_hash=?5",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    registration.registration_id,
+                    semantic_ref,
+                    contract_hash,
+                    suite_id,
+                    suite_hash
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut latest: Option<(OffsetDateTime, String, String, String, String)> = None;
+        let mut ambiguous = false;
+        for (id, status, raw, tested_at) in rows {
+            let Ok(executed) = parse_time(&tested_at) else {
+                return Ok(Vec::new());
+            };
+            if executed > at {
+                continue;
+            }
+            match &latest {
+                Some((prior, _, _, _, _)) if executed < *prior => {}
+                Some((prior, _, _, _, _)) if executed == *prior => {
+                    ambiguous = true;
+                }
+                _ => {
+                    latest = Some((executed, id, status, raw, tested_at));
+                    ambiguous = false;
+                }
+            }
+        }
+        if ambiguous {
+            return Ok(Vec::new());
+        }
+        let Some((_, id, status, raw, tested_at)) = latest else {
+            return Ok(Vec::new());
+        };
+        if status != "pass" {
+            return Ok(Vec::new());
+        }
+        let Ok(evidence) = parse_document(
+            raw.as_bytes(),
+            MAX_EVIDENCE_BYTES,
+            &EVIDENCE_SCHEMA,
+            include_str!("../../../specs/provider-conformance-result.schema.json"),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let expired = evidence
+            .pointer("/expires_at")
+            .and_then(Value::as_str)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|value| value <= at);
+        let counts_valid = evidence
+            .get("tests_total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| {
+                total > 0
+                    && evidence.get("tests_passed").and_then(Value::as_u64) == Some(total)
+                    && evidence.get("tests_failed").and_then(Value::as_u64) == Some(0)
+            });
+        let matches = !expired
+            && counts_valid
+            && evidence.pointer("/executed_at").and_then(Value::as_str) == Some(tested_at.as_str())
+            && evidence.pointer("/result_id").and_then(Value::as_str) == Some(id.as_str())
+            && evidence.pointer("/provider_id").and_then(Value::as_str)
+                == Some(registration.provider_id.as_str())
+            && evidence
+                .pointer("/provider_version")
+                .and_then(Value::as_str)
+                == Some(registration.provider_version.as_str())
+            && evidence.pointer("/result").and_then(Value::as_str) == Some("pass")
+            && evidence
+                .pointer("/semantic_capability_ref")
+                .and_then(Value::as_str)
+                == Some(semantic_ref)
+            && evidence
+                .pointer("/semantic_contract_version")
+                .and_then(Value::as_str)
+                == Some(claim.contract.version.as_str())
+            && evidence
+                .pointer("/semantic_contract_hash")
+                .and_then(Value::as_str)
+                == Some(contract_hash)
+            && evidence
+                .pointer("/conformance_suite/id")
+                .and_then(Value::as_str)
+                == Some(suite_id.as_str())
+            && evidence
+                .pointer("/conformance_suite/hash")
+                .and_then(Value::as_str)
+                == Some(suite_hash)
+            && evidence
+                .pointer("/conformance_suite/version")
+                .and_then(Value::as_str)
+                == Some(suite_version.as_str())
+            && evidence
+                .pointer("/provider_build_identity/value")
+                .and_then(Value::as_str)
+                == Some(registration.build_hash.as_str());
+        Ok(if matches {
+            vec![(id, suite_id.clone(), suite_hash.to_owned())]
+        } else {
+            Vec::new()
+        })
+    }
+
+    fn verified_manifest(&self, registration: &ProviderRegistration) -> Result<CapabilityManifest> {
+        let manifest_json: String = self
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ProviderStoreError::NotFound)?;
+        let (value, manifest) = parse_manifest(manifest_json.as_bytes())?;
+        let canonical = canonical_text(&value)?;
+        let hash = digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", canonical.as_bytes());
+        let id = digest(
+            b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+            format!(
+                "{}\0{}\0{}\0{}",
+                manifest.id, manifest.version, hash, registration.build_hash
+            )
+            .as_bytes(),
+        );
+        if canonical != manifest_json
+            || hash != registration.manifest_hash
+            || id != registration.registration_id
+            || manifest.id != registration.provider_id
+            || manifest.version != registration.provider_version
+        {
+            return Err(ProviderStoreError::Conflict(
+                "stored provider manifest does not match registration identity",
+            ));
+        }
+        Ok(manifest)
+    }
+}
+
+fn preflight_migrations(connection: &Connection) -> Result<()> {
+    const KNOWN: &[(&str, &str)] = &[
+        (
+            "0001_v0_1_trusted_control_plane",
+            "UNGENERATED-DRAFT-CHECKSUM",
+        ),
+        (
+            "0002_task_manager_contract_reconciliation",
+            "task-manager-v0.1",
+        ),
+        (
+            "0003_task_manager_recovery_fencing_privacy",
+            "task-manager-recovery-fencing-privacy-v0.1",
+        ),
+        (
+            "0004_task_manager_review_hardening",
+            "task-manager-review-hardening-v0.1",
+        ),
+        (
+            "0005_artifact_store_root_binding",
+            "artifact-store-root-binding-v0.1",
+        ),
+        (
+            "0006_artifact_writer_admission",
+            "artifact-writer-admission-v0.1",
+        ),
+        (
+            "0007_artifact_owner_export_context",
+            "artifact-owner-export-context-v0.1",
+        ),
+        (
+            "0008_artifact_export_reconciliation_challenge",
+            "artifact-export-reconciliation-challenge-v0.1",
+        ),
+        (
+            "0009_artifact_writer_session_fencing",
+            "artifact-writer-session-fencing-v0.1",
+        ),
+        (
+            "0010_keyed_import_causal_receipts",
+            "keyed-import-causal-receipts-v0.1",
+        ),
+        (
+            "0011_provenance_service_boundary",
+            "provenance-service-boundary-v0.1",
+        ),
+        (
+            "0012_semantic_registry_store",
+            "semantic-registry-store-v0.1",
+        ),
+        (MIGRATION_ID, MIGRATION_CHECKSUM),
+    ];
+    let mut statement =
+        connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;
+    let migrations = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut stamped = false;
+    for (id, checksum) in migrations {
+        let Some((_, expected)) = KNOWN.iter().find(|(known, _)| *known == id) else {
+            return Err(ProviderStoreError::Conflict(
+                "unknown control-plane migration",
+            ));
+        };
+        if checksum != *expected {
+            return Err(ProviderStoreError::Conflict(
+                "control-plane migration checksum mismatch",
+            ));
+        }
+        stamped |= id == MIGRATION_ID;
+    }
+    for (kind, name) in [
+        ("table", "provider_manifest_payloads"),
+        ("table", "provider_health_observations"),
+        ("trigger", "provider_manifest_payload_immutable_update"),
+        ("trigger", "provider_manifest_payload_immutable_delete"),
+        ("trigger", "provider_registration_identity_immutable"),
+        ("trigger", "provider_registration_no_delete"),
+        ("trigger", "provider_registration_revocation_terminal"),
+        ("trigger", "provider_evidence_immutable_update"),
+        ("trigger", "provider_evidence_immutable_delete"),
+        ("index", "ix_provider_conformance_latest"),
+    ] {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        if present != stamped {
+            return Err(ProviderStoreError::Conflict(
+                "provider schema objects and migration stamp disagree",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_manifest(raw: &[u8]) -> Result<(Value, CapabilityManifest)> {
+    let value = parse_document(
+        raw,
+        MAX_MANIFEST_BYTES,
+        &MANIFEST_SCHEMA,
+        include_str!("../../../specs/capability-manifest.schema.json"),
+    )?;
+    let manifest = serde_json::from_value(value.clone())
+        .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+    Ok((value, manifest))
+}
+
+fn parse_document(
+    raw: &[u8],
+    max_bytes: usize,
+    cache: &OnceLock<std::result::Result<jsonschema::Validator, String>>,
+    schema_source: &str,
+) -> Result<Value> {
+    let value = parse_strict_value(
+        raw,
+        StrictJsonLimits {
+            max_bytes,
+            max_depth: 32,
+        },
+    )
+    .map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+    let validator = cache
+        .get_or_init(|| {
+            let schema: Value =
+                serde_json::from_str(schema_source).map_err(|error| error.to_string())?;
+            jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| ProviderStoreError::Json(format!("embedded schema: {error}")))?;
+    if let Some(error) = validator.iter_errors(&value).next() {
+        return Err(ProviderStoreError::Json(format!(
+            "schema violation at {} ({})",
+            error.instance_path(),
+            error.schema_path()
+        )));
+    }
+    Ok(value)
+}
+
+fn string_at<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or(ProviderStoreError::Invalid(
+            "evidence is missing a required string",
+        ))
+}
+fn canonical_text(value: &Value) -> Result<String> {
+    let bytes = canonicalize(value).map_err(|error| ProviderStoreError::Json(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|error| ProviderStoreError::Json(error.to_string()))
+}
+fn digest(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    let mut result = String::from("sha256:");
+    for byte in hash {
+        write!(&mut result, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    result
+}
+fn parse_time(value: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| ProviderStoreError::Invalid("timestamp must be RFC 3339"))
+}
+fn registration_record(
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+    trust: ProviderTrustStatus,
+    registered_at: &str,
+) -> Value {
+    let capabilities: Vec<Value> = manifest
+        .provides
+        .iter()
+        .map(|claim| {
+            json!({
+                "capability": claim.contract.capability,
+                "version": claim.contract.version,
+                "contract_hash": claim.contract.contract_hash,
+                "conformance_suite": claim.conformance.suite,
+                "conformance_suite_hash": claim.conformance.suite_hash,
+                "conformance_status": "declared",
+                "eligible": false,
+                "representations": claim.representations,
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": "0.1",
+        "registration_id": registration.registration_id,
+        "provider": {
+            "id": registration.provider_id,
+            "version": registration.provider_version,
+            "manifest_hash": registration.manifest_hash,
+        },
+        "package": { "source_kind": "local", "content_hash": registration.build_hash },
+        "runtime": {
+            "kind": manifest.runtime.kind,
+            "minimum_isolation": manifest.provides.iter().map(|claim| claim.execution.minimum_isolation).max(),
+        },
+        "registry_snapshot_id": registration.snapshot_id,
+        "capabilities": capabilities,
+        "trust": { "status": trust.as_str() },
+        "state": "disabled",
+        "registered_at": registered_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RegistryBuildOptions, RegistryStore, SnapshotState};
+    use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+
+    const SNAPSHOT: &str = include_str!("../../../examples/aios-ir/registry-snapshot.json");
+    const TYPES: &str = include_str!("../../../examples/aios-ir/type-contracts.json");
+    const CAPABILITIES: &str = include_str!("../../../examples/aios-ir/capability-contracts.json");
+    const CASES: &str = include_str!("../../../examples/aios-ir/provider-conformance-cases.json");
+    const BUILD_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BUILD_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SUITE_HASH: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const SUITE_HASH_B: &str =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const NOW: &str = "2026-09-22T12:00:00Z";
+
+    fn setup() -> (Connection, SemanticRegistry) {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+            .unwrap();
+        let mut snapshot: RegistrySnapshot = serde_json::from_str(SNAPSHOT).unwrap();
+        let types: Vec<TypeContract> = serde_json::from_str(TYPES).unwrap();
+        let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(CAPABILITIES).unwrap();
+        let contract = capabilities
+            .iter_mut()
+            .find(|contract| contract.capability == "artifact.hash")
+            .unwrap();
+        contract.conformance.suite_hash = Some(SUITE_HASH.into());
+        let hash = crate::capability_contract_hash(contract)
+            .unwrap()
+            .to_string();
+        let entry = snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == "artifact.hash")
+            .unwrap();
+        entry.content_hash = hash;
+        let other = capabilities
+            .iter_mut()
+            .find(|contract| contract.capability == "table.normalize")
+            .unwrap();
+        other.conformance.suite_hash = Some(SUITE_HASH_B.into());
+        let other_hash = crate::capability_contract_hash(other).unwrap().to_string();
+        snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == "table.normalize")
+            .unwrap()
+            .content_hash = other_hash;
+        let entry_view = |entry: &aios_contracts::ContractRef| crate::SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        snapshot.snapshot_id = crate::registry_snapshot_id(
+            &snapshot.schema_version,
+            &snapshot
+                .type_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+            &snapshot
+                .capability_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+        let registry = SemanticRegistry::from_records(
+            snapshot,
+            types,
+            capabilities,
+            RegistryBuildOptions::default(),
+        )
+        .unwrap();
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&registry)
+            .unwrap();
+        (connection, registry)
+    }
+
+    fn manifest(registry: &SemanticRegistry) -> Value {
+        let cases: Value = serde_json::from_str(CASES).unwrap();
+        let mut value = cases[0]["provider"].clone();
+        value["provides"][0]["conformance"]["suite_hash"] = SUITE_HASH.into();
+        value["provides"][0]["contract"]["contract_hash"] = registry
+            .capability_contract_hash("artifact.hash", 1)
+            .unwrap()
+            .as_str()
+            .into();
+        value
+    }
+    fn two_claim_manifest(registry: &SemanticRegistry) -> Value {
+        let mut value = manifest(registry);
+        let mut other = value["provides"][0].clone();
+        other["contract"]["capability"] = "table.normalize".into();
+        other["contract"]["contract_hash"] = registry
+            .capability_contract_hash("table.normalize", 1)
+            .unwrap()
+            .as_str()
+            .into();
+        other["conformance"]["suite"] = "conformance://table.normalize/1".into();
+        other["conformance"]["suite_hash"] = SUITE_HASH_B.into();
+        other["effect_classes"] = json!(["PURE"]);
+        other["authority"] = json!({"actions":[],"resource_classes":[]});
+        value["provides"].as_array_mut().unwrap().push(other);
+        value
+    }
+    fn snapshot_change(first: &SemanticRegistry, changed_capability: &str) -> SemanticRegistry {
+        let mut snapshot = first.snapshot().clone();
+        let types = first.type_contracts().cloned().collect::<Vec<_>>();
+        let mut capabilities = first.capability_contracts().cloned().collect::<Vec<_>>();
+        let unrelated = capabilities
+            .iter_mut()
+            .find(|contract| contract.capability == changed_capability)
+            .unwrap();
+        unrelated.version = "1.1".into();
+        let hash = crate::capability_contract_hash(unrelated)
+            .unwrap()
+            .to_string();
+        let entry = snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == changed_capability)
+            .unwrap();
+        entry.version = "1.1".into();
+        entry.content_hash = hash;
+        let entry_view = |entry: &aios_contracts::ContractRef| crate::SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        snapshot.snapshot_id = crate::registry_snapshot_id(
+            &snapshot.schema_version,
+            &snapshot
+                .type_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+            &snapshot
+                .capability_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+        SemanticRegistry::from_records(
+            snapshot,
+            types,
+            capabilities,
+            RegistryBuildOptions::default(),
+        )
+        .unwrap()
+    }
+    fn type_representation_change(first: &SemanticRegistry) -> SemanticRegistry {
+        let mut snapshot = first.snapshot().clone();
+        let mut types = first.type_contracts().cloned().collect::<Vec<_>>();
+        let capabilities = first.capability_contracts().cloned().collect::<Vec<_>>();
+        let contract = types
+            .iter_mut()
+            .find(|contract| contract.type_id == "artifact.file")
+            .unwrap();
+        contract.version = "1.1".into();
+        contract.representations[0].id = "artifact-handle-v2".into();
+        let hash = crate::type_contract_hash(contract).unwrap().to_string();
+        let entry = snapshot
+            .type_contracts
+            .iter_mut()
+            .find(|entry| entry.id == "artifact.file")
+            .unwrap();
+        entry.version = "1.1".into();
+        entry.content_hash = hash;
+        let entry_view = |entry: &aios_contracts::ContractRef| crate::SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        snapshot.snapshot_id = crate::registry_snapshot_id(
+            &snapshot.schema_version,
+            &snapshot
+                .type_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+            &snapshot
+                .capability_contracts
+                .iter()
+                .map(entry_view)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+        SemanticRegistry::from_records(
+            snapshot,
+            types,
+            capabilities,
+            RegistryBuildOptions::default(),
+        )
+        .unwrap()
+    }
+    fn evidence(manifest: &Value, build: &str, result: &str) -> Value {
+        let claim = &manifest["provides"][0];
+        json!({
+            "schema_version": "0.1",
+            "result_id": "evidence-a",
+            "provider_id": manifest["id"],
+            "provider_version": manifest["version"],
+            "provider_build_identity": { "kind": "build_hash", "value": build },
+            "semantic_capability_ref": "artifact.hash@1",
+            "semantic_contract_version": claim["contract"]["version"],
+            "semantic_contract_hash": claim["contract"]["contract_hash"],
+            "conformance_suite": {
+                "id": claim["conformance"]["suite"],
+                "version": "0.1",
+                "hash": SUITE_HASH,
+            },
+            "harness": { "id": "fixture-harness", "version": "1" },
+            "result": result,
+            "tests_total": 2,
+            "tests_passed": if result == "pass" {2} else {1},
+            "tests_failed": i32::from(result != "pass"),
+            "executed_at": "2026-09-22T11:00:00Z",
+            "expires_at": "2026-09-23T11:00:00Z",
+        })
+    }
+    fn bytes(value: &Value) -> Vec<u8> {
+        serde_json::to_vec(value).unwrap()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps fixture execution, evidence admission, and substitution assertions together"
+    )]
+    fn exact_build_evidence_enables_two_candidates_and_revocation_removes_one() {
+        // Execute the same bounded conformance vectors through two fixture
+        // implementations before the trusted caller records their results.
+        // One buffers the artifact; the other reads it in small chunks.
+        fn hex_digest(hash: impl IntoIterator<Item = u8>) -> String {
+            let mut result = String::new();
+            for byte in hash {
+                write!(&mut result, "{byte:02x}").unwrap();
+            }
+            result
+        }
+        fn buffered_hash(bytes: &[u8]) -> String {
+            hex_digest(Sha256::digest(bytes))
+        }
+        fn streamed_hash(bytes: &[u8]) -> String {
+            let mut digest = Sha256::new();
+            for chunk in bytes.chunks(2) {
+                digest.update(chunk);
+            }
+            hex_digest(digest.finalize())
+        }
+        let (mut connection, registry) = setup();
+        let original_snapshot_id = registry.snapshot_id().to_owned();
+        let original_contract_hash = registry
+            .capability_contract_hash("artifact.hash", 1)
+            .unwrap()
+            .to_string();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let first_manifest = manifest(&registry);
+        let mut second_manifest = first_manifest.clone();
+        second_manifest["id"] = "org.ainative.fixture.artifact-hash-b".into();
+        for (manifest, fixture_name, implementation, id) in [
+            (
+                &first_manifest,
+                "buffered-sha256",
+                buffered_hash as fn(&[u8]) -> String,
+                "evidence-a",
+            ),
+            (
+                &second_manifest,
+                "streamed-sha256",
+                streamed_hash as fn(&[u8]) -> String,
+                "evidence-b",
+            ),
+        ] {
+            // These are stable identities for the two local Stage E fixture
+            // implementations, not attestations of compiled provider binaries.
+            let build = digest(
+                b"AIOS-STAGE-E-FIXTURE-BUILD\0v0.1\0",
+                fixture_name.as_bytes(),
+            );
+            let vectors = [
+                (
+                    b"".as_slice(),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                ),
+                (
+                    b"abc".as_slice(),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                ),
+            ];
+            let passed = vectors
+                .iter()
+                .filter(|(input, expected)| implementation(input) == *expected)
+                .count();
+            assert_eq!(passed, vectors.len(), "{fixture_name}");
+            let registration = store
+                .register(
+                    &registry,
+                    &bytes(manifest),
+                    &build,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            let mut pass = evidence(manifest, &build, "pass");
+            pass["result_id"] = id.into();
+            pass["tests_total"] = vectors.len().into();
+            pass["tests_passed"] = passed.into();
+            pass["tests_failed"] = (vectors.len() - passed).into();
+            store
+                .record_evidence(&registration.registration_id, &bytes(&pass))
+                .unwrap();
+            store.enable(&registration.registration_id, NOW).unwrap();
+        }
+        let hash = first_manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let candidates = store
+            .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        let first_id = candidates[0].registration.registration_id.clone();
+        store.revoke(&first_id, NOW).unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(registry.snapshot_id(), original_snapshot_id);
+        assert_eq!(
+            registry
+                .capability_contract_hash("artifact.hash", 1)
+                .unwrap()
+                .as_str(),
+            original_contract_hash
+        );
+        assert!(store.enable(&first_id, NOW).is_err());
+        store
+            .observe_health(
+                &first_id,
+                &ProviderHealth {
+                    status: "ready".into(),
+                    checked_at: NOW.into(),
+                    reason: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rejects_duplicate_json_invalid_envelope_and_stale_build_or_suite() {
+        let (mut connection, registry) = setup();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let duplicate = br#"{"schema_version":"0.1","schema_version":"0.1"}"#;
+        assert!(
+            store
+                .register(
+                    &registry,
+                    duplicate,
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut invalid = manifest(&registry);
+        invalid["provides"][0]["effect_classes"] = json!(["ARTIFACT_READ", "NETWORK"]);
+        assert!(matches!(
+            store.register(
+                &registry,
+                &bytes(&invalid),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW
+            ),
+            Err(ProviderStoreError::StaticCompatibility(_))
+        ));
+        let mut unknown_field = manifest(&registry);
+        unknown_field["forged_authority"] = json!({"granted":true});
+        assert!(
+            store
+                .register(
+                    &registry,
+                    &bytes(&unknown_field),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut null_hash = manifest(&registry);
+        null_hash["provides"][0]["contract"]["contract_hash"] = Value::Null;
+        assert!(
+            store
+                .register(
+                    &registry,
+                    &bytes(&null_hash),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW
+                )
+                .is_err()
+        );
+        let manifest = manifest(&registry);
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        for change in [
+            "build",
+            "suite",
+            "suite-version",
+            "contract",
+            "partial",
+            "fail",
+            "expired",
+        ] {
+            let mut wrong = evidence(&manifest, BUILD_A, "pass");
+            wrong["result_id"] = format!("evidence-{change}").into();
+            match change {
+                "build" => wrong["provider_build_identity"]["value"] = BUILD_B.into(),
+                "suite" => wrong["conformance_suite"]["hash"] = BUILD_B.into(),
+                "suite-version" => wrong["conformance_suite"]["version"] = "9.9".into(),
+                "contract" => wrong["semantic_contract_hash"] = BUILD_B.into(),
+                "partial" => wrong["result"] = "partial".into(),
+                "fail" => wrong["result"] = "fail".into(),
+                _ => wrong["expires_at"] = "2026-09-22T11:30:00Z".into(),
+            }
+            if matches!(change, "partial" | "fail" | "expired") {
+                store
+                    .record_evidence(&registration.registration_id, &bytes(&wrong))
+                    .unwrap();
+                assert!(store.enable(&registration.registration_id, NOW).is_err());
+            } else {
+                assert!(
+                    store
+                        .record_evidence(&registration.registration_id, &bytes(&wrong))
+                        .is_err(),
+                    "{change}"
+                );
+            }
+        }
+        let mut first = evidence(&manifest, BUILD_A, "fail");
+        first["result_id"] = "same-id".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&first))
+            .unwrap();
+        first["notes"] = "different bytes".into();
+        assert!(matches!(
+            store.record_evidence(&registration.registration_id, &bytes(&first)),
+            Err(ProviderStoreError::Conflict(_))
+        ));
+        assert!(store.enable(&registration.registration_id, NOW).is_err());
+    }
+
+    #[test]
+    fn legacy_mismatched_evidence_and_health_never_grant_eligibility() {
+        let (mut connection, registry) = setup();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let manifest = manifest(&registry);
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let mut wrong = evidence(&manifest, BUILD_A, "pass");
+        wrong["provider_id"] = "provider:forged".into();
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        // Simulates a historical baseline row predating 0013 validation.
+        store.connection.execute(
+            "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
+             VALUES ('legacy',?1,'artifact.hash@1',?2,'conformance://artifact.hash/1',?3,'pass',?4,'2026-09-22T11:00:00Z')",
+            params![registration.registration_id,hash,SUITE_HASH,String::from_utf8(bytes(&wrong)).unwrap()],
+        ).unwrap();
+        assert!(store.enable(&registration.registration_id, NOW).is_err());
+        store
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='registered' WHERE registration_id=?1",
+                [&registration.registration_id],
+            )
+            .unwrap();
+        store
+            .observe_health(
+                &registration.registration_id,
+                &ProviderHealth {
+                    status: "ready".into(),
+                    checked_at: "2026-09-22T10:00:00-07:00".into(),
+                    reason: None,
+                },
+            )
+            .unwrap();
+        store
+            .observe_health(
+                &registration.registration_id,
+                &ProviderHealth {
+                    status: "unavailable".into(),
+                    checked_at: "2026-09-22T12:00:00Z".into(),
+                    reason: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .health(&registration.registration_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn migration_preflight_rejects_unstamped_or_incomplete_provider_schema() {
+        let (mut connection, _) = setup();
+        connection.execute_batch("CREATE TABLE provider_manifest_payloads (registration_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL)").unwrap();
+        assert!(ProviderStore::initialize(&mut connection).is_err());
+        connection
+            .execute_batch("DROP TABLE provider_manifest_payloads")
+            .unwrap();
+        ProviderStore::initialize(&mut connection).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER provider_evidence_immutable_update")
+            .unwrap();
+        assert!(ProviderStore::initialize(&mut connection).is_err());
+    }
+
+    #[test]
+    fn same_build_is_reused_across_snapshots_with_unchanged_claimed_contract() {
+        let (mut connection, first) = setup();
+        let second = snapshot_change(&first, "table.normalize");
+        let changed_claim = snapshot_change(&first, "artifact.hash");
+        assert_ne!(first.snapshot_id(), second.snapshot_id());
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&second)
+            .unwrap();
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&changed_claim)
+            .unwrap();
+        let manifest = manifest(&first);
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let original = {
+            let mut store = ProviderStore::initialize(&mut connection).unwrap();
+            let original = store
+                .register(
+                    &first,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            store
+                .record_evidence(
+                    &original.registration_id,
+                    &bytes(&evidence(&manifest, BUILD_A, "pass")),
+                )
+                .unwrap();
+            store.enable(&original.registration_id, NOW).unwrap();
+            let reused = store
+                .register(
+                    &second,
+                    &bytes(&manifest),
+                    BUILD_A,
+                    ProviderTrustStatus::Unverified,
+                    "2026-09-22T13:00:00Z",
+                )
+                .unwrap();
+            assert_eq!(reused, original);
+            let candidates = store
+                .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].registration.snapshot_id, first.snapshot_id());
+            assert_eq!(candidates[0].requested_snapshot_id, second.snapshot_id());
+            assert!(
+                store
+                    .eligible_candidates("artifact.hash@1", BUILD_B, second.snapshot_id(), NOW)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .eligible_candidates("artifact.hash@1", &hash, changed_claim.snapshot_id(), NOW)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .register(
+                        &changed_claim,
+                        &bytes(&manifest),
+                        BUILD_A,
+                        ProviderTrustStatus::LocallyTrusted,
+                        NOW
+                    )
+                    .is_err()
+            );
+            original
+        };
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .set_snapshot_state(first.snapshot_id(), SnapshotState::Revoked)
+            .unwrap();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        store.revoke(&original.registration_id, NOW).unwrap();
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", &hash, second.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn latest_exact_result_controls_failure_expiry_and_renewal() {
+        let (mut connection, registry) = setup();
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let manifest = manifest(&registry);
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let candidates = |store: &ProviderStore<'_>, at| {
+            store
+                .eligible_candidates("artifact.hash@1", hash, registry.snapshot_id(), at)
+                .unwrap()
+        };
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        assert_eq!(candidates(&store, NOW).len(), 1);
+        let mut failure = evidence(&manifest, BUILD_A, "fail");
+        failure["result_id"] = "evidence-fail".into();
+        failure["executed_at"] = "2026-09-22T12:30:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&failure))
+            .unwrap();
+        assert!(candidates(&store, "2026-09-22T13:00:00Z").is_empty());
+        let mut renewed = evidence(&manifest, BUILD_A, "pass");
+        renewed["result_id"] = "evidence-renewed".into();
+        renewed["executed_at"] = "2026-09-22T13:30:00Z".into();
+        renewed["expires_at"] = "2026-09-22T15:00:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&renewed))
+            .unwrap();
+        assert_eq!(
+            candidates(&store, "2026-09-22T14:00:00Z")[0].evidence_id,
+            "evidence-renewed"
+        );
+        assert!(candidates(&store, "2026-09-22T15:00:00Z").is_empty());
+        let mut after_expiry = renewed.clone();
+        after_expiry["result_id"] = "evidence-after-expiry".into();
+        after_expiry["executed_at"] = "2026-09-22T16:00:00Z".into();
+        after_expiry["expires_at"] = "2026-09-23T16:00:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&after_expiry))
+            .unwrap();
+        assert_eq!(
+            candidates(&store, "2026-09-22T16:10:00Z")[0].evidence_id,
+            "evidence-after-expiry"
+        );
+    }
+
+    #[test]
+    fn same_capability_hash_does_not_reuse_incompatible_type_representation() {
+        let (mut connection, first) = setup();
+        let second = type_representation_change(&first);
+        assert_eq!(
+            first.capability_contract_hash("artifact.hash", 1),
+            second.capability_contract_hash("artifact.hash", 1)
+        );
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&second)
+            .unwrap();
+        let mut manifest = manifest(&first);
+        manifest["provides"][0]["representations"]["source"] = json!(["artifact-handle"]);
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &first,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, first.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .eligible_candidates("artifact.hash@1", hash, second.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.register(
+                &second,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW
+            ),
+            Err(ProviderStoreError::StaticCompatibility(_))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unrelated_claim_change_or_failure_does_not_hide_valid_claim() {
+        let (mut connection, first) = setup();
+        let second = snapshot_change(&first, "table.normalize");
+        RegistryStore::initialize(&mut connection)
+            .unwrap()
+            .admit_registry(&second)
+            .unwrap();
+        let manifest = two_claim_manifest(&first);
+        let mut store = ProviderStore::initialize(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &first,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::LocallyTrusted,
+                NOW,
+            )
+            .unwrap();
+        let hash_a = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let hash_b = manifest["provides"][1]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let a = evidence(&manifest, BUILD_A, "pass");
+        store
+            .record_evidence(&registration.registration_id, &bytes(&a))
+            .unwrap();
+        let mut b = evidence(&manifest, BUILD_A, "pass");
+        b["result_id"] = "evidence-b-pass".into();
+        b["semantic_capability_ref"] = "table.normalize@1".into();
+        b["semantic_contract_hash"] = hash_b.into();
+        b["conformance_suite"]["id"] = "conformance://table.normalize/1".into();
+        b["conformance_suite"]["hash"] = SUITE_HASH_B.into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&b))
+            .unwrap();
+        store.enable(&registration.registration_id, NOW).unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates("artifact.hash@1", hash_a, second.snapshot_id(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .eligible_candidates("table.normalize@1", hash_b, second.snapshot_id(), NOW)
+                .unwrap()
+                .is_empty()
+        );
+        let mut b_fail = b.clone();
+        b_fail["result_id"] = "evidence-b-fail".into();
+        b_fail["result"] = "fail".into();
+        b_fail["executed_at"] = "2026-09-22T12:15:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&b_fail))
+            .unwrap();
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash_a,
+                    second.snapshot_id(),
+                    "2026-09-22T12:16:00Z"
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .eligible_candidates(
+                    "table.normalize@1",
+                    hash_b,
+                    first.snapshot_id(),
+                    "2026-09-22T12:16:00Z"
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let mut b_renewed = b.clone();
+        b_renewed["result_id"] = "evidence-b-renewed".into();
+        b_renewed["executed_at"] = "2026-09-22T12:20:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&b_renewed))
+            .unwrap();
+        let mut a_fail = a.clone();
+        a_fail["result_id"] = "evidence-a-fail".into();
+        a_fail["result"] = "fail".into();
+        a_fail["executed_at"] = "2026-09-22T12:30:00Z".into();
+        store
+            .record_evidence(&registration.registration_id, &bytes(&a_fail))
+            .unwrap();
+        assert!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash_a,
+                    second.snapshot_id(),
+                    "2026-09-22T12:31:00Z"
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "table.normalize@1",
+                    hash_b,
+                    first.snapshot_id(),
+                    "2026-09-22T12:31:00Z"
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}

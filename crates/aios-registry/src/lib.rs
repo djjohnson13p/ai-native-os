@@ -12,7 +12,9 @@ mod error;
 mod hash;
 mod loader;
 pub mod numbers;
+mod provider_store;
 mod schema;
+mod store;
 mod strict_json;
 mod version;
 
@@ -33,6 +35,11 @@ pub use loader::{
     DEFAULT_SNAPSHOT_FILE, HashVerificationMode, RegistryBuildOptions, RegistryLimits,
     RegistryLoadOptions, SemanticRegistry, load_registry_bundle,
 };
+pub use provider_store::{
+    ProviderCandidate, ProviderHealth, ProviderRegistration, ProviderStore, ProviderStoreError,
+    ProviderTrustStatus,
+};
+pub use store::{Activation, RegistryStore, RegistryStoreError, SnapshotState};
 pub use strict_json::{
     StrictJsonError, StrictJsonErrorKind, StrictJsonLimits, parse_strict_json, parse_strict_value,
 };

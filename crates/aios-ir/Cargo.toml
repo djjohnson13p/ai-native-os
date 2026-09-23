@@ -17,6 +17,7 @@ time.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

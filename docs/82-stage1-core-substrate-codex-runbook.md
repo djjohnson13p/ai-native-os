@@ -192,7 +192,7 @@ specs/capability-contract.schema.json
 specs/type-contract.schema.json
 specs/registry-snapshot.schema.json
 specs/provider-registration.schema.json
-specs/provider-conformance-evidence.schema.json
+specs/provider-conformance-result.schema.json
 examples/registry-lifecycle/
 ```
 

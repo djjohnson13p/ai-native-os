@@ -52,7 +52,7 @@
       "maturity": "SPIKE_READY",
       "workstream": "Semantic registry snapshots and provider registration/conformance",
       "issue": 2,
-      "artifacts": ["specs/capability-contract.schema.json", "specs/type-contract.schema.json", "specs/registry-snapshot.schema.json", "specs/provider-registration.schema.json", "specs/provider-conformance-evidence.schema.json", "specs/provider-conformance-reason-codes.json", "docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md"],
+      "artifacts": ["specs/capability-contract.schema.json", "specs/type-contract.schema.json", "specs/registry-snapshot.schema.json", "specs/provider-registration.schema.json", "specs/provider-conformance-result.schema.json", "specs/provider-conformance-reason-codes.json", "docs/76-v0.1-semantic-registry-and-provider-registration-lifecycle.md"],
       "controlling_adrs": ["ADR-0013", "ADR-0034", "ADR-0038"],
       "fixture_paths": ["examples/aios-ir/", "examples/registry-lifecycle/"],
       "blocking_questions": [],

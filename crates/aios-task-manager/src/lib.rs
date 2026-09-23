@@ -3432,7 +3432,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3495,6 +3495,16 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0011_provenance_service_boundary",
         "provenance-service-boundary-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0012_semantic_registry_store",
+        "semantic-registry-store-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0013_provider_registry",
+        "provider-registry-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3655,6 +3665,77 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 "provenance service-boundary migration is incomplete",
             ));
         }
+        let has_semantic_registry_store = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_semantic_registry_store {
+            require_migration_tables(
+                connection,
+                &[
+                    "semantic_type_contracts",
+                    "semantic_capability_contracts",
+                    "registry_snapshot_admissions",
+                    "registry_snapshot_entries",
+                    "registry_activations",
+                ],
+            )?;
+            for trigger in [
+                "immutable_admitted_registry_snapshots_update",
+                "immutable_admitted_registry_snapshots_delete",
+                "immutable_semantic_type_contracts_update",
+                "immutable_semantic_type_contracts_delete",
+                "immutable_semantic_capability_contracts_update",
+                "immutable_semantic_capability_contracts_delete",
+                "immutable_registry_snapshot_entries_update",
+                "immutable_registry_snapshot_entries_delete",
+                "immutable_registry_snapshot_admissions_delete",
+            ] {
+                let present = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                    [trigger],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !present {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "semantic registry migration is incomplete",
+                    ));
+                }
+            }
+        }
+        let has_provider_registry = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_provider_registry {
+            require_migration_tables(
+                connection,
+                &["provider_health_observations", "provider_manifest_payloads"],
+            )?;
+            for (kind, name) in [
+                ("trigger", "provider_manifest_payload_immutable_update"),
+                ("trigger", "provider_manifest_payload_immutable_delete"),
+                ("trigger", "provider_registration_identity_immutable"),
+                ("trigger", "provider_registration_no_delete"),
+                ("trigger", "provider_registration_revocation_terminal"),
+                ("trigger", "provider_evidence_immutable_update"),
+                ("trigger", "provider_evidence_immutable_delete"),
+                ("index", "ix_provider_conformance_latest"),
+            ] {
+                let present = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                    params![kind, name],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !present {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "provider registry migration is incomplete",
+                    ));
+                }
+            }
+        }
         if has_v11
             && connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
@@ -3775,6 +3856,16 @@ fn migrate_task_manager_schema(
         connection,
         "0011_provenance_service_boundary",
         "provenance-service-boundary-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0012_semantic_registry_store",
+        "semantic-registry-store-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0013_provider_registry",
+        "provider-registry-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5925,6 +6016,7 @@ fn conformance_evidence_valid(
     binding: &BindingEvidence,
     contract: &SnapshotContract,
     checked_at: &str,
+    admitted_suite_version: Option<&str>,
 ) -> Result<bool> {
     let Ok(evidence) = serde_json::from_str::<Value>(&binding.conformance_json) else {
         return Ok(false);
@@ -5932,25 +6024,39 @@ fn conformance_evidence_valid(
     if !provider_conformance_result_validator()?.is_valid(&evidence) {
         return Ok(false);
     }
-    let executed_at_valid = binding
+    let Ok(checked_at_time) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
+        return Ok(false);
+    };
+    let tested_at = binding
         .conformance_tested_at
         .as_deref()
-        .is_some_and(|tested_at| OffsetDateTime::parse(tested_at, &Rfc3339).is_ok());
+        .and_then(|tested_at| OffsetDateTime::parse(tested_at, &Rfc3339).ok());
+    let executed_at_valid = tested_at.is_some_and(|tested_at| tested_at <= checked_at_time);
     let not_expired = match evidence.get("expires_at") {
         None | Some(Value::Null) => true,
         Some(Value::String(expires_at)) => {
             let Ok(expires_at) = OffsetDateTime::parse(expires_at, &Rfc3339) else {
                 return Ok(false);
             };
-            let Ok(checked_at) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
-                return Ok(false);
-            };
-            expires_at > checked_at
+            expires_at > checked_at_time
+                && admitted_suite_version
+                    .is_none_or(|_| tested_at.is_some_and(|tested| expires_at > tested))
         }
         Some(_) => false,
     };
+    let admitted_pass_valid = admitted_suite_version.is_none_or(|suite_version| {
+        let total = evidence.get("tests_total").and_then(Value::as_u64);
+        total.is_some_and(|total| total > 0)
+            && evidence.get("tests_passed").and_then(Value::as_u64) == total
+            && evidence.get("tests_failed").and_then(Value::as_u64) == Some(0)
+            && evidence
+                .pointer("/conformance_suite/version")
+                .and_then(Value::as_str)
+                == Some(suite_version)
+    });
     Ok(executed_at_valid
         && not_expired
+        && admitted_pass_valid
         && evidence.get("result_id").and_then(Value::as_str)
             == Some(binding.conformance_evidence_id.as_str())
         && evidence.get("provider_id").and_then(Value::as_str)
@@ -5985,6 +6091,417 @@ fn conformance_evidence_valid(
             == Some(binding.conformance_status.as_str())
         && evidence.get("executed_at").and_then(Value::as_str)
             == binding.conformance_tested_at.as_deref())
+}
+
+fn latest_conformance_evidence_id(
+    transaction: &Transaction<'_>,
+    check: &BindingGrantCheck<'_>,
+    has_provider_store: bool,
+) -> Result<Option<String>> {
+    let seed: Option<(String, String, Option<String>, String)> = transaction.query_row(
+        "SELECT b.provider_registration_id,b.capability,b.capability_contract_hash,r.registration_json
+         FROM execution_bindings b JOIN provider_registrations r ON r.registration_id=b.provider_registration_id
+         WHERE b.binding_id=?1 AND b.attempt_id=?2 AND b.task_id=?3
+           AND b.semantic_program_hash=?4 AND b.node_id=?5",
+        params![check.binding_id, check.attempt_id, check.task_id, check.semantic_hash, check.node_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let Some((registration_id, capability, contract_hash, receipt_json)) = seed else {
+        return Ok(None);
+    };
+    let Ok(checked_at) = OffsetDateTime::parse(check.checked_at, &Rfc3339) else {
+        return Ok(None);
+    };
+    let claimed_suite = if has_provider_store {
+        let Ok(receipt) = aios_registry::parse_strict_value(
+            receipt_json.as_bytes(),
+            aios_registry::StrictJsonLimits::default(),
+        ) else {
+            return Ok(None);
+        };
+        let Some(claims) = receipt.get("capabilities").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        let matching = claims
+            .iter()
+            .filter_map(|claim| {
+                let id = claim.get("capability")?.as_str()?;
+                let version =
+                    aios_registry::FullVersion::parse(claim.get("version")?.as_str()?).ok()?;
+                if capability != format!("{id}@{}", version.major)
+                    || claim.get("contract_hash")?.as_str() != contract_hash.as_deref()
+                {
+                    return None;
+                }
+                Some((
+                    claim.get("conformance_suite")?.as_str()?.to_owned(),
+                    claim.get("conformance_suite_hash")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Ok(None);
+        }
+        Some(matching[0].clone())
+    } else {
+        None
+    };
+    let mut statement = transaction.prepare(
+        "SELECT evidence_id,tested_at,suite_id,suite_hash FROM provider_conformance_evidence
+         WHERE registration_id=?1 AND capability=?2 AND contract_hash=?3",
+    )?;
+    let mut rows = statement.query(params![registration_id, capability, contract_hash])?;
+    let mut latest: Option<OffsetDateTime> = None;
+    let mut latest_id: Option<String> = None;
+    let mut tied = false;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(raw_time) = row.get::<_, Option<String>>(1)? else {
+            return Ok(None);
+        };
+        let suite_id: String = row.get(2)?;
+        let suite_hash: Option<String> = row.get(3)?;
+        if claimed_suite.as_ref().is_some_and(|(id, hash)| {
+            id != &suite_id || Some(hash.as_str()) != suite_hash.as_deref()
+        }) {
+            continue;
+        }
+        let Ok(time) = OffsetDateTime::parse(&raw_time, &Rfc3339) else {
+            return Ok(None);
+        };
+        if time > checked_at {
+            continue;
+        }
+        match latest {
+            Some(previous) if time < previous => {}
+            Some(previous) if time == previous => tied = true,
+            _ => {
+                latest = Some(time);
+                latest_id = Some(id);
+                tied = false;
+            }
+        }
+    }
+    Ok((!tied).then_some(latest_id).flatten())
+}
+
+fn embedded_provider_schema(
+    source: &'static str,
+    cache: &'static OnceLock<std::result::Result<jsonschema::Validator, String>>,
+) -> Result<&'static jsonschema::Validator> {
+    cache
+        .get_or_init(|| {
+            let schema: Value = serde_json::from_str(source).map_err(|error| error.to_string())?;
+            jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|_| TaskManagerError::InvalidRecord("embedded provider schema is invalid"))
+}
+
+fn provider_manifest_validator() -> Result<&'static jsonschema::Validator> {
+    static CACHE: OnceLock<std::result::Result<jsonschema::Validator, String>> = OnceLock::new();
+    embedded_provider_schema(
+        include_str!("../../../specs/capability-manifest.schema.json"),
+        &CACHE,
+    )
+}
+
+fn provider_registration_validator() -> Result<&'static jsonschema::Validator> {
+    static CACHE: OnceLock<std::result::Result<jsonschema::Validator, String>> = OnceLock::new();
+    embedded_provider_schema(
+        include_str!("../../../specs/provider-registration.schema.json"),
+        &CACHE,
+    )
+}
+
+fn provider_identity_digest(domain: &[u8], content: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(content);
+    let mut result = String::from("sha256:");
+    for byte in digest.finalize() {
+        write!(&mut result, "{byte:02x}").expect("String writes do not fail");
+    }
+    result
+}
+
+type ProviderAdmissionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "verifies persisted provider identity, immutable receipt, and both semantic snapshots"
+)]
+fn verified_provider_admission(
+    transaction: &Transaction<'_>,
+    binding: &BindingEvidence,
+) -> Result<bool> {
+    let Some(registration_id) = binding.provider_registration_id.as_deref() else {
+        return Ok(false);
+    };
+    let record: Option<ProviderAdmissionRow> = transaction
+        .query_row(
+            "SELECT r.provider_id,r.provider_version,r.manifest_hash,r.package_content_hash,
+                r.registry_snapshot_id,r.registration_json,r.registered_at,m.manifest_json
+         FROM provider_registrations r JOIN provider_manifest_payloads m
+           ON m.registration_id=r.registration_id WHERE r.registration_id=?1",
+            [registration_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        provider_id,
+        version,
+        manifest_hash,
+        build_hash,
+        snapshot_id,
+        receipt_json,
+        registered_at,
+        manifest_json,
+    )) = record
+    else {
+        return Ok(false);
+    };
+    if provider_id != binding.principal_id
+        || version != binding.provider_version
+        || Some(manifest_hash.as_str()) != binding.provider_manifest_hash.as_deref()
+        || Some(build_hash.as_str()) != binding.provider_build_hash.as_deref()
+        || OffsetDateTime::parse(&registered_at, &Rfc3339).is_err()
+    {
+        return Ok(false);
+    }
+    let limits = aios_registry::StrictJsonLimits {
+        max_bytes: 1024 * 1024,
+        max_depth: 32,
+    };
+    let Ok(manifest_value) = aios_registry::parse_strict_value(manifest_json.as_bytes(), limits)
+    else {
+        return Ok(false);
+    };
+    if canonical_json(&manifest_value)? != manifest_json
+        || !provider_manifest_validator()?.is_valid(&manifest_value)
+    {
+        return Ok(false);
+    }
+    let Ok(manifest) =
+        serde_json::from_value::<aios_contracts::CapabilityManifest>(manifest_value.clone())
+    else {
+        return Ok(false);
+    };
+    let expected_manifest_hash =
+        provider_identity_digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", manifest_json.as_bytes());
+    let expected_registration_id = provider_identity_digest(
+        b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+        format!("{provider_id}\0{version}\0{manifest_hash}\0{build_hash}").as_bytes(),
+    );
+    if manifest.id != provider_id
+        || manifest.version != version
+        || expected_manifest_hash != manifest_hash
+        || expected_registration_id != registration_id
+    {
+        return Ok(false);
+    }
+    let Ok(receipt) = aios_registry::parse_strict_value(receipt_json.as_bytes(), limits) else {
+        return Ok(false);
+    };
+    if canonical_json(&receipt)? != receipt_json
+        || !provider_registration_validator()?.is_valid(&receipt)
+        || receipt.get("registration_id").and_then(Value::as_str) != Some(registration_id)
+        || receipt.pointer("/provider/id").and_then(Value::as_str) != Some(provider_id.as_str())
+        || receipt.pointer("/provider/version").and_then(Value::as_str) != Some(version.as_str())
+        || receipt
+            .pointer("/provider/manifest_hash")
+            .and_then(Value::as_str)
+            != Some(manifest_hash.as_str())
+        || receipt
+            .pointer("/package/content_hash")
+            .and_then(Value::as_str)
+            != Some(build_hash.as_str())
+        || receipt.get("registry_snapshot_id").and_then(Value::as_str) != Some(snapshot_id.as_str())
+        || receipt.get("registered_at").and_then(Value::as_str) != Some(registered_at.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(receipt_claims) = receipt.get("capabilities").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if receipt_claims.len() != manifest.provides.len() {
+        return Ok(false);
+    }
+    let mut binding_claim_matches = 0;
+    for (claim, recorded) in manifest.provides.iter().zip(receipt_claims) {
+        if recorded.get("capability").and_then(Value::as_str)
+            != Some(claim.contract.capability.as_str())
+            || recorded.get("version").and_then(Value::as_str)
+                != Some(claim.contract.version.as_str())
+            || recorded.get("contract_hash").and_then(Value::as_str)
+                != claim.contract.contract_hash.as_deref()
+            || recorded.get("conformance_suite").and_then(Value::as_str)
+                != Some(claim.conformance.suite.as_str())
+            || recorded
+                .get("conformance_suite_hash")
+                .and_then(Value::as_str)
+                != claim.conformance.suite_hash.as_deref()
+            || recorded.get("conformance_status").and_then(Value::as_str) != Some("declared")
+            || recorded.get("eligible").and_then(Value::as_bool) != Some(false)
+        {
+            return Ok(false);
+        }
+        let Ok(version) = aios_registry::FullVersion::parse(&claim.contract.version) else {
+            return Ok(false);
+        };
+        if binding.capability == format!("{}@{}", claim.contract.capability, version.major)
+            && claim.contract.contract_hash.as_deref() == binding.contract_hash.as_deref()
+            && Some(claim.conformance.suite.as_str()) == binding.conformance_suite_id.as_deref()
+            && claim.conformance.suite_hash.as_deref() == binding.conformance_suite_hash.as_deref()
+        {
+            binding_claim_matches += 1;
+        }
+    }
+    if binding_claim_matches != 1 {
+        return Ok(false);
+    }
+    let Some(origin_registry) = load_admitted_semantic_registry(transaction, &snapshot_id)? else {
+        return Ok(false);
+    };
+    let Some(selected_registry) =
+        load_admitted_semantic_registry(transaction, &binding.registry_snapshot_id)?
+    else {
+        return Ok(false);
+    };
+    let options = aios_registry::ProviderConformanceOptions::default();
+    let origin_report =
+        aios_registry::validate_provider_manifest(&origin_registry, &manifest, options);
+    let mut selected_manifest = manifest.clone();
+    selected_manifest.provides.retain(|claim| {
+        aios_registry::FullVersion::parse(&claim.contract.version)
+            .ok()
+            .is_some_and(|version| {
+                binding.capability == format!("{}@{}", claim.contract.capability, version.major)
+                    && claim.contract.contract_hash.as_deref() == binding.contract_hash.as_deref()
+                    && Some(claim.conformance.suite.as_str())
+                        == binding.conformance_suite_id.as_deref()
+                    && claim.conformance.suite_hash.as_deref()
+                        == binding.conformance_suite_hash.as_deref()
+            })
+    });
+    let selected_report =
+        aios_registry::validate_provider_manifest(&selected_registry, &selected_manifest, options);
+    Ok(origin_report.valid
+        && !origin_report.bootstrap_contract_hash_bypass_used
+        && selected_report.valid
+        && !selected_report.bootstrap_contract_hash_bypass_used)
+}
+
+fn load_admitted_semantic_registry(
+    transaction: &Transaction<'_>,
+    snapshot_id: &str,
+) -> Result<Option<aios_registry::SemanticRegistry>> {
+    let snapshot_json: Option<String> = transaction
+        .query_row(
+            "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(snapshot_json) = snapshot_json else {
+        return Ok(None);
+    };
+    let Ok(snapshot) = aios_registry::parse_strict_json::<aios_contracts::RegistrySnapshot>(
+        snapshot_json.as_bytes(),
+        aios_registry::StrictJsonLimits::default(),
+    ) else {
+        return Ok(None);
+    };
+    let mut types = Vec::new();
+    let mut capabilities = Vec::new();
+    for (class, sink_type) in [("type", true), ("capability", false)] {
+        let mut statement = transaction.prepare(
+            "SELECT t.contract_json,c.contract_json FROM registry_snapshot_entries e
+             LEFT JOIN semantic_type_contracts t ON e.contract_class='type' AND t.content_hash=e.content_hash
+             LEFT JOIN semantic_capability_contracts c ON e.contract_class='capability' AND c.content_hash=e.content_hash
+             WHERE e.snapshot_id=?1 AND e.contract_class=?2",
+        )?;
+        let mut rows = statement.query(params![snapshot_id, class])?;
+        while let Some(row) = rows.next()? {
+            if sink_type {
+                let Some(json) = row.get::<_, Option<String>>(0)? else {
+                    return Ok(None);
+                };
+                let Ok(contract) = aios_registry::parse_strict_json::<aios_contracts::TypeContract>(
+                    json.as_bytes(),
+                    aios_registry::StrictJsonLimits::default(),
+                ) else {
+                    return Ok(None);
+                };
+                types.push(contract);
+            } else {
+                let Some(json) = row.get::<_, Option<String>>(1)? else {
+                    return Ok(None);
+                };
+                let Ok(contract) = aios_registry::parse_strict_json::<
+                    aios_contracts::CapabilityContract,
+                >(
+                    json.as_bytes(), aios_registry::StrictJsonLimits::default()
+                ) else {
+                    return Ok(None);
+                };
+                capabilities.push(contract);
+            }
+        }
+    }
+    let Ok(registry) = aios_registry::SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        aios_registry::RegistryBuildOptions::default(),
+    ) else {
+        return Ok(None);
+    };
+    Ok((registry.snapshot_id() == snapshot_id).then_some(registry))
+}
+
+fn admitted_suite_version(
+    transaction: &Transaction<'_>,
+    binding: &BindingEvidence,
+) -> Result<Option<String>> {
+    let Some(registry) =
+        load_admitted_semantic_registry(transaction, &binding.registry_snapshot_id)?
+    else {
+        return Ok(None);
+    };
+    let Some((capability, major)) = binding.capability.rsplit_once('@') else {
+        return Ok(None);
+    };
+    let Ok(major) = major.parse::<u64>() else {
+        return Ok(None);
+    };
+    let Some(contract) = registry.capability_contract(capability, major) else {
+        return Ok(None);
+    };
+    Ok(contract.conformance.suite_version.clone())
 }
 
 fn binding_json_matches(binding: &BindingEvidence, check: &BindingGrantCheck<'_>) -> Result<bool> {
@@ -6124,9 +6641,21 @@ fn binding_grants_valid(
     if grant_ids.len() > 64 || !all_unique(&grant_ids) {
         return Ok(false);
     }
-    let binding = transaction
-        .query_row(
-            "SELECT b.capability, b.provider_id, p.program_json, p.registry_snapshot_id,
+    let has_registry_store: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+        [], |row| row.get(0),
+    )?;
+    let has_provider_store: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+        [], |row| row.get(0),
+    )?;
+    let Some(latest_evidence_id) =
+        latest_conformance_evidence_id(transaction, check, has_provider_store)?
+    else {
+        return Ok(false);
+    };
+    let mut binding_query = String::from(
+        "SELECT b.capability, b.provider_id, p.program_json, p.registry_snapshot_id,
                     b.capability_contract_hash, s.manifest_json, b.ir_version,
                     b.provider_version, b.provider_manifest_hash, b.provider_build_hash,
                     b.provider_registration_id, b.attempt, b.policy_decision_refs_json,
@@ -6139,36 +6668,59 @@ fn binding_grants_valid(
              JOIN registry_snapshots s ON s.snapshot_id = p.registry_snapshot_id
              JOIN provider_registrations r ON r.registration_id = b.provider_registration_id
                 AND r.provider_id = b.provider_id AND r.provider_version = b.provider_version
-                AND r.registry_snapshot_id = p.registry_snapshot_id AND r.state = 'registered'
+                AND r.state = 'registered'
                 AND r.trust_status IN ('locally-trusted', 'project-reviewed', 'organization-approved')
                 AND r.manifest_hash = b.provider_manifest_hash
                 AND r.package_content_hash = b.provider_build_hash
-             JOIN provider_conformance_evidence c ON c.registration_id = r.registration_id
-                AND c.capability = b.capability AND c.contract_hash = b.capability_contract_hash
-                AND c.status = 'pass'
+             JOIN provider_conformance_evidence c ON c.evidence_id = ?6
+                AND c.registration_id = r.registration_id AND c.capability = b.capability
+                AND c.contract_hash = b.capability_contract_hash AND c.status = 'pass'
              WHERE b.binding_id = ?1 AND b.attempt_id = ?2 AND b.task_id = ?3
                 AND b.semantic_program_hash = ?4 AND b.node_id = ?5
-                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash
-                AND (SELECT COUNT(*) FROM provider_conformance_evidence c2
-                     WHERE c2.registration_id=r.registration_id
-                       AND c2.capability=b.capability
-                       AND c2.contract_hash=b.capability_contract_hash
-                       AND c2.status='pass')=1",
-            params![check.binding_id, check.attempt_id, check.task_id, check.semantic_hash, check.node_id],
+                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash",
+    );
+    if has_registry_store {
+        binding_query.push_str(
+            " AND EXISTS(SELECT 1 FROM registry_snapshot_admissions a
+               WHERE a.snapshot_id=p.registry_snapshot_id AND a.state='ADMITTED')",
+        );
+    }
+    let binding = transaction
+        .query_row(
+            &binding_query,
+            params![
+                check.binding_id,
+                check.attempt_id,
+                check.task_id,
+                check.semantic_hash,
+                check.node_id,
+                latest_evidence_id
+            ],
             |row| {
                 Ok(BindingEvidence {
-                    capability: row.get(0)?, principal_id: row.get(1)?,
-                    program_json: row.get(2)?, registry_snapshot_id: row.get(3)?,
-                    contract_hash: row.get(4)?, snapshot_manifest_json: row.get(5)?,
-                    ir_version: row.get(6)?, provider_version: row.get(7)?,
-                    provider_manifest_hash: row.get(8)?, provider_build_hash: row.get(9)?,
-                    provider_registration_id: row.get(10)?, attempt: row.get(11)?,
-                    policy_decision_refs_json: row.get(12)?, grant_refs_json: row.get(13)?,
-                    execution_profile_ref: row.get(14)?, placement_json: row.get(15)?,
-                    binding_json: row.get(16)?, created_at: row.get(17)?,
+                    capability: row.get(0)?,
+                    principal_id: row.get(1)?,
+                    program_json: row.get(2)?,
+                    registry_snapshot_id: row.get(3)?,
+                    contract_hash: row.get(4)?,
+                    snapshot_manifest_json: row.get(5)?,
+                    ir_version: row.get(6)?,
+                    provider_version: row.get(7)?,
+                    provider_manifest_hash: row.get(8)?,
+                    provider_build_hash: row.get(9)?,
+                    provider_registration_id: row.get(10)?,
+                    attempt: row.get(11)?,
+                    policy_decision_refs_json: row.get(12)?,
+                    grant_refs_json: row.get(13)?,
+                    execution_profile_ref: row.get(14)?,
+                    placement_json: row.get(15)?,
+                    binding_json: row.get(16)?,
+                    created_at: row.get(17)?,
                     conformance_evidence_id: row.get(18)?,
-                    conformance_suite_id: row.get(19)?, conformance_suite_hash: row.get(20)?,
-                    conformance_status: row.get(21)?, conformance_json: row.get(22)?,
+                    conformance_suite_id: row.get(19)?,
+                    conformance_suite_hash: row.get(20)?,
+                    conformance_status: row.get(21)?,
+                    conformance_json: row.get(22)?,
                     conformance_tested_at: row.get(23)?,
                 })
             },
@@ -6180,6 +6732,7 @@ fn binding_grants_valid(
     if binding.provider_registration_id.is_none()
         || binding.grant_refs_json != check.grant_refs_json
         || !binding_json_matches(&binding, check)?
+        || (has_provider_store && !verified_provider_admission(transaction, &binding)?)
     {
         return Ok(false);
     }
@@ -6187,8 +6740,21 @@ fn binding_grants_valid(
     let Some(contract) = snapshot_contract(&snapshot, &binding.capability) else {
         return Ok(false);
     };
+    let suite_version = if has_provider_store {
+        let Some(version) = admitted_suite_version(transaction, &binding)? else {
+            return Ok(false);
+        };
+        Some(version)
+    } else {
+        None
+    };
     if Some(contract.content_hash.as_str()) != binding.contract_hash.as_deref()
-        || !conformance_evidence_valid(&binding, &contract, check.checked_at)?
+        || !conformance_evidence_valid(
+            &binding,
+            &contract,
+            check.checked_at,
+            suite_version.as_deref(),
+        )?
     {
         return Ok(false);
     }

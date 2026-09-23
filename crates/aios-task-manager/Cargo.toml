@@ -6,8 +6,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+aios-contracts.workspace = true
 aios-ir.workspace = true
 aios-provenance.workspace = true
+aios-registry.workspace = true
 cap-std.workspace = true
 fs2.workspace = true
 jsonschema.workspace = true

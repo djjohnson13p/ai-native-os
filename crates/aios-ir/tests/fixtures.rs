@@ -8,10 +8,12 @@ use aios_contracts::{
 };
 use aios_ir::{ValidationLimits, ValidationReport, Validator};
 use aios_registry::{
-    HashVerificationMode, RegistryBuildOptions, RegistryLoadOptions, SemanticRegistry,
+    HashVerificationMode, ProviderStore, ProviderTrustStatus, RegistryBuildOptions,
+    RegistryLoadOptions, RegistryStore, SemanticRegistry,
 };
 use jsonschema::Resource;
 use proptest::prelude::*;
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -412,6 +414,74 @@ fn downstream_examples_reference_generated_semantic_identities() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
+    let registry =
+        SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+    let program = fixture_value("canonicalization-cases.json")["cases"][1]["left"].clone();
+    let baseline = validate(
+        &Validator::new(registry.clone(), ValidationLimits::default()),
+        &program,
+    );
+    assert!(baseline.output.validation.valid);
+    let expected_hash = baseline.output.validation.semantic_hash.clone();
+
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+        .unwrap();
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    RegistryStore::initialize(&mut connection)
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    let mut providers = ProviderStore::initialize(&mut connection).unwrap();
+    let mut manifest = fixture_value("provider-conformance-cases.json")[0]["provider"].clone();
+    for (id, build) in [
+        (
+            "org.ainative.fixture.artifact-hash-a",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "org.ainative.fixture.artifact-hash-b",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        manifest["id"] = id.into();
+        let registered = providers
+            .register(
+                &registry,
+                &serde_json::to_vec(&manifest).unwrap(),
+                build,
+                ProviderTrustStatus::LocallyTrusted,
+                FIXED_TIME,
+            )
+            .unwrap();
+        let after_registration = validate(
+            &Validator::new(registry.clone(), ValidationLimits::default()),
+            &program,
+        );
+        assert_eq!(
+            after_registration.output.validation.semantic_hash,
+            expected_hash
+        );
+        providers
+            .revoke(&registered.registration_id, FIXED_TIME)
+            .unwrap();
+    }
+    let after_revocation = validate(
+        &Validator::new(registry, ValidationLimits::default()),
+        &program,
+    );
+    assert_eq!(
+        after_revocation.output.validation.semantic_hash,
+        expected_hash
+    );
 }
 
 #[test]
