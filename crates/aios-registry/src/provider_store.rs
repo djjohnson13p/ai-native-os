@@ -400,6 +400,10 @@ impl<'a> ProviderStore<'a> {
     /// The caller must authenticate the harness/source before calling this trusted
     /// control-plane boundary. This store checks identity and consistency; it
     /// never executes provider code or treats a manifest's declared status as proof.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks the complete provider, manifest, contract and evidence admission receipt"
+    )]
     pub fn record_evidence(
         &mut self,
         registration_id: &str,
@@ -464,6 +468,28 @@ impl<'a> ProviderStore<'a> {
             if total.is_none() || total != passed || failed != Some(0) || total == Some(0) {
                 return Err(ProviderStoreError::Invalid(
                     "passing evidence needs nonzero, complete test counts",
+                ));
+            }
+            if !evidence_matches_binding(
+                raw_evidence,
+                &EvidenceMatch {
+                    evidence_id: &id,
+                    provider_id: &registration.provider_id,
+                    provider_version: &registration.provider_version,
+                    build_hash: &registration.build_hash,
+                    capability: semantic_ref,
+                    contract_version: &claim.contract.version,
+                    contract_hash,
+                    suite_id,
+                    suite_hash,
+                    suite_version,
+                    status: result,
+                    tested_at,
+                    evaluated_at: tested_at,
+                },
+            ) {
+                return Err(ProviderStoreError::Invalid(
+                    "passing evidence projection is inconsistent",
                 ));
             }
         }
@@ -1186,66 +1212,27 @@ impl<'a> ProviderStore<'a> {
         if status != "pass" {
             return Ok(Vec::new());
         }
-        let Ok(evidence) = parse_document(
+        let evaluated_at = at
+            .format(&Rfc3339)
+            .map_err(|_| ProviderStoreError::Invalid("evaluation time is invalid"))?;
+        let matches = evidence_matches_binding(
             raw.as_bytes(),
-            MAX_EVIDENCE_BYTES,
-            &EVIDENCE_SCHEMA,
-            include_str!("../../../specs/provider-conformance-result.schema.json"),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let expired = evidence
-            .pointer("/expires_at")
-            .and_then(Value::as_str)
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .is_some_and(|value| value <= at);
-        let counts_valid = evidence
-            .get("tests_total")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| {
-                total > 0
-                    && evidence.get("tests_passed").and_then(Value::as_u64) == Some(total)
-                    && evidence.get("tests_failed").and_then(Value::as_u64) == Some(0)
-            });
-        let matches = !expired
-            && counts_valid
-            && evidence.pointer("/executed_at").and_then(Value::as_str) == Some(tested_at.as_str())
-            && evidence.pointer("/result_id").and_then(Value::as_str) == Some(id.as_str())
-            && evidence.pointer("/provider_id").and_then(Value::as_str)
-                == Some(registration.provider_id.as_str())
-            && evidence
-                .pointer("/provider_version")
-                .and_then(Value::as_str)
-                == Some(registration.provider_version.as_str())
-            && evidence.pointer("/result").and_then(Value::as_str) == Some("pass")
-            && evidence
-                .pointer("/semantic_capability_ref")
-                .and_then(Value::as_str)
-                == Some(semantic_ref)
-            && evidence
-                .pointer("/semantic_contract_version")
-                .and_then(Value::as_str)
-                == Some(claim.contract.version.as_str())
-            && evidence
-                .pointer("/semantic_contract_hash")
-                .and_then(Value::as_str)
-                == Some(contract_hash)
-            && evidence
-                .pointer("/conformance_suite/id")
-                .and_then(Value::as_str)
-                == Some(suite_id.as_str())
-            && evidence
-                .pointer("/conformance_suite/hash")
-                .and_then(Value::as_str)
-                == Some(suite_hash)
-            && evidence
-                .pointer("/conformance_suite/version")
-                .and_then(Value::as_str)
-                == Some(suite_version.as_str())
-            && evidence
-                .pointer("/provider_build_identity/value")
-                .and_then(Value::as_str)
-                == Some(registration.build_hash.as_str());
+            &EvidenceMatch {
+                evidence_id: &id,
+                provider_id: &registration.provider_id,
+                provider_version: &registration.provider_version,
+                build_hash: &registration.build_hash,
+                capability: semantic_ref,
+                contract_version: &claim.contract.version,
+                contract_hash,
+                suite_id,
+                suite_hash,
+                suite_version: &suite_version,
+                status: &status,
+                tested_at: &tested_at,
+                evaluated_at: &evaluated_at,
+            },
+        );
         Ok(if matches {
             vec![(id, suite_id.clone(), suite_hash.to_owned())]
         } else {
@@ -1571,6 +1558,106 @@ fn parse_document(
         )));
     }
     Ok(value)
+}
+
+/// Immutable evidence fields that must agree before a binding consumes an attempt.
+pub struct EvidenceMatch<'a> {
+    pub evidence_id: &'a str,
+    pub provider_id: &'a str,
+    pub provider_version: &'a str,
+    pub build_hash: &'a str,
+    pub capability: &'a str,
+    pub contract_version: &'a str,
+    pub contract_hash: &'a str,
+    pub suite_id: &'a str,
+    pub suite_hash: &'a str,
+    pub suite_version: &'a str,
+    pub status: &'a str,
+    pub tested_at: &'a str,
+    pub evaluated_at: &'a str,
+}
+
+/// Apply the same bounded, schema-checked evidence projection at insertion and launch.
+pub fn evidence_matches_binding(raw: &[u8], expected: &EvidenceMatch<'_>) -> bool {
+    let Ok(evidence) = parse_document(
+        raw,
+        MAX_EVIDENCE_BYTES,
+        &EVIDENCE_SCHEMA,
+        include_str!("../../../specs/provider-conformance-result.schema.json"),
+    ) else {
+        return false;
+    };
+    let Some(tested) = OffsetDateTime::parse(expected.tested_at, &Rfc3339).ok() else {
+        return false;
+    };
+    let Some(evaluated) = OffsetDateTime::parse(expected.evaluated_at, &Rfc3339).ok() else {
+        return false;
+    };
+    if tested > evaluated
+        || evidence.get("executed_at").and_then(Value::as_str) != Some(expected.tested_at)
+    {
+        return false;
+    }
+    if let Some(expires) = evidence.get("expires_at") {
+        match expires {
+            Value::Null => {}
+            Value::String(text) => {
+                let Some(expires) = OffsetDateTime::parse(text, &Rfc3339).ok() else {
+                    return false;
+                };
+                if expires <= tested || expires <= evaluated {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    let Some(version) = crate::FullVersion::parse(expected.contract_version).ok() else {
+        return false;
+    };
+    let Some((base, major)) = expected.capability.rsplit_once('@') else {
+        return false;
+    };
+    if major != version.major.to_string() || base.is_empty() || expected.status != "pass" {
+        return false;
+    }
+    let total = evidence.get("tests_total").and_then(Value::as_u64);
+    total.is_some_and(|total| total > 0)
+        && evidence.get("tests_passed").and_then(Value::as_u64) == total
+        && evidence.get("tests_failed").and_then(Value::as_u64) == Some(0)
+        && evidence.get("result_id").and_then(Value::as_str) == Some(expected.evidence_id)
+        && evidence.get("provider_id").and_then(Value::as_str) == Some(expected.provider_id)
+        && evidence.get("provider_version").and_then(Value::as_str)
+            == Some(expected.provider_version)
+        && evidence
+            .pointer("/provider_build_identity/value")
+            .and_then(Value::as_str)
+            == Some(expected.build_hash)
+        && evidence
+            .get("semantic_capability_ref")
+            .and_then(Value::as_str)
+            == Some(expected.capability)
+        && evidence
+            .get("semantic_contract_version")
+            .and_then(Value::as_str)
+            == Some(expected.contract_version)
+        && evidence
+            .get("semantic_contract_hash")
+            .and_then(Value::as_str)
+            == Some(expected.contract_hash)
+        && evidence
+            .pointer("/conformance_suite/id")
+            .and_then(Value::as_str)
+            == Some(expected.suite_id)
+        && evidence
+            .pointer("/conformance_suite/hash")
+            .and_then(Value::as_str)
+            == Some(expected.suite_hash)
+        && evidence
+            .pointer("/conformance_suite/version")
+            .and_then(Value::as_str)
+            == Some(expected.suite_version)
+        && evidence.get("result").and_then(Value::as_str) == Some(expected.status)
 }
 
 fn string_at<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {

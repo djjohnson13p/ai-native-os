@@ -1,9 +1,12 @@
 //! `SQLite` admission uses the same strict, bounded parser as launch-time checks.
 
 use rusqlite::{Connection, functions::FunctionFlags, types::ValueRef};
+use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
-    BindingReceiptColumns, BindingReceiptProjection, StrictJsonLimits, parse_strict_value,
+    BindingReceiptColumns, BindingReceiptProjection, EvidenceMatch, FullVersion, StrictJsonLimits,
+    evidence_matches_binding, parse_strict_value,
 };
 
 /// Register the parser required by the durable execution-binding insert guard.
@@ -12,6 +15,10 @@ use crate::{
 /// # Errors
 ///
 /// Returns the `SQLite` registration error if the connection cannot install the function.
+#[allow(
+    clippy::too_many_lines,
+    reason = "registers one versioned admission parser and its companion SQLite predicates"
+)]
 pub fn register_strict_json_sqlite(connection: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8
         | FunctionFlags::SQLITE_DETERMINISTIC
@@ -22,6 +29,90 @@ pub fn register_strict_json_sqlite(connection: &Connection) -> rusqlite::Result<
             _ => false,
         };
         Ok(valid)
+    })?;
+    connection.create_scalar_function(
+        "aios_manifest_capability_matches_v1",
+        3,
+        flags,
+        |context| {
+            let (Some(base), Some(version), Some(capability)) = (
+                context.get::<Option<String>>(0)?,
+                context.get::<Option<String>>(1)?,
+                context.get::<Option<String>>(2)?,
+            ) else {
+                return Ok(false);
+            };
+            Ok(FullVersion::parse(&version)
+                .is_ok_and(|version| capability == format!("{base}@{}", version.major)))
+        },
+    )?;
+    connection.create_scalar_function("aios_evidence_unexpired_at_v1", 2, flags, |context| {
+        let ValueRef::Text(raw) = context.get_raw(0) else {
+            return Ok(false);
+        };
+        let Ok(evidence) = parse_strict_value(raw, StrictJsonLimits::default()) else {
+            return Ok(false);
+        };
+        let Some(created_at) = context
+            .get::<Option<String>>(1)?
+            .and_then(|text| OffsetDateTime::parse(&text, &Rfc3339).ok())
+        else {
+            return Ok(false);
+        };
+        Ok(match evidence.get("expires_at") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => OffsetDateTime::parse(text, &Rfc3339)
+                .is_ok_and(|expires_at| expires_at > created_at),
+            Some(_) => false,
+        })
+    })?;
+    connection.create_scalar_function(
+        "aios_evidence_matches_binding_v1",
+        14,
+        flags,
+        |context| {
+            let ValueRef::Text(raw) = context.get_raw(0) else {
+                return Ok(false);
+            };
+            let fields = (1..14)
+                .map(|index| context.get::<String>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected = EvidenceMatch {
+                evidence_id: &fields[0],
+                provider_id: &fields[1],
+                provider_version: &fields[2],
+                build_hash: &fields[3],
+                capability: &fields[4],
+                contract_version: &fields[5],
+                contract_hash: &fields[6],
+                suite_id: &fields[7],
+                suite_hash: &fields[8],
+                suite_version: &fields[9],
+                status: &fields[10],
+                tested_at: &fields[11],
+                evaluated_at: &fields[12],
+            };
+            Ok(evidence_matches_binding(raw, &expected))
+        },
+    )?;
+    connection.create_scalar_function("aios_rfc3339_compare_v1", 2, flags, |context| {
+        let (Some(left), Some(right)) = (
+            context.get::<Option<String>>(0)?,
+            context.get::<Option<String>>(1)?,
+        ) else {
+            return Ok(None::<i64>);
+        };
+        let (Ok(left), Ok(right)) = (
+            OffsetDateTime::parse(&left, &Rfc3339),
+            OffsetDateTime::parse(&right, &Rfc3339),
+        ) else {
+            return Ok(None::<i64>);
+        };
+        Ok(Some(match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }))
     })?;
     connection.create_scalar_function("aios_binding_receipt_matches_v1", 20, flags, |context| {
         let raw: String = context.get(0)?;
@@ -116,5 +207,71 @@ mod tests {
             " ".repeat(8 * 1024 * 1024),
             "[]"
         )));
+        let matches = |base: &str, version: &str, capability: &str| {
+            connection
+                .query_row(
+                    "SELECT aios_manifest_capability_matches_v1(?1,?2,?3)",
+                    params![base, version, capability],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        };
+        assert!(matches("artifact.hash", "1.9.3", "artifact.hash@1"));
+        assert!(!matches("artifact.hash", "1.9.3", "artifact.hash@2"));
+        assert!(!matches("artifact.hash", "01.9", "artifact.hash@1"));
+        assert!(!matches("artifact.hash", "1.9", "artifact.hash@01"));
+        assert!(!matches(
+            "artifact.hash",
+            "18446744073709551616.0",
+            "artifact.hash@1"
+        ));
+        let unexpired = |raw: &str, created_at: &str| {
+            connection
+                .query_row(
+                    "SELECT aios_evidence_unexpired_at_v1(?1,?2)",
+                    params![raw, created_at],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        };
+        let created = "2026-09-23T00:00:00Z";
+        assert!(unexpired(
+            r#"{"expires_at":"2026-09-24T01:00:00+01:00"}"#,
+            created
+        ));
+        assert!(!unexpired(
+            r#"{"expires_at":"2026-09-22T00:00:00Z"}"#,
+            created
+        ));
+        assert!(!unexpired(
+            r#"{"expires_at":"2026-09-24T00:00:00Z","expires_at":null}"#,
+            created,
+        ));
+        assert!(!unexpired(
+            r#"{"expires_at\u0000x":null,"expires_at":"2026-09-22T00:00:00Z"}"#,
+            created,
+        ));
+        assert!(!unexpired(
+            r#"{"expires_at":"2026-09-24 00:00:00"}"#,
+            created
+        ));
+        let compare = |left: &str, right: &str| {
+            connection
+                .query_row(
+                    "SELECT aios_rfc3339_compare_v1(?1,?2)",
+                    params![left, right],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            compare("2026-09-23T01:00:00+01:00", "2026-09-23T00:00:00Z"),
+            Some(0)
+        );
+        assert_eq!(
+            compare("2026-09-23T00:00:00.000000001Z", "2026-09-23T00:00:00Z"),
+            Some(1)
+        );
+        assert_eq!(compare("2026-09-23 00:00:00", created), None);
     }
 }

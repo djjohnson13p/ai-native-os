@@ -387,81 +387,52 @@ WHEN aios_binding_evidence_pin_v1(NEW.binding_json) IS NOT NULL
       AND e.status='pass'
       AND e.suite_id IS NOT NULL AND e.suite_hash IS NOT NULL
       AND EXISTS (
-          SELECT 1 FROM provider_manifest_payloads m,
+          SELECT 1 FROM provider_manifest_payloads m
+          JOIN provider_registrations r ON r.registration_id=m.registration_id
+          JOIN semantic_capability_contracts c
+            ON c.content_hash=NEW.capability_contract_hash,
                json_each(m.manifest_json,'$.provides') AS offered
           WHERE m.registration_id=NEW.provider_registration_id
-            AND json_valid(m.manifest_json)
-            AND json_extract(offered.value,'$.contract.capability') IS
-                substr(NEW.capability,1,instr(NEW.capability,'@')-1)
+            AND aios_strict_json(m.manifest_json)
+            AND aios_manifest_capability_matches_v1(
+                json_extract(offered.value,'$.contract.capability'),
+                json_extract(offered.value,'$.contract.version'),NEW.capability)
+            AND c.semantic_id IS json_extract(offered.value,'$.contract.capability')
+            AND c.full_version IS json_extract(offered.value,'$.contract.version')
             AND json_extract(offered.value,'$.contract.contract_hash') IS NEW.capability_contract_hash
             AND json_extract(offered.value,'$.conformance.suite') IS e.suite_id
             AND json_extract(offered.value,'$.conformance.suite_hash') IS e.suite_hash
+            AND aios_strict_json(c.contract_json)
+            AND aios_evidence_matches_binding_v1(
+                e.evidence_json,e.evidence_id,r.provider_id,r.provider_version,
+                r.package_content_hash,NEW.capability,
+                json_extract(offered.value,'$.contract.version'),
+                NEW.capability_contract_hash,e.suite_id,e.suite_hash,
+                json_extract(c.contract_json,'$.conformance.suite_version'),
+                e.status,e.tested_at,NEW.created_at)
       )
 )
 BEGIN SELECT RAISE(ABORT, 'binding conformance evidence was not admitted'); END;
 
 -- A pinned result must have existed by the binding's declared creation time.
--- Compare UTC seconds and then all nine fractional digits; julianday alone
--- rounds at millisecond precision and raw RFC 3339 text compares offsets wrong.
+-- Compare parsed RFC 3339 instants at full nanosecond precision.
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_not_future
 BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
-    WITH pin AS (
-        SELECT tested_at FROM provider_conformance_evidence
-        WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
-    ), times AS (
-        SELECT
-            COALESCE(CAST(strftime('%s', tested_at) AS INTEGER),CASE WHEN substr(tested_at,-6,1) IN ('+','-') AND substr(tested_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(tested_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(tested_at,1,length(tested_at)-6)||'Z') AS INTEGER) - (CASE substr(tested_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(tested_at,-5,2) AS INTEGER)*3600 + CAST(substr(tested_at,-2,2) AS INTEGER)*60) END) AS tested_second,
-            COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
-            substr(CASE WHEN substr(tested_at,20,1)='.' THEN
-                substr(tested_at,21,
-                    instr(replace(replace(replace(substr(tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                ELSE '' END || '000000000',1,9) AS tested_fraction,
-            substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
-                substr(NEW.created_at,21,
-                    instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                ELSE '' END || '000000000',1,9) AS created_fraction
-        FROM pin
-    )
-    SELECT 1 FROM times
-    WHERE tested_second IS NOT NULL AND created_second IS NOT NULL
-      AND (tested_second < created_second OR
-           (tested_second = created_second AND tested_fraction <= created_fraction))
+    SELECT 1 FROM provider_conformance_evidence
+    WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
+      AND aios_rfc3339_compare_v1(tested_at,NEW.created_at) <= 0
 )
 BEGIN SELECT RAISE(ABORT, 'binding predates pinned conformance evidence'); END;
 
--- A result expiring at or before binding creation cannot authorize an
--- immutable attempt. The optional absence of expires_at means unbounded;
--- present values compare as UTC seconds plus full nanosecond fractions.
+-- Parse the complete evidence with the same strict JSON/RFC 3339 rules as
+-- launch. SQLite JSON1 aliases NUL-suffixed keys and accepts non-RFC times.
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_unexpired_at_insert
 BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
-    WITH pin AS (
-        SELECT evidence_json FROM provider_conformance_evidence
-        WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
-    ), expiry AS (
-        SELECT json_extract(evidence_json, '$.expires_at') AS expires_at,
-               json_type(evidence_json, '$.expires_at') AS expiry_type
-        FROM pin WHERE json_valid(evidence_json)
-    ), times AS (
-        SELECT expiry_type,
-               COALESCE(CAST(strftime('%s', expires_at) AS INTEGER),CASE WHEN substr(expires_at,-6,1) IN ('+','-') AND substr(expires_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(expires_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(expires_at,1,length(expires_at)-6)||'Z') AS INTEGER) - (CASE substr(expires_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(expires_at,-5,2) AS INTEGER)*3600 + CAST(substr(expires_at,-2,2) AS INTEGER)*60) END) AS expiry_second,
-               COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS created_second,
-               substr(CASE WHEN substr(expires_at,20,1)='.' THEN
-                   substr(expires_at,21,
-                       instr(replace(replace(replace(substr(expires_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                   ELSE '' END || '000000000',1,9) AS expiry_fraction,
-               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
-                   substr(NEW.created_at,21,
-                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                   ELSE '' END || '000000000',1,9) AS created_fraction
-        FROM expiry
-    )
-    SELECT 1 FROM times
-    WHERE expiry_type IS NULL OR expiry_type='null'
-       OR (expiry_type='text' AND expiry_second IS NOT NULL AND created_second IS NOT NULL
-           AND (expiry_second>created_second OR
-                (expiry_second=created_second AND expiry_fraction>created_fraction)))
+    SELECT 1 FROM provider_conformance_evidence
+    WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
+      AND aios_evidence_unexpired_at_v1(evidence_json,NEW.created_at)
 )
 BEGIN SELECT RAISE(ABORT, 'binding conformance evidence expired at creation'); END;
 
@@ -471,43 +442,31 @@ BEGIN SELECT RAISE(ABORT, 'binding conformance evidence expired at creation'); E
 CREATE TRIGGER IF NOT EXISTS execution_binding_evidence_latest_at_insert
 BEFORE INSERT ON execution_bindings
 WHEN NOT EXISTS (
-    WITH clock AS (
-        SELECT COALESCE(CAST(strftime('%s', NEW.created_at) AS INTEGER),CASE WHEN substr(NEW.created_at,-6,1) IN ('+','-') AND substr(NEW.created_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(NEW.created_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(NEW.created_at,1,length(NEW.created_at)-6)||'Z') AS INTEGER) - (CASE substr(NEW.created_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(NEW.created_at,-5,2) AS INTEGER)*3600 + CAST(substr(NEW.created_at,-2,2) AS INTEGER)*60) END) AS second,
-               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
-                   substr(NEW.created_at,21,
-                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                   ELSE '' END || '000000000',1,9) AS fraction
-    ), pin AS (
+    WITH pin AS (
         SELECT registration_id,capability,contract_hash,suite_id,suite_hash
         FROM provider_conformance_evidence
         WHERE evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
           AND suite_id IS NOT NULL AND suite_hash IS NOT NULL
     ), candidates AS (
-        SELECT e.evidence_id,e.status,
-               COALESCE(CAST(strftime('%s', e.tested_at) AS INTEGER),CASE WHEN substr(e.tested_at,-6,1) IN ('+','-') AND substr(e.tested_at,-5,5) GLOB '[0-2][0-9]:[0-5][0-9]' AND CAST(substr(e.tested_at,-5,2) AS INTEGER)<=23 THEN CAST(strftime('%s',substr(e.tested_at,1,length(e.tested_at)-6)||'Z') AS INTEGER) - (CASE substr(e.tested_at,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(e.tested_at,-5,2) AS INTEGER)*3600 + CAST(substr(e.tested_at,-2,2) AS INTEGER)*60) END) AS second,
-               substr(CASE WHEN substr(e.tested_at,20,1)='.' THEN
-                   substr(e.tested_at,21,
-                       instr(replace(replace(replace(substr(e.tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
-                   ELSE '' END || '000000000',1,9) AS fraction
+        SELECT e.evidence_id,e.status,e.tested_at
         FROM provider_conformance_evidence e JOIN pin p
           ON e.registration_id=p.registration_id AND e.capability=p.capability
          AND e.contract_hash=p.contract_hash AND e.suite_id=p.suite_id
          AND e.suite_hash=p.suite_hash
-    ), eligible AS (
-        SELECT c.* FROM candidates c, clock t
-        WHERE c.second IS NOT NULL AND t.second IS NOT NULL
-          AND (c.second<t.second OR
-               (c.second=t.second AND c.fraction<=t.fraction))
     )
-    SELECT 1 FROM eligible selected
+    SELECT 1 FROM candidates selected
     WHERE selected.evidence_id=aios_binding_evidence_pin_v1(NEW.binding_json)
       AND selected.status='pass'
-      AND NOT EXISTS (SELECT 1 FROM candidates WHERE second IS NULL)
+      AND aios_rfc3339_compare_v1(selected.tested_at,NEW.created_at) <= 0
       AND NOT EXISTS (
-          SELECT 1 FROM eligible other
+          SELECT 1 FROM candidates
+          WHERE aios_rfc3339_compare_v1(tested_at,NEW.created_at) IS NULL
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM candidates other
           WHERE other.evidence_id<>selected.evidence_id
-            AND (other.second>selected.second OR
-                 (other.second=selected.second AND other.fraction>=selected.fraction))
+            AND aios_rfc3339_compare_v1(other.tested_at,NEW.created_at) <= 0
+            AND aios_rfc3339_compare_v1(other.tested_at,selected.tested_at) >= 0
       )
 )
 BEGIN SELECT RAISE(ABORT, 'binding conformance evidence is not latest'); END;

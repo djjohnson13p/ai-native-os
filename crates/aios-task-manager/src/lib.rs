@@ -3588,6 +3588,13 @@ const PRIOR_PROVIDER_C5A_GUARDS: &[&str] = &[
     "execution_binding_provider_enablement_not_future",
 ];
 
+const PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS: &[&str] = &[
+    "execution_binding_evidence_present_at_insert",
+    "execution_binding_evidence_not_future",
+    "execution_binding_evidence_unexpired_at_insert",
+    "execution_binding_evidence_latest_at_insert",
+];
+
 fn missing_additive_guard(connection: &Connection, guards: &[&str]) -> Result<bool> {
     for guard in guards {
         let present: bool = connection.query_row(
@@ -3692,7 +3699,8 @@ fn upgrade_stamped_registry_guards_fenced(
         && (missing_additive_guard(connection, PROVIDER_ADDITIVE_GUARDS)?
             || !provider_additive_tables_current(connection, true, true)?
             || legacy_provider_trust_guard_present(connection)?
-            || legacy_c5a_provider_guard_present(connection)?);
+            || legacy_c5a_provider_guard_present(connection)?
+            || legacy_2b1_evidence_guard_present(connection)?);
     if !upgrade_semantic && !upgrade_provider && (fence_stamped || !semantic_stamped) {
         return Ok(());
     }
@@ -3839,6 +3847,23 @@ fn upgrade_stamped_registry_guards_fenced(
             if actual
                 .as_deref()
                 .map(|sql| legacy_c5a_provider_guard_matches(name, sql))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                transaction.execute_batch(&format!("DROP TRIGGER {name}"))?;
+            }
+        }
+        for name in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+            let actual: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual
+                .as_deref()
+                .map(|sql| legacy_2b1_evidence_guard_matches(name, sql))
                 .transpose()?
                 .unwrap_or(false)
             {
@@ -4003,6 +4028,7 @@ fn additive_guard_definitions_current(
         if normalize_schema_sql(&actual) != normalize_schema_sql(&expected)
             && !(provider && !require_all && legacy_provider_trust_guard_matches(guard, &actual)?)
             && !(provider && !require_all && legacy_c5a_provider_guard_matches(guard, &actual)?)
+            && !(provider && !require_all && legacy_2b1_evidence_guard_matches(guard, &actual)?)
         {
             return Ok(false);
         }
@@ -4099,6 +4125,57 @@ fn legacy_c5a_provider_guard_present(connection: &Connection) -> Result<bool> {
         if actual
             .as_deref()
             .map(|sql| legacy_c5a_provider_guard_matches(name, sql))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_2b1_evidence_guard_definition(name: &str) -> Result<String> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    for guard in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+        canonical.execute_batch(&format!("DROP TRIGGER {guard}"))?;
+    }
+    canonical.execute_batch(include_str!("legacy_2b1f8e2_provider_evidence_guards.sql"))?;
+    canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_2b1_evidence_guard_matches(name: &str, actual: &str) -> Result<bool> {
+    if !PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS.contains(&name) {
+        return Ok(false);
+    }
+    Ok(normalize_schema_sql(actual)
+        == normalize_schema_sql(&legacy_2b1_evidence_guard_definition(name)?))
+}
+
+fn legacy_2b1_evidence_guard_present(connection: &Connection) -> Result<bool> {
+    for name in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual
+            .as_deref()
+            .map(|sql| legacy_2b1_evidence_guard_matches(name, sql))
             .transpose()?
             .unwrap_or(false)
         {
@@ -6914,13 +6991,61 @@ fn snapshot_contract_hash(value: &Value, capability: &str) -> Option<String> {
     snapshot_contract(value, capability).map(|contract| contract.content_hash)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps Stage-1 shared evidence projection beside the retained baseline validation path"
+)]
 fn conformance_evidence_valid(
     binding: &BindingEvidence,
     contract: &SnapshotContract,
     checked_at: &str,
     admitted_suite_version: Option<&str>,
 ) -> Result<bool> {
-    let Ok(evidence) = serde_json::from_str::<Value>(&binding.conformance_json) else {
+    if let Some(suite_version) = admitted_suite_version {
+        let (Some(build_hash), Some(suite_id), Some(suite_hash), Some(tested_at)) = (
+            binding.provider_build_hash.as_deref(),
+            binding.conformance_suite_id.as_deref(),
+            binding.conformance_suite_hash.as_deref(),
+            binding.conformance_tested_at.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        let expected = aios_registry::EvidenceMatch {
+            evidence_id: &binding.conformance_evidence_id,
+            provider_id: &binding.principal_id,
+            provider_version: &binding.provider_version,
+            build_hash,
+            capability: &binding.capability,
+            contract_version: &contract.version,
+            contract_hash: &contract.content_hash,
+            suite_id,
+            suite_hash,
+            suite_version,
+            status: &binding.conformance_status,
+            tested_at,
+            evaluated_at: &binding.created_at,
+        };
+        let created = OffsetDateTime::parse(&binding.created_at, &Rfc3339).ok();
+        let checked = OffsetDateTime::parse(checked_at, &Rfc3339).ok();
+        return Ok(created
+            .zip(checked)
+            .is_some_and(|(created, checked)| created <= checked)
+            && aios_registry::evidence_matches_binding(
+                binding.conformance_json.as_bytes(),
+                &expected,
+            )
+            && aios_registry::evidence_matches_binding(
+                binding.conformance_json.as_bytes(),
+                &aios_registry::EvidenceMatch {
+                    evaluated_at: checked_at,
+                    ..expected
+                },
+            ));
+    }
+    let Ok(evidence) = aios_registry::parse_strict_value(
+        binding.conformance_json.as_bytes(),
+        aios_registry::StrictJsonLimits::default(),
+    ) else {
         return Ok(false);
     };
     if !provider_conformance_result_validator()?.is_valid(&evidence) {
@@ -9695,6 +9820,45 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_reopen_upgrades_complete_prior_evidence_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prior-evidence-guards.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        for guard in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {guard}"))
+                .unwrap();
+        }
+        manager
+            .connection
+            .execute_batch(include_str!("legacy_2b1f8e2_provider_evidence_guards.sql"))
+            .unwrap();
+        assert!(legacy_2b1_evidence_guard_present(&manager.connection).unwrap());
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provider registry migration is incomplete"
+            ))
+        ));
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        assert!(!legacy_2b1_evidence_guard_present(&reopened.connection).unwrap());
+        assert!(
+            additive_guard_definitions_current(
+                &reopened.connection,
+                PROVIDER_ADDITIVE_GUARDS,
+                true,
+                true,
+                true
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn erased_revocation_history_requires_operator_quarantine() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("replaced-revoked-provider.sqlite3");
@@ -10235,6 +10399,11 @@ mod tests {
              VALUES ('offset-snapshot','{}','2026-09-19T00:00:00Z');
              INSERT INTO registry_snapshot_admissions(snapshot_id,state)
              VALUES ('offset-snapshot','ADMITTED');
+             INSERT INTO semantic_capability_contracts
+             (content_hash,semantic_id,full_version,contract_json)
+             VALUES ('sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                     'artifact.hash','1.0',
+                     '{\"conformance\":{\"suite_version\":\"0.1\"}}');
              INSERT INTO provider_registrations
              (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
               registry_snapshot_id,state,trust_status,registration_json,registered_at)
@@ -10244,17 +10413,17 @@ mod tests {
                      '2026-09-19T15:00:00+15:00');
              INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
              VALUES ('offset-provider',
-                     '{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"offset-contract\"},\"conformance\":{\"suite\":\"offset-suite\",\"suite_hash\":\"offset-suite-hash\"}}]}');
+                     '{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"version\":\"1.0\",\"contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"},\"conformance\":{\"suite\":\"offset-suite\",\"version\":\"0.1\",\"suite_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"}}]}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T15:00:00+15:00'
              WHERE registration_id='offset-provider';
              INSERT INTO provider_conformance_evidence
              (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
               status,evidence_json,tested_at)
-             VALUES ('offset-evidence','offset-provider','artifact.hash@1','offset-contract',
-                     'offset-suite','offset-suite-hash','pass',
-                     '{\"expires_at\":\"2026-09-19T15:00:02+15:00\"}',
-                     '2026-09-18T09:00:00.100-15:00');
+             VALUES ('offset-evidence','offset-provider','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                     'offset-suite','sha256:2222222222222222222222222222222222222222222222222222222222222222','pass',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"offset-evidence\",\"provider_id\":\"provider:offset\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"build:offset\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_suite\":{\"id\":\"offset-suite\",\"version\":\"0.1\",\"hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"harness\":{\"id\":\"harness:offset\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00.100Z\",\"expires_at\":\"2026-09-19T00:00:02Z\"}',
+                     '2026-09-19T00:00:00.100Z');
              INSERT INTO provider_trust_admissions
              (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,
               admitted_at,receipt_json)
@@ -10268,10 +10437,10 @@ mod tests {
               attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
               placement_json,binding_json,created_at)
              VALUES ('offset-binding','offset-attempt','T-offset-provider','offset-program',
-                     'offset-snapshot','0.1','offset-node','artifact.hash@1','offset-contract',
+                     'offset-snapshot','0.1','offset-node','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
                      'offset-provider','provider:offset','1.0.0','manifest:offset','build:offset',
                      1,'[]','[]','offset-profile','{}',
-                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"offset-program\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"offset-contract\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"offset-trust\",\"provider\":{\"id\":\"provider:offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:offset\",\"package_or_build_hash\":\"build:offset\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
+                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"offset-program\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"offset-trust\",\"provider\":{\"id\":\"provider:offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:offset\",\"package_or_build_hash\":\"build:offset\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
                      '2026-09-19T01:00:00.300+01:00');",
         ).unwrap();
         let clone_receipt = |binding_id: &str, attempt_id: &str, attempt: i64| {
@@ -10433,7 +10602,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("binding provider identity does not match registration"),
+            error.contains("binding provider identity does not match registration")
+                || error.contains("binding conformance evidence is not latest"),
             "{error}"
         );
         assert_eq!(count_binding_and_markers(binding_id), 0);
@@ -10680,6 +10850,23 @@ mod tests {
             .connection
             .execute_batch("DROP TRIGGER execution_binding_evidence_unexpired_at_insert")
             .unwrap();
+        // A partially upgraded store can contain one prior evidence guard
+        // alongside current guards. Reopening must replace the mixed set and
+        // quarantine the already admitted binding and its immutable markers.
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER execution_binding_evidence_present_at_insert")
+            .unwrap();
+        let prior_guards = include_str!("legacy_2b1f8e2_provider_evidence_guards.sql");
+        let first_guard = prior_guards
+            .split_once("END;")
+            .expect("prior guard definition")
+            .0;
+        manager
+            .connection
+            .execute_batch(&format!("{first_guard}END;"))
+            .unwrap();
+        assert!(legacy_2b1_evidence_guard_present(&manager.connection).unwrap());
         let stamp: (String, String) = manager
             .connection
             .query_row(
@@ -10691,6 +10878,7 @@ mod tests {
             .unwrap();
         drop(manager);
         let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(!legacy_2b1_evidence_guard_present(&reopened.connection).unwrap());
         assert_eq!(reopened.connection.query_row(
             "SELECT state FROM provider_registrations WHERE registration_id='offset-provider'",
             [], |row| row.get::<_, String>(0),
@@ -10779,6 +10967,11 @@ mod tests {
              VALUES ('repair-snapshot','{}','2026-09-19T00:00:00Z');
              INSERT INTO registry_snapshot_admissions(snapshot_id,state)
              VALUES ('repair-snapshot','ADMITTED');
+             INSERT INTO semantic_capability_contracts
+             (content_hash,semantic_id,full_version,contract_json)
+             VALUES ('sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                     'artifact.hash','1.0',
+                     '{\"conformance\":{\"suite_version\":\"0.1\"}}');
              INSERT INTO provider_registrations
              (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
               registry_snapshot_id,state,trust_status,registration_json,registered_at)
@@ -10786,15 +10979,17 @@ mod tests {
                      'repair-snapshot','disabled','locally-trusted',
                      '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
               INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
-              VALUES ('repair-provider','{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"version\":\"1.0\",\"contract_hash\":\"repair-contract\"},\"conformance\":{\"suite\":\"repair-suite\",\"suite_hash\":\"repair-suite-hash\"}}]}');
+              VALUES ('repair-provider','{\"provides\":[{\"contract\":{\"capability\":\"artifact.hash\",\"version\":\"1.0\",\"contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\"},\"conformance\":{\"suite\":\"repair-suite\",\"suite_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"}}]}');
              UPDATE provider_registrations SET state='registered',
                  updated_at='2026-09-19T00:00:00Z'
              WHERE registration_id='repair-provider';
              INSERT INTO provider_conformance_evidence
              (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
               status,evidence_json,tested_at)
-             VALUES ('repair-evidence','repair-provider','artifact.hash@1','repair-contract',
-                     'repair-suite','repair-suite-hash','pass','{}','2026-09-19T00:00:00Z');
+             VALUES ('repair-evidence','repair-provider','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                     'repair-suite','sha256:4444444444444444444444444444444444444444444444444444444444444444','pass',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"repair-evidence\",\"provider_id\":\"provider:repair\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"build:repair\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_suite\":{\"id\":\"repair-suite\",\"version\":\"0.1\",\"hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"harness\":{\"id\":\"harness:repair\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00Z\",\"expires_at\":\"2026-09-20T00:00:00Z\"}',
+                     '2026-09-19T00:00:00Z');
              INSERT INTO execution_bindings
              (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
               ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
@@ -10802,10 +10997,10 @@ mod tests {
               attempt,policy_decision_refs_json,grant_refs_json,
               execution_profile_ref,placement_json,binding_json,created_at)
              VALUES ('repair-binding','repair-attempt','T-semantic-repair','repair-program',
-                     'repair-snapshot','0.1','repair-node','artifact.hash@1','repair-contract',
+                     'repair-snapshot','0.1','repair-node','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
                      'repair-provider','provider:repair','1.0.0','manifest:repair','build:repair',
                      1,'[]','[]','repair-profile','{}',
-                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"repair-program\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"repair-contract\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"repair-provider\",\"provider\":{\"id\":\"provider:repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:repair\",\"package_or_build_hash\":\"build:repair\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
+                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"repair-program\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"repair-provider\",\"provider\":{\"id\":\"provider:repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"manifest:repair\",\"package_or_build_hash\":\"build:repair\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
                      '2026-09-19T00:00:00Z');",
         ).unwrap();
         let stamp: (String, String) = manager

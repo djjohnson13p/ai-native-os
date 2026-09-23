@@ -1433,6 +1433,187 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             .unwrap(),
     )
     .unwrap();
+    for case in [
+        "valid-control",
+        "offset-equivalent-tie",
+        "wrong-major",
+        "duplicate-expiry",
+        "nul-prefix-expiry",
+        "non-rfc-expiry",
+        "malformed-payload",
+        "non-rfc-tested-at",
+        "result-id",
+        "provider-id",
+        "provider-version",
+        "build-hash",
+        "contract-version",
+        "suite-version",
+        "status",
+        "counts",
+        "executed-at",
+    ] {
+        manager
+            .connection
+            .execute_batch("SAVEPOINT adversarial_evidence_case")
+            .unwrap();
+        let evidence_id = format!("E-{case}");
+        // Each hostile row is uniquely latest at binding creation; an E1 tie
+        // must not mask the parser or projection guard under test.
+        let evidence_time = "2026-09-19T00:00:00.100Z";
+        let binding_time = "2026-09-19T00:00:00.250Z";
+        let mut payload = evidence(&evidence_id, "pass", evidence_time);
+        let capability = if case == "wrong-major" {
+            payload["semantic_capability_ref"] = "test.complete@2".into();
+            "test.complete@2"
+        } else {
+            "test.complete@1"
+        };
+        let tested_at = if case == "non-rfc-tested-at" {
+            payload["executed_at"] = "2026-09-19 00:00:00.100".into();
+            "2026-09-19 00:00:00.100"
+        } else {
+            evidence_time
+        };
+        match case {
+            "result-id" => payload["result_id"] = "E-forged".into(),
+            "provider-id" => payload["provider_id"] = "provider:forged".into(),
+            "provider-version" => payload["provider_version"] = "9.9.9".into(),
+            "build-hash" => payload["provider_build_identity"]["value"] = "build:forged".into(),
+            "contract-version" => payload["semantic_contract_version"] = "2.0".into(),
+            "suite-version" => payload["conformance_suite"]["version"] = "9.9".into(),
+            "status" => payload["result"] = "fail".into(),
+            "counts" => payload["tests_passed"] = 1.into(),
+            "executed-at" => payload["executed_at"] = "2026-09-19T00:00:00.200Z".into(),
+            _ => {}
+        }
+        let mut raw = canonical_json(&payload).unwrap();
+        let expiry = "\"expires_at\":\"2026-09-20T00:00:00Z\"";
+        raw = match case {
+            "duplicate-expiry" => raw.replacen(
+                expiry,
+                "\"expires_at\":\"2026-09-20T00:00:00Z\",\"expires_at\":null",
+                1,
+            ),
+            "nul-prefix-expiry" => raw.replacen(
+                expiry,
+                "\"expires_at\\u0000x\":null,\"expires_at\":\"2026-09-18T00:00:00Z\"",
+                1,
+            ),
+            "non-rfc-expiry" => raw.replacen(expiry, "\"expires_at\":\"2026-09-24 00:00:00\"", 1),
+            "malformed-payload" => "{}".into(),
+            _ => raw,
+        };
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             SELECT ?1,registration_id,?2,contract_hash,suite_id,suite_hash,
+                    status,?3,?4 FROM provider_conformance_evidence WHERE evidence_id='E1'",
+                params![evidence_id, capability, raw, tested_at],
+            )
+            .unwrap();
+        if case == "offset-equivalent-tie" {
+            let offset_time = "2026-09-19T01:00:00.100+01:00";
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO provider_conformance_evidence
+                     (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+                      status,evidence_json,tested_at)
+                     SELECT 'E-offset-tie',registration_id,capability,contract_hash,suite_id,
+                            suite_hash,status,?1,?2
+                     FROM provider_conformance_evidence WHERE evidence_id='E1'",
+                    params![
+                        canonical_json(&evidence("E-offset-tie", "pass", offset_time)).unwrap(),
+                        offset_time
+                    ],
+                )
+                .unwrap();
+        }
+        let mut receipt = first_receipt.clone();
+        receipt["binding_id"] = "binding-real-5".into();
+        receipt["attempt_id"] = "attempt-real-5".into();
+        receipt["attempt"] = 5.into();
+        receipt["capability"] = capability.into();
+        receipt["conformance_evidence_id"] = evidence_id.into();
+        receipt["created_at"] = binding_time.into();
+        let insertion = manager.connection.execute(
+            "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+              policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+              binding_json,created_at)
+             SELECT 'binding-real-5','attempt-real-5',task_id,semantic_program_hash,
+              registry_snapshot_id,ir_version,node_id,?2,capability_contract_hash,
+              provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+              provider_build_hash,5,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,?3,?4
+             FROM execution_bindings WHERE binding_id=?1",
+            params![
+                first,
+                capability,
+                canonical_json(&receipt).unwrap(),
+                binding_time
+            ],
+        );
+        if case == "valid-control" {
+            insertion.unwrap();
+            for table in [
+                "execution_bindings",
+                "execution_binding_admission_markers",
+                "execution_binding_trust_markers",
+                "execution_binding_enablement_markers",
+            ] {
+                let count: i64 = manager
+                    .connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-real-5'"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "valid control did not create {table}");
+            }
+            manager
+                .connection
+                .execute_batch(
+                    "ROLLBACK TO adversarial_evidence_case; RELEASE adversarial_evidence_case",
+                )
+                .unwrap();
+            continue;
+        }
+        let error = insertion.unwrap_err().to_string();
+        assert!(
+            error.contains("binding conformance evidence")
+                || error.contains("binding predates pinned conformance evidence"),
+            "{case}: {error}"
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-real-5'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{case} retained {table}");
+        }
+        manager
+            .connection
+            .execute_batch(
+                "ROLLBACK TO adversarial_evidence_case; RELEASE adversarial_evidence_case",
+            )
+            .unwrap();
+    }
     manager
         .connection
         .execute(

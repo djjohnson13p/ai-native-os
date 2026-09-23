@@ -39,8 +39,9 @@ pub use loader::{
     RegistryLoadOptions, SemanticRegistry, load_registry_bundle,
 };
 pub use provider_store::{
-    ProviderCandidate, ProviderHealth, ProviderRegistration, ProviderStore, ProviderStoreError,
-    ProviderTrustStatus, verified_provider_effective_trust, verified_provider_trust_source,
+    EvidenceMatch, ProviderCandidate, ProviderHealth, ProviderRegistration, ProviderStore,
+    ProviderStoreError, ProviderTrustStatus, evidence_matches_binding,
+    verified_provider_effective_trust, verified_provider_trust_source,
     verified_provider_trust_source_at, verify_provider_registration_receipt,
 };
 pub use store::{
