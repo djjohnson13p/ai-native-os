@@ -43,7 +43,7 @@ A requirement can be both `INTERFACE` and `CROSS-CUTTING`.
 | Artifact/data | R-DATA-001..005 + R-ART-001..005 | CORE-v0.1 | docs 20, 35, 75, 85; Artifact allocation/publication schemas | #4, #5 | content identity/staging/publication/lineage/crash tests |
 | Credential mediation | R-ID-003..006 + R-CRED-001..006 | CORE-v0.1 boundary / CROSS-CUTTING | docs 56, 79, 85; credential handle/use contracts | #28 | brokered operation/exportability/secret non-leakage fixtures |
 | Provider execution | R-EXEC-001..009 | CORE-v0.1 | docs 78, 80, 82, 85; binding/invocation/profile contracts | **#30** | bounded offline deterministic provider + malicious-provider tests |
-| Persistence integrity | R-PERSIST-001..006 | CORE-v0.1 / CROSS-CUTTING | docs 35, 73–80, 85; `persistence-v0.1.sql` | #1/#4/#5/#3/#30 | transaction/idempotency/owner-fencing/privacy/crash-injection tests |
+| Persistence integrity | R-PERSIST-001..006 | CORE-v0.1 / CROSS-CUTTING | docs 35, 73–80, 85; `persistence-v0.1.sql` | #1/#4/#5/#3/#30 | transaction/idempotency/owner-fencing/privacy/crash-injection tests; raw-intent legacy export rejection |
 | Recovery certainty | R-REC-001..011 | CORE-v0.1 / CROSS-CUTTING | docs 24, 74, 80, 85, 86; recovery contracts | #11 + all core issues | crash/response-loss/private-entry/per-subject unknown-outcome tests |
 | Semantic Objects | R-OBJ-001..006 | INTERFACE → Stage 5 | docs 42, 44, 49; object/relationship/identity schemas | #19, #25 | first federated objects + merge/split tests |
 | Domain Packs | R-DOM-001..003 | INTERFACE → Stage 5+ | docs 40, 41, 43, 46; domain-pack schema | #19 | cross-domain workflow/conformance |
@@ -102,7 +102,7 @@ After #17, Stage 1 proceeds in the sequence from `docs/82-stage1-core-substrate-
 | --- | --- | --- | --- |
 | Task Manager | R-TASK-001..005, R-PERSIST-001/002, R-REC-005/008/009 | #1 | create/CAS transitions/idempotency/restart recovery |
 | Artifact Store | R-DATA-001..005, R-ART-001..005, R-PERSIST-003, R-STOR-001/006 | #4 | local immutable content identity, staging/publication/crash recovery |
-| Provenance | R-PROV-001..006, R-PERSIST-002/004, R-REC-008 | #5 | append/hash-chain/material action attribution |
+| Provenance | R-PROV-001..006, R-PERSIST-002/004/006, R-REC-008 | #5 | append/hash-chain/material action attribution; typed creation commitment and raw-intent legacy export rejection |
 | Semantic/provider registry | R-CONTRACT-001..007, R-CAP-001..003/006 | #2 | immutable snapshot + multiple provider records/conformance |
 | Authority Coordinator | R-SEC-001..007, R-AUTH-001..008 | #3 | concrete deterministic allow/deny/approval/scoped grants |
 | Credential Broker minimum | R-CRED-001..006, R-ID-003..006 | #28 | brokered synthetic secret use; no source-secret propagation |

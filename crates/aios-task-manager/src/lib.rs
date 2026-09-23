@@ -4140,6 +4140,11 @@ fn migrate_task_manager_schema(
                 "persistence migration found a provenance event without identity",
             ));
         }
+        if !provenance_append_only_triggers_are_current(connection)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration found invalid provenance append-only triggers",
+            ));
+        }
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
             [],
@@ -7770,6 +7775,76 @@ mod tests {
                     "provenance service-boundary migration is incomplete"
                 ))
             ));
+        }
+    }
+
+    #[test]
+    fn unstamped_provenance_refuses_noop_triggers_before_v11_stamp() {
+        for (name, operation) in [
+            ("provenance_events_no_update", "UPDATE"),
+            ("provenance_events_no_delete", "DELETE"),
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory
+                .path()
+                .join(format!("unstamped-noop-{operation}.sqlite3"));
+            let task_id = "T-unstamped-noop-trigger";
+            let original_hash = {
+                let mut manager =
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                manager.create_task(&create(task_id)).unwrap();
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash
+            };
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';
+                     DROP TRIGGER {name};
+                     CREATE TRIGGER {name} BEFORE {operation} ON provenance_events BEGIN SELECT 1; END;"
+                ))
+                .unwrap();
+            drop(connection);
+
+            assert!(matches!(
+                TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                Err(TaskManagerError::InvalidRecord(
+                    "persistence migration found invalid provenance append-only triggers"
+                ))
+            ));
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert!(!provenance_append_only_triggers_are_current(&connection).unwrap());
+            connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {name};
+                     CREATE TRIGGER {name} BEFORE {operation} ON provenance_events
+                     BEGIN SELECT RAISE(ABORT, 'provenance_events are append-only'); END;"
+                ))
+                .unwrap();
+            drop(connection);
+            let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert!(manager.verify_provenance(task_id).unwrap());
+            assert_eq!(
+                manager
+                    .provenance_head(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .event_hash,
+                original_hash
+            );
         }
     }
 
