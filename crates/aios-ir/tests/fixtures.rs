@@ -515,6 +515,24 @@ fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
         "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM','2026-09-19T00:00:00Z')",
         [],
     ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
     RegistryStore::initialize(&mut connection)
         .unwrap()
         .admit_registry(&registry)

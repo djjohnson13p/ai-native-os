@@ -134,7 +134,8 @@ pub struct ProviderStore<'a> {
 }
 
 impl<'a> ProviderStore<'a> {
-    /// Open the additive provider schema on an already initialized control-plane DB.
+    /// Opens a fully migrated provider registry. Task Manager installs or
+    /// upgrades the schema under its store lock and durable ownership fence.
     pub fn initialize(connection: &'a mut Connection) -> Result<Self> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -149,34 +150,10 @@ impl<'a> ProviderStore<'a> {
         }
         preflight_migrations(connection)?;
         // The provider migration is layered on a complete, stamped semantic
-        // registry. Validate it before any 0013 DDL can be applied.
+        // registry. Both migrations must already be fenced and committed.
         crate::RegistryStore::initialize(connection).map_err(|_| {
             ProviderStoreError::Conflict("semantic registry migration is incomplete")
         })?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(include_str!(
-            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
-        ))?;
-        let old: Option<String> = transaction
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE migration_id=?1",
-                [MIGRATION_ID],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if old
-            .as_deref()
-            .is_some_and(|value| value != MIGRATION_CHECKSUM)
-        {
-            return Err(ProviderStoreError::Conflict(
-                "provider registry migration checksum mismatch",
-            ));
-        }
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            params![MIGRATION_ID, MIGRATION_CHECKSUM],
-        )?;
-        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -1155,7 +1132,12 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         }
         present_objects.push((kind, name, sql));
     }
-    if stamped && present_objects.iter().any(|(_, _, sql)| sql.is_some()) {
+    if stamped && present_objects.iter().any(|(_, _, sql)| sql.is_none()) {
+        return Err(ProviderStoreError::Conflict(
+            "provider registry migration is incomplete",
+        ));
+    }
+    if stamped {
         let canonical = Connection::open_in_memory()?;
         canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
         canonical.execute_batch(include_str!(
@@ -1175,6 +1157,11 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
                 ));
             }
         }
+    }
+    if !stamped {
+        return Err(ProviderStoreError::Conflict(
+            "Task Manager fenced provider registry migration is required",
+        ));
     }
     Ok(())
 }
@@ -1389,11 +1376,53 @@ mod tests {
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const NOW: &str = "2026-09-22T12:00:00Z";
 
+    fn seed_test_registry_schemas(connection: &Connection) {
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM',?1)",
+            [NOW],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1',?1)",
+            [NOW],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,?3)",
+            params![MIGRATION_ID, MIGRATION_CHECKSUM, NOW],
+        ).unwrap();
+    }
+
     fn setup() -> (Connection, SemanticRegistry) {
+        setup_with_provider_migration(true)
+    }
+
+    fn setup_with_provider_migration(migrate_provider: bool) -> (Connection, SemanticRegistry) {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM',?1)",
+            [NOW],
+        ).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1',?1)",
+            [NOW],
+        ).unwrap();
         let mut snapshot: RegistrySnapshot = serde_json::from_str(SNAPSHOT).unwrap();
         let types: Vec<TypeContract> = serde_json::from_str(TYPES).unwrap();
         let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(CAPABILITIES).unwrap();
@@ -1454,6 +1483,17 @@ mod tests {
             .unwrap()
             .admit_registry(&registry)
             .unwrap();
+        if migrate_provider {
+            connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            connection.execute(
+                "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,?3)",
+                params![MIGRATION_ID, MIGRATION_CHECKSUM, NOW],
+            ).unwrap();
+        }
         (connection, registry)
     }
 
@@ -1974,11 +2014,23 @@ mod tests {
 
     #[test]
     fn migration_preflight_rejects_unstamped_or_incomplete_provider_schema() {
-        let (mut connection, _) = setup();
+        let (mut connection, _) = setup_with_provider_migration(false);
         connection.execute_batch("CREATE TABLE provider_manifest_payloads (registration_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL)").unwrap();
         assert!(ProviderStore::initialize(&mut connection).is_err());
         connection
             .execute_batch("DROP TABLE provider_manifest_payloads")
+            .unwrap();
+        assert!(ProviderStore::initialize(&mut connection).is_err());
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,?3)",
+                params![MIGRATION_ID, MIGRATION_CHECKSUM, NOW],
+            )
             .unwrap();
         ProviderStore::initialize(&mut connection).unwrap();
         connection
@@ -2052,6 +2104,7 @@ mod tests {
         connection
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
+        seed_test_registry_schemas(&connection);
         RegistryStore::initialize(&mut connection)
             .unwrap()
             .admit_registry(&registry)
@@ -2152,6 +2205,7 @@ mod tests {
         connection
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
+        seed_test_registry_schemas(&connection);
         RegistryStore::initialize(&mut connection)
             .unwrap()
             .admit_registry(&registry)
@@ -2234,7 +2288,7 @@ mod tests {
                 "execution_bindings",
             ),
         ] {
-            let (mut connection, _) = setup();
+            let (mut connection, _) = setup_with_provider_migration(false);
             connection
                 .execute_batch(&format!(
                     "CREATE TRIGGER {name} BEFORE INSERT ON {table} BEGIN SELECT 1; END;"
@@ -2247,7 +2301,7 @@ mod tests {
                 ))
             ));
         }
-        let (mut connection, _) = setup();
+        let (mut connection, _) = setup_with_provider_migration(false);
         connection
             .execute_batch(
                 "CREATE TABLE execution_binding_admission_markers (
@@ -2535,6 +2589,7 @@ mod tests {
             connection
                 .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
                 .unwrap();
+            seed_test_registry_schemas(&connection);
             RegistryStore::initialize(&mut connection)
                 .unwrap()
                 .admit_registry(&registry)
@@ -2612,6 +2667,7 @@ mod tests {
         writer
             .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
             .unwrap();
+        seed_test_registry_schemas(&writer);
         RegistryStore::initialize(&mut writer)
             .unwrap()
             .admit_registry(&first)

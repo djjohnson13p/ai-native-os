@@ -742,6 +742,103 @@ fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) 
 }
 
 impl TaskManager {
+    /// Installs or upgrades the optional semantic registry schema while this
+    /// manager owns the identity-bound store lock and current durable lease.
+    ///
+    /// # Errors
+    /// Returns an error if migration preflight, store identity, or the lease fails.
+    pub fn initialize_registry_store(&mut self) -> Result<()> {
+        self.migrate_registry_schema(false)
+    }
+
+    /// Installs or upgrades both registry schemas under the same store fence.
+    ///
+    /// # Errors
+    /// Returns an error if migration preflight, store identity, or the lease fails.
+    pub fn initialize_provider_store(&mut self) -> Result<()> {
+        self.migrate_registry_schema(true)
+    }
+
+    fn migrate_registry_schema(&mut self, provider: bool) -> Result<()> {
+        if let Some(lock) = &self.store_lock {
+            verify_locked_store_identity(&self.connection, lock)?;
+        }
+        preflight_migration_state(&self.connection)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        // CREATE IF NOT EXISTS must never bless unversioned lookalike tables.
+        for (migration, objects, legacy_guards, additive_guards) in [
+            (
+                "0012_semantic_registry_store",
+                "'semantic_type_contracts','semantic_capability_contracts',
+                 'registry_snapshot_admissions','registry_snapshot_entries','registry_activations'",
+                SEMANTIC_LEGACY_GUARDS,
+                SEMANTIC_ADDITIVE_GUARDS,
+            ),
+            (
+                "0013_provider_registry",
+                "'provider_manifest_payloads','provider_health_observations',
+                 'ix_provider_conformance_latest','execution_binding_admission_markers'",
+                PROVIDER_LEGACY_GUARDS,
+                PROVIDER_ADDITIVE_GUARDS,
+            ),
+        ] {
+            let stamped: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id=?1)",
+                [migration],
+                |row| row.get(0),
+            )?;
+            if !stamped {
+                let present: bool = transaction.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ({objects}))"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if present {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "unstamped registry schema objects require operator quarantine",
+                    ));
+                }
+                for guard in legacy_guards.iter().chain(additive_guards) {
+                    let present: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                        [guard],
+                        |row| row.get(0),
+                    )?;
+                    if present {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "unstamped registry schema objects require operator quarantine",
+                        ));
+                    }
+                }
+            }
+        }
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [],
+        )?;
+        if provider {
+            transaction.execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                [],
+            )?;
+        }
+        preflight_migration_state(&transaction)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Opens or creates the authoritative local `SQLite` store.
     ///
     /// # Errors
@@ -6410,10 +6507,14 @@ fn latest_conformance_evidence_id(
     let mut tied = false;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
+        let Some(suite_id) = row.get::<_, Option<String>>(2)? else {
+            // Baseline evidence may predate required suite identities. It is
+            // retained for audit but cannot participate in Stage-1 selection.
+            continue;
+        };
         let Some(raw_time) = row.get::<_, Option<String>>(1)? else {
             return Ok(None);
         };
-        let suite_id: String = row.get(2)?;
         let suite_hash: Option<String> = row.get(3)?;
         if claimed_suite.as_ref().is_some_and(|(id, hash)| {
             id != &suite_id || Some(hash.as_str()) != suite_hash.as_deref()
@@ -8638,11 +8739,96 @@ mod tests {
     }
 
     #[test]
+    fn public_registry_initializers_cannot_migrate_without_live_manager_fence() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("registry-public-migration-fence.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut independent = Connection::open(&path).unwrap();
+        assert!(aios_registry::RegistryStore::initialize(&mut independent).is_err());
+        assert!(aios_registry::ProviderStore::initialize(&mut independent).is_err());
+        let migrations: i64 = independent.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrations, 0);
+        drop(independent);
+
+        manager
+            .connection
+            .execute(
+                "UPDATE task_manager_lease SET fence_epoch=fence_epoch+1 WHERE singleton_id=1",
+                [],
+            )
+            .unwrap();
+        assert!(manager.initialize_provider_store().is_err());
+        let migrations: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrations, 0);
+    }
+
+    #[test]
+    fn fenced_registry_migration_rejects_unstamped_lookalike_tables() {
+        let mut manager = test_manager();
+        manager
+            .connection
+            .execute_batch("CREATE TABLE semantic_type_contracts (forged TEXT)")
+            .unwrap();
+        assert!(manager.initialize_registry_store().is_err());
+        let stamped: bool = manager
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stamped);
+    }
+
+    #[test]
+    fn fenced_registry_migration_rejects_unstamped_triggers_on_baseline_tables() {
+        for (trigger, provider) in [
+            (
+                "CREATE TRIGGER immutable_admitted_registry_snapshots_update BEFORE UPDATE ON registry_snapshots BEGIN SELECT 1; END",
+                false,
+            ),
+            (
+                "CREATE TRIGGER provider_registration_no_delete BEFORE DELETE ON provider_registrations BEGIN SELECT 1; END",
+                true,
+            ),
+        ] {
+            let mut manager = test_manager();
+            manager.connection.execute_batch(trigger).unwrap();
+            assert!(
+                if provider {
+                    manager.initialize_provider_store()
+                } else {
+                    manager.initialize_registry_store()
+                }
+                .is_err()
+            );
+            let stamps: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamps, 0);
+        }
+    }
+
+    #[test]
     fn file_backed_reopen_upgrades_old_stamped_registry_guard() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("old-stamped-registry.sqlite3");
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_registry_store().unwrap();
         let stamp: (String, String) = manager
             .connection
             .query_row(
@@ -8704,8 +8890,7 @@ mod tests {
     #[test]
     fn stamped_provider_registry_requires_duplicate_insert_guards() {
         let mut manager = test_manager();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
-        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_provider_store().unwrap();
         for trigger in PROVIDER_ADDITIVE_GUARDS {
             manager
                 .connection
@@ -8731,8 +8916,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("old-stamped-provider.sqlite3");
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
-        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_provider_store().unwrap();
         let stamp: (String, String) = manager
             .connection
             .query_row(
@@ -8773,8 +8957,7 @@ mod tests {
     #[test]
     fn stamped_guard_names_do_not_authenticate_noop_definitions() {
         let mut manager = test_manager();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
-        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_provider_store().unwrap();
         for (name, table) in [
             (
                 "immutable_admitted_registry_snapshot_entries_insert",
@@ -8870,8 +9053,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("untrusted-old-guards.sqlite3");
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
-        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_provider_store().unwrap();
         let old_epoch: i64 = manager
             .connection
             .query_row(
@@ -8914,8 +9096,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("atomic-old-guards.sqlite3");
         let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
-        aios_registry::RegistryStore::initialize(&mut manager.connection).unwrap();
-        aios_registry::ProviderStore::initialize(&mut manager.connection).unwrap();
+        manager.initialize_provider_store().unwrap();
         let old_epoch: i64 = manager
             .connection
             .query_row(

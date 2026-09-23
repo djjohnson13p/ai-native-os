@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::{self, RecordKind};
 use crate::{
@@ -132,15 +132,14 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
 }
 
 fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<()> {
-    // Older stores have the 0012 stamp but predate the admission guards.
-    // Their absence is upgraded below. A same-name substitute must fail before
-    // CREATE IF NOT EXISTS can silently accept an ineffective trigger body.
+    // Older stamped stores can be upgraded only by Task Manager while its
+    // identity-bound lock and durable ownership lease are held.
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
     canonical.execute_batch(include_str!(
         "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
     ))?;
-    for (guard, additive) in [
+    for (guard, _additive) in [
         ("immutable_admitted_registry_snapshots_update", false),
         ("immutable_admitted_registry_snapshots_delete", false),
         ("immutable_semantic_type_contracts_update", false),
@@ -171,7 +170,7 @@ fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<
                 "semantic registry migration is incomplete or unstamped",
             ));
         }
-        if actual.is_none() && stamped && !additive {
+        if actual.is_none() && stamped {
             return Err(RegistryStoreError::Conflict(
                 "semantic registry migration is incomplete or unstamped",
             ));
@@ -188,6 +187,11 @@ fn preflight_admission_guards(connection: &Connection, stamped: bool) -> Result<
                 ));
             }
         }
+    }
+    if !stamped {
+        return Err(RegistryStoreError::Conflict(
+            "Task Manager fenced semantic registry migration is required",
+        ));
     }
     Ok(())
 }
@@ -306,32 +310,12 @@ pub struct RegistryStore<'a> {
 }
 
 impl<'a> RegistryStore<'a> {
-    /// Installs additive schema over a Task Manager initialized control-plane DB.
-    /// Existing historical fixture rows remain untouched and are not admitted.
+    /// Opens a fully migrated semantic registry. Task Manager installs or upgrades
+    /// the schema under its identity-bound store lock and durable ownership fence.
     pub fn initialize(connection: &'a mut Connection) -> Result<Self> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         preflight_store_migration(connection)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE migration_id=?1",
-                [MIGRATION_ID],
-                |row| row.get(0),
-            )
-            .optional()?;
-        // CREATE IF NOT EXISTS upgrades already-stamped 0012 stores with the
-        // admission guards while preserving all rows and identities.
-        transaction.execute_batch(include_str!(
-            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
-        ))?;
-        if existing.is_none() {
-            transaction.execute(
-                "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                params![MIGRATION_ID, MIGRATION_CHECKSUM],
-            )?;
-        }
-        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -682,9 +666,23 @@ impl<'a> RegistryStore<'a> {
 
     /// Returns only an admitted, verified default for new validation work.
     pub fn default_snapshot(&self, scope_kind: &str, scope_id: &str) -> Result<Option<Activation>> {
+        self.default_snapshot_with_interleave(scope_kind, scope_id, || {})
+    }
+
+    fn default_snapshot_with_interleave(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        after_pointer: impl FnOnce(),
+    ) -> Result<Option<Activation>> {
+        // The pointer, admission state, and strict reopen must observe one
+        // SQLite snapshot. A writer can otherwise revoke or switch the default
+        // between these reads and make the result inconsistent.
+        let read = self.connection.unchecked_transaction()?;
         let Some(activation) = self.activation_pointer(scope_kind, scope_id)? else {
             return Ok(None);
         };
+        after_pointer();
         let snapshot_id = &activation.snapshot_id;
         let state: String = self.connection.query_row(
             "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
@@ -695,6 +693,7 @@ impl<'a> RegistryStore<'a> {
             return Ok(None);
         }
         self.open_snapshot(snapshot_id)?;
+        read.commit()?;
         Ok(Some(activation))
     }
 }
@@ -831,6 +830,17 @@ mod tests {
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM','2026-09-19T00:00:00Z')",
             [],
+        ).unwrap();
+        // Unit fixtures seed an already migrated in-memory/file database. The
+        // production migration belongs to Task Manager's fenced transaction.
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,?2,'2026-09-19T00:00:00Z')",
+            params![MIGRATION_ID, MIGRATION_CHECKSUM],
         ).unwrap();
     }
 
@@ -977,6 +987,72 @@ mod tests {
     }
 
     #[test]
+    fn default_selection_uses_one_read_snapshot_across_concurrent_revoke_and_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("control.db");
+        let (first_id, second_id) = {
+            let mut connection = Connection::open(&database).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
+            baseline(&connection);
+            let mut store = RegistryStore::initialize(&mut connection).unwrap();
+            let first_id = store.admit_registry(&fixture_registry()).unwrap();
+            let second_id = store.admit_registry(&second_registry()).unwrap();
+            store
+                .activate_default("user", "u1", None, &first_id)
+                .unwrap();
+            (first_id, second_id)
+        };
+
+        let mut reader = Connection::open(&database).unwrap();
+        let store = RegistryStore::initialize(&mut reader).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // The callback runs after the reader has loaded the old pointer. WAL
+        // permits another connection to commit while that read is in flight.
+        let selected = store
+            .default_snapshot_with_interleave("user", "u1", || {
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                writer
+                    .execute(
+                        "UPDATE registry_snapshot_admissions SET state='REVOKED' WHERE snapshot_id=?1",
+                        [&first_id],
+                    )
+                    .unwrap();
+                writer
+                    .execute(
+                        "UPDATE registry_activations SET snapshot_id=?1,revision=2 WHERE scope_kind='user' AND scope_id='u1'",
+                        [&second_id],
+                    )
+                    .unwrap();
+                writer.execute_batch("COMMIT").unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.snapshot_id, first_id);
+        assert_eq!(selected.revision, 1);
+
+        // The next call sees the newly committed default and containment.
+        let current = store.default_snapshot("user", "u1").unwrap().unwrap();
+        assert_eq!(current.snapshot_id, second_id);
+        assert_eq!(current.revision, 2);
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id=?1",
+                    [&first_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "REVOKED"
+        );
+    }
+
+    #[test]
     fn direct_sql_cannot_reverse_containment_or_restore_a_default_after_reopen() {
         for contained_state in [SnapshotState::Quarantined, SnapshotState::Revoked] {
             let temp = tempfile::tempdir().unwrap();
@@ -1033,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_stamped_0012_store_with_missing_guards_without_rewriting_rows() {
+    fn stamped_0012_store_with_missing_guards_requires_fenced_upgrade() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("control.db");
         let id = {
@@ -1064,6 +1140,12 @@ mod tests {
         };
 
         let mut connection = Connection::open(&database).unwrap();
+        assert!(RegistryStore::initialize(&mut connection).is_err());
+        connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
         let store = RegistryStore::initialize(&mut connection).unwrap();
         assert!(
             store
@@ -1642,10 +1724,12 @@ mod tests {
                 ).unwrap();
                 }
                 "checksum" => {
-                    connection.execute(
-                    "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES (?1,'wrong','2026-09-19T00:00:00Z')",
-                    [MIGRATION_ID],
-                ).unwrap();
+                    connection
+                        .execute(
+                            "UPDATE schema_migrations SET checksum='wrong' WHERE migration_id=?1",
+                            [MIGRATION_ID],
+                        )
+                        .unwrap();
                 }
                 _ => {
                     RegistryStore::initialize(&mut connection).unwrap();
@@ -1662,7 +1746,7 @@ mod tests {
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='immutable_registry_snapshot_entries_delete')",
                 [], |row| row.get(0),
             ).unwrap();
-            assert!(!present, "{mutation}");
+            assert_eq!(present, mutation != "missing-trigger", "{mutation}");
         }
     }
 

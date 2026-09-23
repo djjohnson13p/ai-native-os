@@ -72,7 +72,9 @@ fn historical_validation_keeps_its_snapshot_after_default_switch_and_offline_reo
     )
     .unwrap();
 
-    drop(TaskManager::open(&database).unwrap());
+    let mut manager = TaskManager::open(&database).unwrap();
+    manager.initialize_registry_store().unwrap();
+    drop(manager);
     let first_id = {
         let mut connection = Connection::open(&database).unwrap();
         let (first_id, second_id) = {

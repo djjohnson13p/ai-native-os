@@ -618,6 +618,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
     };
 
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.initialize_provider_store().unwrap();
     let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
         "../../../examples/aios-ir/registry-snapshot.json"
     ))
@@ -978,6 +979,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
     };
 
     let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.initialize_provider_store().unwrap();
     seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
     prepare_completion_for_admission(&manager);
     let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
@@ -1178,6 +1180,26 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
             .unwrap()
         };
     let first = insert(&manager, 2, "E1");
+    assert!(valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.250Z"
+    ));
+    // The baseline permits retained evidence without a suite ID. That older
+    // row cannot win latest Stage-1 evidence selection or abort the reader.
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence (
+            evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+            status,evidence_json,tested_at)
+         SELECT 'legacy-null-suite',registration_id,capability,contract_hash,NULL,suite_hash,
+                status,evidence_json,'2026-09-19T00:00:00.200Z'
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+            [],
+        )
+        .unwrap();
     assert!(valid(
         &mut manager,
         &first,
