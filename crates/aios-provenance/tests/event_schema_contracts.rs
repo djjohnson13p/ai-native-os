@@ -56,6 +56,10 @@ fn event_payload_fixtures_match_runtime_verifier() {
 
     for case in fixture["cases"].as_array().unwrap() {
         let event = &case["event"];
+        let Ok(event_hash) = hash_record(&stream, 2, Some(&genesis_hash), event) else {
+            assert_eq!(case["valid"], false, "{}", case["name"]);
+            continue;
+        };
         let second = JournalRecord {
             schema_version: SCHEMA_VERSION.to_owned(),
             hash_profile: HASH_PROFILE.to_owned(),
@@ -63,7 +67,7 @@ fn event_payload_fixtures_match_runtime_verifier() {
             sequence: 2,
             previous_event_hash: Some(genesis_hash.clone()),
             event: event.clone(),
-            event_hash: hash_record(&stream, 2, Some(&genesis_hash), event).unwrap(),
+            event_hash,
         };
         let result = verify_records(
             &[first.clone(), second],

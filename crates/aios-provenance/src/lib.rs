@@ -36,6 +36,9 @@ const MAX_PROJECTION_SOURCE_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_STRING_CHARS: usize = 4096;
 const MAX_ARRAY_ITEMS: usize = 512;
 const MAX_OBJECT_FIELDS: usize = 256;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_SAFE_JSON_INTEGER_I64: i64 = 9_007_199_254_740_991;
+const MAX_SAFE_JSON_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
 const HASH_DOMAIN: &[u8] = b"AIOS-PROVENANCE-EVENT\0v0.1\0";
 const PROJECTION_HASH_PROFILE: &str = "aios-provenance-redacted-projection-v1";
 const PROJECTION_RECORD_DOMAIN: &[u8] = b"AIOS-PROVENANCE-PROJECTION-RECORD\0v1\0";
@@ -282,6 +285,10 @@ pub fn append_in_tx(
         ));
     }
     validate_sequence_event_invariant(sequence, event)?;
+    if string_field(event, "event_type") == Some("task.transitioned") {
+        let mut latest_revision = latest_task_revision_in_tx(transaction, &stream_id)?;
+        advance_task_revision(&mut latest_revision, event)?;
+    }
     let previous_event_hash = head.map(|value| value.event_hash);
     let event_hash = hash_record(&stream_id, sequence, previous_event_hash.as_deref(), event)?;
     let event_id = string_field(event, "event_id")
@@ -413,6 +420,7 @@ pub fn verify_stream(
     })?;
     let mut previous: Option<String> = None;
     let mut expected_sequence = 1_u64;
+    let mut latest_revision = None;
     for row in rows {
         let (record, index) = match row {
             Ok(value) => value,
@@ -451,6 +459,18 @@ pub fn verify_stream(
                 Some(record.sequence),
                 Some(index.event_id),
                 Some(computed),
+                checkpoint,
+            ));
+        }
+        if advance_task_revision(&mut latest_revision, &record.event).is_err() {
+            return Ok(failure(
+                stream_id,
+                verified_at,
+                "PROVENANCE_SCHEMA_INVALID",
+                "Task revision is discontinuous",
+                Some(record.sequence),
+                diagnostic_event_id(&index.event_id),
+                previous,
                 checkpoint,
             ));
         }
@@ -682,6 +702,7 @@ pub fn verify_records(
     validate_checkpoint(checkpoint)?;
     let mut previous: Option<String> = None;
     let mut expected_sequence = 1_u64;
+    let mut latest_revision = None;
     let mut event_ids = std::collections::HashSet::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(event_id) = string_field(&record.event, "event_id") {
@@ -711,7 +732,21 @@ pub fn verify_records(
             checkpoint,
             verified_at,
         ) {
-            Ok(computed) => previous = Some(computed),
+            Ok(computed) => {
+                if advance_task_revision(&mut latest_revision, &record.event).is_err() {
+                    return Ok(failure(
+                        stream_id,
+                        verified_at,
+                        "PROVENANCE_SCHEMA_INVALID",
+                        "Task revision is discontinuous",
+                        Some(record.sequence),
+                        string_field(&record.event, "event_id").and_then(diagnostic_event_id),
+                        previous,
+                        checkpoint,
+                    ));
+                }
+                previous = Some(computed);
+            }
             Err(failure) => return Ok(*failure),
         }
         expected_sequence = expected_sequence.saturating_add(1);
@@ -999,6 +1034,7 @@ fn verify_projected_records(
     let mut task_alias: Option<&str> = None;
     let mut event_aliases = std::collections::BTreeSet::new();
     let mut alias_namespaces = std::collections::HashMap::<String, String>::new();
+    let mut latest_revision = None;
     for (index, record) in records.iter().enumerate() {
         let expected_sequence = index as u64 + 1;
         if record.schema_version != SCHEMA_VERSION
@@ -1066,6 +1102,16 @@ fn verify_projected_records(
                 "projected record hash does not match its contents",
                 Some(record.sequence),
                 Some(computed),
+            );
+        }
+        if advance_task_revision(&mut latest_revision, &record.projected_event).is_err() {
+            return projection_failure(
+                manifest,
+                verified_at,
+                "PROJECTION_RECORD_INVALID",
+                "projected Task revision is discontinuous",
+                Some(record.sequence),
+                previous,
             );
         }
         previous = Some(computed);
@@ -1689,7 +1735,7 @@ pub fn hash_record(
     previous: Option<&str>,
     event: &Value,
 ) -> Result<String> {
-    if !within_shape_bounds(event) {
+    if sequence == 0 || sequence > MAX_SAFE_JSON_INTEGER || !within_shape_bounds(event) {
         return Err(Error::InvalidRecord(
             "provenance event exceeds shape bounds".to_owned(),
         ));
@@ -1885,6 +1931,64 @@ fn validate_sequence_event_invariant(sequence: u64, event: &Value) -> Result<()>
         return Err(Error::InvalidRecord(
             "task.created must occur exactly at provenance genesis".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn latest_task_revision_in_tx(
+    transaction: &Transaction<'_>,
+    stream_id: &str,
+) -> Result<Option<u64>> {
+    let stored: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT event_type,event_json FROM provenance_events WHERE stream_id=?1 AND event_type IN ('task.created','task.transitioned') ORDER BY sequence DESC LIMIT 1",
+            [stream_id],
+            |row| Ok((bounded_row_text(row, 0)?, bounded_row_text(row, 1)?)),
+        )
+        .optional()?;
+    let Some((event_type, event_json)) = stored else {
+        return Ok(None);
+    };
+    let event = parse_unique_json_bytes(event_json.as_bytes())?;
+    if string_field(&event, "event_type") != Some(event_type.as_str()) {
+        return Err(Error::InvalidRecord(
+            "stored Task revision event conflicts with its index".to_owned(),
+        ));
+    }
+    match event_type.as_str() {
+        "task.created" => Ok(event.pointer("/details/revision").and_then(Value::as_u64)),
+        "task.transitioned" => Ok(event
+            .pointer("/task_transition/new_revision")
+            .and_then(Value::as_u64)),
+        _ => unreachable!("query filters Task revision events"),
+    }
+}
+
+fn advance_task_revision(latest: &mut Option<u64>, event: &Value) -> Result<()> {
+    match string_field(event, "event_type") {
+        Some("task.created") => {
+            if latest.is_some() {
+                return Err(Error::InvalidRecord(
+                    "Task creation revision is not genesis".to_owned(),
+                ));
+            }
+            *latest = Some(1);
+        }
+        Some("task.transitioned") => {
+            let previous = event
+                .pointer("/task_transition/previous_revision")
+                .and_then(Value::as_u64);
+            let next = event
+                .pointer("/task_transition/new_revision")
+                .and_then(Value::as_u64);
+            if previous != *latest || next.is_none() {
+                return Err(Error::InvalidRecord(
+                    "Task transition revision is discontinuous".to_owned(),
+                ));
+            }
+            *latest = next;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2350,10 +2454,11 @@ fn expect_object_keys<'a>(
 }
 
 fn expect_integer(value: &Value, minimum: u64, maximum: Option<u64>) -> Result<()> {
-    if value
-        .as_u64()
-        .is_some_and(|value| value >= minimum && maximum.is_none_or(|maximum| value <= maximum))
-    {
+    if value.as_u64().is_some_and(|value| {
+        value >= minimum
+            && value <= MAX_SAFE_JSON_INTEGER
+            && maximum.is_none_or(|maximum| value <= maximum)
+    }) {
         Ok(())
     } else {
         Err(invalid_details(
@@ -2593,6 +2698,7 @@ fn within_shape_bounds(value: &Value) -> bool {
         }
         match value {
             Value::String(value) if value.chars().count() > MAX_STRING_CHARS => return false,
+            Value::Number(value) if !safe_json_number(value) => return false,
             Value::Array(values) => {
                 if values.len() > MAX_ARRAY_ITEMS {
                     return false;
@@ -2611,6 +2717,18 @@ fn within_shape_bounds(value: &Value) -> bool {
         }
     }
     true
+}
+
+fn safe_json_number(value: &serde_json::Number) -> bool {
+    if let Some(integer) = value.as_i64() {
+        (-MAX_SAFE_JSON_INTEGER_I64..=MAX_SAFE_JSON_INTEGER_I64).contains(&integer)
+    } else if let Some(integer) = value.as_u64() {
+        integer <= MAX_SAFE_JSON_INTEGER
+    } else {
+        value.as_f64().is_some_and(|number| {
+            number.fract() != 0.0 || number.abs() <= MAX_SAFE_JSON_INTEGER_F64
+        })
+    }
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRecord> {
@@ -2860,6 +2978,185 @@ mod tests {
                 "mutation_text_commitments":{"waiting_on":null,"failure_summary":null}
             }
         })
+    }
+
+    #[test]
+    fn task_revision_continues_across_intervening_records() {
+        let task_id = "T-revision-continuity";
+        let stream = stream_id(task_id).unwrap();
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        let first = append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let middle = append_in_tx(
+            &transaction,
+            task_id,
+            &event(task_id, 2),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let mut skipped = typed_transition_event(task_id);
+        skipped["task_transition"]["previous_revision"] = json!(10);
+        skipped["task_transition"]["new_revision"] = json!(11);
+        assert!(append_in_tx(&transaction, task_id, &skipped, &ExpectedHead::Any).is_err());
+
+        let forged_hash = hash_record(&stream, 3, Some(&middle.event_hash), &skipped).unwrap();
+        let forged = JournalRecord {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            hash_profile: HASH_PROFILE.to_owned(),
+            stream_id: stream.clone(),
+            sequence: 3,
+            previous_event_hash: Some(middle.event_hash.clone()),
+            event: skipped,
+            event_hash: forged_hash,
+        };
+        let verdict =
+            verify_records(&[first, middle.clone(), forged.clone()], &stream, None, NOW).unwrap();
+        assert!(!verdict.valid);
+        assert_eq!(verdict.diagnostics[0].code, "PROVENANCE_SCHEMA_INVALID");
+
+        transaction.execute(
+            "INSERT INTO provenance_events (schema_version,hash_profile,event_id,task_id,stream_id,sequence,timestamp,event_type,status,previous_event_hash,event_hash,event_json) VALUES (?1,?2,?3,?4,?5,3,?6,'task.transitioned','success',?7,?8,?9)",
+            params![SCHEMA_VERSION,HASH_PROFILE,forged.event["event_id"].as_str().unwrap(),task_id,stream,NOW,middle.event_hash,forged.event_hash,serde_json::to_string(&forged.event).unwrap()],
+        ).unwrap();
+        let stored_verdict = verify_stream(&transaction, &stream, None, None, NOW).unwrap();
+        assert!(!stored_verdict.valid);
+        assert_eq!(
+            stored_verdict.diagnostics[0].code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+        transaction
+            .execute(
+                "DELETE FROM provenance_events WHERE stream_id=?1 AND sequence=3",
+                [&stream],
+            )
+            .unwrap();
+
+        let mut valid = typed_transition_event(task_id);
+        valid["event_id"] = json!("event-valid-transition");
+        append_in_tx(&transaction, task_id, &valid, &ExpectedHead::Any).unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &event(task_id, 4),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let mut next = typed_transition_event(task_id);
+        next["event_id"] = json!("event-next-transition");
+        next["task_transition"]["previous_revision"] = json!(2);
+        next["task_transition"]["new_revision"] = json!(3);
+        next["task_transition"]["previous_state"] = json!("PLANNING");
+        next["task_transition"]["new_state"] = json!("RUNNABLE");
+        append_in_tx(&transaction, task_id, &next, &ExpectedHead::Any).unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+        let records = list_events(&connection, &stream, None, 5).unwrap().records;
+        assert!(verify_records(&records, &stream, None, NOW).unwrap().valid);
+    }
+
+    #[test]
+    fn canonical_hash_rejects_integer_rounding_collision() {
+        let first = json!(9_007_199_254_740_992_u64);
+        let second = json!(9_007_199_254_740_993_u64);
+        assert_eq!(
+            serde_json_canonicalizer::to_vec(&first).unwrap(),
+            serde_json_canonicalizer::to_vec(&second).unwrap()
+        );
+        let task_id = "T-unsafe-integer";
+        let stream = stream_id(task_id).unwrap();
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let mut safe = event(task_id, 2);
+        safe["event_type"] = json!("artifact.imported");
+        safe["details"] = json!({"size_bytes":MAX_SAFE_JSON_INTEGER});
+        assert!(validate_event(task_id, &safe).is_ok());
+        append_in_tx(&transaction, task_id, &safe, &ExpectedHead::Any).unwrap();
+        for integer in [9_007_199_254_740_992_u64, 9_007_199_254_740_993_u64] {
+            let mut event = safe.clone();
+            event["event_id"] = json!(format!("unsafe-event-{integer}"));
+            event["details"]["size_bytes"] = json!(integer);
+            assert!(hash_record(&stream, 3, None, &event).is_err());
+            assert!(validate_event(task_id, &event).is_err());
+            assert!(append_in_tx(&transaction, task_id, &event, &ExpectedHead::Any).is_err());
+            assert!(
+                hash_canonical(PROJECTION_RECORD_DOMAIN, &json!({"size_bytes":integer})).is_err()
+            );
+        }
+        assert!(
+            hash_record(
+                &stream,
+                MAX_SAFE_JSON_INTEGER + 1,
+                None,
+                &typed_creation_event("T-unsafe-integer", 1)
+            )
+            .is_err()
+        );
+        assert!(
+            hash_record(
+                &stream,
+                1,
+                None,
+                &typed_creation_event("T-unsafe-integer", 1)
+            )
+            .is_ok()
+        );
+        transaction.commit().unwrap();
+        assert!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .valid
+        );
+
+        let export = export_jsonl(&connection, &stream, NOW).unwrap();
+        assert!(
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
+        let unsafe_projection = rehash_projection(&export, |records| {
+            records[1].projected_event["details"]["size_bytes"] = json!(9_007_199_254_740_992_u64);
+        });
+        assert!(projection_rejected(&unsafe_projection));
+
+        let mut records = list_events(&connection, &stream, None, 3).unwrap().records;
+        records[1].event["details"]["size_bytes"] = json!(9_007_199_254_740_992_u64);
+        assert_eq!(
+            verify_records(&records, &stream, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_json=?1 WHERE stream_id=?2 AND sequence=2",
+                params![serde_json::to_string(&records[1].event).unwrap(), stream],
+            )
+            .unwrap();
+        assert_eq!(
+            verify_stream(&connection, &stream, None, None, NOW)
+                .unwrap()
+                .diagnostics[0]
+                .code,
+            "PROVENANCE_SCHEMA_INVALID"
+        );
     }
 
     fn append_many(connection: &mut Connection, count: u64) -> Vec<JournalRecord> {
@@ -4129,6 +4426,65 @@ mod tests {
             records.remove(0);
         });
         assert!(projection_rejected(&wrong_genesis));
+    }
+
+    #[test]
+    fn rehashed_projection_rejects_task_revision_gap_across_other_events() {
+        let task_id = "T-projected-revision-continuity";
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &event(task_id, 2),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_transition_event(task_id),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &event(task_id, 4),
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        let mut next = typed_transition_event(task_id);
+        next["event_id"] = json!("event-next-projected-transition");
+        next["task_transition"]["previous_revision"] = json!(2);
+        next["task_transition"]["new_revision"] = json!(3);
+        next["task_transition"]["previous_state"] = json!("PLANNING");
+        next["task_transition"]["new_state"] = json!("RUNNABLE");
+        append_in_tx(&transaction, task_id, &next, &ExpectedHead::Any).unwrap();
+        transaction.commit().unwrap();
+
+        let export = export_jsonl(&connection, &stream_id(task_id).unwrap(), NOW).unwrap();
+        assert!(
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
+        let forged = rehash_projection(&export, |records| {
+            records[4].projected_event["task_transition"]["previous_revision"] = json!(10);
+            records[4].projected_event["task_transition"]["new_revision"] = json!(11);
+        });
+        let verdict =
+            verify_jsonl_export(&forged.manifest_json, &forged.records_jsonl, NOW).unwrap();
+        assert!(!verdict.valid);
+        assert_eq!(verdict.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+        assert_eq!(verdict.diagnostics[0].sequence, Some(5));
     }
 
     #[test]

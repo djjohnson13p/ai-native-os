@@ -158,6 +158,23 @@ callback exporter or use `TaskManager::export_provenance`.
 Stamped stores with a nullable provenance Task key or any unowned journal row
 are rejected at startup rather than treated as a valid migrated store; existing
 valid records and hashes are unaffected.
+Stamped stores also require `event_id` as the journal table's sole primary-key
+column and reject null event IDs. Otherwise duplicate IDs across separately
+valid streams make receipt lookup ambiguous, and SQLite ordinary rowid tables
+can accept null values in a `TEXT PRIMARY KEY`. This rejects malformed stamped
+stores without rewriting valid rows.
+Integers in the canonical hash view are limited in magnitude to
+`9007199254740991` before RFC 8785 serialization; v0.1 typed event and
+envelope integer fields are also nonnegative. Out-of-range values were
+previously accepted by some validators but could collide in the canonical
+bytes; they now fail append or stored-row verification. Existing in-range
+event bytes and hashes remain unchanged.
+The separately hashed portable projection and manifest apply the same exact
+integer bound before canonicalization.
+The `task.created` genesis establishes Task revision 1. Every later
+`task.transitioned` record must consume the latest committed Task revision
+and advance it by one, including when other event types intervene. Append and
+verification reject an otherwise hash-valid but discontinuous Task history.
 
 ## Related
 

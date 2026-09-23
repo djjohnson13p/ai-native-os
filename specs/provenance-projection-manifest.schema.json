@@ -11,7 +11,7 @@
     "projection_hash_profile": {"const": "aios-provenance-redacted-projection-v1"},
     "bundle_id": {"type": "string", "pattern": "^bundle:v1:[0-9a-f]{64}$"},
     "record_count": {"type": "integer", "minimum": 1, "maximum": 10000},
-    "head_sequence": {"type": "integer", "minimum": 1},
+    "head_sequence": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
     "head_projection_hash": {"$ref": "#/$defs/hash"},
     "descriptor_hash": {"$ref": "#/$defs/hash"}
   },

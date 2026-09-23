@@ -3646,11 +3646,23 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         if has_v11
             && (!table_has_column(connection, "provenance_events", "schema_version")?
                 || !table_has_column(connection, "provenance_events", "hash_profile")?
+                || !provenance_event_id_is_primary_key(connection)?
                 || !table_column_not_null(connection, "provenance_events", "task_id")?
                 || !provenance_task_fk_is_current(connection)?)
         {
             return Err(TaskManagerError::InvalidRecord(
                 "provenance service-boundary migration is incomplete",
+            ));
+        }
+        if has_v11
+            && connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "provenance event has no identity",
             ));
         }
         if has_v11
@@ -3783,6 +3795,7 @@ fn migrate_task_manager_schema(
     let provenance_requires_rebuild =
         !table_has_column(connection, "provenance_events", "schema_version")?
             || !table_has_column(connection, "provenance_events", "hash_profile")?
+            || !provenance_event_id_is_primary_key(connection)?
             || !table_column_not_null(connection, "provenance_events", "task_id")?
             || !provenance_task_fk_is_current(connection)?;
     let foreign_key_rebuild =
@@ -4114,6 +4127,16 @@ fn migrate_task_manager_schema(
         if foreign_key_failures != 0 {
             return Err(TaskManagerError::InvalidRecord(
                 "persistence migration produced invalid foreign-key references",
+            ));
+        }
+        let missing_event_id = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if missing_event_id {
+            return Err(TaskManagerError::InvalidRecord(
+                "persistence migration found a provenance event without identity",
             ));
         }
         connection.execute(
@@ -4451,6 +4474,19 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
         }
     }
     Ok(false)
+}
+
+fn provenance_event_id_is_primary_key(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(provenance_events)")?;
+    let columns = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+    })?;
+    let primary_key_columns = columns
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, position)| *position != 0)
+        .collect::<Vec<_>>();
+    Ok(matches!(primary_key_columns.as_slice(), [(name, 1)] if name == "event_id"))
 }
 
 fn provenance_task_fk_is_current(connection: &Connection) -> Result<bool> {
@@ -7554,6 +7590,263 @@ mod tests {
             normalized_intent: None,
             active_step_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn provenance_event_id_key_shape_rejects_unique_and_composite_substitutes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE provenance_events(event_id TEXT UNIQUE, task_id TEXT)")
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        connection
+            .execute_batch(
+                "DROP TABLE provenance_events;
+                 CREATE TABLE provenance_events(
+                     event_id TEXT, task_id TEXT, PRIMARY KEY(event_id, task_id)
+                 );",
+            )
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        connection
+            .execute_batch(
+                "DROP TABLE provenance_events;
+                 CREATE TABLE provenance_events(event_id TEXT PRIMARY KEY, task_id TEXT) WITHOUT ROWID;",
+            )
+            .unwrap();
+        assert!(provenance_event_id_is_primary_key(&connection).unwrap());
+    }
+
+    #[test]
+    fn stamped_provenance_rejects_null_event_id_despite_sqlite_primary_key() {
+        let mut manager = test_manager();
+        manager
+            .create_task(&create("T-null-event-identity"))
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provenance_events_no_update;
+                 UPDATE provenance_events SET event_id=NULL;",
+            )
+            .unwrap();
+        assert!(provenance_event_id_is_primary_key(&manager.connection).unwrap());
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance event has no identity"
+            ))
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks hash-valid duplicate identities and atomic rollback on both migration paths"
+    )]
+    fn stamped_provenance_requires_event_id_single_column_primary_key() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("duplicate-provenance-event-ids.sqlite3");
+        let first_task = "T-duplicate-event-first";
+        let second_task = "T-duplicate-event-second";
+        {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(first_task)).unwrap();
+            manager.create_task(&create(second_task)).unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let without_primary_key = schema
+            .replacen(
+                "CREATE TABLE provenance_events",
+                "CREATE TABLE provenance_events_without_pk",
+                1,
+            )
+            .replacen(
+                "event_id                 TEXT PRIMARY KEY",
+                "event_id                 TEXT",
+                1,
+            );
+        assert_ne!(without_primary_key, schema);
+        assert!(without_primary_key.contains("event_id                 TEXT,"));
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TRIGGER provenance_events_no_update;
+                 DROP TRIGGER provenance_events_no_delete;
+                 {without_primary_key};
+                 INSERT INTO provenance_events_without_pk SELECT * FROM provenance_events;
+                 DROP TABLE provenance_events;
+                 ALTER TABLE provenance_events_without_pk RENAME TO provenance_events;"
+            ))
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        assert!(provenance_task_fk_is_current(&connection).unwrap());
+
+        let first_event_id: String = connection
+            .query_row(
+                "SELECT event_id FROM provenance_events WHERE task_id=?1",
+                [first_task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_stream = provenance_stream_id(second_task);
+        let second_json: String = connection
+            .query_row(
+                "SELECT event_json FROM provenance_events WHERE task_id=?1",
+                [second_task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut second_event: Value = serde_json::from_str(&second_json).unwrap();
+        second_event["event_id"] = serde_json::json!(first_event_id);
+        let second_hash =
+            aios_provenance::hash_record(&second_stream, 1, None, &second_event).unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_events SET event_id=?1,event_hash=?2,event_json=?3 WHERE task_id=?4",
+                params![first_event_id, second_hash, second_event.to_string(), second_task],
+            )
+            .unwrap();
+        for task_id in [first_task, second_task] {
+            let result = aios_provenance::verify_stream(
+                &connection,
+                &provenance_stream_id(task_id),
+                None,
+                None,
+                T0,
+            )
+            .unwrap();
+            assert!(result.valid, "{task_id}: {result:?}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [&first_event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            preflight_migration_state(&connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance service-boundary migration is incomplete"
+            ))
+        ));
+        drop(connection);
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "provenance service-boundary migration is incomplete"
+            ))
+        ));
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [&first_event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unstamped_provenance_rebuild_restores_event_id_primary_key() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("unstamped-provenance-without-pk.sqlite3");
+        let task_id = "T-rebuild-provenance-key";
+        let original_hash = {
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.create_task(&create(task_id)).unwrap();
+            manager
+                .provenance_head(task_id)
+                .unwrap()
+                .unwrap()
+                .event_hash
+        };
+        let connection = Connection::open(&path).unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='provenance_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let without_primary_key = schema
+            .replacen(
+                "CREATE TABLE provenance_events",
+                "CREATE TABLE provenance_events_without_pk",
+                1,
+            )
+            .replacen(
+                "event_id                 TEXT PRIMARY KEY",
+                "event_id                 TEXT",
+                1,
+            );
+        assert!(without_primary_key.contains("event_id                 TEXT,"));
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TRIGGER provenance_events_no_update;
+                 DROP TRIGGER provenance_events_no_delete;
+                 {without_primary_key};
+                 INSERT INTO provenance_events_without_pk SELECT * FROM provenance_events;
+                 DROP TABLE provenance_events;
+                 ALTER TABLE provenance_events_without_pk RENAME TO provenance_events;
+                 DELETE FROM schema_migrations WHERE migration_id='0011_provenance_service_boundary';"
+            ))
+            .unwrap();
+        assert!(!provenance_event_id_is_primary_key(&connection).unwrap());
+        drop(connection);
+
+        let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(provenance_event_id_is_primary_key(&manager.connection).unwrap());
+        assert!(manager.verify_provenance(task_id).unwrap());
+        assert_eq!(
+            manager
+                .provenance_head(task_id)
+                .unwrap()
+                .unwrap()
+                .event_hash,
+            original_hash
+        );
     }
 
     fn request(

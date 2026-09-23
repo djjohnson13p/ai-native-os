@@ -1883,6 +1883,52 @@ fn seed_completion_fixture_with_identity(
              WHERE task_id = 'T-completion';",
         )
         .unwrap();
+    // This fixture condenses a completed execution into revision 2 so the
+    // completion guards can be tested without building the whole lifecycle.
+    // The synthetic CREATED -> VERIFYING jump still needs an authentic typed
+    // transition in the hash chain before later test transitions can append.
+    let transaction = manager.connection.transaction().unwrap();
+    let verifying_event = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "event_id": "event:seed:completion-verifying",
+        "task_id": "T-completion",
+        "event_type": "task.transitioned",
+        "timestamp": TEST_TIME,
+        "actor": {"kind":"system-service","id":"service:test"},
+        "status": "success",
+        "task_transition": {
+            "transition_id": "transition:seed:completion-verifying",
+            "previous_state": "CREATED",
+            "new_state": "VERIFYING",
+            "previous_revision": 1,
+            "new_revision": 2,
+            "reason_code": "STATE_CHANGE_REQUESTED"
+        },
+        "committed_mutation": {
+            "active_plan": null,
+            "active_step_ids": null,
+            "waiting_on": null,
+            "failure": null,
+            "recovery": null
+        },
+        "details": {"reason_message_ref": null, "active_program": null}
+    });
+    let appended = append_event(&transaction, "T-completion", &verifying_event).unwrap();
+    transaction
+        .execute(
+            "UPDATE tasks SET state_reason_json=?2 WHERE task_id=?1",
+            rusqlite::params![
+                "T-completion",
+                serde_json::json!({
+                    "code":"STATE_CHANGE_REQUESTED",
+                    "message":null,
+                    "provenance_event_id":appended.event_id
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
     let publication_request = ArtifactPublicationRequest {
         schema_version: SCHEMA_VERSION.to_owned(),
         publication_id: "publication-completion".to_owned(),

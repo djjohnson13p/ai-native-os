@@ -63,6 +63,45 @@
       }
     },
     {
+      "name": "plan-revision-safe-json-maximum",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:safe-maximum",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740991}
+      }
+    },
+    {
+      "name": "plan-revision-rounded-even-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:rounded-even",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740992}
+      }
+    },
+    {
+      "name": "plan-revision-rounded-odd-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:rounded-odd",
+        "task_id": "task:fixture",
+        "event_type": "plan.created",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "details": {"plan_id": "plan:one", "revision": 9007199254740993}
+      }
+    },
+    {
       "name": "plan-resource-rejected",
       "valid": false,
       "event": {
