@@ -515,8 +515,9 @@ Important safety rules now include:
 
 Issue #17's validator is complete. Stage 1 trusted-core work follows
 `docs/82-stage1-core-substrate-codex-runbook.md` in order; Issue #38 records
-the current implementation milestone and exact review state. The Stage 0
-adversarial packet in `docs/83-pre-implementation-red-team-and-astra-review-packet.md`
-remains historical review context.
+the current implementation milestone and exact review state. The completed
+Stage 0 findings in `docs/83-pre-implementation-red-team-and-astra-review-packet.md`
+are historical; its Stage 1 blocker questions remain active for trusted-boundary
+reviews.
 
 No production-readiness or working-operating-system claim is made yet.
