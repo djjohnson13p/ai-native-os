@@ -757,7 +757,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         .map(str::to_owned);
     {
         let transaction = manager.connection.transaction().unwrap();
-        assert!(!verified_provider_admission(&transaction, &binding).unwrap());
+        assert!(!verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
         transaction.rollback().unwrap();
     }
     manager
@@ -772,9 +772,9 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
         )
         .unwrap();
     let transaction = manager.connection.transaction().unwrap();
-    assert!(verified_provider_admission(&transaction, &binding).unwrap());
+    assert!(verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
     binding.registry_snapshot_id = first.snapshot_id().into();
-    assert!(verified_provider_admission(&transaction, &binding).unwrap());
+    assert!(verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap());
     let original_receipt: String = transaction
         .query_row(
             "SELECT registration_json FROM provider_registrations WHERE registration_id=?1",
@@ -806,7 +806,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             )
             .unwrap();
         assert!(
-            !verified_provider_admission(&transaction, &binding).unwrap(),
+            !verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap(),
             "forged receipt field {pointer} must not authorize launch"
         );
         transaction
@@ -926,6 +926,40 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             ],
         )
         .unwrap();
+    let first_trust_source: String = manager
+        .connection
+        .query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-real-receipt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(first_trust_source.starts_with("sha256:"));
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            verified_provider_admission(&transaction, "binding-real-receipt", &binding).unwrap()
+        );
+        transaction.rollback().unwrap();
+    }
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .admit_trust(
+            binding.provider_registration_id.as_deref().unwrap(),
+            "decision:fixture-later-review",
+            ProviderTrustStatus::ProjectReviewed,
+            "review:fixture-owner",
+            "2026-09-19T00:00:01Z",
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            !verified_provider_admission(&transaction, "binding-real-receipt", &binding).unwrap()
+        );
+        transaction.rollback().unwrap();
+    }
     let transaction = manager.connection.transaction().unwrap();
     assert_eq!(
         latest_conformance_evidence_id(
@@ -1023,7 +1057,7 @@ fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
             .unwrap();
         let transaction = manager.connection.transaction().unwrap();
         assert_eq!(
-            verified_provider_admission(&transaction, &binding).unwrap(),
+            verified_provider_receipt_and_compatibility(&transaction, &binding).unwrap(),
             permitted
         );
     }
@@ -1348,6 +1382,7 @@ fn immutable_binding_pins_real_provider_evidence_across_retests() {
         .connection
         .execute_batch(
             "DROP TRIGGER execution_binding_evidence_present_at_insert;
+         DROP TRIGGER execution_binding_evidence_not_future;
          DROP TRIGGER execution_binding_admission_marker_insert;
          DROP TABLE execution_binding_admission_markers;",
         )
@@ -7066,18 +7101,26 @@ fn null_certainty_started_and_unknown_operations_block_execution_advancement() {
 
 #[test]
 fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
-    for (name, mutation) in [
+    for (name, mutation, admitted) in [
         (
             "unknown-trust",
             "UPDATE provider_registrations SET trust_status='self-declared' WHERE registration_id='registration-completion'",
+            false,
         ),
         (
             "nonpass-conformance",
             "UPDATE provider_conformance_evidence SET status='fail' WHERE evidence_id='evidence-completion'",
+            false,
+        ),
+        (
+            "organization-approved",
+            "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id='registration-completion'",
+            true,
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        align_completion_fixture_state(&mut manager, TaskState::Recovering);
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
@@ -7096,15 +7139,32 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
                 TaskState::Running,
             ))
             .unwrap();
-        assert!(!result.applied, "{name}");
-        assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+        assert_eq!(result.applied, admitted, "{name}");
+        if !admitted {
+            assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+        }
         let step = manager
             .get_step_execution("attempt-completion")
             .unwrap()
             .unwrap();
-        assert_eq!(step.state, StepState::Ready, "{name}");
+        assert_eq!(
+            step.state,
+            if admitted {
+                StepState::Running
+            } else {
+                StepState::Ready
+            },
+            "{name}"
+        );
         let task = manager.get_task("T-completion").unwrap().unwrap();
-        assert_eq!((task.state, task.revision), (TaskState::Recovering, 2));
+        assert_eq!(
+            (task.state, task.revision),
+            if admitted {
+                (TaskState::Running, 3)
+            } else {
+                (TaskState::Recovering, 2)
+            }
+        );
     }
 }
 

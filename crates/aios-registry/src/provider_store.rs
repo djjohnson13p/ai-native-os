@@ -535,7 +535,7 @@ impl<'a> ProviderStore<'a> {
                 "invalid provider trust decision",
             ));
         }
-        parse_time(admitted_at)?;
+        let decision_time = parse_time(admitted_at)?;
         let registration = self.load_registration(registration_id)?;
         let manifest = self.verified_manifest(&registration)?;
         let fence = self
@@ -569,6 +569,21 @@ impl<'a> ProviderStore<'a> {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        if prior.is_none() {
+            let previous_at: String = transaction.query_row(
+                "SELECT COALESCE(
+                    (SELECT admitted_at FROM provider_trust_admissions
+                     WHERE registration_id=?1 ORDER BY revision DESC LIMIT 1),
+                    (SELECT registered_at FROM provider_registrations WHERE registration_id=?1))",
+                [registration_id],
+                |row| row.get(0),
+            )?;
+            if decision_time < parse_time(&previous_at)? {
+                return Err(ProviderStoreError::Conflict(
+                    "provider trust admission time cannot move backward",
+                ));
+            }
+        }
         let revision: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(revision),0)+1 FROM provider_trust_admissions WHERE registration_id=?1",
             [registration_id], |row| row.get(0),
@@ -619,8 +634,12 @@ impl<'a> ProviderStore<'a> {
         }
         if state == "registered" {
             let manifest = self.verified_manifest(&registration)?;
-            let trust =
-                verified_provider_effective_trust(self.connection, &registration, &manifest)?;
+            let trust = verified_provider_effective_trust_at(
+                self.connection,
+                &registration,
+                &manifest,
+                now,
+            )?;
             if !trust.permits_execution() {
                 return Err(ProviderStoreError::Invalid(
                     "trust status does not permit enablement",
@@ -716,7 +735,7 @@ impl<'a> ProviderStore<'a> {
         for id in ids {
             let registration = self.load_registration(&id)?;
             let mut manifest = self.verified_manifest(&registration)?;
-            if !verified_provider_effective_trust(self.connection, &registration, &manifest)
+            if !verified_provider_effective_trust_at(self.connection, &registration, &manifest, at)
                 .is_ok_and(ProviderTrustStatus::permits_execution)
             {
                 continue;
@@ -1255,7 +1274,16 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ("trigger", "execution_binding_evidence_not_future"),
         ("trigger", "execution_binding_evidence_pin_required"),
         ("table", "execution_binding_admission_markers"),
+        ("table", "execution_binding_trust_markers"),
         ("trigger", "execution_binding_admission_marker_insert"),
+        ("trigger", "execution_binding_trust_marker_insert"),
+        ("trigger", "execution_binding_trust_not_future"),
+        (
+            "trigger",
+            "execution_binding_trust_marker_no_duplicate_insert",
+        ),
+        ("trigger", "execution_binding_trust_marker_no_update"),
+        ("trigger", "execution_binding_trust_marker_no_delete"),
         ("trigger", "execution_binding_marker_no_duplicate_insert"),
         ("trigger", "execution_binding_marker_no_update"),
         ("trigger", "execution_binding_marker_no_delete"),
@@ -1574,6 +1602,45 @@ pub fn verified_provider_effective_trust(
     registration: &ProviderRegistration,
     manifest: &CapabilityManifest,
 ) -> Result<ProviderTrustStatus> {
+    verified_provider_trust_source(connection, registration, manifest).map(|(trust, _)| trust)
+}
+
+fn verified_provider_effective_trust_at(
+    connection: &Connection,
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+    at: &str,
+) -> Result<ProviderTrustStatus> {
+    let checked = parse_time(at)?;
+    let (trust, source) = verified_provider_trust_source(connection, registration, manifest)?;
+    let admitted_at: String = if source == registration.registration_id {
+        connection.query_row(
+            "SELECT registered_at FROM provider_registrations WHERE registration_id=?1",
+            [&registration.registration_id],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            "SELECT admitted_at FROM provider_trust_admissions WHERE admission_id=?1",
+            [&source],
+            |row| row.get(0),
+        )?
+    };
+    if parse_time(&admitted_at)? > checked {
+        return Err(ProviderStoreError::Conflict(
+            "provider trust admission is in the future",
+        ));
+    }
+    Ok(trust)
+}
+
+/// Returns effective trust and the immutable receipt ID that established it.
+/// Bind-time and launch gates compare this source with the binding trust marker.
+pub fn verified_provider_trust_source(
+    connection: &Connection,
+    registration: &ProviderRegistration,
+    manifest: &CapabilityManifest,
+) -> Result<(ProviderTrustStatus, String)> {
     verify_stored_registration_receipt(connection, registration, manifest)?;
     let initial: String = connection.query_row(
         "SELECT trust_status FROM provider_registrations WHERE registration_id=?1",
@@ -1581,12 +1648,19 @@ pub fn verified_provider_effective_trust(
         |row| row.get(0),
     )?;
     let mut effective = ProviderTrustStatus::parse(&initial)?;
+    let mut source_id = registration.registration_id.clone();
     let mut statement = connection.prepare(
         "SELECT admission_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json
          FROM provider_trust_admissions WHERE registration_id=?1 ORDER BY revision",
     )?;
     let mut rows = statement.query([&registration.registration_id])?;
     let mut expected_revision = 1_i64;
+    let registered_at: String = connection.query_row(
+        "SELECT registered_at FROM provider_registrations WHERE registration_id=?1",
+        [&registration.registration_id],
+        |row| row.get(0),
+    )?;
+    let mut latest_time = parse_time(&registered_at)?;
     while let Some(row) = rows.next()? {
         let (id, decision, revision, trust, authority, at, receipt): (
             String,
@@ -1618,7 +1692,12 @@ pub fn verified_provider_effective_trust(
                 "invalid provider trust admission history",
             ));
         }
-        parse_time(&at)?;
+        let decision_time = parse_time(&at)?;
+        if decision_time < latest_time {
+            return Err(ProviderStoreError::Conflict(
+                "provider trust admission history moves backward in time",
+            ));
+        }
         let parsed = ProviderTrustStatus::parse(&trust)?;
         if !parsed.permits_execution() {
             return Err(ProviderStoreError::Conflict(
@@ -1641,6 +1720,8 @@ pub fn verified_provider_effective_trust(
             ));
         }
         effective = parsed;
+        source_id = id;
+        latest_time = decision_time;
         expected_revision =
             expected_revision
                 .checked_add(1)
@@ -1648,7 +1729,7 @@ pub fn verified_provider_effective_trust(
                     "provider trust admission revision overflow",
                 ))?;
     }
-    Ok(effective)
+    Ok((effective, source_id))
 }
 
 /// Verifies the complete immutable registration admission receipt without a
@@ -2784,7 +2865,7 @@ mod tests {
                 &bytes(&manifest),
                 BUILD_A,
                 ProviderTrustStatus::LocallyTrusted,
-                NOW,
+                "2026-09-22T10:00:00Z",
             )
             .unwrap();
         let mut result = evidence(&manifest, BUILD_A, "pass");
@@ -2813,6 +2894,7 @@ mod tests {
                 if suffix == "after" { 2 } else { 1 }])
         };
         assert!(insert("before", "2026-09-22T11:00:00.123456788Z").is_err());
+        assert!(insert("before-registration", "2026-09-22T09:59:59Z").is_err());
         assert!(insert("malformed", "not-a-date").is_err());
         let count: i64 = connection
             .query_row(
@@ -2827,6 +2909,139 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::drop_non_drop)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks trust-source creation, immutability, and retroactive use together"
+    )]
+    fn binding_trust_marker_requires_existing_review_and_pins_source() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::Unverified,
+                NOW,
+            )
+            .unwrap();
+        let evidence_id = store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        drop(store);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        let insert = |connection: &Connection,
+                      suffix: &str,
+                      attempt: i64,
+                      predicted: &str,
+                      created_at: &str| {
+            connection.execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,attempt,policy_decision_refs_json,
+                  grant_refs_json,execution_profile_ref,placement_json,binding_json,created_at)
+                 VALUES (?1,?2,'synthetic-task','sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         ?3,'0.1','synthetic-node','artifact.hash@1',?4,?5,?6,?7,?8,
+                         '[]','[]','synthetic-profile','{}',?9,?10)",
+                params![format!("binding-{suffix}"),format!("attempt-{suffix}"),registry.snapshot_id(),
+                    manifest["provides"][0]["contract"]["contract_hash"].as_str().unwrap(),
+                    registration.registration_id,registration.provider_id,registration.provider_version,
+                    attempt,json!({"conformance_evidence_id":evidence_id,
+                        "trust_admission_id":predicted}).to_string(),created_at],
+            )
+        };
+        assert!(insert(&connection, "before", 1, "predictable-future-decision", NOW).is_err());
+        let counts: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM execution_binding_admission_markers),
+                    (SELECT COUNT(*) FROM execution_binding_trust_markers)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let first = store
+            .admit_trust(
+                &registration.registration_id,
+                "review-one",
+                ProviderTrustStatus::LocallyTrusted,
+                "authenticated-review",
+                "2026-09-22T12:00:00.123456789z",
+            )
+            .unwrap();
+        drop(store);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        assert!(
+            insert(
+                &connection,
+                "trust-too-early",
+                1,
+                &first,
+                "2026-09-22T12:00:00.123456788Z"
+            )
+            .is_err()
+        );
+        insert(
+            &connection,
+            "first",
+            1,
+            &first,
+            "2026-09-22T12:00:00.123456789Z",
+        )
+        .unwrap();
+        let first_marker: String = connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-first'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(first_marker, first);
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let second = store
+            .admit_trust(
+                &registration.registration_id,
+                "review-two",
+                ProviderTrustStatus::ProjectReviewed,
+                "authenticated-project-review",
+                "2026-09-22T12:00:00.123456789Z",
+            )
+            .unwrap();
+        drop(store);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        insert(
+            &connection,
+            "second",
+            2,
+            &second,
+            "2026-09-22T12:00:00.123456790Z",
+        )
+        .unwrap();
+        let second_marker: String = connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-second'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(second_marker, second);
+        assert_ne!(first_marker, second_marker);
+        assert!(connection.execute(
+            "UPDATE execution_binding_trust_markers SET trust_source_id=?1 WHERE binding_id='binding-first'",
+            [&second],
+        ).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn same_build_trust_review_appends_distinct_immutable_receipt() {
         let (mut connection, registry) = setup();
         let manifest = manifest(&registry);
@@ -2875,7 +3090,7 @@ mod tests {
                 "review-1",
                 ProviderTrustStatus::LocallyTrusted,
                 "authenticated-local-review",
-                "2026-09-22T11:30:00Z",
+                NOW,
             )
             .unwrap();
         assert_eq!(
@@ -2885,7 +3100,7 @@ mod tests {
                     "review-1",
                     ProviderTrustStatus::LocallyTrusted,
                     "authenticated-local-review",
-                    "2026-09-22T11:30:00Z"
+                    NOW
                 )
                 .unwrap(),
             id
@@ -2897,7 +3112,7 @@ mod tests {
                     "review-1",
                     ProviderTrustStatus::OrganizationApproved,
                     "authenticated-local-review",
-                    "2026-09-22T11:30:00Z"
+                    NOW
                 )
                 .is_err()
         );
@@ -2931,15 +3146,90 @@ mod tests {
             "UPDATE provider_trust_admissions SET trust_status='organization-approved' WHERE admission_id=?1",
             [&id],
         ).is_err());
-        assert!(store.connection.execute(
-            "DELETE FROM provider_trust_admissions WHERE admission_id=?1",
-            [&id],
-        ).is_err());
-        assert!(store.connection.execute(
-            "INSERT OR REPLACE INTO provider_trust_admissions
+        assert!(
+            store
+                .connection
+                .execute(
+                    "DELETE FROM provider_trust_admissions WHERE admission_id=?1",
+                    [&id],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT OR REPLACE INTO provider_trust_admissions
              SELECT * FROM provider_trust_admissions WHERE admission_id=?1",
-            [&id],
-        ).is_err());
+                    [&id],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn future_trust_decision_cannot_enable_or_yield_past_candidate() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let hash = manifest["provides"][0]["contract"]["contract_hash"]
+            .as_str()
+            .unwrap();
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::Unverified,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                &registration.registration_id,
+                &bytes(&evidence(&manifest, BUILD_A, "pass")),
+            )
+            .unwrap();
+        store
+            .admit_trust(
+                &registration.registration_id,
+                "future-review",
+                ProviderTrustStatus::LocallyTrusted,
+                "authenticated-review",
+                "2026-09-22T13:00:00Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .enable(&registration.registration_id, "2026-09-22T12:30:00Z")
+                .is_err()
+        );
+        store
+            .enable(&registration.registration_id, "2026-09-22T13:00:00Z")
+            .unwrap();
+        assert!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T12:30:00Z"
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .eligible_candidates(
+                    "artifact.hash@1",
+                    hash,
+                    registry.snapshot_id(),
+                    "2026-09-22T13:00:00Z"
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2986,6 +3276,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(current_receipt, original_receipt);
+    }
+
+    #[test]
+    fn trust_review_history_cannot_move_backward_in_time() {
+        let (mut connection, registry) = setup();
+        let manifest = manifest(&registry);
+        let mut store = ProviderStore::initialize_unfenced_fixture(&mut connection).unwrap();
+        let registration = store
+            .register(
+                &registry,
+                &bytes(&manifest),
+                BUILD_A,
+                ProviderTrustStatus::Unverified,
+                NOW,
+            )
+            .unwrap();
+        assert!(
+            store
+                .admit_trust(
+                    &registration.registration_id,
+                    "before-registration",
+                    ProviderTrustStatus::LocallyTrusted,
+                    "reviewer",
+                    "2026-09-22T11:00:00Z"
+                )
+                .is_err()
+        );
+        let first = store
+            .admit_trust(
+                &registration.registration_id,
+                "first-review",
+                ProviderTrustStatus::LocallyTrusted,
+                "reviewer",
+                "2026-09-22T14:00:00Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .admit_trust(
+                    &registration.registration_id,
+                    "backdated-review",
+                    ProviderTrustStatus::ProjectReviewed,
+                    "reviewer",
+                    "2026-09-22T11:00:00Z"
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .admit_trust(
+                    &registration.registration_id,
+                    "first-review",
+                    ProviderTrustStatus::LocallyTrusted,
+                    "reviewer",
+                    "2026-09-22T14:00:00Z"
+                )
+                .unwrap(),
+            first
+        );
+        // The complete history verifier also rejects a pre-existing direct-SQL
+        // row whose timestamp moves backward despite its valid receipt hash.
+        let receipt = trust_admission_receipt(
+            &registration.registration_id,
+            "backdated-review",
+            2,
+            ProviderTrustStatus::ProjectReviewed,
+            "reviewer",
+            "2026-09-22T11:00:00Z",
+        )
+        .unwrap();
+        let forged_id = digest(b"AIOS-PROVIDER-TRUST-ADMISSION\0v0.1\0", receipt.as_bytes());
+        store.connection.execute(
+            "INSERT INTO provider_trust_admissions
+             (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,admitted_at,receipt_json)
+             VALUES (?1,?2,'backdated-review',2,'project-reviewed','reviewer','2026-09-22T11:00:00Z',?3)",
+            params![forged_id,registration.registration_id,receipt],
+        ).unwrap();
+        let parsed: CapabilityManifest = serde_json::from_value(manifest).unwrap();
+        assert!(verified_provider_trust_source(store.connection, &registration, &parsed).is_err());
     }
 
     #[test]

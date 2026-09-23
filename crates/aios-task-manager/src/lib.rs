@@ -3437,6 +3437,11 @@ const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
     "provider_trust_admission_receipt_insert",
     "execution_binding_evidence_pin_required",
     "execution_binding_evidence_not_future",
+    "execution_binding_trust_marker_no_update",
+    "execution_binding_trust_marker_no_delete",
+    "execution_binding_trust_marker_no_duplicate_insert",
+    "execution_binding_trust_marker_insert",
+    "execution_binding_trust_not_future",
 ];
 
 const PROVIDER_LEGACY_GUARDS: &[&str] = &[
@@ -3584,6 +3589,7 @@ fn provider_additive_tables_current(
     for name in [
         "execution_binding_admission_markers",
         "provider_trust_admissions",
+        "execution_binding_trust_markers",
     ] {
         let actual: Option<String> = connection
             .query_row(
@@ -6518,7 +6524,7 @@ type ProviderAdmissionRow = (
     clippy::too_many_lines,
     reason = "verifies persisted provider identity, immutable receipt, and both semantic snapshots"
 )]
-fn verified_provider_admission(
+fn verified_provider_receipt_and_compatibility(
     transaction: &Transaction<'_>,
     binding: &BindingEvidence,
 ) -> Result<bool> {
@@ -6736,6 +6742,39 @@ fn verified_provider_admission(
         && !origin_report.bootstrap_contract_hash_bypass_used
         && selected_report.valid
         && !selected_report.bootstrap_contract_hash_bypass_used)
+}
+
+/// A binding must retain the exact trust source that existed when its
+/// immutable receipt was inserted. Later provider review requires a new
+/// attempt; it cannot retroactively authorize an older binding.
+fn verified_provider_admission(
+    transaction: &Transaction<'_>,
+    binding_id: &str,
+    binding: &BindingEvidence,
+) -> Result<bool> {
+    if !verified_provider_receipt_and_compatibility(transaction, binding)? {
+        return Ok(false);
+    }
+    let Some(registration_id) = binding.provider_registration_id.as_deref() else {
+        return Ok(false);
+    };
+    let latest_admission_id: Option<String> = transaction
+        .query_row(
+            "SELECT admission_id FROM provider_trust_admissions
+             WHERE registration_id=?1 ORDER BY revision DESC LIMIT 1",
+            [registration_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected_source = latest_admission_id.as_deref().unwrap_or(registration_id);
+    let admitted_source: Option<String> = transaction
+        .query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id=?1",
+            [binding_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(admitted_source.as_deref() == Some(expected_source))
 }
 
 fn load_admitted_semantic_registry(
@@ -7025,6 +7064,12 @@ fn binding_grants_valid(
             " AND EXISTS(SELECT 1 FROM execution_binding_admission_markers marker
                WHERE marker.binding_id=b.binding_id AND marker.conformance_evidence_id=c.evidence_id)",
         );
+    } else {
+        // Older stores have no append-only trust decisions to verify, so the
+        // immutable registration row remains the complete trust authority.
+        binding_query.push_str(
+            " AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')",
+        );
     }
     let binding = transaction
         .query_row(
@@ -7073,7 +7118,8 @@ fn binding_grants_valid(
     if binding.provider_registration_id.is_none()
         || binding.grant_refs_json != check.grant_refs_json
         || !binding_json_matches(&binding, check, has_provider_store)?
-        || (has_provider_store && !verified_provider_admission(transaction, &binding)?)
+        || (has_provider_store
+            && !verified_provider_admission(transaction, check.binding_id, &binding)?)
     {
         return Ok(false);
     }

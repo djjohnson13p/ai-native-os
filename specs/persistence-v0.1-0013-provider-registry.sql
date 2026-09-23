@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS execution_binding_admission_markers (
         REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
     conformance_evidence_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS execution_binding_trust_markers (
+    binding_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES execution_bindings(binding_id) DEFERRABLE INITIALLY DEFERRED,
+    trust_source_id TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS execution_binding_trust_marker_no_update
+BEFORE UPDATE ON execution_binding_trust_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding trust marker is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_trust_marker_no_delete
+BEFORE DELETE ON execution_binding_trust_markers
+BEGIN SELECT RAISE(ABORT, 'execution binding trust marker cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS execution_binding_trust_marker_no_duplicate_insert
+BEFORE INSERT ON execution_binding_trust_markers
+WHEN EXISTS (SELECT 1 FROM execution_binding_trust_markers
+             WHERE binding_id=NEW.binding_id)
+  OR EXISTS (SELECT 1 FROM execution_bindings WHERE binding_id=NEW.binding_id)
+BEGIN SELECT RAISE(ABORT, 'execution binding trust marker cannot be backfilled or replaced'); END;
 CREATE TRIGGER IF NOT EXISTS execution_binding_marker_no_update
 BEFORE UPDATE ON execution_binding_admission_markers
 BEGIN SELECT RAISE(ABORT, 'execution binding admission marker is immutable'); END;
@@ -196,11 +213,11 @@ WHEN NOT EXISTS (
             CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
             substr(CASE WHEN substr(tested_at,20,1)='.' THEN
                 substr(tested_at,21,
-                    instr(replace(replace(substr(tested_at,21),'+','Z'),'-','Z'),'Z')-1)
+                    instr(replace(replace(replace(substr(tested_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
                 ELSE '' END || '000000000',1,9) AS tested_fraction,
             substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
                 substr(NEW.created_at,21,
-                    instr(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'Z')-1)
+                    instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
                 ELSE '' END || '000000000',1,9) AS created_fraction
         FROM pin
     )
@@ -210,6 +227,62 @@ WHEN NOT EXISTS (
            (tested_second = created_second AND tested_fraction <= created_fraction))
 )
 BEGIN SELECT RAISE(ABORT, 'binding predates pinned conformance evidence'); END;
+
+-- A binding can use only a trust decision already present at INSERT time.
+-- The marker's source is the immutable original registration receipt for an
+-- initially trusted build, or the latest appended trust decision receipt.
+-- Historical untrusted bindings cannot acquire a marker after later review.
+CREATE TRIGGER IF NOT EXISTS execution_binding_trust_marker_insert
+BEFORE INSERT ON execution_bindings
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM provider_registrations r
+        WHERE r.registration_id=NEW.provider_registration_id
+          AND r.state<>'revoked'
+          AND r.trust_status NOT IN ('denied','revoked')
+          AND (r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')
+               OR EXISTS (SELECT 1 FROM provider_trust_admissions a
+                          WHERE a.registration_id=r.registration_id))
+    ) THEN RAISE(ABORT, 'binding requires current trusted provider admission') END;
+    INSERT INTO execution_binding_trust_markers(binding_id,trust_source_id)
+    SELECT NEW.binding_id, COALESCE(
+        (SELECT a.admission_id FROM provider_trust_admissions a
+         WHERE a.registration_id=NEW.provider_registration_id
+         ORDER BY a.revision DESC LIMIT 1),
+        NEW.provider_registration_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS execution_binding_trust_not_future
+BEFORE INSERT ON execution_bindings
+WHEN NOT EXISTS (
+    WITH latest AS (
+        SELECT COALESCE(
+            (SELECT admitted_at FROM provider_trust_admissions
+             WHERE registration_id=NEW.provider_registration_id
+             ORDER BY revision DESC LIMIT 1),
+            (SELECT registered_at FROM provider_registrations
+             WHERE registration_id=NEW.provider_registration_id)
+        ) AS admitted_at
+    ), times AS (
+        SELECT CAST(strftime('%s', admitted_at) AS INTEGER) AS admitted_second,
+               CAST(strftime('%s', NEW.created_at) AS INTEGER) AS created_second,
+               substr(CASE WHEN substr(admitted_at,20,1)='.' THEN
+                   substr(admitted_at,21,
+                       instr(replace(replace(replace(substr(admitted_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS admitted_fraction,
+               substr(CASE WHEN substr(NEW.created_at,20,1)='.' THEN
+                   substr(NEW.created_at,21,
+                       instr(replace(replace(replace(substr(NEW.created_at,21),'+','Z'),'-','Z'),'z','Z'),'Z')-1)
+                   ELSE '' END || '000000000',1,9) AS created_fraction
+        FROM latest
+    )
+    SELECT 1 FROM times
+    WHERE admitted_second IS NOT NULL AND created_second IS NOT NULL
+      AND (admitted_second < created_second OR
+           (admitted_second=created_second AND admitted_fraction<=created_fraction))
+)
+BEGIN SELECT RAISE(ABORT, 'binding predates provider trust admission'); END;
 
 CREATE TRIGGER IF NOT EXISTS execution_binding_admission_marker_insert
 BEFORE INSERT ON execution_bindings
