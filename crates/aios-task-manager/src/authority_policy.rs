@@ -821,82 +821,85 @@ pub(super) fn policy_objects_current(connection: &Connection, stamped: bool) -> 
 impl TaskManager {
     /// Trusted coordinator configuration path. Activating the same payload twice
     /// still changes the revision and invalidates prior approvals.
+    #[allow(
+        clippy::needless_borrow,
+        reason = "transaction closure keeps existing SQL call sites explicit"
+    )]
     pub(crate) fn activate_local_authority_policy(&mut self, raw: &[u8]) -> Result<i64> {
         let policy = LocalPolicy::parse(raw)?;
         let canonical = canonical_json(&policy)?;
         let content_hash = digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &canonical);
-        let now = self.clock.now();
-        checked_time(&now)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
-                [&content_hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            if existing != canonical {
-                return Err(reject());
+        super::trusted_time::with_protected_immediate(&self.connection, &self.clock, |tx, now| {
+            checked_time(now)?;
+            assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
+                    [&content_hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != canonical {
+                    return Err(reject());
+                }
+            } else {
+                tx.execute("INSERT INTO authority_policy_payloads(content_hash,policy_json,created_at) VALUES (?1,?2,?3)",params![content_hash,canonical,now])?;
             }
-        } else {
-            tx.execute("INSERT INTO authority_policy_payloads(content_hash,policy_json,created_at) VALUES (?1,?2,?3)",params![content_hash,canonical,now])?;
-        }
-        let revision: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(revision),0)+1 FROM authority_policy_activations",
-            [],
-            |r| r.get(0),
-        )?;
-        tx.execute("INSERT INTO authority_policy_activations(revision,content_hash,activated_at) VALUES (?1,?2,?3)",params![revision,content_hash,now])?;
-        let snapshot_id = content_hash.clone();
-        let entity_hash = digest(
-            b"AIOS-LOCAL-POLICY-ENTITY-SCHEMA\0v1\0",
-            "task-provider-artifact-allocation-v0.1",
-        );
-        let prior_snapshot_created: Option<String> = tx
-            .query_row(
-                "SELECT created_at FROM policy_snapshots WHERE snapshot_id=?1",
-                [&snapshot_id],
+            let revision: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM authority_policy_activations",
+                [],
                 |r| r.get(0),
-            )
-            .optional()?;
-        let snapshot_created = prior_snapshot_created.as_deref().unwrap_or(&now);
-        let snapshot_json =
-            canonical_json(&json!({"schema_version":"0.1","snapshot_id":snapshot_id,
+            )?;
+            tx.execute("INSERT INTO authority_policy_activations(revision,content_hash,activated_at) VALUES (?1,?2,?3)",params![revision,content_hash,now])?;
+            let snapshot_id = content_hash.clone();
+            let entity_hash = digest(
+                b"AIOS-LOCAL-POLICY-ENTITY-SCHEMA\0v1\0",
+                "task-provider-artifact-allocation-v0.1",
+            );
+            let prior_snapshot_created: Option<String> = tx
+                .query_row(
+                    "SELECT created_at FROM policy_snapshots WHERE snapshot_id=?1",
+                    [&snapshot_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let snapshot_created = prior_snapshot_created.as_deref().unwrap_or(now);
+            let snapshot_json =
+                canonical_json(&json!({"schema_version":"0.1","snapshot_id":snapshot_id,
             "scope":{"kind":"device","id":"stage1-local"},"policy_language":"builtin",
             "policy_language_version":"0.1","policy_set_hash":content_hash,
             "entity_schema_hash":entity_hash,"engine":{"id":"aios-deterministic","version":"0.1"},
             "created_at":snapshot_created}))?;
-        tx.execute("INSERT OR IGNORE INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,
+            tx.execute("INSERT OR IGNORE INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,
             policy_language_version,policy_set_hash,entity_schema_hash,engine_id,engine_version,snapshot_json,created_at)
             VALUES (?1,'device','stage1-local','builtin','0.1',?2,?3,'aios-deterministic','0.1',?4,?5)",
             params![snapshot_id,content_hash,entity_hash,snapshot_json,snapshot_created])?;
-        let stored: String = tx.query_row(
-            "SELECT snapshot_json FROM policy_snapshots WHERE snapshot_id=?1",
-            [&snapshot_id],
-            |r| r.get(0),
-        )?;
-        if stored != snapshot_json {
-            return Err(reject());
-        }
-        tx.commit()?;
-        Ok(revision)
+            let stored: String = tx.query_row(
+                "SELECT snapshot_json FROM policy_snapshots WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |r| r.get(0),
+            )?;
+            if stored != snapshot_json {
+                return Err(reject());
+            }
+            Ok(revision)
+        })
     }
 
     /// Evaluate all normalized candidate resources. This writes only requests,
     /// decisions, and approval prompts; it cannot issue a grant or launch work.
     #[allow(
         clippy::too_many_lines,
+        clippy::needless_borrow,
         reason = "keeps the private evaluation transaction atomic"
     )]
     pub(crate) fn evaluate_pending_authority_candidate(
         &mut self,
         candidate_id: &str,
     ) -> Result<CandidatePolicyEvaluation> {
-        let started = self.clock.now();
+        let started =
+            super::trusted_time::assess(&self.connection, &self.clock)?.require_trusted_time()?;
         let started_at = checked_time(&started)?;
         let preliminary = CandidateFacts::load(&self.connection, candidate_id, started_at)?;
         let selected = self.provider_store_writer()?.eligible_candidates(
@@ -905,11 +908,13 @@ impl TaskManager {
             &preliminary.snapshot,
             &started,
         )?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
-        let (revision, content_hash, policy_json): (i64, String, String) = tx
+        super::trusted_time::with_protected_immediate(
+            &self.connection,
+            &self.clock,
+            |tx, started| {
+                let started_at = checked_time(started)?;
+                assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+                let (revision, content_hash, policy_json): (i64, String, String) = tx
             .query_row(
                 "SELECT a.revision,a.content_hash,p.policy_json FROM authority_policy_activations a
              JOIN authority_policy_payloads p USING(content_hash)
@@ -919,88 +924,86 @@ impl TaskManager {
             )
             .optional()?
             .ok_or_else(reject)?;
-        if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != content_hash {
-            return Err(reject());
-        }
-        let policy = LocalPolicy::parse(policy_json.as_bytes())?;
-        if canonical_json(&policy)? != policy_json {
-            return Err(reject());
-        }
-        let activated_at: String = tx.query_row(
-            "SELECT activated_at FROM authority_policy_activations WHERE revision=?1",
-            [revision],
-            |r| r.get(0),
-        )?;
-        if checked_time(&activated_at)? > started_at {
-            return Err(reject());
-        }
-        let snapshot_id = content_hash.clone();
-        let snapshot:(String,String,String,String,String,String,String,String,String,String)=tx.query_row(
+                if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != content_hash {
+                    return Err(reject());
+                }
+                let policy = LocalPolicy::parse(policy_json.as_bytes())?;
+                if canonical_json(&policy)? != policy_json {
+                    return Err(reject());
+                }
+                let activated_at: String = tx.query_row(
+                    "SELECT activated_at FROM authority_policy_activations WHERE revision=?1",
+                    [revision],
+                    |r| r.get(0),
+                )?;
+                if checked_time(&activated_at)? > started_at {
+                    return Err(reject());
+                }
+                let snapshot_id = content_hash.clone();
+                let snapshot:(String,String,String,String,String,String,String,String,String,String)=tx.query_row(
             "SELECT scope_kind,scope_id,policy_language,policy_language_version,policy_set_hash,
               entity_schema_hash,engine_id,engine_version,snapshot_json,created_at
              FROM policy_snapshots WHERE snapshot_id=?1",[&snapshot_id],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))
             .optional()?.ok_or_else(reject)?;
-        let entity_hash = digest(
-            b"AIOS-LOCAL-POLICY-ENTITY-SCHEMA\0v1\0",
-            "task-provider-artifact-allocation-v0.1",
-        );
-        if snapshot.0 != "device"
-            || snapshot.1 != "stage1-local"
-            || snapshot.2 != "builtin"
-            || snapshot.3 != "0.1"
-            || snapshot.4 != content_hash
-            || snapshot.5 != entity_hash
-            || snapshot.6 != "aios-deterministic"
-            || snapshot.7 != "0.1"
-            || checked_time(&snapshot.9)? > started_at
-        {
-            return Err(reject());
-        }
-        let expected_snapshot = canonical_json(
-            &json!({"schema_version":"0.1","snapshot_id":snapshot_id,
+                let entity_hash = digest(
+                    b"AIOS-LOCAL-POLICY-ENTITY-SCHEMA\0v1\0",
+                    "task-provider-artifact-allocation-v0.1",
+                );
+                if snapshot.0 != "device"
+                    || snapshot.1 != "stage1-local"
+                    || snapshot.2 != "builtin"
+                    || snapshot.3 != "0.1"
+                    || snapshot.4 != content_hash
+                    || snapshot.5 != entity_hash
+                    || snapshot.6 != "aios-deterministic"
+                    || snapshot.7 != "0.1"
+                    || checked_time(&snapshot.9)? > started_at
+                {
+                    return Err(reject());
+                }
+                let expected_snapshot = canonical_json(
+                    &json!({"schema_version":"0.1","snapshot_id":snapshot_id,
             "scope":{"kind":"device","id":"stage1-local"},"policy_language":"builtin",
             "policy_language_version":"0.1","policy_set_hash":content_hash,"entity_schema_hash":entity_hash,
             "engine":{"id":"aios-deterministic","version":"0.1"},"created_at":snapshot.9}),
-        )?;
-        if snapshot.8 != expected_snapshot {
-            return Err(reject());
-        }
-        let facts = CandidateFacts::load(&tx, candidate_id, started_at)?;
-        if !super::active_program_validation_valid(&tx, &facts.task_id, &facts.hash)? {
-            return Err(reject());
-        }
-        if !provider_pins_current(&tx, &facts, selected, &started)? {
-            return Err(reject());
-        }
-        let mut decisions = Vec::new();
-        for resource in &facts.resources {
-            let fingerprint = facts.fingerprint(resource, revision, &content_hash)?;
-            let request_id = format!(
-                "request:{}",
-                digest(
-                    b"AIOS-AUTHORITY-REQUEST\0v1\0",
-                    &format!(
-                        "{}\0{}\0{}",
-                        facts.candidate_id, resource.action, resource.selector
-                    )
-                )
-            );
-            let prior: Option<(String, String)> = tx
+                )?;
+                if snapshot.8 != expected_snapshot {
+                    return Err(reject());
+                }
+                let facts = CandidateFacts::load(&tx, candidate_id, started_at)?;
+                if !super::active_program_validation_valid(&tx, &facts.task_id, &facts.hash)? {
+                    return Err(reject());
+                }
+                if !provider_pins_current(&tx, &facts, selected, &started)? {
+                    return Err(reject());
+                }
+                let mut decisions = Vec::new();
+                for resource in &facts.resources {
+                    let fingerprint = facts.fingerprint(resource, revision, &content_hash)?;
+                    let request_id = format!(
+                        "request:{}",
+                        digest(
+                            b"AIOS-AUTHORITY-REQUEST\0v1\0",
+                            &format!(
+                                "{}\0{}\0{}",
+                                facts.candidate_id, resource.action, resource.selector
+                            )
+                        )
+                    );
+                    let prior: Option<(String, String)> = tx
                 .query_row(
                     "SELECT request_json,requested_at FROM authority_requests WHERE request_id=?1",
                     [&request_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let requested_at = prior
-                .as_ref()
-                .map_or(started.as_str(), |(_, at)| at.as_str());
-            if checked_time(requested_at)? > started_at {
-                return Err(reject());
-            }
-            let request_json = canonical_json(
-                &json!({"schema_version":"0.1","request_id":request_id,
+                    let requested_at = prior.as_ref().map_or(started, |(_, at)| at.as_str());
+                    if checked_time(requested_at)? > started_at {
+                        return Err(reject());
+                    }
+                    let request_json = canonical_json(
+                        &json!({"schema_version":"0.1","request_id":request_id,
                 "task_id":facts.task_id,"semantic_program_hash":facts.hash,"registry_snapshot_id":facts.snapshot,
                 "node_id":facts.node,"capability":facts.capability,"principal":{"kind":"provider",
                     "id":facts.provider_id,"version":facts.provider_version,"package_or_build_hash":facts.build_hash},
@@ -1009,9 +1012,9 @@ impl TaskManager {
                 "execution_binding_id":facts.binding_id,"attempt_id":facts.attempt_id,
                 "effect_classes":[if resource.action=="artifact.read"{"ARTIFACT_READ"}else{"ARTIFACT_WRITE"}],
                 "requested_at":requested_at}),
-            )?;
-            if let Some((prior, _)) = prior {
-                let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM authority_requests WHERE request_id=?1
+                    )?;
+                    if let Some((prior, _)) = prior {
+                        let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM authority_requests WHERE request_id=?1
                     AND task_id=?2 AND semantic_program_hash=?3 AND registry_snapshot_id=?4
                     AND node_id=?5 AND capability=?6 AND principal_kind='provider' AND principal_id=?7
                     AND execution_binding_id=?8 AND attempt_id=?9 AND action=?10
@@ -1019,11 +1022,11 @@ impl TaskManager {
                     params![request_id,facts.task_id,facts.hash,facts.snapshot,facts.node,facts.capability,
                         facts.provider_id,facts.binding_id,facts.attempt_id,resource.action,
                         resource.kind,resource.id,resource.selector],|r|r.get(0))?;
-                if prior != request_json || !exact {
-                    return Err(reject());
-                }
-            } else {
-                tx.execute("INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,
+                        if prior != request_json || !exact {
+                            return Err(reject());
+                        }
+                    } else {
+                        tx.execute("INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,
                     registry_snapshot_id,node_id,capability,principal_kind,principal_id,
                     execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,
                     semantic_selector,request_json,requested_at)
@@ -1031,135 +1034,139 @@ impl TaskManager {
                     params![request_id,facts.task_id,facts.hash,facts.snapshot,facts.node,facts.capability,
                         facts.provider_id,facts.binding_id,facts.attempt_id,resource.action,resource.kind,
                         resource.id,resource.selector,request_json,started])?;
-            }
-            let base = policy.decide(&resource.action, &resource.kind, &resource.sensitivity);
-            let approval_id = if base == PolicyEffect::RequireApproval {
-                Some(format!(
-                    "approval:{}",
-                    digest(
-                        b"AIOS-AUTHORITY-APPROVAL\0v1\0",
-                        &format!("{request_id}\0{fingerprint}")
-                    )
-                ))
-            } else {
-                None
-            };
-            let mut effect = base;
-            let mut approval_timing: Option<(String, String)> = None;
-            if let Some(approval_id) = &approval_id {
-                let prior:Option<(String,String,Option<String>,String,String)>=tx.query_row(
+                    }
+                    let base =
+                        policy.decide(&resource.action, &resource.kind, &resource.sensitivity);
+                    let approval_id = if base == PolicyEffect::RequireApproval {
+                        Some(format!(
+                            "approval:{}",
+                            digest(
+                                b"AIOS-AUTHORITY-APPROVAL\0v1\0",
+                                &format!("{request_id}\0{fingerprint}")
+                            )
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut effect = base;
+                    let mut approval_timing: Option<(String, String)> = None;
+                    if let Some(approval_id) = &approval_id {
+                        let prior:Option<(String,String,Option<String>,String,String)>=tx.query_row(
                     "SELECT a.status,b.fingerprint,b.revoked_at,a.expires_at,a.created_at FROM approval_requests a
                      JOIN authority_approval_bindings b ON b.approval_id=a.approval_id WHERE a.approval_id=?1",
                     [approval_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-                if let Some((status, pin, revoked, expires, created)) = prior {
-                    if pin != fingerprint
-                        || revoked.is_some()
-                        || checked_time(&expires)? <= started_at
-                    {
-                        return Err(reject());
-                    }
-                    if checked_time(&created)? > started_at {
-                        return Err(reject());
-                    }
-                    checked_approval_request(
-                        &tx,
-                        &facts,
-                        resource,
-                        approval_id,
-                        &request_id,
-                        &fingerprint,
-                        revision,
-                        &content_hash,
-                        &created,
-                        &expires,
-                    )?;
-                    approval_timing = Some((created, expires.clone()));
-                    effect = match status.as_str() {
-                        "APPROVED" => {
-                            checked_approval_decision(
+                        if let Some((status, pin, revoked, expires, created)) = prior {
+                            if pin != fingerprint
+                                || revoked.is_some()
+                                || checked_time(&expires)? <= started_at
+                            {
+                                return Err(reject());
+                            }
+                            if checked_time(&created)? > started_at {
+                                return Err(reject());
+                            }
+                            checked_approval_request(
                                 &tx,
+                                &facts,
+                                resource,
                                 approval_id,
-                                &status,
-                                &facts.task_id,
-                                &facts.task_principal_id,
+                                &request_id,
+                                &fingerprint,
+                                revision,
+                                &content_hash,
+                                &created,
                                 &expires,
-                                started_at,
                             )?;
-                            PolicyEffect::Allow
+                            approval_timing = Some((created, expires.clone()));
+                            effect = match status.as_str() {
+                                "APPROVED" => {
+                                    checked_approval_decision(
+                                        &tx,
+                                        approval_id,
+                                        &status,
+                                        &facts.task_id,
+                                        &facts.task_principal_id,
+                                        &expires,
+                                        started_at,
+                                    )?;
+                                    PolicyEffect::Allow
+                                }
+                                "DENIED" => {
+                                    checked_approval_decision(
+                                        &tx,
+                                        approval_id,
+                                        &status,
+                                        &facts.task_id,
+                                        &facts.task_principal_id,
+                                        &expires,
+                                        started_at,
+                                    )?;
+                                    PolicyEffect::Deny
+                                }
+                                "PENDING" => PolicyEffect::RequireApproval,
+                                _ => return Err(reject()),
+                            };
                         }
-                        "DENIED" => {
-                            checked_approval_decision(
-                                &tx,
-                                approval_id,
-                                &status,
-                                &facts.task_id,
-                                &facts.task_principal_id,
-                                &expires,
-                                started_at,
-                            )?;
-                            PolicyEffect::Deny
+                    }
+                    let phase = match effect {
+                        PolicyEffect::Allow if base == PolicyEffect::RequireApproval => "approved",
+                        PolicyEffect::Deny if base == PolicyEffect::RequireApproval => {
+                            "approval-denied"
                         }
-                        "PENDING" => PolicyEffect::RequireApproval,
-                        _ => return Err(reject()),
+                        _ => "initial",
                     };
-                }
-            }
-            let phase = match effect {
-                PolicyEffect::Allow if base == PolicyEffect::RequireApproval => "approved",
-                PolicyEffect::Deny if base == PolicyEffect::RequireApproval => "approval-denied",
-                _ => "initial",
-            };
-            let decision_id = format!(
-                "decision:{}",
-                digest(
-                    b"AIOS-AUTHORITY-DECISION\0v1\0",
-                    &format!("{request_id}\0{fingerprint}\0{phase}")
-                )
-            );
-            if base == PolicyEffect::RequireApproval && phase == "initial" {
-                let id = approval_id.as_deref().ok_or_else(reject)?;
-                let had_binding = approval_timing.is_some();
-                let (created, expiry) = match approval_timing {
-                    Some(pair) => pair,
-                    None => (
-                        started.clone(),
-                        (started_at + Duration::hours(1))
-                            .format(&Rfc3339)
-                            .map_err(|_| reject())?,
-                    ),
-                };
-                let prompt = approval_prompt(&facts, resource, id, &request_id, &created, &expiry)?;
-                let existing:Option<StoredApprovalRequest>=tx.query_row(
+                    let decision_id = format!(
+                        "decision:{}",
+                        digest(
+                            b"AIOS-AUTHORITY-DECISION\0v1\0",
+                            &format!("{request_id}\0{fingerprint}\0{phase}")
+                        )
+                    );
+                    if base == PolicyEffect::RequireApproval && phase == "initial" {
+                        let id = approval_id.as_deref().ok_or_else(reject)?;
+                        let had_binding = approval_timing.is_some();
+                        let (created, expiry) = match approval_timing {
+                            Some(pair) => pair,
+                            None => (
+                                started.to_owned(),
+                                (started_at + Duration::hours(1))
+                                    .format(&Rfc3339)
+                                    .map_err(|_| reject())?,
+                            ),
+                        };
+                        let prompt =
+                            approval_prompt(&facts, resource, id, &request_id, &created, &expiry)?;
+                        let existing:Option<StoredApprovalRequest>=tx.query_row(
                     "SELECT authority_request_id,task_id,semantic_program_hash,node_id,action,status,
                       request_json,created_at,expires_at FROM approval_requests WHERE approval_id=?1",
                     [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
-                if let Some((
-                    stored_request,
-                    task,
-                    hash,
-                    node,
-                    action,
-                    status,
-                    stored_prompt,
-                    stored_created,
-                    stored_expiry,
-                )) = existing
-                {
-                    if !had_binding
-                        || stored_request != request_id
-                        || task != facts.task_id
-                        || hash != facts.hash
-                        || node != facts.node
-                        || action != resource.action
-                        || status != "PENDING"
-                        || stored_prompt != prompt
-                        || stored_expiry != expiry
-                        || stored_created != created
-                    {
-                        return Err(reject());
-                    }
-                } else {
-                    tx.execute(
+                        if let Some((
+                            stored_request,
+                            task,
+                            hash,
+                            node,
+                            action,
+                            status,
+                            stored_prompt,
+                            stored_created,
+                            stored_expiry,
+                        )) = existing
+                        {
+                            if !had_binding
+                                || stored_request != request_id
+                                || task != facts.task_id
+                                || hash != facts.hash
+                                || node != facts.node
+                                || action != resource.action
+                                || status != "PENDING"
+                                || stored_prompt != prompt
+                                || stored_expiry != expiry
+                                || stored_created != created
+                            {
+                                return Err(reject());
+                            }
+                        } else {
+                            tx.execute(
                         "INSERT INTO approval_requests(approval_id,authority_request_id,task_id,
                     semantic_program_hash,node_id,action,status,request_json,created_at,expires_at)
                     VALUES (?1,?2,?3,?4,?5,?6,'PENDING',?7,?8,?9)",
@@ -1175,30 +1182,28 @@ impl TaskManager {
                             expiry
                         ],
                     )?;
-                }
-            }
-            let existing: Option<(String, String)> = tx
+                        }
+                    }
+                    let existing: Option<(String, String)> = tx
                 .query_row(
                     "SELECT decision_json,decided_at FROM policy_decisions WHERE decision_id=?1",
                     [&decision_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let decided_at = existing
-                .as_ref()
-                .map_or(started.as_str(), |(_, at)| at.as_str());
-            if checked_time(decided_at)? > started_at {
-                return Err(reject());
-            }
-            let reason = match (effect, phase) {
-                (PolicyEffect::Allow, "approved") => "APPROVAL_GRANTED",
-                (PolicyEffect::Allow, _) => "POLICY_ALLOW",
-                (PolicyEffect::Deny, "approval-denied") => "APPROVAL_DENIED",
-                (PolicyEffect::Deny, _) => "POLICY_DENY",
-                _ => "POLICY_REQUIRES_APPROVAL",
-            };
-            let decision_json = canonical_json(
-                &json!({"schema_version":"0.1","decision_id":decision_id,
+                    let decided_at = existing.as_ref().map_or(started, |(_, at)| at.as_str());
+                    if checked_time(decided_at)? > started_at {
+                        return Err(reject());
+                    }
+                    let reason = match (effect, phase) {
+                        (PolicyEffect::Allow, "approved") => "APPROVAL_GRANTED",
+                        (PolicyEffect::Allow, _) => "POLICY_ALLOW",
+                        (PolicyEffect::Deny, "approval-denied") => "APPROVAL_DENIED",
+                        (PolicyEffect::Deny, _) => "POLICY_DENY",
+                        _ => "POLICY_REQUIRES_APPROVAL",
+                    };
+                    let decision_json = canonical_json(
+                        &json!({"schema_version":"0.1","decision_id":decision_id,
                 "authority_request_id":request_id,"task_id":facts.task_id,"semantic_program_hash":facts.hash,
                 "registry_snapshot_id":facts.snapshot,"node_id":facts.node,"capability":facts.capability,
                 "principal":{"kind":"provider","id":facts.provider_id,"version":facts.provider_version,
@@ -1208,9 +1213,9 @@ impl TaskManager {
                 "decision":effect.as_str(),"policy_snapshot_id":snapshot_id,"reason_codes":[reason],
                 "approval_request_id":approval_id,"engine":{"id":"aios-deterministic","version":"0.1"},
                 "decided_at":decided_at}),
-            )?;
-            if let Some((existing, _)) = &existing {
-                let exact: bool = tx.query_row(
+                    )?;
+                    if let Some((existing, _)) = &existing {
+                        let exact: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM policy_decisions d
                     JOIN authority_evaluation_fingerprints e ON e.decision_id=d.decision_id
                     WHERE d.decision_id=?1
@@ -1241,35 +1246,35 @@ impl TaskManager {
                     ],
                     |r| r.get(0),
                 )?;
-                if existing != &decision_json || !exact {
-                    return Err(reject());
-                }
-            } else {
-                tx.execute(
-                    "INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,
+                        if existing != &decision_json || !exact {
+                            return Err(reject());
+                        }
+                    } else {
+                        tx.execute(
+                            "INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,
                     semantic_program_hash,node_id,principal_kind,principal_id,action,
                     resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,
                     approval_request_id,reason_codes_json,decision_json,decided_at)
                     VALUES (?1,?2,?3,?4,?5,'provider',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    params![
-                        decision_id,
-                        request_id,
-                        facts.task_id,
-                        facts.hash,
-                        facts.node,
-                        facts.provider_id,
-                        resource.action,
-                        resource.kind,
-                        resource.id,
-                        effect.as_str(),
-                        snapshot_id,
-                        approval_id,
-                        canonical_json(&vec![reason])?,
-                        decision_json,
-                        started
-                    ],
-                )?;
-                tx.execute(
+                            params![
+                                decision_id,
+                                request_id,
+                                facts.task_id,
+                                facts.hash,
+                                facts.node,
+                                facts.provider_id,
+                                resource.action,
+                                resource.kind,
+                                resource.id,
+                                effect.as_str(),
+                                snapshot_id,
+                                approval_id,
+                                canonical_json(&vec![reason])?,
+                                decision_json,
+                                started
+                            ],
+                        )?;
+                        tx.execute(
                     "INSERT INTO authority_evaluation_fingerprints(decision_id,candidate_id,
                     fingerprint,activation_revision,evaluated_at) VALUES (?1,?2,?3,?4,?5)",
                     params![
@@ -1280,9 +1285,9 @@ impl TaskManager {
                         started
                     ],
                 )?;
-            }
-            if base == PolicyEffect::RequireApproval && phase == "initial" {
-                let old: Option<(String, String, i64, String)> = tx
+                    }
+                    if base == PolicyEffect::RequireApproval && phase == "initial" {
+                        let old: Option<(String, String, i64, String)> = tx
                     .query_row(
                         "SELECT candidate_id,fingerprint,activation_revision,requiring_decision_id
                      FROM authority_approval_bindings WHERE approval_id=?1",
@@ -1290,52 +1295,54 @@ impl TaskManager {
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
-                if let Some(old) = old {
-                    if old
-                        != (
-                            facts.candidate_id.clone(),
-                            fingerprint.clone(),
-                            revision,
-                            decision_id.clone(),
-                        )
-                    {
-                        return Err(reject());
-                    }
-                } else {
-                    tx.execute(
-                        "INSERT INTO authority_approval_bindings(approval_id,candidate_id,
+                        if let Some(old) = old {
+                            if old
+                                != (
+                                    facts.candidate_id.clone(),
+                                    fingerprint.clone(),
+                                    revision,
+                                    decision_id.clone(),
+                                )
+                            {
+                                return Err(reject());
+                            }
+                        } else {
+                            tx.execute(
+                                "INSERT INTO authority_approval_bindings(approval_id,candidate_id,
                     fingerprint,activation_revision,requiring_decision_id) VALUES (?1,?2,?3,?4,?5)",
-                        params![
-                            approval_id,
-                            facts.candidate_id,
-                            fingerprint,
-                            revision,
-                            decision_id
-                        ],
-                    )?;
+                                params![
+                                    approval_id,
+                                    facts.candidate_id,
+                                    fingerprint,
+                                    revision,
+                                    decision_id
+                                ],
+                            )?;
+                        }
+                    }
+                    decisions.push(CandidatePolicyDecision {
+                        action: resource.action.clone(),
+                        semantic_selector: resource.selector.clone(),
+                        authority_request_id: request_id,
+                        decision_id,
+                        effect,
+                        approval_id,
+                        evaluation_fingerprint: fingerprint,
+                    });
                 }
-            }
-            decisions.push(CandidatePolicyDecision {
-                action: resource.action.clone(),
-                semantic_selector: resource.selector.clone(),
-                authority_request_id: request_id,
-                decision_id,
-                effect,
-                approval_id,
-                evaluation_fingerprint: fingerprint,
-            });
-        }
-        tx.commit()?;
-        Ok(CandidatePolicyEvaluation {
-            activation_revision: revision,
-            decisions,
-        })
+                Ok(CandidatePolicyEvaluation {
+                    activation_revision: revision,
+                    decisions,
+                })
+            },
+        )
     }
 
     /// Record a local authenticated user's one-shot decision after validating
     /// the complete current fingerprint. No provider-controlled approval path exists.
     #[allow(
         clippy::too_many_lines,
+        clippy::needless_borrow,
         reason = "keeps approval freshness, policy, and durable decision in one transaction"
     )]
     pub(crate) fn decide_candidate_approval(
@@ -1344,7 +1351,8 @@ impl TaskManager {
         approver: &AuthenticatedApprover<'_>,
         approve: bool,
     ) -> Result<()> {
-        let now = self.clock.now();
+        let now =
+            super::trusted_time::assess(&self.connection, &self.clock)?.require_trusted_time()?;
         let checked = checked_time(&now)?;
         let candidate_id: String = self
             .connection
@@ -1362,124 +1370,123 @@ impl TaskManager {
             &preliminary.snapshot,
             &now,
         )?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
-        let (candidate_id,pin,revision,status,expires,principal,created): (String,String,i64,String,String,String,String)=tx.query_row(
+        super::trusted_time::with_protected_immediate(&self.connection, &self.clock, |tx, now| {
+            let checked = checked_time(now)?;
+            assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+            let (candidate_id,pin,revision,status,expires,principal,created): (String,String,i64,String,String,String,String)=tx.query_row(
             "SELECT b.candidate_id,b.fingerprint,b.activation_revision,a.status,a.expires_at,t.principal_id,a.created_at
              FROM authority_approval_bindings b JOIN approval_requests a USING(approval_id)
              JOIN tasks t ON t.task_id=a.task_id WHERE b.approval_id=?1",
             [approval_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))
             .optional()?.ok_or_else(reject)?;
-        if status != "PENDING"
-            || principal != approver.principal_id
-            || principal.is_empty()
-            || checked_time(&expires)? <= checked
-            || checked_time(&created)? > checked
-        {
-            return Err(reject());
-        }
-        let current_revision: i64 = tx.query_row(
-            "SELECT MAX(revision) FROM authority_policy_activations",
-            [],
-            |r| r.get(0),
-        )?;
-        if revision != current_revision {
-            return Err(reject());
-        }
-        let facts = CandidateFacts::load(&tx, &candidate_id, checked)?;
-        if !super::active_program_validation_valid(&tx, &facts.task_id, &facts.hash)? {
-            return Err(reject());
-        }
-        if !provider_pins_current(&tx, &facts, eligible, &now)? {
-            return Err(reject());
-        }
-        let content_hash: String = tx.query_row(
-            "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
-            [revision],
-            |r| r.get(0),
-        )?;
-        let policy_json: String = tx
-            .query_row(
-                "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
-                [&content_hash],
+            if status != "PENDING"
+                || principal != approver.principal_id
+                || principal.is_empty()
+                || checked_time(&expires)? <= checked
+                || checked_time(&created)? > checked
+            {
+                return Err(reject());
+            }
+            let current_revision: i64 = tx.query_row(
+                "SELECT MAX(revision) FROM authority_policy_activations",
+                [],
                 |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(reject)?;
-        if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != content_hash {
-            return Err(reject());
-        }
-        let policy = LocalPolicy::parse(policy_json.as_bytes())?;
-        if canonical_json(&policy)? != policy_json {
-            return Err(reject());
-        }
-        let bound:Option<(String,String,String,String)>=tx.query_row(
+            )?;
+            if revision != current_revision {
+                return Err(reject());
+            }
+            let facts = CandidateFacts::load(&tx, &candidate_id, checked)?;
+            if !super::active_program_validation_valid(&tx, &facts.task_id, &facts.hash)? {
+                return Err(reject());
+            }
+            if !provider_pins_current(&tx, &facts, eligible, &now)? {
+                return Err(reject());
+            }
+            let content_hash: String = tx.query_row(
+                "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
+                [revision],
+                |r| r.get(0),
+            )?;
+            let policy_json: String = tx
+                .query_row(
+                    "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
+                    [&content_hash],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(reject)?;
+            if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != content_hash {
+                return Err(reject());
+            }
+            let policy = LocalPolicy::parse(policy_json.as_bytes())?;
+            if canonical_json(&policy)? != policy_json {
+                return Err(reject());
+            }
+            let bound:Option<(String,String,String,String)>=tx.query_row(
             "SELECT r.request_id,r.action,r.semantic_selector,r.resolved_resource_id FROM approval_requests a
              JOIN authority_requests r ON r.request_id=a.authority_request_id WHERE a.approval_id=?1",
             [approval_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let (request_id, action, selector, id) = bound.ok_or_else(reject)?;
-        let resource = facts
-            .resources
-            .iter()
-            .find(|r| r.action == action && r.selector == selector && r.id == id)
-            .ok_or_else(reject)?;
-        if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
-            != PolicyEffect::RequireApproval
-        {
-            return Err(reject());
-        }
-        if facts.fingerprint(resource, revision, &content_hash)? != pin {
-            return Err(reject());
-        }
-        checked_approval_request(
-            &tx,
-            &facts,
-            resource,
-            approval_id,
-            &request_id,
-            &pin,
-            revision,
-            &content_hash,
-            &created,
-            &expires,
-        )?;
-        let decision_id = format!(
-            "approval-decision:{}",
-            digest(b"AIOS-APPROVAL-DECISION\0v1\0", approval_id)
-        );
-        let decision_json =
-            canonical_json(&json!({"schema_version":"0.1","decision_id":decision_id,
+            let (request_id, action, selector, id) = bound.ok_or_else(reject)?;
+            let resource = facts
+                .resources
+                .iter()
+                .find(|r| r.action == action && r.selector == selector && r.id == id)
+                .ok_or_else(reject)?;
+            if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
+                != PolicyEffect::RequireApproval
+            {
+                return Err(reject());
+            }
+            if facts.fingerprint(resource, revision, &content_hash)? != pin {
+                return Err(reject());
+            }
+            checked_approval_request(
+                &tx,
+                &facts,
+                resource,
+                approval_id,
+                &request_id,
+                &pin,
+                revision,
+                &content_hash,
+                &created,
+                &expires,
+            )?;
+            let decision_id = format!(
+                "approval-decision:{}",
+                digest(b"AIOS-APPROVAL-DECISION\0v1\0", approval_id)
+            );
+            let decision_json =
+                canonical_json(&json!({"schema_version":"0.1","decision_id":decision_id,
             "approval_id":approval_id,"task_id":facts.task_id,
             "decision":if approve{"APPROVE"}else{"DENY"},
             "decided_by":{"kind":"user","id":principal},"scope":"ONE_SHOT",
             "approved_until":if approve{Some(expires.as_str())}else{None},"decided_at":now}))?;
-        tx.execute(
-            "INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,
+            tx.execute(
+                "INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,
             decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at)
             VALUES (?1,?2,?3,?4,'user',?5,'ONE_SHOT',?6,?7,?8)",
-            params![
-                decision_id,
-                approval_id,
-                facts.task_id,
-                if approve { "APPROVE" } else { "DENY" },
-                principal,
-                if approve {
-                    Some(expires.as_str())
-                } else {
-                    None
-                },
-                decision_json,
-                now
-            ],
-        )?;
-        tx.execute(
-            "UPDATE approval_requests SET status=?1 WHERE approval_id=?2 AND status='PENDING'",
-            params![if approve { "APPROVED" } else { "DENIED" }, approval_id],
-        )?;
-        tx.commit()?;
-        Ok(())
+                params![
+                    decision_id,
+                    approval_id,
+                    facts.task_id,
+                    if approve { "APPROVE" } else { "DENY" },
+                    principal,
+                    if approve {
+                        Some(expires.as_str())
+                    } else {
+                        None
+                    },
+                    decision_json,
+                    now
+                ],
+            )?;
+            tx.execute(
+                "UPDATE approval_requests SET status=?1 WHERE approval_id=?2 AND status='PENDING'",
+                params![if approve { "APPROVED" } else { "DENIED" }, approval_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Withdraw a prior approval. The sidecar is deliberately one-way because

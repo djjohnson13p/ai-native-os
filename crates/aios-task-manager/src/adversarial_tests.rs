@@ -85,6 +85,9 @@ impl Clock for FixedClock {
     fn now(&self) -> String {
         "2026-09-19T00:00:00Z".to_owned()
     }
+    fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+        Some(crate::trusted_time::synthetic_sample(self.now()))
+    }
 }
 
 struct LaterClock;
@@ -93,6 +96,9 @@ impl Clock for LaterClock {
     fn now(&self) -> String {
         "2026-09-19T00:00:02Z".to_owned()
     }
+    fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+        Some(crate::trusted_time::synthetic_sample(self.now()))
+    }
 }
 
 struct MicroClock;
@@ -100,6 +106,9 @@ struct MicroClock;
 impl Clock for MicroClock {
     fn now(&self) -> String {
         "2026-09-19T00:00:00.000500Z".to_owned()
+    }
+    fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+        Some(crate::trusted_time::synthetic_sample(self.now()))
     }
 }
 
@@ -3224,7 +3233,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        13
+        14
     );
 }
 

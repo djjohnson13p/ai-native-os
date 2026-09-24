@@ -812,11 +812,31 @@ mod tests {
         fn now(&self) -> String {
             NOW.to_owned()
         }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
     }
     struct LaterClock;
     impl Clock for LaterClock {
         fn now(&self) -> String {
             "2026-09-19T02:00:00Z".to_owned()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
+    struct LockedExpiryClock(AtomicUsize);
+    impl Clock for LockedExpiryClock {
+        fn now(&self) -> String {
+            NOW.to_owned()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            let wall = if self.0.fetch_add(1, Ordering::SeqCst) < 2 {
+                NOW
+            } else {
+                "2026-09-19T02:00:00Z"
+            };
+            Some(crate::trusted_time::synthetic_sample(wall.to_owned()))
         }
     }
 
@@ -829,6 +849,9 @@ mod tests {
             } else {
                 "2026-09-18T23:59:59Z".to_owned()
             }
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
         }
     }
 
@@ -1697,6 +1720,39 @@ mod tests {
                 .evaluate_pending_authority_candidate("candidate:fresh")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn approval_expiry_during_locked_decision_does_not_record_approval() {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, approval, _) = pending_policy_fixture();
+        manager.clock = Arc::new(LockedExpiryClock(AtomicUsize::new(0)));
+        assert!(
+            manager
+                .decide_candidate_approval(
+                    &approval,
+                    &AuthenticatedApprover {
+                        principal_id: "user:test"
+                    },
+                    true,
+                )
+                .is_err()
+        );
+        let (status, decisions): (String, i64) = manager
+            .connection
+            .query_row(
+                "SELECT status,(SELECT COUNT(*) FROM approval_decisions WHERE approval_id=?1)
+                 FROM approval_requests WHERE approval_id=?1",
+                [&approval],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), decisions), ("PENDING", 0));
+        manager.clock = Arc::new(FixedClock);
+        assert!(matches!(
+            crate::trusted_time::protected_now(&manager.connection, &manager.clock),
+            Err(crate::TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))
+        ));
     }
 
     #[test]

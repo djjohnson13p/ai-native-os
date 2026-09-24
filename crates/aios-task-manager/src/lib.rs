@@ -15,6 +15,7 @@
 mod artifact_store;
 mod authority_candidate;
 mod authority_policy;
+mod trusted_time;
 
 pub use aios_provenance::{
     CheckpointExpectation as ProvenanceCheckpointExpectation,
@@ -33,6 +34,7 @@ pub use artifact_store::{
     OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
     VerifiedArtifactExportNoEffect,
 };
+pub use trusted_time::{SecurityClockSample, TimeSource};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -496,6 +498,11 @@ pub struct TaskManager {
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> String;
+
+    /// Security sample used for expiry decisions; unavailable samples fail closed.
+    fn security_sample(&self) -> Option<trusted_time::SecurityClockSample> {
+        None
+    }
 }
 
 struct SystemClock;
@@ -505,6 +512,16 @@ impl Clock for SystemClock {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    }
+
+    fn security_sample(&self) -> Option<trusted_time::SecurityClockSample> {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+        Some(trusted_time::SecurityClockSample {
+            wall: OffsetDateTime::now_utc().format(&Rfc3339).ok()?,
+            monotonic_nanos: u64::try_from(elapsed.as_nanos()).ok()?,
+            source: trusted_time::TimeSource::SystemClock,
+        })
     }
 }
 
@@ -838,6 +855,9 @@ impl TaskManager {
         preflight_migration_state(&connection)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
+        // Assess before any recovery path can make a protected expiry decision.
+        // An uncertain sample is durable but does not prevent ordinary inspection/recovery.
+        trusted_time::assess(&connection, &clock)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
             artifact_store::initialize_root(store_lock.as_deref(), &mut connection)?;
         let artifact_scope_issuer =
@@ -2287,13 +2307,31 @@ impl TaskManager {
         internal_recovery: bool,
     ) -> Result<TransitionResult> {
         validate_transition_request(request, internal_recovery)?;
-        let resulted_at = self.clock.now();
+        let mut resulted_at = if request.to_state == TaskState::Running {
+            trusted_time::assess(&self.connection, &self.clock)?.require_trusted_time()?
+        } else {
+            self.clock.now()
+        };
         let request_json = canonical_json(request)?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut locked_time = if request.to_state == TaskState::Running {
+            let fresh = trusted_time::capture_locked(&transaction, &self.clock)?;
+            resulted_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    fresh.commit(&self.connection)?;
+                    return Err(error);
+                }
+            };
+            Some(fresh)
+        } else {
+            None
+        };
         assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
         if let Some(stored_request) = transaction
             .query_row(
@@ -2320,6 +2358,9 @@ impl TaskManager {
         else {
             let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
             persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+            if let Some(fresh) = &locked_time {
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+            }
             transaction.commit()?;
             return Ok(result);
         };
@@ -2351,6 +2392,9 @@ impl TaskManager {
         if let Some(code) = rejection {
             let result = rejected(request, code, observed, &resulted_at);
             persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+            if let Some(fresh) = &locked_time {
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+            }
             transaction.commit()?;
             return Ok(result);
         }
@@ -2369,6 +2413,9 @@ impl TaskManager {
                 &resulted_at,
             );
             transaction.rollback()?;
+            if let Some(fresh) = locked_time.take() {
+                fresh.commit(&self.connection)?;
+            }
             let rejection_transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2574,6 +2621,9 @@ impl TaskManager {
             "INSERT INTO task_transitions (transition_id, task_id, expected_revision, expected_state, to_state, result_revision, result_state, outcome, reason_code, request_json, result_json, provenance_event_id, requested_at, committed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, 'COMMITTED', ?7, ?8, ?9, ?10, ?11, ?11)",
             params![request.transition_id, request.task_id, i64::try_from(request.expected_revision).unwrap_or(i64::MAX), request.expected_state.as_str(), request.to_state.as_str(), i64::try_from(new_revision).unwrap_or(i64::MAX), result.reason_code, request_json, serde_json::to_string(&result)?, result.provenance_event_id, resulted_at],
         )?;
+        if let Some(fresh) = &locked_time {
+            fresh.commit_in(&transaction)?.require_trusted_time()?;
+        }
         transaction.commit()?;
         Ok(result)
     }
@@ -4559,7 +4609,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4653,6 +4703,7 @@ fn preflight_migration_state_with_mode(
         "0017_authority_policy_evaluation",
         "authority-policy-evaluation-v0.1",
     )?;
+    verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4737,6 +4788,16 @@ fn preflight_migration_state_with_mode(
         if !authority_policy::policy_objects_current(connection, has_policy_evaluation)? {
             return Err(TaskManagerError::InvalidRecord(
                 "authority policy evaluation schema requires operator quarantine",
+            ));
+        }
+        let has_trusted_time: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0018_trusted_time')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !trusted_time::objects_current(connection, has_trusted_time)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "trusted time schema requires operator quarantine",
             ));
         }
         let has_v3 = connection.query_row(
@@ -5109,6 +5170,7 @@ fn migrate_task_manager_schema(
         "0017_authority_policy_evaluation",
         "authority-policy-evaluation-v0.1",
     )?;
+    verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
@@ -5501,6 +5563,11 @@ fn migrate_task_manager_schema(
         ))?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0017_authority_policy_evaluation', 'authority-policy-evaluation-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(trusted_time::MIGRATION)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0018_trusted_time', 'trusted-time-v0.1', '2026-09-23T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -9656,6 +9723,9 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> String {
             T0.to_owned()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
         }
     }
 
