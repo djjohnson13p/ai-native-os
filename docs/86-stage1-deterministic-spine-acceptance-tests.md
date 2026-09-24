@@ -335,6 +335,12 @@ Pass criteria:
 
 - timeout/cancellation is durable/attributable;
 - subsequent protected accesses fail after revocation/cancel boundary.
+- a frozen or slightly rolled-back wall clock cannot extend a grant beyond its
+  issuance-time monotonic deadline; exact deadline equality denies use;
+- first use, issuance replay, lost response, and process restart cannot reset
+  that deadline, and an old-session grant cannot authorize new work;
+- approval withdrawal races atomically with issuance and denies the next
+  protected access through an already-open handle.
 
 ## Gate S8 — Crash/recovery certainty
 
