@@ -67,7 +67,7 @@
       "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039", "ADR-0044"],
       "fixture_paths": ["examples/authority/", "examples/reference-task/policy-local-read.json"],
       "blocking_questions": [],
-      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency. Migration 0016 adds a non-executable pre-policy candidate reservation, preserving immutable binding creation after grant issuance. Multi-output task.output resolution is pending an explicit broker contract."
+      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency. Migration 0016 adds a non-executable pre-policy candidate reservation. Additive 0017 gives pending local Artifact candidates immutable builtin policy content, versioned activation, deterministic ALLOW/DENY/REQUIRE_APPROVAL evaluation, and fingerprint-bound one-shot approval, without issuing executable grants or bindings. The baseline SQL approval ledger's missing REVOKE/REVOKED and required decision scope remain a finalization/point-of-use reconciliation gate. Multi-output task.output resolution is pending an explicit broker contract."
     },
     {
       "id": "credential-broker-v0.1",

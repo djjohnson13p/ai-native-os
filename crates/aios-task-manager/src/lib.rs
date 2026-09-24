@@ -14,6 +14,7 @@
 
 mod artifact_store;
 mod authority_candidate;
+mod authority_policy;
 
 pub use aios_provenance::{
     CheckpointExpectation as ProvenanceCheckpointExpectation,
@@ -4558,7 +4559,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4647,6 +4648,11 @@ fn preflight_migration_state_with_mode(
         "0016_authority_candidate_reservations",
         "authority-candidate-reservations-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0017_authority_policy_evaluation",
+        "authority-policy-evaluation-v0.1",
+    )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4722,6 +4728,15 @@ fn preflight_migration_state_with_mode(
         if !authority_candidate_objects_current(connection, has_candidate_reservations)? {
             return Err(TaskManagerError::InvalidRecord(
                 "authority candidate reservation schema requires operator quarantine",
+            ));
+        }
+        let has_policy_evaluation: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0017_authority_policy_evaluation')",
+            [], |row| row.get(0),
+        )?;
+        if !authority_policy::policy_objects_current(connection, has_policy_evaluation)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority policy evaluation schema requires operator quarantine",
             ));
         }
         let has_v3 = connection.query_row(
@@ -5088,6 +5103,11 @@ fn migrate_task_manager_schema(
         connection,
         "0016_authority_candidate_reservations",
         "authority-candidate-reservations-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0017_authority_policy_evaluation",
+        "authority-policy-evaluation-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5474,6 +5494,13 @@ fn migrate_task_manager_schema(
         ))?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0016_authority_candidate_reservations', 'authority-candidate-reservations-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0017-authority-policy-evaluation.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0017_authority_policy_evaluation', 'authority-policy-evaluation-v0.1', '2026-09-23T00:00:00Z')",
             [],
         )?;
         Ok(())
