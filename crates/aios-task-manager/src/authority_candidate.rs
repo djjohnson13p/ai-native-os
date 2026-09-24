@@ -1,11 +1,13 @@
 //! Non-executable reservations for deterministic authority evaluation.
 
 use super::{
-    Result, TaskManager, TaskManagerError, active_program_validation_valid, assert_manager_lease,
+    CreateStepExecution, Result, StepState, TaskManager, TaskManagerError,
+    active_program_validation_valid, all_unique, assert_manager_lease, canonical_json,
     program_node,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde_json::Value;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +345,480 @@ fn replay_existing(
     }))
 }
 
+struct BindingPins {
+    binding_id: String,
+    attempt_id: String,
+    task_id: String,
+    hash: String,
+    snapshot: String,
+    ir_version: String,
+    node_id: String,
+    capability: String,
+    contract_hash: String,
+    registration_id: String,
+    provider_id: String,
+    provider_version: String,
+    manifest_hash: String,
+    build_hash: String,
+    evidence_id: String,
+    trust_source_id: String,
+    profile_ref: String,
+    locality: String,
+    attempt: i64,
+    resource_count: i64,
+    reserved_at: String,
+    program_json: String,
+}
+
+struct BindingResource {
+    action: String,
+    selector: String,
+    kind: String,
+    id: String,
+    port: Option<String>,
+    semantic_type: String,
+}
+
+/// Consumes only a PENDING reservation in the coordinator's existing transaction.
+/// The caller has already evaluated current policy and issued the exact grants.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the binding receipt and its guarded insert form one auditable projection"
+)]
+pub(super) fn insert_reserved_binding_in(
+    transaction: &Transaction<'_>,
+    candidate_id: &str,
+    policy_decision_ids: &[String],
+    grant_ids: &[String],
+    created_at: &str,
+) -> Result<()> {
+    if !valid_id(candidate_id)
+        || policy_decision_ids.is_empty()
+        || policy_decision_ids.len() > 32
+        || policy_decision_ids.len() != grant_ids.len()
+        || !all_unique(policy_decision_ids)
+        || !all_unique(grant_ids)
+        || policy_decision_ids.iter().any(|id| !valid_id(id))
+        || grant_ids.iter().any(|id| !valid_id(id))
+    {
+        return Err(reject());
+    }
+    let created = OffsetDateTime::parse(created_at, &Rfc3339).map_err(|_| reject())?;
+    let pins = transaction
+        .query_row(
+            "SELECT c.binding_id,c.attempt_id,c.task_id,c.semantic_program_hash,
+          c.registry_snapshot_id,c.ir_version,c.node_id,c.capability,
+          c.capability_contract_hash,c.provider_registration_id,c.provider_id,
+          c.provider_version,c.provider_manifest_hash,c.provider_build_hash,
+          c.conformance_evidence_id,c.provider_trust_source_id,c.execution_profile_ref,
+          c.placement_locality,c.attempt_number,c.resource_count,c.created_at,p.program_json
+         FROM authority_candidate_reservations c
+         JOIN authority_candidate_status s USING(candidate_id)
+         JOIN tasks t ON t.task_id=c.task_id
+         JOIN semantic_program_revisions p ON p.task_id=t.task_id
+           AND p.program_revision=t.active_program_revision AND p.status='active'
+           AND p.semantic_hash=c.semantic_program_hash
+           AND p.registry_snapshot_id=c.registry_snapshot_id
+         WHERE c.candidate_id=?1 AND s.state='PENDING'",
+            [candidate_id],
+            |row| {
+                Ok(BindingPins {
+                    binding_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    hash: row.get(3)?,
+                    snapshot: row.get(4)?,
+                    ir_version: row.get(5)?,
+                    node_id: row.get(6)?,
+                    capability: row.get(7)?,
+                    contract_hash: row.get(8)?,
+                    registration_id: row.get(9)?,
+                    provider_id: row.get(10)?,
+                    provider_version: row.get(11)?,
+                    manifest_hash: row.get(12)?,
+                    build_hash: row.get(13)?,
+                    evidence_id: row.get(14)?,
+                    trust_source_id: row.get(15)?,
+                    profile_ref: row.get(16)?,
+                    locality: row.get(17)?,
+                    attempt: row.get(18)?,
+                    resource_count: row.get(19)?,
+                    reserved_at: row.get(20)?,
+                    program_json: row.get(21)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(reject)?;
+    if pins.resource_count != i64::try_from(policy_decision_ids.len()).map_err(|_| reject())?
+        || OffsetDateTime::parse(&pins.reserved_at, &Rfc3339).map_err(|_| reject())? > created
+        || pins.locality != "local"
+    {
+        return Err(reject());
+    }
+    let resources = {
+        let mut statement = transaction.prepare(
+            "SELECT action,semantic_selector,resource_kind,resource_id,output_port,
+                    expected_semantic_type FROM authority_candidate_resources
+             WHERE candidate_id=?1 ORDER BY action,semantic_selector",
+        )?;
+        statement
+            .query_map([candidate_id], |row| {
+                Ok(BindingResource {
+                    action: row.get(0)?,
+                    selector: row.get(1)?,
+                    kind: row.get(2)?,
+                    id: row.get(3)?,
+                    port: row.get(4)?,
+                    semantic_type: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if resources.len() != policy_decision_ids.len() {
+        return Err(reject());
+    }
+    let expected = resources
+        .iter()
+        .map(|r| (r.action.as_str(), r.selector.as_str()))
+        .collect::<BTreeSet<_>>();
+    if expected.len() != resources.len() {
+        return Err(reject());
+    }
+    let mut covered = BTreeSet::new();
+    for decision_id in policy_decision_ids {
+        let key: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT r.action,r.semantic_selector FROM policy_decisions d
+             JOIN authority_requests r ON r.request_id=d.authority_request_id
+             JOIN authority_candidate_resources cr ON cr.candidate_id=?2
+               AND cr.action=r.action AND cr.semantic_selector=r.semantic_selector
+               AND cr.resource_kind=r.resolved_resource_kind
+               AND cr.resource_id=r.resolved_resource_id
+             WHERE d.decision_id=?1 AND d.decision='ALLOW'
+               AND r.task_id=?3 AND r.semantic_program_hash=?4
+               AND r.registry_snapshot_id=?5 AND r.node_id=?6
+               AND r.execution_binding_id=?7 AND r.attempt_id=?8
+               AND r.capability=?9 AND r.principal_kind='provider'
+               AND r.principal_id=?10 AND d.task_id=r.task_id
+               AND d.semantic_program_hash=r.semantic_program_hash
+               AND d.node_id=r.node_id AND d.action=r.action
+               AND d.resolved_resource_kind=r.resolved_resource_kind
+               AND d.resolved_resource_id=r.resolved_resource_id
+               AND d.principal_kind=r.principal_kind AND d.principal_id=r.principal_id",
+                params![
+                    decision_id,
+                    candidate_id,
+                    pins.task_id,
+                    pins.hash,
+                    pins.snapshot,
+                    pins.node_id,
+                    pins.binding_id,
+                    pins.attempt_id,
+                    pins.capability,
+                    pins.provider_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (action, selector) = key.ok_or_else(reject)?;
+        if !covered.insert((action, selector)) {
+            return Err(reject());
+        }
+    }
+    if covered
+        .iter()
+        .map(|(action, selector)| (action.as_str(), selector.as_str()))
+        .collect::<BTreeSet<_>>()
+        != expected
+    {
+        return Err(reject());
+    }
+    let mut covered_decisions = BTreeSet::new();
+    for grant_id in grant_ids {
+        let decision_id: Option<String> = transaction
+            .query_row(
+                "SELECT g.policy_decision_id FROM authority_grants g
+             JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+               AND i.token_id=g.token_id AND i.task_id=g.task_id
+               AND i.execution_binding_id=g.execution_binding_id
+               AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id
+               AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+             WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
+               AND g.node_id=?4 AND g.capability=?5 AND g.principal_kind='provider'
+               AND g.principal_id=?6 AND g.execution_binding_id=?7 AND g.attempt_id=?8
+               AND g.state='ACTIVE' AND g.uses_consumed=0
+               AND g.delegable=0 AND g.max_delegation_depth=0",
+                params![
+                    grant_id,
+                    pins.task_id,
+                    pins.hash,
+                    pins.node_id,
+                    pins.capability,
+                    pins.provider_id,
+                    pins.binding_id,
+                    pins.attempt_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let decision_id = decision_id.ok_or_else(reject)?;
+        if !policy_decision_ids.contains(&decision_id) || !covered_decisions.insert(decision_id) {
+            return Err(reject());
+        }
+    }
+    let program: Value = serde_json::from_str(&pins.program_json).map_err(|_| reject())?;
+    let node = program_node(&program, &pins.node_id).ok_or_else(reject)?;
+    if node
+        .pointer("/operation/capability")
+        .and_then(Value::as_str)
+        != Some(pins.capability.as_str())
+    {
+        return Err(reject());
+    }
+    let mut inputs = Map::new();
+    let node_inputs = node
+        .get("inputs")
+        .and_then(Value::as_object)
+        .ok_or_else(reject)?;
+    for (port, wiring) in node_inputs {
+        if wiring.get("source").and_then(Value::as_str) != Some("input") {
+            return Err(reject());
+        }
+        let name = wiring
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(reject)?;
+        let selector = format!("input:{name}");
+        let resource = resources
+            .iter()
+            .find(|r| {
+                r.action == "artifact.read"
+                    && r.selector == selector
+                    && r.kind == "artifact"
+                    && r.port.is_none()
+            })
+            .ok_or_else(reject)?;
+        let program_type = program
+            .pointer(&format!("/inputs/{name}/type"))
+            .and_then(Value::as_str)
+            .ok_or_else(reject)?;
+        if resource.semantic_type != program_type {
+            return Err(reject());
+        }
+        inputs.insert(
+            port.clone(),
+            json!({"semantic_type":resource.semantic_type,
+            "artifact_or_value_ref":resource.id}),
+        );
+    }
+    let mut outputs = Map::new();
+    let node_outputs = node
+        .get("outputs")
+        .and_then(Value::as_object)
+        .ok_or_else(reject)?;
+    for (port, semantic_type) in node_outputs {
+        let resource = resources
+            .iter()
+            .find(|r| {
+                r.action == "artifact.write"
+                    && r.kind == "output-allocation"
+                    && r.port.as_deref() == Some(port)
+            })
+            .ok_or_else(reject)?;
+        if semantic_type.as_str() != Some(resource.semantic_type.as_str()) {
+            return Err(reject());
+        }
+        outputs.insert(
+            port.clone(),
+            json!({"semantic_type":resource.semantic_type,
+            "allocation_ref":resource.id}),
+        );
+    }
+    if resources.iter().filter(|r| r.kind == "artifact").count() != inputs.len()
+        || resources
+            .iter()
+            .filter(|r| r.kind == "output-allocation")
+            .count()
+            != outputs.len()
+    {
+        return Err(reject());
+    }
+    let policy_json = canonical_json(&policy_decision_ids)?;
+    let grants_json = canonical_json(&grant_ids)?;
+    let placement = json!({"locality":pins.locality});
+    let placement_json = canonical_json(&placement)?;
+    let receipt = canonical_json(&json!({
+        "schema_version":"0.1","binding_id":pins.binding_id,"attempt_id":pins.attempt_id,
+        "task_id":pins.task_id,"semantic_program_hash":pins.hash,
+        "registry_snapshot_id":pins.snapshot,"ir_version":pins.ir_version,
+        "node_id":pins.node_id,"capability":pins.capability,
+        "capability_contract_hash":pins.contract_hash,
+        "conformance_evidence_id":pins.evidence_id,
+        "provider_trust_source_id":pins.trust_source_id,
+        "provider":{"id":pins.provider_id,"version":pins.provider_version,
+            "manifest_hash":pins.manifest_hash,"package_or_build_hash":pins.build_hash},
+        "inputs":inputs,"outputs":outputs,"policy_decision_refs":policy_decision_ids,
+        "authority":{"grant_refs":grant_ids},
+        "execution_profile":{"profile_ref":pins.profile_ref},"placement":placement,
+        "attempt":pins.attempt,"created_at":created_at,
+    }))?;
+    transaction.execute(
+        "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
+         registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+         provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+         provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+         execution_profile_ref,placement_json,binding_json,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        params![
+            pins.binding_id,
+            pins.attempt_id,
+            pins.task_id,
+            pins.hash,
+            pins.snapshot,
+            pins.ir_version,
+            pins.node_id,
+            pins.capability,
+            pins.contract_hash,
+            pins.registration_id,
+            pins.provider_id,
+            pins.provider_version,
+            pins.manifest_hash,
+            pins.build_hash,
+            pins.attempt,
+            policy_json,
+            grants_json,
+            pins.profile_ref,
+            placement_json,
+            receipt,
+            created_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Inserts the one READY attempt for a freshly bound candidate. Its input IDs
+/// must cover the entire reserved read set and the binding's exact input map.
+#[allow(dead_code, reason = "called by the coordinator finalizer")]
+pub(super) fn insert_reserved_ready_step_in(
+    transaction: &Transaction<'_>,
+    candidate_id: &str,
+    created_at: &str,
+) -> Result<()> {
+    let (
+        attempt_id,
+        task_id,
+        hash,
+        snapshot,
+        node_id,
+        binding_id,
+        provider_id,
+        provider_version,
+        attempt_number,
+        binding_json,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+    ) = transaction
+        .query_row(
+            "SELECT c.attempt_id,c.task_id,c.semantic_program_hash,c.registry_snapshot_id,
+                    c.node_id,c.binding_id,c.provider_id,c.provider_version,c.attempt_number,
+                    b.binding_json
+             FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s USING(candidate_id)
+             JOIN execution_bindings b ON b.binding_id=c.binding_id AND b.attempt_id=c.attempt_id
+             WHERE c.candidate_id=?1 AND s.state='PENDING'",
+            [candidate_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(reject)?;
+    let input_artifacts = exact_reserved_step_inputs(transaction, candidate_id, &binding_json)?;
+    let request = CreateStepExecution {
+        attempt_id,
+        task_id,
+        semantic_program_hash: hash,
+        registry_snapshot_id: Some(snapshot),
+        node_id,
+        binding_id: Some(binding_id),
+        provider_id: Some(provider_id),
+        provider_version: Some(provider_version),
+        attempt_number: u16::try_from(attempt_number).map_err(|_| reject())?,
+        state: StepState::Ready,
+        operation_id: None,
+        idempotency_key: None,
+        outcome_certainty: None,
+        input_artifacts,
+        output_artifacts: Vec::new(),
+        failure: None,
+        started_at: None,
+        finished_at: None,
+    };
+    TaskManager::create_step_execution_in(transaction, &request, created_at)
+}
+
+fn exact_reserved_step_inputs(
+    transaction: &Transaction<'_>,
+    candidate_id: &str,
+    binding_json: &str,
+) -> Result<Vec<String>> {
+    let input_artifacts: Vec<String> = transaction
+        .prepare(
+            "SELECT resource_id FROM authority_candidate_resources
+         WHERE candidate_id=?1 AND action='artifact.read' AND resource_kind='artifact'
+         ORDER BY semantic_selector",
+        )?
+        .query_map([candidate_id], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if !all_unique(&input_artifacts) {
+        return Err(reject());
+    }
+    let receipt: Value = aios_registry::parse_strict_value(
+        binding_json.as_bytes(),
+        aios_registry::StrictJsonLimits::default(),
+    )
+    .map_err(|_| reject())?;
+    let inputs = receipt
+        .get("inputs")
+        .and_then(Value::as_object)
+        .ok_or_else(reject)?;
+    let mut bound_ids = BTreeSet::new();
+    for binding in inputs.values() {
+        let id = binding
+            .get("artifact_or_value_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(reject)?;
+        if !bound_ids.insert(id.to_owned()) {
+            return Err(reject());
+        }
+    }
+    if bound_ids != input_artifacts.iter().cloned().collect() {
+        return Err(reject());
+    }
+    Ok(input_artifacts)
+}
+
 impl TaskManager {
     /// Reserves identities before policy or grant issuance. The result cannot launch or use Artifacts.
     #[allow(
@@ -389,7 +865,7 @@ impl TaskManager {
              JOIN semantic_program_revisions p ON p.task_id=t.task_id
                AND p.program_revision=t.active_program_revision AND p.status='active'
              WHERE t.task_id=?1 AND p.semantic_hash=?2 AND p.registry_snapshot_id=?3
-               AND t.state IN ('WAITING_FOR_AUTH','RUNNABLE','RUNNING')",
+               AND t.state IN ('PLANNING','WAITING_FOR_AUTH','RUNNABLE','RUNNING')",
                 params![
                     request.task_id,
                     request.semantic_program_hash,
@@ -434,7 +910,7 @@ impl TaskManager {
              JOIN semantic_program_revisions p ON p.task_id=t.task_id
                AND p.program_revision=t.active_program_revision AND p.status='active'
              WHERE t.task_id=?1 AND p.semantic_hash=?2 AND p.registry_snapshot_id=?3
-               AND t.state IN ('WAITING_FOR_AUTH','RUNNABLE','RUNNING')",
+               AND t.state IN ('PLANNING','WAITING_FOR_AUTH','RUNNABLE','RUNNING')",
                 params![
                     request.task_id,
                     request.semantic_program_hash,
@@ -790,13 +1266,23 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Clock, CreateStepExecution, StepState};
+    use crate::artifact_store::{
+        ArtifactExpectedState, ArtifactLineage, ArtifactOriginKind, ArtifactPublicationRequest,
+        ImportArtifactRequest, RetentionClass, Sensitivity,
+    };
+    use crate::{
+        ActivePlan, Actor, Clock, CreateStepExecution, CreateTask, StepState, TaskMutation,
+        TaskState, TransitionReason, TransitionRequest, WaitingKind, WaitingOn,
+    };
     use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
     use aios_registry::{
         ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     use std::{
+        io::{Cursor, Read, Seek, SeekFrom, Write},
         path::Path,
         sync::{
             Arc,
@@ -814,6 +1300,45 @@ mod tests {
         }
         fn security_sample(&self) -> Option<crate::SecurityClockSample> {
             Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
+    struct FrozenWallClock {
+        monotonic: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Clock for FrozenWallClock {
+        fn now(&self) -> String {
+            NOW.to_owned()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::SecurityClockSample {
+                wall: NOW.to_owned(),
+                monotonic_nanos: self.monotonic.load(Ordering::SeqCst),
+                source: crate::TimeSource::InjectedClock,
+            })
+        }
+    }
+    struct PreflightRegressionClock {
+        baseline: Arc<std::sync::atomic::AtomicU64>,
+        phase: Arc<AtomicUsize>,
+        expired: u64,
+    }
+    impl Clock for PreflightRegressionClock {
+        fn now(&self) -> String {
+            NOW.to_owned()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            let monotonic_nanos = match self.phase.load(Ordering::SeqCst) {
+                1 => {
+                    self.phase.store(2, Ordering::SeqCst);
+                    self.expired
+                }
+                _ => self.baseline.load(Ordering::SeqCst),
+            };
+            Some(crate::SecurityClockSample {
+                wall: NOW.to_owned(),
+                monotonic_nanos,
+                source: crate::TimeSource::InjectedClock,
+            })
         }
     }
     struct LaterClock;
@@ -968,25 +1493,48 @@ mod tests {
         fixture_at(None)
     }
 
+    fn coherent_planning_fixture(path: &Path) -> (TaskManager, String, String, String) {
+        fixture_at_mode(Some(path), true)
+    }
+
+    fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
+        fixture_at_mode(path, false)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "builds one complete provider and Task admission fixture"
     )]
-    fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
+    fn fixture_at_mode(
+        path: Option<&Path>,
+        coherent_planning: bool,
+    ) -> (TaskManager, String, String, String) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
             None => TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap(),
         };
         manager
-            .connection
-            .execute(
-                "INSERT INTO tasks(task_id,revision,state,principal_kind,principal_id,
-            original_intent,active_program_revision,constraints_json,created_at,updated_at)
-            VALUES ('T-candidate',1,'WAITING_FOR_AUTH','user','user:test','copy source',1,
-              '{\"privacy\":\"local-only\",\"max_cost_microunits\":1000,\"preserve_inputs\":true}',?1,?1)",
-                [NOW],
-            )
+            .create_task(&CreateTask {
+                task_id: "T-candidate".into(),
+                principal: Actor {
+                    kind: "user".into(),
+                    id: "user:test".into(),
+                },
+                workspace_id: None,
+                original_intent: "copy source".into(),
+                normalized_intent: None,
+                active_step_ids: vec!["copy".into()],
+            })
             .unwrap();
+        if !coherent_planning {
+            manager.connection.execute(
+                "UPDATE tasks SET state='WAITING_FOR_AUTH',active_program_revision=1,
+                 active_plan_revision=1,
+                 constraints_json='{\"privacy\":\"local-only\",\"max_cost_microunits\":1000,\"preserve_inputs\":true}'
+                 WHERE task_id='T-candidate'",
+                [],
+            ).unwrap();
+        }
         let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
             "../../../examples/aios-ir/registry-snapshot.json"
         ))
@@ -1112,9 +1660,18 @@ mod tests {
             ir_version,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,result_json,validated_at)
             VALUES ('validation-candidate','T-candidate','program-candidate','0.1',1,?1,?2,'validator:test','0.1',?3,?4)",
             params![hash,registry.snapshot_id(),validation.to_string(),NOW]).unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO plan_revisions(task_id,plan_revision,plan_id,plan_json,created_at)
+             VALUES ('T-candidate',1,'plan-candidate','{}',?1)",
+                [NOW],
+            )
+            .unwrap();
         manager.connection.execute("INSERT INTO semantic_program_revisions(task_id,program_revision,program_id,
-            ir_version,semantic_hash,registry_snapshot_id,validation_result_id,status,program_json,created_at)
-            VALUES ('T-candidate',1,'program-candidate','0.1',?1,?2,'validation-candidate','active',?3,?4)",
+            ir_version,semantic_hash,registry_snapshot_id,validation_result_id,status,program_json,
+            created_from_plan_revision,created_at)
+            VALUES ('T-candidate',1,'program-candidate','0.1',?1,?2,'validation-candidate','active',?3,1,?4)",
             params![hash,registry.snapshot_id(),program_json,NOW]).unwrap();
         manager
             .connection
@@ -1133,6 +1690,42 @@ mod tests {
                 [NOW],
             )
             .unwrap();
+        if coherent_planning {
+            manager
+                .connection
+                .execute(
+                    "UPDATE tasks SET active_program_revision=1 WHERE task_id='T-candidate'",
+                    [],
+                )
+                .unwrap();
+            let result = manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:candidate-planning".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 1,
+                    expected_state: TaskState::Created,
+                    to_state: TaskState::Planning,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "PLAN_STARTED".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation {
+                        active_plan: Some(ActivePlan {
+                            plan_id: "plan-candidate".into(),
+                            revision: 1,
+                        }),
+                        ..TaskMutation::default()
+                    },
+                })
+                .unwrap();
+            assert!(result.applied, "{result:?}");
+        }
         (
             manager,
             hash,
@@ -1142,23 +1735,88 @@ mod tests {
     }
 
     fn choices() -> Vec<CandidateResourceChoice> {
+        choices_with_source("artifact:source")
+    }
+
+    fn choices_with_source(artifact_id: &str) -> Vec<CandidateResourceChoice> {
+        choices_with_source_and_output(artifact_id, "allocation:copy")
+    }
+
+    fn choices_with_source_and_output(
+        artifact_id: &str,
+        allocation_id: &str,
+    ) -> Vec<CandidateResourceChoice> {
         vec![
             CandidateResourceChoice {
                 action: "artifact.read".into(),
                 semantic_selector: "input:source".into(),
                 handle: CandidateResourceHandle::InputArtifact {
-                    artifact_id: "artifact:source".into(),
+                    artifact_id: artifact_id.into(),
                 },
             },
             CandidateResourceChoice {
                 action: "artifact.write".into(),
                 semantic_selector: "task.output".into(),
                 handle: CandidateResourceHandle::OutputAllocation {
-                    allocation_id: "allocation:copy".into(),
+                    allocation_id: allocation_id.into(),
                     output_port: "copy".into(),
                 },
             },
         ]
+    }
+
+    fn assert_catalog_reason(code: &str) {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../../specs/authority-reason-codes.json"))
+                .unwrap();
+        assert!(
+            catalog["codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["code"] == code),
+            "reason code is absent from authority catalog: {code}"
+        );
+    }
+
+    fn assert_policy_decision_reason(
+        manager: &TaskManager,
+        decision_id: &str,
+        expected_effect: &str,
+        expected_code: &str,
+    ) {
+        let (effect, codes, body): (String, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT decision,reason_codes_json,decision_json FROM policy_decisions WHERE decision_id=?1",
+                [decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let codes: Value = serde_json::from_str(&codes).unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(effect, expected_effect);
+        assert_eq!(body["decision"], expected_effect);
+        assert_eq!(codes, json!([expected_code]));
+        assert_eq!(body["reason_codes"], codes);
+        assert_catalog_reason(expected_code);
+    }
+
+    fn assert_approval_request_reason(manager: &TaskManager, approval_id: &str) {
+        let body: String = manager
+            .connection
+            .query_row(
+                "SELECT request_json FROM approval_requests WHERE approval_id=?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["policy_reason_codes"],
+            json!(["AUTH_REQUIRE_APPROVAL"])
+        );
+        assert_catalog_reason("AUTH_REQUIRE_APPROVAL");
     }
 
     #[test]
@@ -1242,7 +1900,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![PolicyEffect::Allow, PolicyEffect::RequireApproval]
         );
+        assert_policy_decision_reason(
+            &manager,
+            &initial.decisions[0].decision_id,
+            "ALLOW",
+            "AUTH_ALLOW",
+        );
+        assert_policy_decision_reason(
+            &manager,
+            &initial.decisions[1].decision_id,
+            "REQUIRE_APPROVAL",
+            "AUTH_REQUIRE_APPROVAL",
+        );
         let approval = initial.decisions[1].approval_id.as_deref().unwrap();
+        assert_approval_request_reason(&manager, approval);
         assert_eq!(
             manager
                 .evaluate_pending_authority_candidate("candidate:policy")
@@ -1289,6 +1960,12 @@ mod tests {
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(approved.decisions[1].effect, PolicyEffect::Allow);
+        assert_policy_decision_reason(
+            &manager,
+            &approved.decisions[1].decision_id,
+            "ALLOW",
+            "AUTH_REQUIRE_APPROVAL",
+        );
         assert_ne!(
             approved.decisions[1].decision_id,
             initial.decisions[1].decision_id
@@ -1333,6 +2010,41 @@ mod tests {
             )
             .unwrap();
         assert!(!crate::approval_not_withdrawn(&manager.connection, Some(approval)).unwrap());
+        let first_withdrawal: String = manager
+            .connection
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            manager
+                .revoke_candidate_approval(
+                    approval,
+                    &AuthenticatedApprover {
+                        principal_id: "user:wrong",
+                    },
+                )
+                .is_err()
+        );
+        manager
+            .revoke_candidate_approval(
+                approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+            )
+            .unwrap();
+        let replayed_withdrawal: String = manager
+            .connection
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed_withdrawal, first_withdrawal);
         let (status, decision): (String, String) = manager
             .connection
             .query_row(
@@ -1375,6 +2087,12 @@ mod tests {
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(hard.decisions[1].effect, PolicyEffect::Deny);
+        assert_policy_decision_reason(
+            &manager,
+            &hard.decisions[1].decision_id,
+            "DENY",
+            "AUTH_DENY_POLICY",
+        );
         assert!(
             manager
                 .decide_candidate_approval(
@@ -1385,6 +2103,24 @@ mod tests {
                     true
                 )
                 .is_err()
+        );
+        manager
+            .activate_local_authority_policy(
+                json!({"schema_version":"0.1","rules":[
+                    {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"}
+                ]})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let default_denied = manager
+            .evaluate_pending_authority_candidate("candidate:policy")
+            .unwrap();
+        assert_policy_decision_reason(
+            &manager,
+            &default_denied.decisions[1].decision_id,
+            "DENY",
+            "AUTH_DENY_DEFAULT",
         );
         for table in [
             "authority_grants",
@@ -1450,6 +2186,12 @@ mod tests {
             .evaluate_pending_authority_candidate("candidate:stale")
             .unwrap();
         assert_eq!(denied.decisions[1].effect, PolicyEffect::Deny);
+        assert_policy_decision_reason(
+            &manager,
+            &denied.decisions[1].decision_id,
+            "DENY",
+            "AUTH_APPROVAL_DENIED",
+        );
         assert_ne!(
             denied.decisions[1].decision_id,
             initial.decisions[1].decision_id
@@ -1677,6 +2419,1642 @@ mod tests {
             evaluation.decisions[1].approval_id.clone().unwrap(),
             registration,
         )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises the complete issuance sequence and rollback in one transaction"
+    )]
+    fn grant_deadline_and_exact_binding_join_one_rollback_boundary() {
+        use crate::artifact_store::{OutputAllocationRequest, RetentionClass, Sensitivity};
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:issuance-rollback",
+                binding_id: "binding:issuance-rollback",
+                attempt_id: "attempt:issuance-rollback",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:issuance-rollback")
+            .unwrap();
+        let decisions: Vec<String> = evaluated
+            .decisions
+            .iter()
+            .map(|d| d.decision_id.clone())
+            .collect();
+        let owner = manager.lease_owner.clone();
+        let epoch = manager.lease_epoch;
+        let result = crate::trusted_time::with_protected_observation(
+            &manager.connection,
+            &manager.clock,
+            |tx, time| {
+                let grants = TaskManager::issue_candidate_grants_in(
+                    tx,
+                    "candidate:issuance-rollback",
+                    &evaluated,
+                    time,
+                    &owner,
+                    epoch,
+                )?;
+                insert_reserved_binding_in(
+                    tx,
+                    "candidate:issuance-rollback",
+                    &decisions,
+                    &grants,
+                    time.now(),
+                )?;
+                insert_reserved_ready_step_in(tx, "candidate:issuance-rollback", time.now())?;
+                assert_eq!(grants.len(), 2);
+                let expires_at: String = tx.query_row(
+                    "SELECT expires_at FROM authority_grants WHERE grant_id=?1",
+                    [&grants[1]],
+                    |row| row.get(0),
+                )?;
+                let allocation = OutputAllocationRequest {
+                    schema_version: "0.1".into(),
+                    allocation_id: "allocation:copy".into(),
+                    task_id: "T-candidate".into(),
+                    semantic_program_hash: hash.clone(),
+                    node_id: "copy".into(),
+                    binding_id: Some("binding:issuance-rollback".into()),
+                    attempt_id: Some("attempt:issuance-rollback".into()),
+                    output_port: Some("copy".into()),
+                    expected_semantic_type: Some("artifact.file@1".into()),
+                    allowed_media_types: vec![],
+                    max_size_bytes: Some(8 * 1024 * 1024),
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at,
+                };
+                for bad in [
+                    OutputAllocationRequest {
+                        allocation_id: "allocation:wrong".into(),
+                        ..allocation.clone()
+                    },
+                    OutputAllocationRequest {
+                        output_port: Some("wrong".into()),
+                        ..allocation.clone()
+                    },
+                ] {
+                    assert!(
+                        TaskManager::allocate_reserved_candidate_output_in(
+                            tx,
+                            "candidate:issuance-rollback",
+                            &bad,
+                            time,
+                            &owner,
+                            epoch,
+                        )
+                        .is_err()
+                    );
+                }
+                assert!(tx.execute(
+                    "UPDATE authority_candidate_status SET state='FINALIZED',revision=revision+1
+                     WHERE candidate_id='candidate:issuance-rollback' AND state='PENDING'",
+                    [],
+                ).is_err(), "a missing output allocation must block finalization");
+                TaskManager::allocate_reserved_candidate_output_in(
+                    tx,
+                    "candidate:issuance-rollback",
+                    &allocation,
+                    time,
+                    &owner,
+                    epoch,
+                )?;
+                assert_eq!(tx.execute(
+                    "UPDATE authority_candidate_status SET state='FINALIZED',revision=revision+1
+                     WHERE candidate_id='candidate:issuance-rollback' AND state='PENDING' AND revision=1",
+                    [],
+                )?, 1);
+                Err::<(), _>(TaskManagerError::InvalidRecord("test issuance rollback"))
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TaskManagerError::InvalidRecord("test issuance rollback"))
+            ),
+            "{result:?}"
+        );
+        let count: i64 = manager.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM authority_grants WHERE execution_binding_id='binding:issuance-rollback')
+                  +(SELECT COUNT(*) FROM execution_bindings WHERE binding_id='binding:issuance-rollback')
+                  +(SELECT COUNT(*) FROM step_executions WHERE binding_id='binding:issuance-rollback')
+                  +(SELECT COUNT(*) FROM artifact_output_allocations WHERE allocation_id='allocation:copy')
+                  +(SELECT COUNT(*) FROM authority_grant_deadlines WHERE execution_binding_id='binding:issuance-rollback')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn coordinator_finalizes_exact_candidate_as_one_issuance() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:complete",
+                binding_id: "binding:complete",
+                attempt_id: "attempt:complete",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:complete")
+            .unwrap();
+        assert_eq!(finalized.grant_ids.len(), 2);
+        assert_eq!(finalized.allocation_ids, ["allocation:copy"]);
+        assert_eq!(finalized.binding_id, "binding:complete");
+        let status: (String, i64) = manager.connection.query_row(
+            "SELECT state,revision FROM authority_candidate_status WHERE candidate_id='candidate:complete'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, ("FINALIZED".into(), 2));
+        let state: String = manager
+            .connection
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id='T-candidate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "WAITING_FOR_AUTH");
+        let grant_events: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provenance_events
+             WHERE task_id='T-candidate' AND event_type='authorization.granted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grant_events, 2);
+        assert!(manager.open_artifact_output("allocation:copy").is_err());
+        assert_eq!(
+            manager
+                .finalize_pending_authority_candidate("candidate:complete")
+                .unwrap(),
+            finalized,
+            "a lost finalization response must replay the same committed identities"
+        );
+        let replayed_events: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE task_id='T-candidate'
+             AND event_type='authorization.granted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed_events, 2);
+    }
+
+    #[test]
+    fn hard_deny_activation_blocks_prepared_task_before_runnable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("policy-before-runnable.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:policy-before-runnable",
+                binding_id: "binding:policy-before-runnable",
+                attempt_id: "attempt:policy-before-runnable",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:policy-before-runnable")
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"DENY","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"DENY","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let runnable = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:policy-before-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(
+            !runnable.applied,
+            "stale grants cannot start a prepared task"
+        );
+        assert_eq!(
+            manager.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Planning
+        );
+        assert_eq!(
+            manager
+                .finalize_pending_authority_candidate("candidate:policy-before-runnable")
+                .unwrap(),
+            finalized
+        );
+    }
+
+    #[test]
+    fn planning_unconditional_allow_prepares_but_does_not_launch() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-candidate'",
+                [],
+            )
+            .unwrap();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:planning-allow",
+                binding_id: "binding:planning-allow",
+                attempt_id: "attempt:planning-allow",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:planning-allow")
+            .unwrap();
+        assert!(
+            evaluated
+                .decisions
+                .iter()
+                .all(|decision| decision.approval_id.is_none())
+        );
+        let prepared = manager
+            .finalize_pending_authority_candidate("candidate:planning-allow")
+            .unwrap();
+        assert_eq!(prepared.grant_ids.len(), 2);
+        assert!(manager.open_artifact_output("allocation:copy").is_err());
+        let state: String = manager
+            .connection
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id='T-candidate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "PLANNING");
+    }
+
+    #[test]
+    fn planning_approval_condition_cannot_issue_or_be_decided_early() {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) = fixture();
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET state='PLANNING' WHERE task_id='T-candidate'",
+                [],
+            )
+            .unwrap();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:planning-approval",
+                binding_id: "binding:planning-approval",
+                attempt_id: "attempt:planning-approval",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:planning-approval")
+            .unwrap();
+        let approval_id = evaluated
+            .decisions
+            .iter()
+            .find_map(|decision| decision.approval_id.as_deref())
+            .unwrap();
+        let approver = AuthenticatedApprover {
+            principal_id: "user:test",
+        };
+        assert!(
+            manager
+                .decide_candidate_approval(approval_id, &approver, true)
+                .is_err()
+        );
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:planning-approval")
+                .is_err()
+        );
+        let grants: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE execution_binding_id='binding:planning-approval'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(grants, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers real import, exact issuance, restart retirement, historical replay, and idempotent second restart"
+    )]
+    fn coherent_task_replans_after_old_session_grants_are_retired() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("coherent-finalization.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        assert_eq!(
+            manager.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Planning
+        );
+        let imported = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:coherent-replan".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"unused real input"),
+            )
+            .unwrap();
+        manager.connection.execute(
+            "DELETE FROM task_artifacts WHERE task_id='T-candidate' AND artifact_id='artifact:source'",
+            [],
+        ).unwrap();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:coherent",
+                binding_id: "binding:coherent",
+                attempt_id: "attempt:coherent",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices_with_source(&imported.artifact_id),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let prepared = manager
+            .finalize_pending_authority_candidate("candidate:coherent")
+            .unwrap();
+        assert_eq!(
+            manager.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Planning
+        );
+        let runnable = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:candidate-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(runnable.applied, "{runnable:?}");
+        drop(manager);
+        crate::FAIL_STARTUP_AFTER_AUTHORITY_RETIRE.with(|flag| flag.set(true));
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "injected failure after authority retirement"
+            ))
+        ));
+        let interrupted = rusqlite::Connection::open(&path).unwrap();
+        let cut: (String, i64) = interrupted
+            .query_row(
+                "SELECT t.state,(SELECT COUNT(*) FROM authority_grants g
+             WHERE g.task_id=t.task_id AND g.state='ACTIVE')
+             FROM tasks t WHERE t.task_id='T-candidate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cut, ("RUNNABLE".into(), 0));
+        drop(interrupted);
+        let mut reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Planning
+        );
+        let active: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='ACTIVE'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(active, 0);
+        let retired: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate'
+             AND state='REVOKED' AND revocation_reason_code='AUTHORITY_SESSION_RETIRED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 2);
+        assert_eq!(
+            reopened
+                .finalize_pending_authority_candidate("candidate:coherent")
+                .unwrap(),
+            prepared
+        );
+        drop(reopened);
+        let mut reopened_again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened_again
+                .get_task("T-candidate")
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Planning
+        );
+        reopened_again
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:fresh-after-restart",
+                binding_id: "binding:fresh-after-restart",
+                attempt_id: "attempt:fresh-after-restart",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 2,
+                resources: &choices_with_source_and_output(
+                    &imported.artifact_id,
+                    "allocation:fresh-after-restart",
+                ),
+            })
+            .unwrap();
+        let fresh = reopened_again
+            .finalize_pending_authority_candidate("candidate:fresh-after-restart")
+            .unwrap();
+        assert!(
+            fresh
+                .grant_ids
+                .iter()
+                .all(|id| !prepared.grant_ids.contains(id))
+        );
+        let old_session = reopened_again
+            .issue_provider_artifact_session("T-candidate", "binding:coherent")
+            .unwrap();
+        assert!(
+            reopened_again
+                .scope_artifact_reads(&old_session, std::slice::from_ref(&imported.artifact_id))
+                .is_err()
+        );
+        let revision = reopened_again
+            .get_task("T-candidate")
+            .unwrap()
+            .unwrap()
+            .revision;
+        let runnable = reopened_again
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:fresh-after-restart-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: revision,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(runnable.applied, "{runnable:?}");
+        let fresh_session = reopened_again
+            .issue_provider_artifact_session("T-candidate", "binding:fresh-after-restart")
+            .unwrap();
+        assert!(
+            reopened_again
+                .scope_artifact_reads(&fresh_session, std::slice::from_ref(&imported.artifact_id))
+                .is_ok()
+        );
+        assert!(
+            reopened_again
+                .scope_artifact_reads(&old_session, std::slice::from_ref(&imported.artifact_id))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "proves one imported input reaches the actual protected reader through the coordinator path"
+    )]
+    fn coherent_candidate_opens_real_input_and_restart_does_not_erase_its_use() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::Never);
+    }
+
+    #[test]
+    fn finished_output_cannot_publish_after_coordinator_monotonic_deadline() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::BeforePlacement);
+    }
+
+    #[test]
+    fn placed_output_cannot_commit_after_coordinator_monotonic_deadline() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::BeforeFinalCommit);
+    }
+
+    #[test]
+    fn retained_reader_rejects_expired_preflight_followed_by_monotonic_regression() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::ReaderPreflightRegression);
+    }
+
+    #[test]
+    fn hard_deny_activation_stops_retained_reader_and_writer_before_more_bytes() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::PolicyBeforeWrite);
+    }
+
+    #[test]
+    fn hard_deny_activation_stops_finished_output_publication() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::PolicyBeforePublication);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DeadlineScenario {
+        Never,
+        BeforePlacement,
+        BeforeFinalCommit,
+        ReaderPreflightRegression,
+        PolicyBeforeWrite,
+        PolicyBeforePublication,
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises one real imported reader and completed writer across the publication deadline"
+    )]
+    fn run_coherent_candidate_reader_and_publication(scenario: DeadlineScenario) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("coherent-reader.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let original = b"a real imported source";
+        let imported = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:coherent-reader".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(original),
+            )
+            .unwrap();
+        manager.connection.execute(
+            "DELETE FROM task_artifacts WHERE task_id='T-candidate' AND artifact_id='artifact:source'",
+            [],
+        ).unwrap();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:reader",
+                binding_id: "binding:reader",
+                attempt_id: "attempt:reader",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices_with_source(&imported.artifact_id),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        manager
+            .finalize_pending_authority_candidate("candidate:reader")
+            .unwrap();
+        for (transition_id, expected_revision, from, to) in [
+            (
+                "transition:reader-runnable",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:reader-running",
+                3,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            let result = manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: transition_id.into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision,
+                    expected_state: from,
+                    to_state: to,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "AUTHORITY_READY".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation::default(),
+                })
+                .unwrap();
+            assert!(result.applied, "{result:?}");
+        }
+        let (issued, deadline): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT MIN(issued_monotonic_nanos),MIN(deadline_monotonic_nanos)
+             FROM authority_grant_deadlines WHERE execution_binding_id='binding:reader'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let observed_high_water: i64 = manager
+            .connection
+            .query_row(
+                "SELECT MAX(monotonic_nanos) FROM trusted_time_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initially_admissible = issued.max(observed_high_water) + 1_000_000_000;
+        assert!(initially_admissible < deadline);
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+            u64::try_from(initially_admissible).unwrap(),
+        ));
+        let regression_phase = Arc::new(AtomicUsize::new(0));
+        manager.clock = if scenario == DeadlineScenario::ReaderPreflightRegression {
+            Arc::new(PreflightRegressionClock {
+                baseline: Arc::clone(&monotonic),
+                phase: Arc::clone(&regression_phase),
+                expired: u64::try_from(deadline).unwrap() + 1,
+            })
+        } else {
+            Arc::new(FrozenWallClock {
+                monotonic: Arc::clone(&monotonic),
+            })
+        };
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:reader")
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&imported.artifact_id))
+            .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &imported.artifact_id)
+            .unwrap();
+        if scenario == DeadlineScenario::ReaderPreflightRegression {
+            regression_phase.store(1, Ordering::SeqCst);
+            let mut denied = [0xa5_u8; 1];
+            assert!(reader.read(&mut denied).is_err());
+            assert_eq!(
+                denied,
+                [0xa5],
+                "regressed admission cannot deliver source bytes"
+            );
+            let expired_observation: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_observations
+                 WHERE monotonic_nanos=?1 AND confidence='TRUSTED_LOCAL'",
+                    [deadline + 1],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                expired_observation > 0,
+                "preflight expiry must remain durable evidence"
+            );
+            assert!(
+                reader.read(&mut denied).is_err(),
+                "later lower samples cannot revive the grant"
+            );
+            assert_eq!(denied, [0xa5]);
+            return;
+        }
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut writer = manager
+            .open_bound_artifact_output(&session, "allocation:copy")
+            .unwrap();
+        writer.write_all(b"copied output").unwrap();
+        if scenario == DeadlineScenario::PolicyBeforeWrite {
+            manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                {"effect":"DENY","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+                {"effect":"DENY","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+            ]}).to_string().as_bytes()).unwrap();
+            let mut denied = [0xa5_u8; 1];
+            assert!(reader.read(&mut denied).is_err());
+            assert_eq!(denied, [0xa5], "revoked reader cannot deliver source bytes");
+            assert!(writer.write_all(b"extra").is_err());
+            assert_eq!(
+                writer.bytes_written(),
+                13,
+                "revoked writer cannot append bytes"
+            );
+            assert!(
+                manager
+                    .scope_artifact_reads(&session, std::slice::from_ref(&imported.artifact_id))
+                    .is_err()
+            );
+            assert_eq!(
+                manager
+                    .finalize_pending_authority_candidate("candidate:reader")
+                    .unwrap()
+                    .binding_id,
+                "binding:reader"
+            );
+            return;
+        }
+        assert_eq!(writer.finish().unwrap(), 13);
+        match scenario {
+            DeadlineScenario::Never
+            | DeadlineScenario::ReaderPreflightRegression
+            | DeadlineScenario::PolicyBeforeWrite => {}
+            DeadlineScenario::PolicyBeforePublication => {
+                manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                    {"effect":"DENY","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+                    {"effect":"DENY","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+                ]}).to_string().as_bytes()).unwrap();
+            }
+            DeadlineScenario::BeforePlacement => {
+                monotonic.store(u64::try_from(deadline).unwrap() + 1, Ordering::SeqCst);
+            }
+            DeadlineScenario::BeforeFinalCommit => {
+                let monotonic = Arc::clone(&monotonic);
+                crate::artifact_store::set_publication_commit_test_hook(move || {
+                    monotonic.store(u64::try_from(deadline).unwrap() + 1, Ordering::SeqCst);
+                    Ok(())
+                });
+            }
+        }
+        let publication = manager.publish_bound_artifact_output(
+            &session,
+            &ArtifactPublicationRequest {
+                schema_version: "0.1".into(),
+                publication_id: "publication:reader-copy".into(),
+                allocation_id: "allocation:copy".into(),
+                task_id: "T-candidate".into(),
+                expected_allocation_state: ArtifactExpectedState::Writing,
+                semantic_type: Some("artifact.file@1".into()),
+                media_type: "text/plain".into(),
+                format: None,
+                lineage: ArtifactLineage {
+                    input_artifact_ids: vec![imported.artifact_id.clone()],
+                    ..ArtifactLineage::default()
+                },
+                labels: vec![],
+            },
+        );
+        if scenario == DeadlineScenario::PolicyBeforePublication {
+            assert!(publication.is_err() || !publication.as_ref().unwrap().published);
+            let committed: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM artifact_publications WHERE publication_id='publication:reader-copy' AND state='COMMITTED'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(committed, 0, "revoked grant cannot publish finished bytes");
+            assert_eq!(
+                manager
+                    .finalize_pending_authority_candidate("candidate:reader")
+                    .unwrap()
+                    .binding_id,
+                "binding:reader"
+            );
+            return;
+        }
+        if scenario != DeadlineScenario::Never {
+            match &publication {
+                Ok(result) => {
+                    assert!(
+                        !result.published,
+                        "expired authority cannot publish finished bytes"
+                    );
+                    assert_eq!(result.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+                }
+                Err(error) => assert!(matches!(
+                    error,
+                    TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")
+                )),
+            }
+            let committed: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM artifact_publications WHERE publication_id='publication:reader-copy' AND state='COMMITTED'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(committed, 0, "expiry cannot create a published artifact");
+            let (no_effect, unresolved): (i64, i64) = manager
+                .connection
+                .query_row(
+                    "SELECT
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=r.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='publication:reader-copy'
+                       AND r.resolution_kind='NO_EFFECT'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=x.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='publication:reader-copy')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if scenario == DeadlineScenario::BeforePlacement {
+                assert!(
+                    no_effect > 0,
+                    "expired authority must deny before a placement primitive"
+                );
+            } else {
+                let invoked: i64 = manager
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=r.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='publication:reader-copy'
+                       AND r.resolution_kind='EFFECT_INVOKED'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    invoked > 0,
+                    "the blob placement must precede expiry at final commit"
+                );
+                let mut digest = String::with_capacity(64);
+                for byte in Sha256::digest(b"copied output") {
+                    write!(&mut digest, "{byte:02x}").unwrap();
+                }
+                let final_ref =
+                    format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+                assert!(
+                    !manager.artifact_store_root.join(final_ref).exists(),
+                    "denied final commit must remove its unreferenced placed blob"
+                );
+            }
+            assert_eq!(
+                unresolved, 0,
+                "denied placement cannot leave uncertain effect evidence"
+            );
+            let latched: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM authority_grant_expiry_latches x JOIN authority_grant_deadlines d ON d.grant_id=x.grant_id WHERE d.execution_binding_id='binding:reader' AND x.reason='MONOTONIC_DEADLINE'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                latched, 2,
+                "publication denial must durably latch both expired grants"
+            );
+            return;
+        }
+        let published = publication.unwrap();
+        assert!(published.published);
+        monotonic.store(u64::try_from(deadline).unwrap() + 1, Ordering::SeqCst);
+        assert!(
+            reader.seek(SeekFrom::Start(0)).is_err(),
+            "retained reader seek must stop at the monotonic deadline"
+        );
+        let mut denied = [0_u8; 1];
+        assert!(
+            reader.read(&mut denied).is_err(),
+            "retained reader must stop at the monotonic deadline"
+        );
+        drop(reader);
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Recovering
+        );
+        let reader_admissions: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE task_id='T-candidate'
+             AND effect_class='ARTIFACT_READ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reader_admissions, 1);
+        let committed_output: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_publications
+             WHERE publication_id='publication:reader-copy' AND state='COMMITTED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_output, 1);
+    }
+
+    #[test]
+    fn restart_does_not_replan_prepared_authority_with_possible_use() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("used-authority.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:used",
+                binding_id: "binding:used",
+                attempt_id: "attempt:used",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let prepared = manager
+            .finalize_pending_authority_candidate("candidate:used")
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET uses_consumed=1 WHERE grant_id=?1",
+                [&prepared.grant_ids[0]],
+            )
+            .unwrap();
+        drop(manager);
+        assert!(matches!(
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+            Err(TaskManagerError::InvalidRecord(
+                "obsolete prepared authority has possible effects or incomplete issuance"
+            ))
+        ));
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM authority_grants WHERE grant_id=?1",
+                [&prepared.grant_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ACTIVE");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers approval-backed issuance, current activation admission, and historical replay"
+    )]
+    fn coherent_task_waits_for_real_candidate_approval_before_finalization() {
+        use crate::authority_policy::AuthenticatedApprover;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("coherent-approval.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:coherent-approval",
+                binding_id: "binding:coherent-approval",
+                attempt_id: "attempt:coherent-approval",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:coherent-approval")
+            .unwrap();
+        let approval_id = evaluated
+            .decisions
+            .iter()
+            .find_map(|decision| decision.approval_id.clone())
+            .unwrap();
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:coherent-approval")
+                .is_err()
+        );
+        let waiting = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:candidate-waiting".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: vec![approval_id.clone()],
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(vec![WaitingOn {
+                        kind: WaitingKind::Approval,
+                        id: approval_id.clone(),
+                        message: None,
+                    }]),
+                    ..TaskMutation::default()
+                },
+            })
+            .unwrap();
+        assert!(waiting.applied, "{waiting:?}");
+        manager
+            .decide_candidate_approval(
+                &approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:coherent-approval")
+            .unwrap();
+        assert_eq!(finalized.grant_ids.len(), 2);
+        let runnable = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:candidate-approved-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 3,
+                expected_state: TaskState::WaitingForAuth,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(runnable.applied, "{runnable:?}");
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let running = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:candidate-approved-running-after-reactivation".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 4,
+                expected_state: TaskState::Runnable,
+                to_state: TaskState::Running,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(
+            !running.applied,
+            "same-content policy reactivation must invalidate approved grants"
+        );
+        assert_eq!(
+            manager
+                .finalize_pending_authority_candidate("candidate:coherent-approval")
+                .unwrap(),
+            finalized
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers the crash cut between approval-backed finalization and Task Runnable CAS"
+    )]
+    fn approved_candidate_restarts_from_waiting_with_old_grants_retired() {
+        use crate::authority_policy::AuthenticatedApprover;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("approved-waiting-restart.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:approved-restart",
+                binding_id: "binding:approved-restart",
+                attempt_id: "attempt:approved-restart",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:approved-restart")
+            .unwrap();
+        let approval_id = evaluated
+            .decisions
+            .iter()
+            .find_map(|decision| decision.approval_id.clone())
+            .unwrap();
+        let waiting = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:approved-restart-waiting".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: vec![approval_id.clone()],
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(vec![WaitingOn {
+                        kind: WaitingKind::Approval,
+                        id: approval_id.clone(),
+                        message: None,
+                    }]),
+                    ..TaskMutation::default()
+                },
+            })
+            .unwrap();
+        assert!(waiting.applied);
+        manager
+            .decide_candidate_approval(
+                &approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let prepared = manager
+            .finalize_pending_authority_candidate("candidate:approved-restart")
+            .unwrap();
+        assert_eq!(
+            manager.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::WaitingForAuth
+        );
+        drop(manager);
+        let mut reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let task = reopened.get_task("T-candidate").unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Planning);
+        assert!(task.waiting_on.is_empty());
+        assert_eq!(
+            reopened
+                .finalize_pending_authority_candidate("candidate:approved-restart")
+                .unwrap(),
+            prepared
+        );
+        let active: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='ACTIVE'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "proves one frozen-wall expiry across public scope, retained writer, and durable latches"
+    )]
+    fn frozen_wall_does_not_extend_a_coordinator_grant_after_monotonic_deadline() {
+        run_frozen_wall_coordinator_grant(false);
+    }
+
+    #[test]
+    fn running_transition_rejects_coordinator_grants_expired_under_frozen_wall() {
+        run_frozen_wall_coordinator_grant(true);
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "proves coordinator grant admission, active use, and durable expiry under one frozen wall fixture"
+    )]
+    fn run_frozen_wall_coordinator_grant(expire_before_running: bool) {
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true);
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:frozen-wall",
+                binding_id: "binding:frozen-wall",
+                attempt_id: "attempt:frozen-wall",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        manager
+            .finalize_pending_authority_candidate("candidate:frozen-wall")
+            .unwrap();
+        let runnable = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:frozen-wall-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(runnable.applied);
+        let (issued,deadline): (i64,i64) = manager.connection.query_row(
+            "SELECT MIN(issued_monotonic_nanos),MIN(deadline_monotonic_nanos) FROM authority_grant_deadlines
+             WHERE execution_binding_id='binding:frozen-wall'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+            u64::try_from(issued).unwrap() + 1_000_000_000,
+        ));
+        manager.clock = Arc::new(FrozenWallClock {
+            monotonic: Arc::clone(&monotonic),
+        });
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:frozen-wall")
+            .unwrap();
+        assert!(
+            manager
+                .scope_artifact_reads(&session, &["artifact:source".into()])
+                .is_ok()
+        );
+        if expire_before_running {
+            monotonic.store(u64::try_from(deadline).unwrap() + 1, Ordering::SeqCst);
+        }
+        let running = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:frozen-wall-running".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 3,
+                expected_state: TaskState::Runnable,
+                to_state: TaskState::Running,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        if expire_before_running {
+            assert!(
+                !running.applied,
+                "expired coordinator grants cannot start a task"
+            );
+            let latched: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM authority_grant_expiry_latches x JOIN authority_grant_deadlines d ON d.grant_id=x.grant_id WHERE d.execution_binding_id='binding:frozen-wall' AND x.reason='MONOTONIC_DEADLINE'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                latched, 2,
+                "rejected task start must latch both expired grants"
+            );
+            return;
+        }
+        assert!(running.applied);
+        let mut writer = manager
+            .open_bound_artifact_output(&session, "allocation:copy")
+            .unwrap();
+        writer.write_all(b"a").unwrap();
+        monotonic.store(u64::try_from(deadline).unwrap() + 1, Ordering::SeqCst);
+        assert!(writer.write_all(b"b").is_err());
+        assert_eq!(
+            writer.bytes_written(),
+            1,
+            "expired write cannot append bytes"
+        );
+        let generation_before: i64 = manager
+            .connection
+            .query_row(
+                "SELECT writer_generation FROM artifact_output_allocations
+             WHERE allocation_id='allocation:copy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            manager
+                .open_bound_artifact_output(&session, "allocation:copy")
+                .is_err(),
+            "expired authority cannot reopen a writer"
+        );
+        let generation_after: i64 = manager
+            .connection
+            .query_row(
+                "SELECT writer_generation FROM artifact_output_allocations
+             WHERE allocation_id='allocation:copy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            generation_after, generation_before,
+            "denial cannot rotate the writer generation"
+        );
+        assert!(
+            manager
+                .scope_artifact_reads(&session, &["artifact:source".into()])
+                .is_err()
+        );
+        let latched: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM authority_grant_expiry_latches x
+             JOIN authority_grant_deadlines d ON d.grant_id=x.grant_id
+             WHERE d.execution_binding_id='binding:frozen-wall'
+               AND x.reason='MONOTONIC_DEADLINE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            latched, 2,
+            "the denied writer must latch both expired grants"
+        );
+        monotonic.store(
+            u64::try_from(issued).unwrap() + 1_000_000_000,
+            Ordering::SeqCst,
+        );
+        assert!(
+            manager
+                .scope_artifact_reads(&session, &["artifact:source".into()])
+                .is_err(),
+            "a regressed clock cannot restore the expired grant"
+        );
+    }
+
+    #[test]
+    fn candidate_finalizer_failure_after_provenance_rolls_back_every_issuance_row() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:failed-finalize",
+                binding_id: "binding:failed-finalize",
+                attempt_id: "attempt:failed-finalize",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        manager.connection.execute_batch(
+            "CREATE TRIGGER fail_candidate_finalization
+             BEFORE UPDATE ON authority_candidate_status
+             WHEN NEW.state='FINALIZED' BEGIN SELECT RAISE(ABORT,'injected final CAS failure'); END;",
+        ).unwrap();
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:failed-finalize")
+                .is_err()
+        );
+        let count: i64 = manager.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM authority_grants WHERE execution_binding_id='binding:failed-finalize')
+              +(SELECT COUNT(*) FROM authority_grant_deadlines WHERE execution_binding_id='binding:failed-finalize')
+              +(SELECT COUNT(*) FROM execution_bindings WHERE binding_id='binding:failed-finalize')
+              +(SELECT COUNT(*) FROM step_executions WHERE binding_id='binding:failed-finalize')
+              +(SELECT COUNT(*) FROM artifact_output_allocations WHERE allocation_id='allocation:copy')
+              +(SELECT COUNT(*) FROM provenance_events WHERE task_id='T-candidate'
+                   AND event_type='authorization.granted')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn approval_withdrawal_retry_and_durable_marker_preserve_original_time() {
+        use crate::authority_policy::AuthenticatedApprover;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("withdrawal-replay.sqlite3");
+        let (mut manager, hash, snapshot, registration) = fixture_at(Some(&path));
+        let resources = choices();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:withdrawal-replay",
+                binding_id: "binding:withdrawal-replay",
+                attempt_id: "attempt:withdrawal-replay",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager
+            .activate_local_authority_policy(
+                json!({"schema_version":"0.1","rules":[
+                    {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+                    {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+                ]})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let initial = manager
+            .evaluate_pending_authority_candidate("candidate:withdrawal-replay")
+            .unwrap();
+        let approval = initial.decisions[1].approval_id.as_deref().unwrap();
+        let owner = AuthenticatedApprover {
+            principal_id: "user:test",
+        };
+        manager
+            .decide_candidate_approval(approval, &owner, true)
+            .unwrap();
+        manager.revoke_candidate_approval(approval, &owner).unwrap();
+        manager.revoke_candidate_approval(approval, &owner).unwrap();
+        let marker: String = manager
+            .connection
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = Connection::open(&path).unwrap();
+        let replay_marker: String = reopened
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replay_marker, marker);
+        assert!(!crate::approval_not_withdrawn(&reopened, Some(approval)).unwrap());
     }
 
     #[test]
@@ -2228,6 +4606,62 @@ mod tests {
                 .evaluate_pending_authority_candidate("candidate:fresh")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn binding_writer_rejects_missing_or_duplicate_authority_refs() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let resources = choices();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:binding-refs",
+                binding_id: "binding:binding-refs",
+                attempt_id: "attempt:binding-refs",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let transaction = manager
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for (decisions, grants) in [
+            (
+                vec!["decision:one".to_owned(), "decision:one".to_owned()],
+                vec!["grant:one".to_owned(), "grant:two".to_owned()],
+            ),
+            (
+                vec!["decision:one".to_owned(), "decision:two".to_owned()],
+                vec!["grant:one".to_owned(), "grant:two".to_owned()],
+            ),
+        ] {
+            assert!(
+                insert_reserved_binding_in(
+                    &transaction,
+                    "candidate:binding-refs",
+                    &decisions,
+                    &grants,
+                    NOW
+                )
+                .is_err()
+            );
+        }
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM execution_bindings WHERE binding_id='binding:binding-refs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        transaction.rollback().unwrap();
     }
 
     #[test]

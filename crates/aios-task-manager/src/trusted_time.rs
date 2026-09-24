@@ -55,6 +55,42 @@ pub(crate) struct LockedTimeObservation {
     effective_nanos: Option<i64>,
 }
 
+/// Evidence from one locked clock sample already written inside the caller's
+/// transaction. It cannot outlive the callback that owns that transaction.
+#[allow(
+    dead_code,
+    reason = "the authority finalizer consumes this paired evidence"
+)]
+pub(crate) struct ProtectedTimeContext {
+    now: String,
+    state_revision: i64,
+    observed_unix_nanos: i64,
+    effective_unix_nanos: i64,
+    monotonic_nanos: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "the authority finalizer consumes this paired evidence"
+)]
+impl ProtectedTimeContext {
+    pub(crate) fn now(&self) -> &str {
+        &self.now
+    }
+    pub(crate) fn state_revision(&self) -> i64 {
+        self.state_revision
+    }
+    pub(crate) fn observed_unix_nanos(&self) -> i64 {
+        self.observed_unix_nanos
+    }
+    pub(crate) fn effective_unix_nanos(&self) -> i64 {
+        self.effective_unix_nanos
+    }
+    pub(crate) fn monotonic_nanos(&self) -> i64 {
+        self.monotonic_nanos
+    }
+}
+
 #[allow(
     dead_code,
     reason = "external effect call sites follow the durable marker foundation"
@@ -127,6 +163,7 @@ pub(crate) struct ExternalEntrySample<'transaction, 'connection> {
     transaction: &'transaction Transaction<'connection>,
     marker_id: String,
     observation: LockedTimeObservation,
+    committed_state_revision: std::cell::Cell<Option<i64>>,
 }
 
 #[allow(
@@ -136,6 +173,19 @@ pub(crate) struct ExternalEntrySample<'transaction, 'connection> {
 impl ExternalEntrySample<'_, '_> {
     pub(crate) fn require_trusted_time(&self) -> Result<String> {
         self.observation.require_trusted_time()
+    }
+
+    /// Exposes the exact locked entry sample to an authority check before an
+    /// external primitive. Resolution reuses this revision instead of writing
+    /// a second observation for the same entry.
+    pub(crate) fn commit_context_in(&self) -> Result<ProtectedTimeContext> {
+        if self.committed_state_revision.get().is_some() {
+            return Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"));
+        }
+        let context = self.observation.commit_context_in(self.transaction)?;
+        self.committed_state_revision
+            .set(Some(context.state_revision()));
+        Ok(context)
     }
 }
 
@@ -155,6 +205,40 @@ impl LockedTimeObservation {
     /// that commit cannot leave its effect ahead of the durable expiry floor.
     pub(crate) fn commit_in(&self, connection: &Connection) -> Result<TimeAssessment> {
         apply_sample_in_transaction(connection, self.sample.as_ref())
+    }
+
+    /// Persist this locked sample and return only evidence from that exact
+    /// revision. A caller must keep its surrounding transaction open until
+    /// the protected admission has finished.
+    pub(crate) fn commit_context_in(
+        &self,
+        connection: &Connection,
+    ) -> Result<ProtectedTimeContext> {
+        let now = self.commit_in(connection)?.require_trusted_time()?;
+        let (state_revision, observed_unix_nanos, monotonic_nanos, effective_unix_nanos): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = connection.query_row(
+            "SELECT o.state_revision,o.observed_unix_nanos,o.monotonic_nanos,
+                    o.expiry_floor_unix_nanos
+             FROM trusted_time_state s JOIN trusted_time_observations o
+               ON o.state_revision=s.revision WHERE s.singleton_id=1
+               AND s.confidence='TRUSTED_LOCAL' AND o.confidence='TRUSTED_LOCAL'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(ProtectedTimeContext {
+            now,
+            state_revision,
+            observed_unix_nanos: observed_unix_nanos
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?,
+            effective_unix_nanos: effective_unix_nanos
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?,
+            monotonic_nanos: monotonic_nanos
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?,
+        })
     }
 }
 
@@ -618,6 +702,7 @@ pub(crate) fn capture_external_entry<'transaction, 'connection>(
         transaction,
         marker_id: permit.marker_id.clone(),
         observation,
+        committed_state_revision: std::cell::Cell::new(None),
     })
 }
 
@@ -664,6 +749,7 @@ fn resolve_external_entry_in_kind(
         transaction,
         marker_id,
         observation,
+        committed_state_revision,
     } = entry;
     if marker_id != permit.marker_id {
         return Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"));
@@ -672,7 +758,24 @@ fn resolve_external_entry_in_kind(
     if resolution_kind == ExternalResolutionKind::EffectInvoked {
         observation.require_trusted_time()?;
     }
-    let assessment = observation.commit_in(transaction)?;
+    let assessment = if let Some(committed_revision) = committed_state_revision.get() {
+        let (revision, confidence, effective_nanos): (i64, String, Option<i64>) = transaction
+            .query_row(
+                "SELECT revision,confidence,expiry_floor_unix_nanos
+                 FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if revision != committed_revision || confidence != "TRUSTED_LOCAL" {
+            return Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"));
+        }
+        TimeAssessment {
+            confidence,
+            effective_nanos,
+        }
+    } else {
+        observation.commit_in(transaction)?
+    };
     if resolution_kind == ExternalResolutionKind::EffectInvoked {
         assessment.require_trusted_time()?;
     }
@@ -751,6 +854,77 @@ pub(crate) fn with_protected_immediate<T>(
             Err(error)
         }
     }
+}
+
+/// Commits a single paired observation before an authority callback so SQL
+/// guards can bind issuance to that same observation. A failed callback rolls
+/// back its business writes and records the exact adverse sample separately.
+/// This is for atomic issuance; expiry-denial latches need a separate
+/// denial-commit boundary and must not be written only inside the callback.
+#[allow(dead_code, reason = "the authority finalizer consumes this boundary")]
+pub(crate) fn with_protected_observation<T>(
+    connection: &Connection,
+    clock: &Arc<dyn Clock>,
+    operation: impl FnOnce(&Transaction<'_>, &ProtectedTimeContext) -> Result<T>,
+) -> Result<T> {
+    protected_now(connection, clock)?;
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    let fresh = capture_locked(&transaction, clock)?;
+    if let Err(error) = fresh.require_trusted_time() {
+        drop(transaction);
+        fresh.commit(connection)?;
+        return Err(error);
+    }
+    let context = fresh.commit_context_in(&transaction);
+    let result = context.and_then(|context| operation(&transaction, &context));
+    match result {
+        Ok(value) => match transaction.commit() {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                fresh.commit(connection)?;
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            drop(transaction);
+            fresh.commit(connection)?;
+            Err(error)
+        }
+    }
+}
+
+/// Advances only the current daemon lease's clock session using the exact
+/// observation already committed in this transaction. A restarted manager has
+/// a different owner identity and can never advance a predecessor's session.
+#[allow(
+    dead_code,
+    reason = "the authority finalizer and grant mediator use this fence"
+)]
+pub(crate) fn advance_clock_session_in(
+    transaction: &Transaction<'_>,
+    owner_id: &str,
+    owner_epoch: i64,
+    time: &ProtectedTimeContext,
+) -> Result<()> {
+    crate::assert_manager_lease(transaction, owner_id, owner_epoch)?;
+    let changed = transaction.execute(
+        "UPDATE authority_clock_sessions
+         SET high_water_monotonic_nanos=?3, high_water_observed_unix_nanos=?4,
+             high_water_state_revision=?5, revision=revision+1
+         WHERE session_id=?1 AND owner_id=?1 AND owner_epoch=?2
+           AND high_water_monotonic_nanos<=?3 AND high_water_state_revision<?5",
+        params![
+            owner_id,
+            owner_epoch,
+            time.monotonic_nanos(),
+            time.observed_unix_nanos(),
+            time.state_revision()
+        ],
+    )?;
+    if changed != 1 {
+        return Err(TaskManagerError::InvalidRecord("CLOCK_SESSION_INVALID"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -914,7 +1088,7 @@ mod tests {
         ExternalEntrySample, ExternalTimePermit, SecurityClockSample, TimeSource, assess,
         capture_external_entry, capture_locked, inflight_objects_current, prepare_external_effect,
         protected_now, resolve_external_entry_in, resolve_external_no_effect_in,
-        with_protected_immediate,
+        with_protected_immediate, with_protected_observation,
     };
     use crate::{Actor, Clock, CreateTask, TaskManager, TaskManagerError};
 
@@ -1064,6 +1238,105 @@ mod tests {
             })
             .unwrap();
         assert!(count >= 5);
+    }
+
+    #[test]
+    fn authority_time_context_is_exact_and_failed_business_work_cannot_escape() {
+        let clock = MutableClock::new("2026-09-19T22:00:00Z");
+        let manager = TaskManager::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        manager
+            .connection
+            .execute_batch("CREATE TABLE protected_time_effect(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let observed =
+            with_protected_observation(&manager.connection, &manager.clock, |tx, time| {
+                let row: (i64, i64, i64, i64) = tx.query_row(
+                    "SELECT state_revision,observed_unix_nanos,expiry_floor_unix_nanos,
+                            monotonic_nanos FROM trusted_time_observations
+                     WHERE state_revision=?1",
+                    [time.state_revision()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                assert_eq!(
+                    row,
+                    (
+                        time.state_revision(),
+                        time.observed_unix_nanos(),
+                        time.effective_unix_nanos(),
+                        time.monotonic_nanos()
+                    )
+                );
+                assert_eq!(time.now(), "2026-09-19T22:00:00Z");
+                tx.execute("INSERT INTO protected_time_effect VALUES (1)", [])?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(observed.1, observed.2);
+        clock.set(Some("2026-09-19T22:00:01Z"));
+        let before: i64 = manager
+            .connection
+            .query_row(
+                "SELECT revision FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rejected: crate::Result<()> =
+            with_protected_observation(&manager.connection, &manager.clock, |tx, time| {
+                assert!(time.state_revision() > before);
+                tx.execute("INSERT INTO protected_time_effect VALUES (2)", [])?;
+                Err(TaskManagerError::InvalidRecord("AUTHORITY_DENIED"))
+            });
+        assert!(matches!(
+            rejected,
+            Err(TaskManagerError::InvalidRecord("AUTHORITY_DENIED"))
+        ));
+        let count: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM protected_time_effect", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let latest: (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT s.revision,o.observed_unix_nanos FROM trusted_time_state s
+             JOIN trusted_time_observations o ON o.state_revision=s.revision
+             WHERE s.singleton_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(latest.0 > before);
+        assert_eq!(
+            latest.1,
+            i64::try_from(
+                time::OffsetDateTime::parse(
+                    "2026-09-19T22:00:01Z",
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap()
+                .unix_timestamp_nanos()
+            )
+            .unwrap()
+        );
+
+        clock.set(None);
+        let denied: crate::Result<()> =
+            with_protected_observation(&manager.connection, &manager.clock, |_, _| {
+                panic!("uncertain time must deny before the callback")
+            });
+        assert!(denied.is_err());
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
     }
 
     #[test]

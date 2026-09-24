@@ -67,7 +67,7 @@ impl Sensitivity {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
     }
 
@@ -101,7 +101,7 @@ impl RetentionClass {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(Into::into)
     }
 
@@ -1284,6 +1284,32 @@ impl Read for ArtifactReader {
                     ));
                 }
             };
+            let time = fresh.commit_context_in(&transaction).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+            })?;
+            if let Some(execution) = self.authority.execution.as_ref() {
+                let admitted = coordinator_grants_valid_in(
+                    &transaction,
+                    &self.task_id,
+                    execution,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    &time,
+                )
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?;
+                if !admitted {
+                    transaction.commit().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                    })?;
+                    locked_time = None;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "ARTIFACT_AUTHORITY_DENIED",
+                    ));
+                }
+            }
             let recovery_revision = transaction
                 .query_row(
                     "SELECT revision FROM tasks WHERE task_id=?1 AND state='RECOVERING'",
@@ -1368,10 +1394,6 @@ impl Read for ArtifactReader {
                 }
             }
             let delivery_was_pending = count > 0 && !self.reader_admission_delivered;
-            fresh
-                .commit_in(&transaction)
-                .and_then(|assessment| assessment.require_trusted_time())
-                .map_err(std::io::Error::other)?;
             let persisted = transaction.commit().map_err(TaskManagerError::from);
             if persisted.is_ok() {
                 locked_time = None;
@@ -1530,6 +1552,16 @@ impl LiveStagingSeal<'_> {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let entry = super::trusted_time::capture_external_entry(&transaction, self.clock, &permit)?;
         let pre_call = entry.require_trusted_time().and_then(|now| {
+            let time = entry.commit_context_in()?;
+            if !coordinator_writer_grants_valid_in(
+                &transaction,
+                self.allocation_id,
+                self.lease_owner,
+                self.lease_epoch,
+                &time,
+            )? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
             validate_writer_fence(
                 &transaction,
                 self.allocation_id,
@@ -1626,6 +1658,10 @@ impl ArtifactStagingWriter {
 }
 
 impl Write for ArtifactStagingWriter {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps locked admission, filesystem write, and durable effect resolution in one auditable path"
+    )]
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         deny_export_callback_reentry(&self.export_callback_active)?;
         if self.poisoned {
@@ -1668,6 +1704,16 @@ impl Write for ArtifactStagingWriter {
                 super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)
                     .map_err(std::io::Error::other)?;
             let pre_call = entry.require_trusted_time().and_then(|now| {
+                let time = entry.commit_context_in()?;
+                if !coordinator_writer_grants_valid_in(
+                    &transaction,
+                    &self.allocation_id,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    &time,
+                )? {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
                 validate_writer_fence(
                     &transaction,
                     &self.allocation_id,
@@ -3065,7 +3111,6 @@ impl TaskManager {
         validate_allocation_request_expiry(request, &created_at)?;
         ensure_task_is_not_recovering(&self.connection, &request.task_id)?;
         ensure_no_unknown_artifact_export(&self.connection, &request.task_id)?;
-        let staging_ref = format!("staging/output-{}", random_token(&self.connection)?);
         allocation_commit_step()?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
@@ -3073,22 +3118,274 @@ impl TaskManager {
             &self.connection,
             &self.clock,
             |transaction, created_at| {
-                validate_allocation_request_expiry(request, created_at)?;
-                assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-                ensure_task_is_not_recovering(&transaction, &request.task_id)?;
-                validate_requested_execution_scope(&transaction, request, &created_at)?;
-                validate_bound_output_policy(&transaction, request)?;
-                transaction.execute(
-            "INSERT INTO artifact_output_allocations (allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,created_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ALLOCATED',?13,?14,?15,?14)",
-            params![request.allocation_id,request.task_id,request.semantic_program_hash,request.node_id,request.binding_id,request.attempt_id,request.output_port,request.expected_semantic_type,serde_json::to_string(&request.allowed_media_types)?,request.max_size_bytes.map(to_i64).transpose()?,request.sensitivity.as_str(),request.retention.as_str(),staging_ref,created_at,request.expires_at],
-        )?;
-                Ok(())
+                Self::allocate_artifact_output_in(
+                    transaction,
+                    request,
+                    created_at,
+                    &lease_owner,
+                    lease_epoch,
+                )
             },
         )?;
         self.get_artifact_output_allocation(&request.allocation_id)?
             .ok_or(TaskManagerError::InvalidRecord(
                 "created Artifact allocation disappeared",
             ))
+    }
+
+    /// Inserts an allocation under the caller's protected IMMEDIATE transaction.
+    /// The caller must supply the locked trusted time and own the commit boundary.
+    pub(super) fn allocate_artifact_output_in(
+        transaction: &rusqlite::Transaction<'_>,
+        request: &OutputAllocationRequest,
+        created_at: &str,
+        lease_owner: &str,
+        lease_epoch: i64,
+    ) -> Result<()> {
+        validate_allocation_request_shape(request)?;
+        validate_allocation_request_expiry(request, created_at)?;
+        assert_manager_lease(transaction, lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(transaction, &request.task_id)?;
+        ensure_no_unknown_artifact_export(transaction, &request.task_id)?;
+        validate_requested_execution_scope(transaction, request, created_at)?;
+        validate_bound_output_policy(transaction, request)?;
+        insert_allocation_row(transaction, request, created_at)
+    }
+
+    /// Consumes one reserved output while the coordinator still owns the
+    /// PENDING candidate transaction. Runtime Artifact entry points never call
+    /// this path; they require a runnable Task and independently check use.
+    #[allow(
+        dead_code,
+        clippy::too_many_lines,
+        reason = "the coordinator finalizer consumes this complete candidate admission check"
+    )]
+    pub(super) fn allocate_reserved_candidate_output_in(
+        transaction: &Transaction<'_>,
+        candidate_id: &str,
+        request: &OutputAllocationRequest,
+        time: &super::trusted_time::ProtectedTimeContext,
+        lease_owner: &str,
+        lease_epoch: i64,
+    ) -> Result<()> {
+        let denied = || TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED");
+        validate_allocation_request_shape(request)?;
+        validate_allocation_request_expiry(request, time.now())?;
+        assert_manager_lease(transaction, lease_owner, lease_epoch)?;
+        ensure_task_is_not_recovering(transaction, &request.task_id)?;
+        ensure_no_unknown_artifact_export(transaction, &request.task_id)?;
+        let execution = transaction
+            .query_row(
+                "SELECT c.attempt_id,c.semantic_program_hash,c.node_id,c.binding_id,
+                    c.capability,c.provider_id,b.policy_decision_refs_json,
+                    b.grant_refs_json,e.input_artifacts_json,t.state
+             FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s USING(candidate_id)
+             JOIN authority_candidate_resources r ON r.candidate_id=c.candidate_id
+             JOIN tasks t ON t.task_id=c.task_id
+             JOIN semantic_program_revisions p ON p.task_id=t.task_id
+               AND p.program_revision=t.active_program_revision AND p.status='active'
+               AND p.superseded_at IS NULL
+               AND p.semantic_hash=c.semantic_program_hash
+               AND p.registry_snapshot_id=c.registry_snapshot_id
+             JOIN execution_bindings b ON b.binding_id=c.binding_id
+               AND b.attempt_id=c.attempt_id AND b.task_id=c.task_id
+               AND b.semantic_program_hash=c.semantic_program_hash
+               AND b.registry_snapshot_id=c.registry_snapshot_id
+               AND b.ir_version=c.ir_version AND b.node_id=c.node_id
+               AND b.capability=c.capability
+               AND b.capability_contract_hash=c.capability_contract_hash
+               AND b.provider_registration_id=c.provider_registration_id
+               AND b.provider_id=c.provider_id AND b.provider_version=c.provider_version
+               AND b.provider_manifest_hash=c.provider_manifest_hash
+               AND b.provider_build_hash=c.provider_build_hash
+               AND b.execution_profile_ref=c.execution_profile_ref
+               AND b.attempt=c.attempt_number
+             JOIN step_executions e ON e.attempt_id=c.attempt_id
+               AND e.binding_id=c.binding_id AND e.task_id=c.task_id
+               AND e.semantic_program_hash=c.semantic_program_hash
+               AND e.registry_snapshot_id=c.registry_snapshot_id
+               AND e.node_id=c.node_id AND e.provider_id=c.provider_id
+               AND e.provider_version=c.provider_version
+               AND e.attempt_number=c.attempt_number
+             WHERE c.candidate_id=?1 AND s.state='PENDING' AND s.revision=1
+               AND t.state IN ('PLANNING','WAITING_FOR_AUTH')
+               AND e.state='READY' AND e.revision=1
+               AND c.task_id=?2 AND c.semantic_program_hash=?3 AND c.node_id=?4
+               AND c.binding_id=?5 AND c.attempt_id=?6
+               AND r.resource_kind='output-allocation' AND r.action='artifact.write'
+               AND r.semantic_selector='task.output' AND r.resource_id=?7
+               AND r.output_port=?8 AND r.expected_semantic_type=?9",
+                params![
+                    candidate_id,
+                    request.task_id,
+                    request.semantic_program_hash,
+                    request.node_id,
+                    request.binding_id,
+                    request.attempt_id,
+                    request.allocation_id,
+                    request.output_port,
+                    request.expected_semantic_type
+                ],
+                |row| {
+                    Ok((
+                        ExecutionAuthority {
+                            attempt_id: row.get(0)?,
+                            semantic_program_hash: row.get(1)?,
+                            node_id: row.get(2)?,
+                            binding_id: row.get(3)?,
+                            capability: row.get(4)?,
+                            principal_id: row.get(5)?,
+                            policy_decision_refs_json: row.get(6)?,
+                            grant_refs_json: row.get(7)?,
+                        },
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(denied)?;
+        let (execution, step_inputs_json, task_state) = execution;
+        let step_inputs: Vec<String> = step_inputs_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .ok_or_else(denied)?;
+        if !all_unique(&step_inputs) {
+            return Err(denied());
+        }
+        let reserved_inputs = {
+            let mut statement = transaction.prepare(
+                "SELECT resource_id,expected_semantic_type
+                 FROM authority_candidate_resources
+                 WHERE candidate_id=?1 AND resource_kind='artifact' AND action='artifact.read'",
+            )?;
+            statement
+                .query_map([candidate_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !all_unique(
+            &reserved_inputs
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
+        ) || step_inputs.len() != reserved_inputs.len()
+            || step_inputs.iter().collect::<BTreeSet<_>>()
+                != reserved_inputs
+                    .iter()
+                    .map(|(id, _)| id)
+                    .collect::<BTreeSet<_>>()
+        {
+            return Err(denied());
+        }
+        for (artifact_id, semantic_type) in &reserved_inputs {
+            let current: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_artifacts ta
+                 JOIN artifacts a ON a.artifact_id=ta.artifact_id
+                 WHERE ta.task_id=?1 AND ta.role='input' AND ta.artifact_id=?2
+                   AND a.semantic_type=?3 AND a.integrity_state='verified')",
+                params![request.task_id, artifact_id, semantic_type],
+                |row| row.get(0),
+            )?;
+            if !current {
+                return Err(denied());
+            }
+        }
+        if !binding_runtime_authority_valid(transaction, &request.task_id, &execution, time.now())?
+        {
+            return Err(denied());
+        }
+        if task_state == "PLANNING" {
+            let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
+            let decision_ids: Vec<String> =
+                serde_json::from_str(&execution.policy_decision_refs_json)?;
+            if grant_ids.is_empty()
+                || grant_ids.len() != decision_ids.len()
+                || !all_unique(&grant_ids)
+                || !all_unique(&decision_ids)
+            {
+                return Err(denied());
+            }
+            for (grant_id, decision_id) in grant_ids.iter().zip(&decision_ids) {
+                let unconditioned: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM authority_grants g
+                     JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                     WHERE g.grant_id=?1 AND d.decision_id=?2 AND d.decision='ALLOW'
+                       AND g.task_id=?3 AND g.execution_binding_id=?4 AND g.attempt_id=?5
+                       AND g.approval_id IS NULL AND d.approval_request_id IS NULL)",
+                    params![
+                        grant_id,
+                        decision_id,
+                        request.task_id,
+                        execution.binding_id,
+                        execution.attempt_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !unconditioned {
+                    return Err(denied());
+                }
+            }
+        }
+        let output_grant = exact_operation_grant(
+            transaction,
+            &request.task_id,
+            &execution,
+            "artifact.write",
+            "output-allocation",
+            &request.allocation_id,
+            time.now(),
+            None,
+        )?
+        .ok_or_else(denied)?;
+        let deadline_current: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM authority_grant_deadlines d
+             JOIN authority_grants g ON g.grant_id=d.grant_id
+               AND g.token_id=d.token_id AND g.task_id=d.task_id
+               AND g.execution_binding_id=d.execution_binding_id
+               AND g.attempt_id=d.attempt_id AND g.policy_decision_id=d.policy_decision_id
+               AND g.issued_at=d.issued_at AND g.expires_at=d.grant_expires_at
+             JOIN authority_issuance_receipts i ON i.grant_id=d.grant_id
+               AND i.token_id=d.token_id AND i.task_id=d.task_id
+               AND i.execution_binding_id=d.execution_binding_id
+               AND i.attempt_id=d.attempt_id AND i.policy_decision_id=d.policy_decision_id
+               AND i.issued_at=d.issued_at
+             JOIN authority_clock_sessions s ON s.session_id=d.session_id
+             WHERE d.grant_id=?1 AND d.task_id=?2
+               AND d.execution_binding_id=?3 AND d.attempt_id=?4
+               AND d.owner_id=?5 AND d.owner_epoch=?6
+               AND s.owner_id=d.owner_id AND s.owner_epoch=d.owner_epoch
+               AND s.high_water_state_revision=?7
+               AND s.high_water_monotonic_nanos=?8
+               AND d.issued_state_revision=?7 AND d.issued_monotonic_nanos=?8
+               AND d.issued_observed_unix_nanos=?9
+               AND d.issued_effective_unix_nanos=?10
+               AND d.deadline_monotonic_nanos>?8
+               AND d.effective_expiry_unix_nanos>?10
+               AND NOT EXISTS(SELECT 1 FROM authority_grant_expiry_latches x
+                   WHERE x.grant_id=d.grant_id))",
+            params![
+                output_grant.grant_id,
+                request.task_id,
+                execution.binding_id,
+                execution.attempt_id,
+                lease_owner,
+                lease_epoch,
+                time.state_revision(),
+                time.monotonic_nanos(),
+                time.observed_unix_nanos(),
+                time.effective_unix_nanos()
+            ],
+            |row| row.get(0),
+        )?;
+        if !deadline_current {
+            return Err(denied());
+        }
+        validate_bound_output_policy(transaction, request)?;
+        insert_allocation_row(transaction, request, time.now())
     }
 
     /// Opens a provider writer only for an allocation bound to a current attempt.
@@ -3277,6 +3574,18 @@ impl TaskManager {
                     "ARTIFACT_ALLOCATION_NOT_FOUND",
                 ));
             };
+            let time = fresh.commit_context_in(&transaction)?;
+            if !coordinator_writer_grants_valid_in(
+                &transaction,
+                allocation_id,
+                &lease_owner,
+                lease_epoch,
+                &time,
+            )? {
+                transaction.commit()?;
+                locked_time = None;
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
             ensure_task_is_not_recovering(&transaction, &allocation.task_id)?;
             let Some(staging_ref) = allocation.staging_ref.clone() else {
                 return Err(TaskManagerError::InvalidRecord(
@@ -3344,7 +3653,6 @@ impl TaskManager {
                         "ARTIFACT_ALLOCATION_STATE_CONFLICT",
                     ));
                 }
-                fresh.commit_in(&transaction)?.require_trusted_time()?;
                 transaction.commit()?;
                 locked_time = None;
                 return Ok(ArtifactStagingWriter {
@@ -3377,7 +3685,6 @@ impl TaskManager {
                 "UPDATE artifact_output_allocations SET state='EXPIRED',updated_at=?2 WHERE allocation_id=?1",
                 params![allocation_id,now],
             )?;
-                fresh.commit_in(&transaction)?.require_trusted_time()?;
                 transaction.commit()?;
                 locked_time = None;
                 return Err(TaskManagerError::InvalidRecord(
@@ -3423,7 +3730,6 @@ impl TaskManager {
                 lease_owner: lease_owner.clone(),
                 lease_epoch,
             };
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
             transaction.commit()?;
             locked_time = None;
             // Each filesystem call gets its own durable preparation and exact
@@ -3454,60 +3760,85 @@ impl TaskManager {
                 sync_cap_directory(&self.artifact_store_dir, "staging")
             })?;
             writer_staging_durability_step()?;
-            let admission = super::trusted_time::with_protected_immediate(
+            let admission = super::trusted_time::with_protected_observation(
                 &self.connection,
                 &self.clock,
-                |transaction, admitted_at| {
-                    validate_staging_open_pin(transaction, &pin, admitted_at)?;
-                    let grant_admission = if let (Some(binding_id), Some(grant)) =
-                        (pin.allocation.binding_id.as_deref(), pin.grant.as_ref())
-                    {
-                        let execution = capture_execution_authority(
-                            transaction,
-                            &pin.allocation.task_id,
-                            binding_id,
-                            admitted_at,
-                        )?;
-                        Some(admit_operation_grant(
-                            transaction,
-                            &pin.allocation.task_id,
-                            &execution,
-                            "artifact.write",
-                            "output-allocation",
-                            allocation_id,
-                            admitted_at,
-                            &grant.grant_id,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let changed = transaction.execute(
-                        "UPDATE artifact_output_allocations
+                |transaction, time| {
+                    if !coordinator_writer_grants_valid_in(
+                        transaction,
+                        allocation_id,
+                        &lease_owner,
+                        lease_epoch,
+                        time,
+                    )? {
+                        return Ok(Err(TaskManagerError::InvalidRecord(
+                            "ARTIFACT_AUTHORITY_DENIED",
+                        )));
+                    }
+                    transaction.execute_batch("SAVEPOINT aios_writer_final_admission")?;
+                    let result = (|| -> Result<Option<GrantAdmission>> {
+                        let admitted_at = time.now();
+                        validate_staging_open_pin(transaction, &pin, admitted_at)?;
+                        let grant_admission = if let (Some(binding_id), Some(grant)) =
+                            (pin.allocation.binding_id.as_deref(), pin.grant.as_ref())
+                        {
+                            let execution = capture_execution_authority(
+                                transaction,
+                                &pin.allocation.task_id,
+                                binding_id,
+                                admitted_at,
+                            )?;
+                            Some(admit_operation_grant(
+                                transaction,
+                                &pin.allocation.task_id,
+                                &execution,
+                                "artifact.write",
+                                "output-allocation",
+                                allocation_id,
+                                admitted_at,
+                                &grant.grant_id,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let changed = transaction.execute(
+                            "UPDATE artifact_output_allocations
                  SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,
                      writer_session_id=?4,writer_generation=?5,updated_at=?6
                  WHERE allocation_id=?1 AND state='ALLOCATED' AND writer_generation=?7",
-                        params![
-                            allocation_id,
-                            grant_admission
-                                .as_ref()
-                                .map(|admission| &admission.grant_id),
-                            grant_admission
-                                .as_ref()
-                                .map(|admission| admission.one_shot_consumed),
-                            writer_session_id,
-                            writer_generation,
-                            admitted_at,
-                            allocation.writer_generation
-                        ],
-                    )?;
-                    if changed != 1 {
-                        return Err(TaskManagerError::InvalidRecord(
-                            "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                        ));
+                            params![
+                                allocation_id,
+                                grant_admission
+                                    .as_ref()
+                                    .map(|admission| &admission.grant_id),
+                                grant_admission
+                                    .as_ref()
+                                    .map(|admission| admission.one_shot_consumed),
+                                writer_session_id,
+                                writer_generation,
+                                admitted_at,
+                                allocation.writer_generation
+                            ],
+                        )?;
+                        if changed != 1 {
+                            return Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                            ));
+                        }
+                        Ok(grant_admission)
+                    })();
+                    if result.is_err() {
+                        transaction.execute_batch(
+                            "ROLLBACK TO aios_writer_final_admission;
+                             RELEASE aios_writer_final_admission",
+                        )?;
+                    } else {
+                        transaction.execute_batch("RELEASE aios_writer_final_admission")?;
                     }
-                    Ok(grant_admission)
+                    Ok(result)
                 },
-            );
+            )
+            .and_then(|result| result);
             let commit_result = admission.and_then(|_| writer_admission_commit_result_step());
             if let Err(error) = commit_result {
                 let durable = load_allocation_row(&self.connection, allocation_id)?;
@@ -3808,6 +4139,28 @@ impl TaskManager {
             };
             locked_time = Some(fresh);
             assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+            let time = locked_time
+                .as_ref()
+                .expect("captured publication time")
+                .commit_context_in(&transaction)?;
+            if !coordinator_writer_grants_valid_in(
+                &transaction,
+                &request.allocation_id,
+                &lease_owner,
+                lease_epoch,
+                &time,
+            )? {
+                transaction.commit()?;
+                locked_time = None;
+                if !blob_reused {
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
+                }
+                return self.fail_pending_publication(request, "ARTIFACT_AUTHORITY_DENIED");
+            }
             if let Err(error) = ensure_task_is_not_recovering(&transaction, &request.task_id) {
                 drop(transaction);
                 if let Some(observation) = locked_time.take() {
@@ -3995,11 +4348,6 @@ impl TaskManager {
             "UPDATE artifact_output_allocations SET state='PUBLISHED',publication_id=?2,published_artifact_id=?3,updated_at=?4 WHERE allocation_id=?1 AND state='FINALIZING'",
             params![request.allocation_id,request.publication_id,artifact_id,resulted_at],
         )?;
-            if let Some(observation) = &locked_time {
-                observation
-                    .commit_in(&transaction)?
-                    .require_trusted_time()?;
-            }
             commit_attempted = true;
             transaction.commit()?;
             locked_time = None;
@@ -4074,59 +4422,92 @@ impl TaskManager {
             ));
         }
         let binding_id = session.authority.binding_id.as_str();
-        let now = super::trusted_time::protected_now(&self.connection, &self.clock)?;
-        let authority = capture_read_authority(&self.connection, task_id, Some(binding_id), &now)?;
-        let execution = authority
-            .execution
-            .as_ref()
-            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-        let mut grant_ids = BTreeMap::new();
-        for artifact_id in artifact_ids {
-            if !artifact_read_authorized(&self.connection, task_id, &authority, artifact_id)? {
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-            }
-            let replay = replayable_reader_admission(
-                &self.connection,
-                task_id,
-                execution,
-                artifact_id,
-                &now,
-                &*self.delivered_reader_admissions.lock().map_err(|_| {
-                    TaskManagerError::InvalidRecord(
-                        "Artifact reader admission registry is unavailable",
-                    )
-                })?,
-            )?;
-            let grant_id = if recovering {
-                replay
-                    .map(|admission| admission.grant_admission.grant_id)
-                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
-            } else if let Some(grant) = exact_operation_grant(
-                &self.connection,
-                task_id,
-                execution,
-                "artifact.read",
-                "artifact",
-                artifact_id,
-                &now,
-                None,
-            )? {
-                grant.grant_id
-            } else {
-                replay
-                    .map(|admission| admission.grant_admission.grant_id)
-                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
-            };
-            grant_ids.insert(artifact_id.clone(), grant_id);
-        }
-        Ok(ArtifactReadScope {
-            scope_id: format!("artifact-read-scope:{}", random_token(&self.connection)?),
-            issuer_id: self.artifact_scope_issuer.clone(),
-            task_id: task_id.to_owned(),
-            authority,
-            artifact_ids: artifact_ids.iter().cloned().collect(),
-            grant_ids,
-        })
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        super::trusted_time::with_protected_observation(
+            &self.connection,
+            &self.clock,
+            |transaction, time| {
+                // A denied scope has no business writes. Return its denial as
+                // data so the paired observation, session advance, and any
+                // expiry latch still commit before the caller sees it.
+                let result = (|| -> Result<ArtifactReadScope> {
+                    assert_manager_lease(transaction, &lease_owner, lease_epoch)?;
+                    if !coordinator_grants_valid_in(
+                        transaction,
+                        task_id,
+                        &session.authority,
+                        &lease_owner,
+                        lease_epoch,
+                        time,
+                    )? {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
+                    let now = time.now();
+                    let authority =
+                        capture_read_authority(transaction, task_id, Some(binding_id), now)?;
+                    let execution = authority
+                        .execution
+                        .as_ref()
+                        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                    let mut grant_ids = BTreeMap::new();
+                    for artifact_id in artifact_ids {
+                        if !artifact_read_authorized(transaction, task_id, &authority, artifact_id)?
+                        {
+                            return Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_AUTHORITY_DENIED",
+                            ));
+                        }
+                        let replay = replayable_reader_admission(
+                            transaction,
+                            task_id,
+                            execution,
+                            artifact_id,
+                            now,
+                            &*self.delivered_reader_admissions.lock().map_err(|_| {
+                                TaskManagerError::InvalidRecord(
+                                    "Artifact reader admission registry is unavailable",
+                                )
+                            })?,
+                        )?;
+                        let grant_id = if recovering {
+                            replay
+                                .map(|admission| admission.grant_admission.grant_id)
+                                .ok_or(TaskManagerError::InvalidRecord(
+                                    "ARTIFACT_AUTHORITY_DENIED",
+                                ))?
+                        } else if let Some(grant) = exact_operation_grant(
+                            transaction,
+                            task_id,
+                            execution,
+                            "artifact.read",
+                            "artifact",
+                            artifact_id,
+                            now,
+                            None,
+                        )? {
+                            grant.grant_id
+                        } else {
+                            replay
+                                .map(|admission| admission.grant_admission.grant_id)
+                                .ok_or(TaskManagerError::InvalidRecord(
+                                    "ARTIFACT_AUTHORITY_DENIED",
+                                ))?
+                        };
+                        grant_ids.insert(artifact_id.clone(), grant_id);
+                    }
+                    Ok(ArtifactReadScope {
+                        scope_id: format!("artifact-read-scope:{}", random_token(transaction)?),
+                        issuer_id: self.artifact_scope_issuer.clone(),
+                        task_id: task_id.to_owned(),
+                        authority,
+                        artifact_ids: artifact_ids.iter().cloned().collect(),
+                        grant_ids,
+                    })
+                })();
+                Ok(result)
+            },
+        )?
     }
 
     /// Creates an owner inspection scope for the trusted in-crate control plane.
@@ -4316,6 +4697,36 @@ impl TaskManager {
             fresh.commit(&self.connection)?;
             return Err(error);
         }
+        let time = match fresh.commit_context_in(&transaction) {
+            Ok(time) => time,
+            Err(error) => {
+                drop(transaction);
+                fresh.commit(&self.connection)?;
+                return Err(error);
+            }
+        };
+        if let Some(execution) = scope.authority.execution.as_ref() {
+            let admitted = coordinator_grants_valid_in(
+                &transaction,
+                &scope.task_id,
+                execution,
+                &lease_owner,
+                lease_epoch,
+                &time,
+            );
+            match admitted {
+                Ok(true) => {}
+                Ok(false) => {
+                    transaction.commit()?;
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+                Err(error) => {
+                    drop(transaction);
+                    fresh.commit(&self.connection)?;
+                    return Err(error);
+                }
+            }
+        }
         let Ok(delivered) = self.delivered_reader_admissions.lock() else {
             drop(transaction);
             fresh.commit(&self.connection)?;
@@ -4340,14 +4751,6 @@ impl TaskManager {
                 return Err(error);
             }
         };
-        if let Err(error) = fresh
-            .commit_in(&transaction)
-            .and_then(|assessment| assessment.require_trusted_time())
-        {
-            drop(transaction);
-            fresh.commit(&self.connection)?;
-            return Err(error);
-        }
         if let Err(error) = transaction.commit() {
             fresh.commit(&self.connection)?;
             return Err(error.into());
@@ -7768,9 +8171,19 @@ fn staging_open_primitive<T>(
     staging_open_before_entry_step(step)?;
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
     let entry = super::trusted_time::capture_external_entry(&transaction, clock, &permit)?;
-    let pre_call = entry
-        .require_trusted_time()
-        .and_then(|now| validate_staging_open_pin(&transaction, pin, &now));
+    let pre_call = entry.require_trusted_time().and_then(|now| {
+        let time = entry.commit_context_in()?;
+        if !coordinator_writer_grants_valid_in(
+            &transaction,
+            &pin.allocation_id,
+            &pin.lease_owner,
+            pin.lease_epoch,
+            &time,
+        )? {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        validate_staging_open_pin(&transaction, pin, &now)
+    });
     if let Err(error) = pre_call {
         super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
         transaction.commit()?;
@@ -7967,6 +8380,31 @@ fn validate_allocation_execution_scope(
     validate_requested_execution_scope(connection, &request, now)
 }
 
+fn coordinator_writer_grants_valid_in(
+    transaction: &rusqlite::Transaction<'_>,
+    allocation_id: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+    time: &super::trusted_time::ProtectedTimeContext,
+) -> Result<bool> {
+    let allocation = load_allocation_row(transaction, allocation_id)?.ok_or(
+        TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+    )?;
+    let Some(binding_id) = allocation.binding_id.as_deref() else {
+        return Ok(true);
+    };
+    let execution =
+        load_execution_authority(transaction, &allocation.task_id, binding_id, time.now())?;
+    coordinator_grants_valid_in(
+        transaction,
+        &allocation.task_id,
+        &execution,
+        lease_owner,
+        lease_epoch,
+        time,
+    )
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the writer fence binds manager lease, grant admission, and durable writer generation as one authority tuple"
@@ -8106,6 +8544,50 @@ fn validate_current_program_node(
         return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
     }
     Ok(())
+}
+
+/// Checks every grant on a finalized coordinator binding against the same
+/// locked paired time used for this admission. Historical synthetic bindings
+/// retain their existing mediation while the coordinator migration is staged.
+fn coordinator_grants_valid_in(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    execution: &ExecutionAuthority,
+    lease_owner: &str,
+    lease_epoch: i64,
+    time: &super::trusted_time::ProtectedTimeContext,
+) -> Result<bool> {
+    let coordinator_binding: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authority_candidate_reservations c
+         JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+         WHERE c.task_id=?1 AND c.binding_id=?2 AND c.attempt_id=?3
+           AND s.state='FINALIZED')",
+        params![task_id, execution.binding_id, execution.attempt_id],
+        |row| row.get(0),
+    )?;
+    if !coordinator_binding {
+        return Ok(true);
+    }
+    super::trusted_time::advance_clock_session_in(transaction, lease_owner, lease_epoch, time)?;
+    let refs: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
+    if refs.is_empty() || refs.len() > 64 || !all_unique(&refs) {
+        return Ok(false);
+    }
+    let mut all_valid = true;
+    for grant_id in refs {
+        if !super::coordinator_grant_policy_current(transaction, &grant_id)?
+            || !super::authority_deadline::check_and_latch_grant_deadline(
+                transaction,
+                &grant_id,
+                lease_owner,
+                lease_epoch,
+                time,
+            )?
+        {
+            all_valid = false;
+        }
+    }
+    Ok(all_valid)
 }
 
 fn capture_read_authority(
@@ -8253,6 +8735,9 @@ fn binding_runtime_authority_valid(
     let mut covered_requests = BTreeSet::new();
     let mut covered_decisions = BTreeSet::new();
     for grant_id in grant_ids {
+        if !super::coordinator_grant_policy_current(connection, &grant_id)? {
+            return Ok(false);
+        }
         let grant = connection
             .query_row(
                 "SELECT g.expires_at,g.approval_id,a.status,a.expires_at,
@@ -8529,6 +9014,9 @@ fn exact_operation_grant(
     let mut matching = Vec::new();
     for grant_id in grant_ids {
         if admitted.is_some_and(|admission| admission.grant_id != grant_id) {
+            continue;
+        }
+        if !super::coordinator_grant_policy_current(connection, &grant_id)? {
             continue;
         }
         let row = connection
@@ -9497,23 +9985,45 @@ struct ReaderFenceContext<'a> {
 }
 
 fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
-    if let Some(identity) = reader.database_identity.as_ref() {
-        verify_database_identity(&reader.authority_connection, identity)?;
-    }
-    validate_reader_fence_in_connection(
+    super::trusted_time::with_protected_observation(
         &reader.authority_connection,
-        &ReaderFenceContext {
-            lease_owner: &reader.lease_owner,
-            lease_epoch: reader.lease_epoch,
-            task_id: &reader.task_id,
-            authority: &reader.authority,
-            artifact_id: &reader.artifact_id,
-            reader_admission: reader.reader_admission.as_ref(),
-            recovery_replay_revision: reader.recovery_replay_revision,
-            export_operation_exemption: reader.export_operation_exemption.as_deref(),
+        &reader.clock,
+        |transaction, time| {
+            let result = (|| -> Result<()> {
+                if let Some(identity) = reader.database_identity.as_ref() {
+                    verify_database_identity(transaction, identity)?;
+                }
+                assert_manager_lease(transaction, &reader.lease_owner, reader.lease_epoch)?;
+                if let Some(execution) = reader.authority.execution.as_ref() {
+                    if !coordinator_grants_valid_in(
+                        transaction,
+                        &reader.task_id,
+                        execution,
+                        &reader.lease_owner,
+                        reader.lease_epoch,
+                        time,
+                    )? {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
+                }
+                validate_reader_fence_in_connection(
+                    transaction,
+                    &ReaderFenceContext {
+                        lease_owner: &reader.lease_owner,
+                        lease_epoch: reader.lease_epoch,
+                        task_id: &reader.task_id,
+                        authority: &reader.authority,
+                        artifact_id: &reader.artifact_id,
+                        reader_admission: reader.reader_admission.as_ref(),
+                        recovery_replay_revision: reader.recovery_replay_revision,
+                        export_operation_exemption: reader.export_operation_exemption.as_deref(),
+                    },
+                    time.now(),
+                )
+            })();
+            Ok(result)
         },
-        &reader.clock.now(),
-    )
+    )?
 }
 
 fn validate_reader_fence_in_connection(
@@ -9866,6 +10376,19 @@ fn validate_import_request(request: &ImportArtifactRequest) -> Result<()> {
         validate_id(import_id, 256, "invalid Artifact import ID")?;
     }
     validate_optional_semantic_type(request.semantic_type.as_deref())?;
+    Ok(())
+}
+
+fn insert_allocation_row(
+    transaction: &Transaction<'_>,
+    request: &OutputAllocationRequest,
+    created_at: &str,
+) -> Result<()> {
+    let staging_ref = format!("staging/output-{}", random_token(transaction)?);
+    transaction.execute(
+        "INSERT INTO artifact_output_allocations (allocation_id,task_id,semantic_program_hash,node_id,binding_id,attempt_id,output_port,expected_semantic_type,allowed_media_types_json,max_size_bytes,sensitivity,retention,state,staging_ref,created_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'ALLOCATED',?13,?14,?15,?14)",
+        params![request.allocation_id,request.task_id,request.semantic_program_hash,request.node_id,request.binding_id,request.attempt_id,request.output_port,request.expected_semantic_type,serde_json::to_string(&request.allowed_media_types)?,request.max_size_bytes.map(to_i64).transpose()?,request.sensitivity.as_str(),request.retention.as_str(),staging_ref,created_at,request.expires_at],
+    )?;
     Ok(())
 }
 
@@ -10950,6 +11473,16 @@ impl TaskManager {
         let entry =
             super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)?;
         let pre_call = entry.require_trusted_time().and_then(|now| {
+            let time = entry.commit_context_in()?;
+            if !coordinator_writer_grants_valid_in(
+                &transaction,
+                &request.allocation_id,
+                &self.lease_owner,
+                self.lease_epoch,
+                &time,
+            )? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
             assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
             ensure_task_is_not_recovering(&transaction, &request.task_id)?;
             let pending_exact: bool = transaction.query_row(
@@ -14459,6 +14992,13 @@ fn publication_commit_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+pub(super) fn set_publication_commit_test_hook(hook: impl FnOnce() -> Result<()> + 'static) {
+    PUBLICATION_COMMIT_TEST_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 #[cfg(test)]
@@ -20493,6 +21033,51 @@ mod tests {
     }
 
     #[test]
+    fn allocation_insert_joins_caller_transaction_and_rolls_back() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let request = allocation("alloc-transaction-rollback");
+        let now =
+            super::super::trusted_time::protected_now(&manager.connection, &manager.clock).unwrap();
+        let transaction = manager
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        TaskManager::allocate_artifact_output_in(
+            &transaction,
+            &request,
+            &now,
+            &manager.lease_owner,
+            manager.lease_epoch,
+        )
+        .unwrap();
+        assert_eq!(
+            transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_output_allocations WHERE allocation_id=?1",
+                    [&request.allocation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        transaction.rollback().unwrap();
+        assert!(
+            manager
+                .get_artifact_output_allocation(&request.allocation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .allocate_artifact_output(&request)
+                .unwrap()
+                .allocation_id,
+            request.allocation_id
+        );
+    }
+
+    #[test]
     fn allocation_rechecks_recovery_inside_admission_transaction() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
@@ -26392,6 +26977,70 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(states, ["CONSUMED", "CONSUMED"]);
+    }
+
+    #[test]
+    fn fixture_activation_exemption_requires_exact_marker_and_survives_reopen() {
+        let unmarked_temp = TempDir::new().unwrap();
+        let mut unmarked = manager(&unmarked_temp);
+        let input = unmarked
+            .import_artifact(&import_request(), &mut Cursor::new(b"unmarked"))
+            .unwrap();
+        install_one_shot_binding_with_issuance(
+            &unmarked,
+            "unmarked-activation",
+            std::slice::from_ref(&input.artifact_id),
+            &[("artifact.read", "artifact", &input.artifact_id)],
+            false,
+        );
+        let unmarked_id = "grant-unmarked-activation-0";
+        unmarked
+            .connection
+            .execute(
+                "UPDATE authority_grants SET token_id='unmarked-token' WHERE grant_id=?1",
+                [unmarked_id],
+            )
+            .unwrap();
+        unmarked
+            .connection
+            .execute(
+                "INSERT INTO authority_issuance_receipts(
+                grant_id,token_id,task_id,execution_binding_id,attempt_id,
+                policy_decision_id,issued_at,issuance_profile)
+             SELECT grant_id,token_id,task_id,execution_binding_id,attempt_id,
+                    policy_decision_id,issued_at,'coordinator-issued-v0.1'
+             FROM authority_grants WHERE grant_id=?1",
+                [unmarked_id],
+            )
+            .unwrap();
+        assert!(
+            !crate::coordinator_grant_policy_current(&unmarked.connection, unmarked_id).unwrap()
+        );
+
+        let marked_temp = TempDir::new().unwrap();
+        let mut marked = manager(&marked_temp);
+        let input = marked
+            .import_artifact(&import_request(), &mut Cursor::new(b"marked"))
+            .unwrap();
+        install_one_shot_binding(
+            &marked,
+            "marked-activation",
+            std::slice::from_ref(&input.artifact_id),
+            &[("artifact.read", "artifact", &input.artifact_id)],
+        );
+        let marked_id = "grant-marked-activation-0";
+        assert!(crate::coordinator_grant_policy_current(&marked.connection, marked_id).unwrap());
+        drop(marked);
+        let reopened = Connection::open(marked_temp.path().join("task-manager.sqlite")).unwrap();
+        assert!(crate::coordinator_grant_policy_current(&reopened, marked_id).unwrap());
+        reopened
+            .execute(
+                "UPDATE _test_fixture_grant_activation_exemptions SET token_id='wrong-token'
+             WHERE grant_id=?1",
+                [marked_id],
+            )
+            .unwrap();
+        assert!(!crate::coordinator_grant_policy_current(&reopened, marked_id).unwrap());
     }
 
     #[test]
