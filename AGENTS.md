@@ -158,6 +158,8 @@ Before implementing a substantial change, map its public contract, trust boundar
 
 Collect local correctness, test-audit, and required Astra findings into one repair plan. Have the implementer apply substantive repairs and obtain required local re-review before pushing a stable candidate. Run every required exact-head check after changes. Request GitHub-native review on that candidate, then repair and re-review if it finds a substantive issue. Do not trigger duplicate reviews or repeatedly poll an active review when the scheduled review loop is already watching it.
 
+Before the complete exact-head gate, run each new or changed adversarial regression on every required platform with its real filesystem and database behavior. Fix cross-platform fixture and implementation failures first, then freeze the candidate for the full gate. A later edit invalidates that gate; rerun the complete gate on the final source. This ordering avoids spending full-suite runs on failures a focused test can expose.
+
 Record actionable findings by review source, head-changing review cycles, and available root/subagent usage in the durable handoff. Use measured completed-work quality and consumption to tune the workflow; do not infer savings from model labels or skip a required independent review.
 
 ### GitHub as the handoff bridge

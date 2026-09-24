@@ -1486,6 +1486,10 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ),
         ("0018_trusted_time", "trusted-time-v0.1"),
         ("0019_inflight_time", "inflight-time-v0.1"),
+        (
+            "0020_artifact_placement_receipts",
+            "artifact-placement-receipts-v0.1",
+        ),
     ];
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;

@@ -111,6 +111,10 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
         ),
         ("0018_trusted_time", "trusted-time-v0.1"),
         ("0019_inflight_time", "inflight-time-v0.1"),
+        (
+            "0020_artifact_placement_receipts",
+            "artifact-placement-receipts-v0.1",
+        ),
     ];
     let mut stamped = false;
     let mut baseline = false;

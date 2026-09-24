@@ -4490,6 +4490,70 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
     preflight_migration_state_with_mode(connection, true)
 }
 
+fn artifact_placement_receipt_objects_current(
+    connection: &Connection,
+    stamped: bool,
+) -> Result<bool> {
+    let canonical = if stamped {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(MIGRATION)?;
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0020-artifact-placement-receipts.sql"
+        ))?;
+        Some(db)
+    } else {
+        None
+    };
+    for name in [
+        "artifact_placement_receipts",
+        "artifact_placement_receipt_exact_insert",
+        "artifact_placement_receipt_no_update",
+        "artifact_placement_receipt_no_delete",
+    ] {
+        let actual: Option<String> = connection
+            .query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let expected = canonical
+            .as_ref()
+            .map(|db| {
+                db.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| {
+                    r.get::<_, String>(0)
+                })
+            })
+            .transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    if stamped {
+        let invalid: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM artifact_placement_receipts a
+                LEFT JOIN tasks t ON t.task_id=a.task_id
+                LEFT JOIN trusted_time_effect_preparations p ON p.marker_id=a.placement_marker_id
+                LEFT JOIN trusted_time_effect_resolutions r ON r.marker_id=p.marker_id
+                WHERE t.task_id IS NULL
+                   OR (a.origin='PUBLICATION' AND (
+                       p.marker_id IS NULL OR p.subject_kind<>'ARTIFACT_PUBLICATION'
+                       OR p.subject_id<>a.operation_id OR p.task_id<>a.task_id
+                       OR p.owner_epoch<>a.owner_epoch OR r.resolution_kind IS NULL
+                       OR r.resolution_kind<>'EFFECT_INVOKED'))
+                   OR (a.origin='IMPORT' AND a.placement_marker_id IS NOT NULL)
+            )",
+            [],
+            |r| r.get(0),
+        )?;
+        if invalid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn authority_fence_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
     const OBJECTS: [&str; 4] = [
         "authority_issuance_receipts",
@@ -4624,7 +4688,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time', '0020_artifact_placement_receipts')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4720,6 +4784,11 @@ fn preflight_migration_state_with_mode(
     )?;
     verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
     verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
+    verify_migration_checksum(
+        connection,
+        "0020_artifact_placement_receipts",
+        "artifact-placement-receipts-v0.1",
+    )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4824,6 +4893,17 @@ fn preflight_migration_state_with_mode(
         if !trusted_time::inflight_objects_current(connection, has_inflight_time)? {
             return Err(TaskManagerError::InvalidRecord(
                 "in-flight time marker schema requires operator quarantine",
+            ));
+        }
+        let has_placement_receipts: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts')",
+            [], |row| row.get(0),
+        )?;
+        if (has_placement_receipts && !has_inflight_time)
+            || !artifact_placement_receipt_objects_current(connection, has_placement_receipts)?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "artifact placement receipt schema requires operator quarantine",
             ));
         }
         let has_v3 = connection.query_row(
@@ -5198,6 +5278,11 @@ fn migrate_task_manager_schema(
     )?;
     verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
     verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
+    verify_migration_checksum(
+        connection,
+        "0020_artifact_placement_receipts",
+        "artifact-placement-receipts-v0.1",
+    )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
@@ -5600,6 +5685,13 @@ fn migrate_task_manager_schema(
         connection.execute_batch(trusted_time::INFLIGHT_MIGRATION)?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0019_inflight_time', 'inflight-time-v0.1', '2026-09-24T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0020-artifact-placement-receipts.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0020_artifact_placement_receipts', 'artifact-placement-receipts-v0.1', '2026-09-24T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -9777,6 +9869,86 @@ mod tests {
             normalized_intent: None,
             active_step_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn artifact_placement_receipts_are_additive_exact_and_immutable() {
+        let mut manager = test_manager();
+        manager.create_task(&create("T-placement-receipt")).unwrap();
+        let stamped: bool = manager.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(stamped);
+        let legacy_grants: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_placement_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_grants, 0);
+        let epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let insert = "INSERT INTO artifact_placement_receipts
+            (placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+             operation_id,operation_request_id,owner_epoch,placement_marker_id)
+            VALUES (?1,?2,?3,3,'IMPORT','T-placement-receipt','import-key','{}',?4,NULL)";
+        let hash = format!("sha256:{}", "a".repeat(64));
+        manager
+            .connection
+            .execute(
+                insert,
+                params!["a".repeat(32), "blobs/pending/unique", hash, epoch],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .connection
+                .execute(
+                    insert,
+                    params!["b".repeat(32), "blobs/pending/unique", hash, epoch]
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute("UPDATE artifact_placement_receipts SET payload_size=4", [])
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute("DELETE FROM artifact_placement_receipts", [])
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO artifact_placement_receipts
+             (placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+              operation_id,operation_request_id,owner_epoch,placement_marker_id)
+             VALUES (?1,'blobs/pending/publication',?2,3,'PUBLICATION',
+              'T-placement-receipt','publication-key','{}',?3,NULL)",
+                    params!["c".repeat(32), hash, epoch],
+                )
+                .is_err()
+        );
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER artifact_placement_receipt_no_delete")
+            .unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
     }
 
     fn remove_fixture_fence_schema(connection: &Connection) {

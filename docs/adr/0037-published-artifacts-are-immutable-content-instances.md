@@ -23,6 +23,7 @@ For v0.1:
 8. Crash windows between filesystem blob placement and metadata commit are recovered explicitly; orphan bytes never become published output merely because they exist.
 9. Editing/transformation creates a new Artifact; a durable mutable logical document/product identity belongs to the Semantic Object layer.
 10. Exporting an Artifact to a user path is a separate authorized capability and does not rename/move the Artifact identity.
+11. Crash recovery of pending blob placement requires a durable receipt for the exact pending path, hash, size, Task, and import/publication operation. A matching filename or byte hash alone is not proof that promotion was admitted. Publication receipts bind the successful, verified hard-link step and its resolved entry-time marker; import receipts follow a complete durable copy and renewed admission. Earlier pending files receive no inferred authority during migration.
 
 Detailed semantics are in `docs/75-v0.1-artifact-store-content-identity-and-publication.md`.
 
@@ -43,6 +44,7 @@ Detailed semantics are in `docs/75-v0.1-artifact-store-content-identity-and-publ
 - publication needs staging + recovery/GC;
 - logical mutable documents require an Object/version relationship above Artifacts;
 - blob-store and metadata durability cannot be one filesystem/database ACID transaction and need explicit recovery rules.
+- receipt-gated recovery may retain old or denied private pending files for explicit cleanup rather than promoting them optimistically.
 
 ## Security impact
 

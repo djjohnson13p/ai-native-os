@@ -126,6 +126,20 @@ Pass criteria:
 - integrity check fails before trusted downstream consumption/completion;
 - recovery/failure is explicit.
 
+### S2.6 Exact placement receipt at restart
+
+Crash after a trusted import has durably copied and verified its pending bytes
+and committed an exact placement receipt, but before the final no-overwrite
+link. Restart and repeat with a publication whose allocation expires just
+before hard-link admission; include an old pending file with no receipt.
+
+Pass criteria:
+
+- the receipted import may finish content placement, but does not invent a published Artifact;
+- the denied publication and old unreceipted file remain private and cannot be promoted by filename/hash alone;
+- a path replacement after verification cannot substitute bytes during recovery;
+- migration 0020 does not backfill authority for old files.
+
 ## Gate S3 — Provenance integrity
 
 ### S3.1 Complete deterministic story

@@ -113,6 +113,12 @@ pub(crate) struct ExternalTimePermit {
     prepared_state_revision: i64,
 }
 
+impl ExternalTimePermit {
+    pub(crate) fn marker_id(&self) -> &str {
+        &self.marker_id
+    }
+}
+
 #[allow(
     dead_code,
     reason = "external effect call sites follow the durable marker foundation"
@@ -1697,7 +1703,12 @@ mod tests {
         manager
             .connection
             .execute_batch(
-                "DROP TABLE trusted_time_effect_pending;
+                "DROP TRIGGER artifact_placement_receipt_no_delete;
+                 DROP TRIGGER artifact_placement_receipt_no_update;
+                 DROP TRIGGER artifact_placement_receipt_exact_insert;
+                 DROP TABLE artifact_placement_receipts;
+                 DELETE FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts';
+                 DROP TABLE trusted_time_effect_pending;
                  DROP TABLE trusted_time_effect_resolutions;
                  DROP TABLE trusted_time_effect_preparations;
                  DELETE FROM schema_migrations WHERE migration_id='0019_inflight_time'",
@@ -1714,9 +1725,13 @@ mod tests {
             TaskManager::open_with_clock(&lookalike_path, Box::new(clock.clone())).unwrap();
         lookalike
             .connection
-            .execute(
-                "DELETE FROM schema_migrations WHERE migration_id='0019_inflight_time'",
-                [],
+            .execute_batch(
+                "DROP TRIGGER artifact_placement_receipt_no_delete;
+                 DROP TRIGGER artifact_placement_receipt_no_update;
+                 DROP TRIGGER artifact_placement_receipt_exact_insert;
+                 DROP TABLE artifact_placement_receipts;
+                 DELETE FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts';
+                 DELETE FROM schema_migrations WHERE migration_id='0019_inflight_time';",
             )
             .unwrap();
         drop(lookalike);

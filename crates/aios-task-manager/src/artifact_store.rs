@@ -2644,7 +2644,15 @@ impl TaskManager {
             .min(IMPORT_LIMIT);
         let (size, content_hash) =
             stream_into_new_internal_file(reader, &self.artifact_store_dir, &staging_ref, maximum)?;
-        let placement = self.place_blob(&staging_ref, &content_hash, size, false, &token);
+        let placement = self.place_blob(
+            &staging_ref,
+            &content_hash,
+            size,
+            false,
+            &token,
+            None,
+            Some(request),
+        );
         let (storage_ref, reused) = match placement {
             Ok(placement) => placement,
             Err(error @ TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH")) => {
@@ -3688,12 +3696,19 @@ impl TaskManager {
             };
             return self.fail_pending_publication(request, code);
         }
+        let publication_pin = PublicationPlacementPin {
+            request,
+            request_json: &request_json,
+            allocation: &allocation,
+        };
         let placement = self.place_blob(
             staging_ref,
             &content_hash,
             size,
             true,
             &request.publication_id,
+            Some(publication_pin),
+            None,
         );
         let (storage_ref, blob_reused) = match placement {
             Ok(placement) => placement,
@@ -3730,8 +3745,15 @@ impl TaskManager {
             assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
             if let Err(error) = ensure_task_is_not_recovering(&transaction, &request.task_id) {
                 drop(transaction);
+                if let Some(observation) = locked_time.take() {
+                    observation.commit(&self.connection)?;
+                }
                 if !blob_reused {
-                    self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
                 }
                 return Err(error);
             }
@@ -3742,8 +3764,15 @@ impl TaskManager {
         )?;
             if !pending_exact {
                 drop(transaction);
+                if let Some(observation) = locked_time.take() {
+                    observation.commit(&self.connection)?;
+                }
                 if !blob_reused {
-                    self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
                 }
                 return Err(TaskManagerError::InvalidRecord(
                     "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
@@ -3758,8 +3787,15 @@ impl TaskManager {
                     .is_err()
             {
                 drop(transaction);
+                if let Some(observation) = locked_time.take() {
+                    observation.commit(&self.connection)?;
+                }
                 if !blob_reused {
-                    self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
                 }
                 return self.fail_pending_publication(request, "ARTIFACT_AUTHORITY_DENIED");
             }
@@ -3788,8 +3824,15 @@ impl TaskManager {
                 validate_publication_authority(&transaction, request, &allocation, &resulted_at)
             {
                 drop(transaction);
+                if let Some(observation) = locked_time.take() {
+                    observation.commit(&self.connection)?;
+                }
                 if !blob_reused {
-                    self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
                 }
                 let Some(code) = artifact_reason(&error) else {
                     return Err(error);
@@ -3798,8 +3841,15 @@ impl TaskManager {
             }
             if !lineage_authorized(&transaction, request, &current_allocation)? {
                 drop(transaction);
+                if let Some(observation) = locked_time.take() {
+                    observation.commit(&self.connection)?;
+                }
                 if !blob_reused {
-                    self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+                    self.remove_uncommitted_publication_blob_if_unreferenced(
+                        &publication_pin,
+                        &content_hash,
+                        &storage_ref,
+                    )?;
                 }
                 return self.fail_pending_publication(request, "ARTIFACT_AUTHORITY_DENIED");
             }
@@ -3894,17 +3944,21 @@ impl TaskManager {
             observation.commit(&self.connection)?;
         }
         if finalized.is_err() && !blob_reused && !commit_attempted {
-            self.remove_uncommitted_blob_if_unreferenced(&content_hash, &storage_ref)?;
+            self.remove_uncommitted_publication_blob_if_unreferenced(
+                &publication_pin,
+                &content_hash,
+                &storage_ref,
+            )?;
         }
         let result = finalized?;
-        // Publication is already durable. Failure to remove residue is safe;
-        // startup reconciliation will classify and clean it separately.
-        let _ = self
-            .artifact_store_dir
-            .remove_file(safe_internal_ref(staging_ref)?);
-        let _ = self
-            .artifact_store_dir
-            .remove_file(safe_internal_ref(&seal_ref(staging_ref))?);
+        // Publication is already durable. A cleanup error leaves private
+        // residue for startup recovery, with an unresolved marker if entry
+        // could have changed the filesystem but its receipt did not commit.
+        let _ = self.remove_terminal_publication_residue(
+            &publication_pin,
+            staging_ref,
+            result.published,
+        );
         Ok(result)
     }
 
@@ -6421,9 +6475,11 @@ impl TaskManager {
                 findings,
             });
         }
-        for content_hash in reconcile_pending_blob_placements(&self.artifact_store_dir)? {
+        let (pending_findings, corrupt_collision_refs) =
+            reconcile_pending_blob_placements(&self.connection, &self.artifact_store_dir)?;
+        for (kind, content_hash) in pending_findings {
             findings.push(ArtifactReconciliationFinding {
-                kind: ArtifactReconciliationKind::BlobCorrupt,
+                kind,
                 allocation_id: None,
                 content_hash,
                 artifact_ids: Vec::new(),
@@ -6492,7 +6548,13 @@ impl TaskManager {
             let (size, hash) = hash_internal_file(&self.artifact_store_dir, &relative)?;
             let expected_hash = content_hash_from_blob_ref(&relative)?;
             if hash != expected_hash {
-                quarantine_orphan_blob_path(&self.artifact_store_dir, &relative, &hash)?;
+                // A receipted pending candidate must not replace a corrupt
+                // final on this or a later reconciliation pass. Keep the
+                // corrupt orphan path as a durable collision barrier; a
+                // separate explicit repair may later quarantine it.
+                if !corrupt_collision_refs.contains(&relative) {
+                    quarantine_orphan_blob_path(&self.artifact_store_dir, &relative, &hash)?;
+                }
                 findings.push(ArtifactReconciliationFinding {
                     kind: ArtifactReconciliationKind::BlobCorrupt,
                     allocation_id: None,
@@ -6502,6 +6564,18 @@ impl TaskManager {
                 continue;
             }
             if known.contains(&hash) {
+                continue;
+            }
+            // A final-looking file without an Artifact row is not proof that a
+            // publication or import was admitted. It may precede a denied
+            // promotion or an interrupted marker resolution.
+            if !qualifying_placement_receipt(&self.connection, &hash, size, None)? {
+                findings.push(ArtifactReconciliationFinding {
+                    kind: ArtifactReconciliationKind::BlobOrphaned,
+                    allocation_id: None,
+                    content_hash: Some(hash),
+                    artifact_ids: Vec::new(),
+                });
                 continue;
             }
             let lease_owner = self.lease_owner.clone();
@@ -10665,7 +10739,565 @@ fn copy_blob_to_pending(
     Ok((copied, tagged_digest(hasher)))
 }
 
+#[derive(Clone, Copy)]
+struct PublicationPlacementPin<'a> {
+    request: &'a ArtifactPublicationRequest,
+    request_json: &'a str,
+    allocation: &'a AllocationRow,
+}
+
 impl TaskManager {
+    fn blob_placement_primitive<T>(
+        &mut self,
+        publication: Option<&PublicationPlacementPin<'_>>,
+        primitive: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        match publication {
+            Some(pin) => self.publication_placement_primitive(pin, primitive),
+            None => primitive(),
+        }
+    }
+
+    fn publication_placement_primitive<T>(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        primitive: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.publication_placement_primitive_checked(pin, primitive, |_, _| Ok(()))
+    }
+
+    fn publication_placement_primitive_checked<T>(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        primitive: impl FnOnce() -> Result<T>,
+        admitted: impl FnOnce(&Transaction<'_>, &str) -> Result<()>,
+    ) -> Result<T> {
+        let request = pin.request;
+        let permit = super::trusted_time::prepare_external_effect(
+            &self.connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &request.task_id,
+            super::trusted_time::ExternalEffectKind::Publication,
+            &request.publication_id,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry =
+            super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)?;
+        let pre_call = entry.require_trusted_time().and_then(|now| {
+            assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+            ensure_task_is_not_recovering(&transaction, &request.task_id)?;
+            let pending_exact: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact_publications
+                 WHERE publication_id=?1 AND allocation_id=?2 AND task_id=?3
+                   AND request_json=?4 AND state='PENDING')",
+                params![
+                    request.publication_id,
+                    request.allocation_id,
+                    request.task_id,
+                    pin.request_json,
+                ],
+                |row| row.get(0),
+            )?;
+            if !pending_exact {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_PUBLICATION_ID_REUSE_CONFLICT",
+                ));
+            }
+            let current = load_allocation_row(&transaction, &request.allocation_id)?.ok_or(
+                TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+            )?;
+            if current != *pin.allocation || !lineage_authorized(&transaction, request, &current)? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            validate_publication_allocation(request, &current, &now)?;
+            validate_publication_authority(&transaction, request, &current, &now)
+        });
+        if let Err(error) = pre_call {
+            super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+            transaction.commit()?;
+            return Err(error);
+        }
+        // A failed filesystem primitive may still have created or altered a
+        // private file. Record invocation before returning either outcome.
+        let outcome = primitive();
+        super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+        let admitted_result = if outcome.is_ok() {
+            admitted(&transaction, permit.marker_id())
+        } else {
+            Ok(())
+        };
+        transaction.commit()?;
+        admitted_result?;
+        outcome
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the import receipt checks the complete request, pending handle, and expected bytes"
+    )]
+    fn admit_import_placement(
+        &mut self,
+        request: &ImportArtifactRequest,
+        placement_identity: &str,
+        store: &Dir,
+        pending_ref: &str,
+        pending: &cap_std::fs::File,
+        content_hash: &str,
+        size: u64,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        ensure_task_is_not_recovering(&transaction, &request.task_id)?;
+        ensure_no_unknown_artifact_export(&transaction, &request.task_id)?;
+        let task_state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id=?1",
+                [&request.task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !task_state
+            .as_deref()
+            .is_some_and(task_accepts_artifact_import)
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let mut candidate = store.open(safe_internal_ref(pending_ref)?)?;
+        let same_identity = same_open_file_identity(pending, &candidate)?;
+        let (actual_size, actual_hash) = hash_reader(&mut candidate)?;
+        if !same_identity || actual_size != size || actual_hash != content_hash {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+        }
+        insert_placement_receipt(
+            &transaction,
+            pending_ref,
+            content_hash,
+            size,
+            "IMPORT",
+            &request.task_id,
+            placement_identity,
+            &canonical_json(request)?,
+            self.lease_epoch,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn create_publication_blob_ancestors(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        store: &Dir,
+        reference: &str,
+    ) -> Result<()> {
+        let relative = safe_internal_ref(reference)?;
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Artifact storage reference is invalid",
+                ));
+            };
+            let parent = current.clone();
+            current.push(component);
+            let current_ref = current
+                .to_str()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact directory reference is not UTF-8",
+                ))?
+                .replace('\\', "/");
+            self.publication_placement_primitive(pin, || {
+                durability_step(&format!("create:{current_ref}"))?;
+                match store.create_dir(&current) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            })?;
+            self.publication_placement_primitive(pin, || {
+                secure_cap_directory_permissions(store, &current)
+            })?;
+            self.publication_placement_primitive(pin, || {
+                durability_step(&format!("sync:{current_ref}"))?;
+                sync_cap_directory(store, &current_ref)
+            })?;
+            let parent_ref = parent
+                .to_str()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "Artifact directory reference is not UTF-8",
+                ))?
+                .replace('\\', "/");
+            self.publication_placement_primitive(pin, || {
+                durability_step(&format!(
+                    "sync-parent:{}",
+                    if parent_ref.is_empty() {
+                        "."
+                    } else {
+                        &parent_ref
+                    }
+                ))?;
+                if parent_ref.is_empty() {
+                    sync_store_root(store)
+                } else {
+                    sync_cap_directory(store, &parent_ref)
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn copy_publication_blob_to_pending(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        source: &mut impl Read,
+        pending: &mut cap_std::fs::File,
+    ) -> Result<(u64, String)> {
+        self.publication_placement_primitive(pin, || secure_cap_file_permissions(pending))?;
+        let mut hasher = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let mut offset = 0;
+            while offset < count {
+                let written = self.publication_placement_primitive(pin, || {
+                    Ok(pending.write(&buffer[offset..count])?)
+                })?;
+                if written == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                }
+                hasher.update(&buffer[offset..offset + written]);
+                copied =
+                    copied
+                        .checked_add(u64::try_from(written).map_err(|_| {
+                            TaskManagerError::InvalidRecord("Artifact size overflow")
+                        })?)
+                        .ok_or(TaskManagerError::InvalidRecord("Artifact size overflow"))?;
+                offset += written;
+            }
+            pending_blob_copy_step()?;
+        }
+        self.publication_placement_primitive(pin, || Ok(pending.flush()?))?;
+        self.publication_placement_primitive(pin, || Ok(pending.sync_all()?))?;
+        Ok((copied, tagged_digest(hasher)))
+    }
+
+    fn remove_placement_pending(
+        &mut self,
+        publication: Option<&PublicationPlacementPin<'_>>,
+        store: &Dir,
+        pending_ref: &str,
+    ) -> Result<()> {
+        self.blob_placement_primitive(publication, || {
+            match store.remove_file(safe_internal_ref(pending_ref)?) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })?;
+        self.blob_placement_primitive(publication, || sync_cap_directory(store, "blobs/pending"))
+    }
+
+    fn quarantine_publication_blob_collision(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        store: &Dir,
+        pending_ref: &str,
+        final_ref: &str,
+        digest: &str,
+    ) -> Result<()> {
+        let token = placement_token(pending_ref);
+        for (source, kind) in [(final_ref, "final"), (pending_ref, "pending")] {
+            let target = format!("quarantine/blob-collision-{kind}-{digest}-{token}");
+            let renamed = self.publication_placement_primitive(pin, || {
+                store
+                    .rename(
+                        safe_internal_ref(source)?,
+                        store,
+                        safe_internal_ref(&target)?,
+                    )
+                    .map_err(Into::into)
+            });
+            match renamed {
+                Ok(()) => {}
+                Err(TaskManagerError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    self.publication_placement_primitive(pin, || {
+                        Ok(store.remove_file(safe_internal_ref(source)?)?)
+                    })?;
+                }
+                Err(TaskManagerError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(parent) = Path::new(final_ref).parent().and_then(Path::to_str) {
+            self.publication_placement_primitive(pin, || sync_cap_directory(store, parent))?;
+        }
+        self.publication_placement_primitive(pin, || sync_cap_directory(store, "blobs/pending"))?;
+        self.publication_placement_primitive(pin, || sync_cap_directory(store, "quarantine"))
+    }
+
+    fn remove_uncommitted_publication_blob_if_unreferenced(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        content_hash: &str,
+        storage_ref: &str,
+    ) -> Result<()> {
+        publication_cleanup_before_first_marker_step()?;
+        let store = self.artifact_store_dir.try_clone()?;
+        let parent = Path::new(storage_ref)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or(TaskManagerError::InvalidRecord(
+                "invalid Artifact blob reference",
+            ))?;
+        // Failed final admission can follow grant expiry or revocation. This
+        // deletion is store-owned recovery of a still-uncommitted blob, so it
+        // authenticates the pending publication and absence of adoption under
+        // the locked marker instead of requiring the spent write grant.
+        for sync_only in [false, true] {
+            let permit = super::trusted_time::prepare_external_effect(
+                &self.connection,
+                &self.clock,
+                &self.lease_owner,
+                self.lease_epoch,
+                &pin.request.task_id,
+                super::trusted_time::ExternalEffectKind::Publication,
+                &pin.request.publication_id,
+            )?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let entry =
+                super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)?;
+            let pre_call = entry.require_trusted_time().and_then(|_| {
+                assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+                let exact: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM artifact_publications p
+                         JOIN artifact_output_allocations a
+                           ON a.allocation_id=p.allocation_id AND a.task_id=p.task_id
+                         WHERE p.publication_id=?1 AND p.allocation_id=?2
+                           AND p.task_id=?3 AND p.request_json=?4 AND p.state='PENDING'
+                           AND a.state='FINALIZING' AND a.publication_id=p.publication_id
+                     ) AND NOT EXISTS(
+                         SELECT 1 FROM artifact_blobs
+                         WHERE content_hash=?5 OR storage_ref=?6
+                     ) AND NOT EXISTS(
+                         SELECT 1 FROM artifacts WHERE content_hash=?5
+                     )",
+                    params![
+                        pin.request.publication_id,
+                        pin.request.allocation_id,
+                        pin.request.task_id,
+                        pin.request_json,
+                        content_hash,
+                        storage_ref,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if exact {
+                    Ok(())
+                } else {
+                    Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+                }
+            });
+            if let Err(error) = pre_call {
+                super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+                transaction.commit()?;
+                return Err(error);
+            }
+            let outcome = if sync_only {
+                sync_cap_directory(&store, parent)
+            } else {
+                match store.remove_file(safe_internal_ref(storage_ref)?) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            };
+            super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+            transaction.commit()?;
+            outcome?;
+        }
+        Ok(())
+    }
+
+    fn committed_publication_cleanup_primitive(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        staging_ref: &str,
+        primitive: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let request = pin.request;
+        let store = self.artifact_store_dir.try_clone()?;
+        let permit = super::trusted_time::prepare_external_effect(
+            &self.connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &request.task_id,
+            super::trusted_time::ExternalEffectKind::Publication,
+            &request.publication_id,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry =
+            super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)?;
+        let pre_call = entry.require_trusted_time().and_then(|_| {
+            assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+            let expected = transaction.query_row(
+                "SELECT blob.storage_ref,blob.size_bytes,p.content_hash FROM artifact_publications p
+                    JOIN artifact_output_allocations a
+                      ON a.allocation_id=p.allocation_id AND a.task_id=p.task_id
+                    JOIN artifacts artifact ON artifact.artifact_id=p.artifact_id
+                    JOIN artifact_blobs blob ON blob.content_hash=p.content_hash
+                    WHERE p.publication_id=?1 AND p.allocation_id=?2 AND p.task_id=?3
+                      AND p.request_json=?4 AND p.state='COMMITTED'
+                      AND a.state='PUBLISHED' AND a.publication_id=p.publication_id
+                      AND a.published_artifact_id=p.artifact_id AND a.staging_ref=?5
+                      AND artifact.content_hash=p.content_hash
+                      AND blob.durability_state='DURABLE'
+                    LIMIT 1",
+                params![
+                    request.publication_id,
+                    request.allocation_id,
+                    request.task_id,
+                    pin.request_json,
+                    staging_ref,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            ).optional()?;
+            let Some((storage_ref, size, content_hash)) = expected else {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            };
+            let (actual_size, actual_hash) = hash_internal_file(&store, &storage_ref)?;
+            if to_i64(actual_size)? != size || actual_hash != content_hash {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+            }
+            Ok(())
+        });
+        if let Err(error) = pre_call {
+            super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+            transaction.commit()?;
+            return Err(error);
+        }
+        let outcome = primitive();
+        super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+        transaction.commit()?;
+        outcome
+    }
+
+    fn failed_publication_cleanup_primitive(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        staging_ref: &str,
+        primitive: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let request = pin.request;
+        let permit = super::trusted_time::prepare_external_effect(
+            &self.connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &request.task_id,
+            super::trusted_time::ExternalEffectKind::Publication,
+            &request.publication_id,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry =
+            super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)?;
+        let pre_call = entry.require_trusted_time().and_then(|_| {
+            assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+            let receipt = transaction
+                .query_row(
+                    "SELECT p.result_json,p.committed_at FROM artifact_publications p
+                     JOIN artifact_output_allocations a
+                       ON a.allocation_id=p.allocation_id AND a.task_id=p.task_id
+                     WHERE p.publication_id=?1 AND p.allocation_id=?2 AND p.task_id=?3
+                       AND p.request_json=?4 AND p.state='FAILED'
+                       AND a.state='FAILED' AND a.publication_id=p.publication_id
+                       AND a.staging_ref=?5",
+                    params![
+                        request.publication_id,
+                        request.allocation_id,
+                        request.task_id,
+                        pin.request_json,
+                        staging_ref,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((result_json, committed_at)) = receipt else {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            };
+            authenticate_failed_publication(
+                &transaction,
+                request,
+                "FAILED",
+                result_json.as_deref(),
+                committed_at.as_deref(),
+            )?;
+            Ok(())
+        });
+        if let Err(error) = pre_call {
+            super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+            transaction.commit()?;
+            return Err(error);
+        }
+        let outcome = primitive();
+        super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+        transaction.commit()?;
+        outcome
+    }
+
+    fn remove_terminal_publication_residue(
+        &mut self,
+        pin: &PublicationPlacementPin<'_>,
+        staging_ref: &str,
+        published: bool,
+    ) -> Result<()> {
+        let store = self.artifact_store_dir.try_clone()?;
+        for reference in [staging_ref.to_owned(), seal_ref(staging_ref)] {
+            let remove = || match store.remove_file(safe_internal_ref(&reference)?) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+            if published {
+                self.committed_publication_cleanup_primitive(pin, staging_ref, remove)?;
+                self.committed_publication_cleanup_primitive(pin, staging_ref, || {
+                    sync_cap_directory(&store, "staging")
+                })?;
+            } else {
+                self.failed_publication_cleanup_primitive(pin, staging_ref, remove)?;
+                self.failed_publication_cleanup_primitive(pin, staging_ref, || {
+                    sync_cap_directory(&store, "staging")
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn remove_uncommitted_blob_if_unreferenced(
         &self,
         content_hash: &str,
@@ -10705,6 +11337,14 @@ impl TaskManager {
         sync_cap_directory(&self.artifact_store_dir, parent)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "blob placement keeps each marked filesystem step in one auditable sequence"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "blob placement carries separate import and publication admission contexts"
+    )]
     fn place_blob(
         &mut self,
         staging_ref: &str,
@@ -10712,7 +11352,14 @@ impl TaskManager {
         size: u64,
         preserve_staging: bool,
         placement_identity: &str,
+        publication: Option<PublicationPlacementPin<'_>>,
+        import: Option<&ImportArtifactRequest>,
     ) -> Result<(String, bool)> {
+        if publication.is_some() && import.is_some() {
+            return Err(TaskManagerError::InvalidRecord(
+                "ambiguous Artifact placement admission",
+            ));
+        }
         let store = self.artifact_store_dir.try_clone()?;
         validate_hash(content_hash)?;
         let digest = content_hash.strip_prefix("sha256:").unwrap_or_default();
@@ -10723,41 +11370,102 @@ impl TaskManager {
             digest
         );
         let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
-        create_durable_ancestors(&store, &parent_ref)?;
+        if let Some(pin) = publication.as_ref() {
+            self.create_publication_blob_ancestors(pin, &store, &parent_ref)?;
+        } else {
+            create_durable_ancestors(&store, &parent_ref)?;
+        }
         let pending_ref = format!(
             "blobs/pending/{}-{}",
             digest,
             placement_token(placement_identity)
         );
         let mut source = store.open(safe_internal_ref(staging_ref)?)?;
-        let mut pending = store.open_with(
-            safe_internal_ref(&pending_ref)?,
-            CapOpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true),
-        )?;
-        let copy_result = copy_blob_to_pending(&mut source, &mut pending);
+        let mut pending_options = CapOpenOptions::new();
+        pending_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            pending_options.mode(0o600);
+        }
+        let mut pending = self.blob_placement_primitive(publication.as_ref(), || {
+            Ok(store.open_with(safe_internal_ref(&pending_ref)?, &pending_options)?)
+        })?;
+        let copy_result = if let Some(pin) = publication.as_ref() {
+            self.copy_publication_blob_to_pending(pin, &mut source, &mut pending)
+        } else {
+            copy_blob_to_pending(&mut source, &mut pending)
+        };
         let (copied, copied_hash) = match copy_result {
             Ok(result) => result,
             Err(error) => {
                 drop(pending);
-                self.remove_uncommitted_blob(&pending_ref)?;
+                self.remove_placement_pending(publication.as_ref(), &store, &pending_ref)?;
                 return Err(error);
             }
         };
         if copied != size || copied_hash != content_hash {
             drop(pending);
-            self.remove_uncommitted_blob(&pending_ref)?;
+            self.remove_placement_pending(publication.as_ref(), &store, &pending_ref)?;
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
         }
-        sync_cap_directory(&store, "blobs/pending")?;
+        self.blob_placement_primitive(publication.as_ref(), || {
+            sync_cap_directory(&store, "blobs/pending")
+        })?;
         pending_placement_step(&store, &pending_ref)?;
-        let reused = match store.hard_link(
-            safe_internal_ref(&pending_ref)?,
-            &store,
-            safe_internal_ref(&storage_ref)?,
-        ) {
+        if let Some(request) = import {
+            self.admit_import_placement(
+                request,
+                placement_identity,
+                &store,
+                &pending_ref,
+                &pending,
+                content_hash,
+                size,
+            )?;
+            import_placement_receipt_step(&store, &pending_ref)?;
+        }
+        let link_once = || {
+            store
+                .hard_link(
+                    safe_internal_ref(&pending_ref)?,
+                    &store,
+                    safe_internal_ref(&storage_ref)?,
+                )
+                .map_err(Into::into)
+        };
+        let owner_epoch = self.lease_epoch;
+        let link = if let Some(pin) = publication.as_ref() {
+            self.publication_placement_primitive_checked(
+                pin,
+                link_once,
+                |transaction, marker_id| {
+                    let mut promoted = store.open(safe_internal_ref(&storage_ref)?)?;
+                    if !same_open_file_identity(&pending, &promoted)? {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                    }
+                    let (promoted_size, promoted_hash) = hash_reader(&mut promoted)?;
+                    if promoted_size != size || promoted_hash != content_hash {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+                    }
+                    insert_placement_receipt(
+                        transaction,
+                        &pending_ref,
+                        content_hash,
+                        size,
+                        "PUBLICATION",
+                        &pin.request.task_id,
+                        &pin.request.publication_id,
+                        pin.request_json,
+                        owner_epoch,
+                        Some(marker_id),
+                    )
+                },
+            )
+        } else {
+            link_once()
+        };
+        let reused = match link {
             Ok(()) => {
                 let mut promoted = store.open(safe_internal_ref(&storage_ref)?)?;
                 let same_identity = same_open_file_identity(&pending, &promoted)?;
@@ -10765,37 +11473,99 @@ impl TaskManager {
                 if !same_identity || promoted_size != size || promoted_hash != content_hash {
                     drop(promoted);
                     drop(pending);
-                    let _ = store.remove_file(safe_internal_ref(&storage_ref)?);
-                    let _ = store.remove_file(safe_internal_ref(&pending_ref)?);
+                    self.blob_placement_primitive(publication.as_ref(), || {
+                        Ok(store.remove_file(safe_internal_ref(&storage_ref)?)?)
+                    })?;
+                    self.remove_placement_pending(publication.as_ref(), &store, &pending_ref)?;
                     return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
                 }
                 false
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(TaskManagerError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
                 let (existing_size, existing_hash) = hash_internal_file(&store, &storage_ref)?;
                 if existing_size != size || existing_hash != content_hash {
                     drop(pending);
                     self.mark_content_hash_failed(content_hash, "CORRUPT")?;
-                    quarantine_blob_collision(&store, &pending_ref, &storage_ref, digest)?;
+                    if let Some(pin) = publication.as_ref() {
+                        self.quarantine_publication_blob_collision(
+                            pin,
+                            &store,
+                            &pending_ref,
+                            &storage_ref,
+                            digest,
+                        )?;
+                    } else {
+                        quarantine_blob_collision(&store, &pending_ref, &storage_ref, digest)?;
+                    }
                     return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
                 }
                 true
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
         drop(pending);
-        durability_step("sync-promoted-blob-parent")?;
-        sync_cap_directory(&store, &parent_ref)?;
-        durability_step("unlink-promoted-blob-pending")?;
-        store.remove_file(safe_internal_ref(&pending_ref)?)?;
-        durability_step("sync-promoted-blob-pending")?;
-        sync_cap_directory(&store, "blobs/pending")?;
+        self.blob_placement_primitive(publication.as_ref(), || {
+            durability_step("sync-promoted-blob-parent")?;
+            sync_cap_directory(&store, &parent_ref)
+        })?;
+        self.blob_placement_primitive(publication.as_ref(), || {
+            durability_step("unlink-promoted-blob-pending")?;
+            Ok(store.remove_file(safe_internal_ref(&pending_ref)?)?)
+        })?;
+        self.blob_placement_primitive(publication.as_ref(), || {
+            durability_step("sync-promoted-blob-pending")?;
+            sync_cap_directory(&store, "blobs/pending")
+        })?;
         if !preserve_staging {
-            store.remove_file(safe_internal_ref(staging_ref)?)?;
-            sync_cap_directory(&store, "staging")?;
+            self.blob_placement_primitive(publication.as_ref(), || {
+                Ok(store.remove_file(safe_internal_ref(staging_ref)?)?)
+            })?;
+            self.blob_placement_primitive(publication.as_ref(), || {
+                sync_cap_directory(&store, "staging")
+            })?;
         }
         Ok((storage_ref, reused))
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recovery receipt binds each distinct identity and authority dimension"
+)]
+fn insert_placement_receipt(
+    transaction: &Transaction<'_>,
+    pending_ref: &str,
+    content_hash: &str,
+    size: u64,
+    origin: &str,
+    task_id: &str,
+    operation_id: &str,
+    operation_request_id: &str,
+    owner_epoch: i64,
+    placement_marker_id: Option<&str>,
+) -> Result<()> {
+    let placement_id = random_token(transaction)?;
+    transaction.execute(
+        "INSERT INTO artifact_placement_receipts(
+           placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+           operation_id,operation_request_id,owner_epoch,placement_marker_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            placement_id,
+            pending_ref,
+            content_hash,
+            to_i64(size)?,
+            origin,
+            task_id,
+            operation_id,
+            operation_request_id,
+            owner_epoch,
+            placement_marker_id,
+        ],
+    )?;
+    Ok(())
 }
 
 fn quarantine_blob_collision(
@@ -12432,8 +13202,47 @@ fn quarantine_orphan_blob_path(store: &Dir, reference: &str, actual_hash: &str) 
     Ok(())
 }
 
-fn reconcile_pending_blob_placements(store: &Dir) -> Result<Vec<Option<String>>> {
+fn qualifying_placement_receipt(
+    connection: &Connection,
+    content_hash: &str,
+    size: u64,
+    pending_ref: Option<&str>,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM artifact_placement_receipts r
+               WHERE r.payload_hash=?1 AND r.payload_size=?2
+                 AND (?3 IS NULL OR r.pending_ref=?3)
+                 AND (
+                   (r.origin='IMPORT' AND r.placement_marker_id IS NULL)
+                   OR (r.origin='PUBLICATION' AND EXISTS (
+                     SELECT 1 FROM trusted_time_effect_preparations p
+                     JOIN trusted_time_effect_resolutions x ON x.marker_id=p.marker_id
+                     WHERE p.marker_id=r.placement_marker_id
+                       AND p.task_id=r.task_id AND p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id=r.operation_id AND p.owner_epoch=r.owner_epoch
+                       AND x.resolution_kind='EFFECT_INVOKED'
+                   ))
+                 )
+             )",
+            params![content_hash, to_i64(size)?, pending_ref],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+type PendingPlacementReconciliation = (
+    Vec<(ArtifactReconciliationKind, Option<String>)>,
+    BTreeSet<String>,
+);
+
+fn reconcile_pending_blob_placements(
+    connection: &Connection,
+    store: &Dir,
+) -> Result<PendingPlacementReconciliation> {
     let mut invalid = Vec::new();
+    let mut corrupt_collision_refs = BTreeSet::new();
     let pending = store
         .read_dir("blobs/pending")?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12451,52 +13260,66 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<Vec<Option<String>>>
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         {
             remove_pending_blob_durably(store, &format!("blobs/pending/{name}"))?;
-            invalid.push(None);
+            invalid.push((ArtifactReconciliationKind::BlobCorrupt, None));
             continue;
         }
         let pending_ref = format!("blobs/pending/{name}");
         let expected = format!("sha256:{digest}");
-        let (_, actual) = hash_internal_file(store, &pending_ref)?;
+        let mut pending_handle = store.open(safe_internal_ref(&pending_ref)?)?;
+        let (size, actual) = hash_reader(&mut pending_handle)?;
         if actual != expected {
             remove_pending_blob_durably(store, &pending_ref)?;
-            invalid.push(Some(expected));
+            invalid.push((ArtifactReconciliationKind::BlobCorrupt, Some(expected)));
+            continue;
+        }
+        if !qualifying_placement_receipt(connection, &expected, size, Some(&pending_ref))? {
+            invalid.push((ArtifactReconciliationKind::BlobOrphaned, Some(expected)));
             continue;
         }
         let parent_ref = format!("blobs/sha256/{}/{}", &digest[0..2], &digest[2..4]);
         let final_ref = format!("{parent_ref}/{digest}");
         create_durable_ancestors(store, &parent_ref)?;
         recovery_pending_placement_step(store, &pending_ref)?;
+        let current_pending = store.open(safe_internal_ref(&pending_ref)?)?;
+        if !same_open_file_identity(&pending_handle, &current_pending)? {
+            invalid.push((ArtifactReconciliationKind::BlobOrphaned, Some(expected)));
+            continue;
+        }
         match store.hard_link(
             safe_internal_ref(&pending_ref)?,
             store,
             safe_internal_ref(&final_ref)?,
         ) {
             Ok(()) => {
-                let (_, final_hash) = hash_internal_file(store, &final_ref)?;
-                if final_hash != expected {
+                let mut final_handle = store.open(safe_internal_ref(&final_ref)?)?;
+                let same_identity = same_open_file_identity(&pending_handle, &final_handle)?;
+                let (final_size, final_hash) = hash_reader(&mut final_handle)?;
+                if !same_identity || final_size != size || final_hash != expected {
                     let _ = store.remove_file(safe_internal_ref(&final_ref)?);
                     return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let (_, final_hash) = hash_internal_file(store, &final_ref)?;
-                if final_hash != expected {
-                    quarantine_replaced_blob(store, &final_ref, digest, &pending_ref)?;
-                    store.hard_link(
-                        safe_internal_ref(&pending_ref)?,
-                        store,
-                        safe_internal_ref(&final_ref)?,
-                    )?;
-                    let (_, restored_hash) = hash_internal_file(store, &final_ref)?;
-                    if restored_hash != expected {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
-                    }
+                let (final_size, final_hash) = hash_internal_file(store, &final_ref)?;
+                if final_size != size || final_hash != expected {
+                    // Never replace an existing final path merely because a
+                    // pending placement has a receipt. Preserve the pending
+                    // object and let the normal blob audit classify the
+                    // existing final as damaged while preserving this
+                    // collision barrier across subsequent recovery passes.
+                    invalid.push((ArtifactReconciliationKind::BlobOrphaned, Some(expected)));
+                    corrupt_collision_refs.insert(final_ref);
+                    continue;
                 }
             }
             Err(error) => return Err(error.into()),
         }
         durability_step("sync-recovered-blob-parent")?;
         sync_cap_directory(store, &parent_ref)?;
+        let current_pending = store.open(safe_internal_ref(&pending_ref)?)?;
+        if !same_open_file_identity(&pending_handle, &current_pending)? {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"));
+        }
         durability_step("unlink-recovered-blob-pending")?;
         store.remove_file(safe_internal_ref(&pending_ref)?)?;
         durability_step("sync-recovered-blob-pending")?;
@@ -12506,7 +13329,7 @@ fn reconcile_pending_blob_placements(store: &Dir) -> Result<Vec<Option<String>>>
     // directory. Repeat this sync even when enumeration is now empty.
     durability_step("sync-invalid-blob-pending")?;
     sync_cap_directory(store, "blobs/pending")?;
-    Ok(invalid)
+    Ok((invalid, corrupt_collision_refs))
 }
 
 fn remove_pending_blob_durably(store: &Dir, pending_ref: &str) -> Result<()> {
@@ -12517,28 +13340,6 @@ fn remove_pending_blob_durably(store: &Dir, pending_ref: &str) -> Result<()> {
     }
     durability_step("sync-invalid-blob-pending")?;
     sync_cap_directory(store, "blobs/pending")
-}
-
-fn quarantine_replaced_blob(
-    store: &Dir,
-    final_ref: &str,
-    digest: &str,
-    pending_ref: &str,
-) -> Result<()> {
-    let target = format!(
-        "quarantine/replaced-corrupt-blob-{digest}-{}",
-        placement_token(pending_ref)
-    );
-    store.rename(
-        safe_internal_ref(final_ref)?,
-        store,
-        safe_internal_ref(&target)?,
-    )?;
-    if let Some(parent) = Path::new(final_ref).parent().and_then(Path::to_str) {
-        sync_cap_directory(store, parent)?;
-    }
-    sync_cap_directory(store, "quarantine")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -13201,6 +14002,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static RECOVERY_PENDING_PLACEMENT_TEST_HOOK: std::cell::RefCell<Option<PendingPlacementTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static IMPORT_PLACEMENT_RECEIPT_TEST_HOOK: std::cell::RefCell<Option<PendingPlacementTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn import_placement_receipt_step(store: &Dir, pending_ref: &str) -> Result<()> {
+    IMPORT_PLACEMENT_RECEIPT_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(store, pending_ref)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test crash injection shares the production placement call signature"
+)]
+fn import_placement_receipt_step(_store: &Dir, _pending_ref: &str) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -13375,6 +14197,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static PENDING_BLOB_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static PUBLICATION_CLEANUP_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn publication_cleanup_before_first_marker_step() -> Result<()> {
+    PUBLICATION_CLEANUP_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test clock advance shares the production call signature"
+)]
+fn publication_cleanup_before_first_marker_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -18510,6 +19353,250 @@ mod tests {
     }
 
     #[test]
+    fn publication_cleanup_commits_final_admission_time_before_newer_samples() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let allocation_id = "alloc-cleanup-time-order";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        write_output(&mut manager, allocation_id, b"cleanup time order");
+        let database = temp.path().join("task-manager.sqlite");
+        let allocation_for_hook = allocation_id.to_owned();
+        PUBLICATION_COMMIT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(&database)?.execute(
+                    "UPDATE artifact_output_allocations
+                     SET expires_at='2026-09-19T21:59:59Z'
+                     WHERE allocation_id=?1",
+                    [&allocation_for_hook],
+                )?;
+                Ok(())
+            }));
+        });
+        let advanced = Arc::clone(&wall);
+        PUBLICATION_CLEANUP_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *advanced.lock().unwrap() = "2026-09-19T22:00:10Z".to_owned();
+                Ok(())
+            }));
+        });
+        let denied = manager
+            .publish_artifact_output(&publication("pub-cleanup-time-order", allocation_id))
+            .unwrap();
+        assert!(!denied.published);
+        assert_eq!(denied.reason_code, "ARTIFACT_AUTHORITY_DENIED");
+        assert!(crate::trusted_time::protected_now(&manager.connection, &manager.clock).is_ok());
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TRUSTED_LOCAL");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn publication_expiry_before_hard_link_denies_promotion_at_exact_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-expire-before-blob-link";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        let bytes = b"deny the promoted blob after copy";
+        write_output(&mut manager, allocation_id, bytes);
+        let database = temp.path().join("task-manager.sqlite");
+        let allocation_for_hook = allocation_id.to_owned();
+        PENDING_PLACEMENT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_store, _pending_ref| {
+                Connection::open(&database)?.execute(
+                    "UPDATE artifact_output_allocations
+                     SET expires_at='2026-09-19T21:59:59Z'
+                     WHERE allocation_id=?1",
+                    [&allocation_for_hook],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.publish_artifact_output(&publication("pub-expire-before-link", allocation_id)),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = tagged_digest(hasher);
+        let digest = digest.strip_prefix("sha256:").unwrap();
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert_no_created_artifact_metadata(&manager);
+        let (denials, unresolved): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=r.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='pub-expire-before-link'
+                       AND r.resolution_kind='NO_EFFECT'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=x.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='pub-expire-before-link')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(denials, 1);
+        assert_eq!(unresolved, 0);
+        let no_effect_marker: String = manager
+            .connection
+            .query_row(
+                "SELECT p.marker_id FROM trusted_time_effect_preparations p
+                 JOIN trusted_time_effect_resolutions r ON r.marker_id=p.marker_id
+                 WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                   AND p.subject_id='pub-expire-before-link'
+                   AND r.resolution_kind='NO_EFFECT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO artifact_placement_receipts(
+                 placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+                 operation_id,operation_request_id,owner_epoch,placement_marker_id)
+                 VALUES (?1,?2,?3,?4,'PUBLICATION',?5,?6,'{}',?7,?8)",
+                    params![
+                        "00000000000000000000000000000001",
+                        "blobs/pending/denied-publication",
+                        format!("sha256:{digest}"),
+                        i64::try_from(bytes.len()).unwrap(),
+                        "T-artifact",
+                        "pub-expire-before-link",
+                        manager.lease_epoch,
+                        no_effect_marker,
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_placement_receipts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .artifact_store_dir
+                .read_dir("blobs/pending")
+                .unwrap()
+                .count(),
+            1
+        );
+        drop(manager);
+        let mut restarted = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        restarted.reconcile_artifacts_startup().unwrap();
+        assert!(!restarted.artifact_store_root.join(final_ref).exists());
+        assert_eq!(
+            restarted
+                .artifact_store_dir
+                .read_dir("blobs/pending")
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn publication_copy_then_expiry_preserves_invoked_write_and_denies_flush() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-expire-after-blob-copy";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        write_output(&mut manager, allocation_id, b"copy then deny flush");
+        let database = temp.path().join("task-manager.sqlite");
+        let allocation_for_hook = allocation_id.to_owned();
+        PENDING_BLOB_COPY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(&database)?.execute(
+                    "UPDATE artifact_output_allocations
+                     SET expires_at='2026-09-19T21:59:59Z'
+                     WHERE allocation_id=?1",
+                    [&allocation_for_hook],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.publish_artifact_output(&publication("pub-expire-after-copy", allocation_id)),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_no_created_artifact_metadata(&manager);
+        assert_eq!(
+            std::fs::read_dir(manager.artifact_store_root.join("blobs/pending"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let (invoked, denied, unresolved): (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=r.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='pub-expire-after-copy'
+                       AND r.resolution_kind='EFFECT_INVOKED'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=r.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='pub-expire-after-copy'
+                       AND r.resolution_kind='NO_EFFECT'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x
+                     JOIN trusted_time_effect_preparations p ON p.marker_id=x.marker_id
+                     WHERE p.subject_kind='ARTIFACT_PUBLICATION'
+                       AND p.subject_id='pub-expire-after-copy')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(invoked > 0);
+        assert_eq!(denied, 2); // flush and denied best-effort cleanup
+        assert_eq!(unresolved, 0);
+        let pending = std::fs::read_dir(manager.artifact_store_root.join("blobs/pending"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        manager.reconcile_artifacts_startup().unwrap();
+        assert!(pending.exists());
+        assert!(
+            physical_blob_refs(&manager.artifact_store_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn final_publication_uses_time_sampled_after_serialized_commit_hook() {
         let temp = TempDir::new().unwrap();
         let now = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
@@ -20398,7 +21485,7 @@ mod tests {
         let (size, hash) =
             stream_into_new_file(&mut Cursor::new(b"orphan".as_slice()), &staging, 1_024).unwrap();
         manager
-            .place_blob(staging_ref, &hash, size, false, "manual-crash")
+            .place_blob(staging_ref, &hash, size, false, "manual-crash", None, None)
             .unwrap();
         std::fs::write(
             manager.artifact_store_root.join("staging/raw-residue"),
@@ -20439,6 +21526,323 @@ mod tests {
             manager
                 .connection
                 .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn admitted_import_receipt_recovers_exact_pending_bytes_after_restart() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"receipt authorizes interrupted import placement";
+        IMPORT_PLACEMENT_RECEIPT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| {
+                Err(TaskManagerError::InvalidRecord("test crash after receipt"))
+            }));
+        });
+        assert!(matches!(
+            manager.import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice())),
+            Err(TaskManagerError::InvalidRecord("test crash after receipt"))
+        ));
+        let pending = std::fs::read_dir(manager.artifact_store_root.join("blobs/pending"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(pending.exists());
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_placement_receipts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        drop(manager);
+        let mut restarted = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        restarted.reconcile_artifacts_startup().unwrap();
+        assert!(!pending.exists());
+        assert_eq!(
+            physical_blob_refs(&restarted.artifact_store_dir)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            restarted
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn populated_0019_upgrade_does_not_backfill_legacy_pending_authority() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"existing blob".as_slice()),
+            )
+            .unwrap();
+        let bytes = b"legacy pending without admitted placement";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let pending_ref = format!("blobs/pending/{digest}-legacy");
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+        secure_cap_file_permissions(&manager.artifact_store_dir.open(&pending_ref).unwrap())
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER artifact_placement_receipt_no_delete;
+                 DROP TRIGGER artifact_placement_receipt_no_update;
+                 DROP TRIGGER artifact_placement_receipt_exact_insert;
+                 DROP TABLE artifact_placement_receipts;
+                 DELETE FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts';",
+            )
+            .unwrap();
+        drop(manager);
+        let mut upgraded = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        upgraded.reconcile_artifacts_startup().unwrap();
+        assert!(upgraded.artifact_store_root.join(&pending_ref).exists());
+        assert!(!upgraded.artifact_store_root.join(final_ref).exists());
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_placement_receipts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn admitted_publication_link_receipt_recovers_without_inventing_metadata() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let allocation_id = "alloc-pub-placement-receipt";
+        manager
+            .allocate_artifact_output(&allocation(allocation_id))
+            .unwrap();
+        let bytes = b"publication link completed before response loss";
+        write_output(&mut manager, allocation_id, bytes);
+        let publication = publication("pub-placement-receipt", allocation_id);
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() =
+                Some((Vec::new(), Some("sync-promoted-blob-parent".to_owned())));
+        });
+        assert!(manager.publish_artifact_output(&publication).is_err());
+        DURABILITY_TEST_CONTROL.with(|control| {
+            control.borrow_mut().take();
+        });
+        let (receipts, invoked): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM artifact_placement_receipts
+                    WHERE origin='PUBLICATION' AND operation_id='pub-placement-receipt'),
+                   (SELECT COUNT(*) FROM artifact_placement_receipts r
+                    JOIN trusted_time_effect_resolutions x ON x.marker_id=r.placement_marker_id
+                    WHERE r.origin='PUBLICATION' AND x.resolution_kind='EFFECT_INVOKED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((receipts, invoked), (1, 1));
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-other-placement".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "test wrong placement marker owner".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        let (marker_id, hash, size): (String, String, i64) = manager
+            .connection
+            .query_row(
+                "SELECT placement_marker_id,payload_hash,payload_size
+                 FROM artifact_placement_receipts WHERE origin='PUBLICATION'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        for (index, task_id, operation_id, epoch) in [
+            (1, "T-artifact", "pub-wrong-operation", manager.lease_epoch),
+            (
+                2,
+                "T-other-placement",
+                "pub-placement-receipt",
+                manager.lease_epoch,
+            ),
+            (
+                3,
+                "T-artifact",
+                "pub-placement-receipt",
+                manager.lease_epoch + 1,
+            ),
+        ] {
+            assert!(
+                manager
+                    .connection
+                    .execute(
+                        "INSERT INTO artifact_placement_receipts(
+                     placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+                     operation_id,operation_request_id,owner_epoch,placement_marker_id)
+                     VALUES (?1,?2,?3,?4,'PUBLICATION',?5,?6,'{}',?7,?8)",
+                        params![
+                            format!("{index:032x}"),
+                            format!("blobs/pending/invalid-marker-{index}"),
+                            hash,
+                            size,
+                            task_id,
+                            operation_id,
+                            epoch,
+                            marker_id,
+                        ],
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            manager
+                .artifact_store_dir
+                .read_dir("blobs/pending")
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_no_created_artifact_metadata(&manager);
+        drop(manager);
+        let mut restarted = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        restarted.reconcile_artifacts_startup().unwrap();
+        assert_eq!(
+            restarted
+                .artifact_store_dir
+                .read_dir("blobs/pending")
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            physical_blob_refs(&restarted.artifact_store_dir)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            restarted
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn receipted_pending_never_replaces_a_corrupt_existing_final_on_restart() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let bytes = b"verified pending behind corrupt final";
+        IMPORT_PLACEMENT_RECEIPT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| {
+                Err(TaskManagerError::InvalidRecord("test crash after receipt"))
+            }));
+        });
+        assert!(
+            manager
+                .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
+                .is_err()
+        );
+        let pending = std::fs::read_dir(manager.artifact_store_root.join("blobs/pending"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        manager
+            .artifact_store_dir
+            .write(&final_ref, b"corrupt final")
+            .unwrap();
+        secure_cap_file_permissions(&manager.artifact_store_dir.open(&final_ref).unwrap()).unwrap();
+        drop(manager);
+        let mut restarted = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        // Opening the store performs the first reconciliation pass. The
+        // corrupt final must stay as a collision barrier so a second pass
+        // cannot turn the receipted pending file into its replacement.
+        assert_eq!(
+            restarted.artifact_store_dir.read(&final_ref).unwrap(),
+            b"corrupt final"
+        );
+        assert!(pending.exists());
+        let report = restarted.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobCorrupt
+                && finding.content_hash.as_deref() == Some(hash.as_str())
+        }));
+        assert!(pending.exists());
+        assert_eq!(
+            restarted.artifact_store_dir.read(&final_ref).unwrap(),
+            b"corrupt final"
+        );
+        assert_eq!(
+            restarted
+                .connection
+                .query_row("SELECT COUNT(*) FROM artifact_blobs", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
             0
@@ -20511,7 +21915,7 @@ mod tests {
             resolve_internal_ref(&manager.artifact_store_root, &staging_ref).unwrap();
         let (size, hash) = hash_file(&staging_path).unwrap();
         manager
-            .place_blob(&staging_ref, &hash, size, true, "pub-crash")
+            .place_blob(&staging_ref, &hash, size, true, "pub-crash", None, None)
             .unwrap();
 
         let report = manager.reconcile_artifacts_startup().unwrap();
@@ -20557,7 +21961,7 @@ mod tests {
         });
 
         assert!(matches!(
-            manager.place_blob(&staging_ref, &hash, size, true, "copy-failure"),
+            manager.place_blob(&staging_ref, &hash, size, true, "copy-failure", None, None),
             Err(TaskManagerError::Io(_))
         ));
         assert_eq!(
@@ -25197,7 +26601,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one collision fixture covers runtime and startup quarantine, shared metadata fanout, provenance, and an already-issued reader fence"
     )]
-    fn partial_final_blob_is_never_overwritten_and_pending_blob_is_reconciled() {
+    fn partial_final_blob_is_never_overwritten_and_unreceipted_pending_stays_private() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
         let bytes = b"complete-content";
@@ -25238,12 +26642,13 @@ mod tests {
             .write(&pending_ref, bytes)
             .unwrap();
         let report = manager.reconcile_artifacts_startup().unwrap();
-        assert!(!report.findings.iter().any(|finding| {
+        assert!(report.findings.iter().any(|finding| {
             finding.kind == ArtifactReconciliationKind::BlobCorrupt
                 && finding.content_hash.as_deref() == Some(hash.as_str())
         }));
-        assert_eq!(manager.artifact_store_dir.read(&final_ref).unwrap(), bytes);
-        assert!(!manager.artifact_store_root.join(pending_ref).exists());
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert!(manager.artifact_store_root.join(&pending_ref).exists());
+        remove_pending_blob_durably(&manager.artifact_store_dir, &pending_ref).unwrap();
         assert!(manager.reconcile_artifacts_startup().is_ok());
 
         let pending_ref = format!("blobs/pending/{digest}-retry");
@@ -25257,19 +26662,10 @@ mod tests {
         manager.reconcile_artifacts_startup().unwrap();
         let operations =
             DURABILITY_TEST_CONTROL.with(|control| control.borrow_mut().take().unwrap().0);
-        assert!(operations.windows(3).any(|window| {
-            window
-                == [
-                    "sync-recovered-blob-parent",
-                    "unlink-recovered-blob-pending",
-                    "sync-recovered-blob-pending",
-                ]
-        }));
-        assert_eq!(
-            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
-            bytes
-        );
-        assert!(!manager.artifact_store_root.join(pending_ref).exists());
+        assert!(!operations.contains(&"sync-recovered-blob-parent".to_owned()));
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
+        assert!(manager.artifact_store_root.join(&pending_ref).exists());
+        remove_pending_blob_durably(&manager.artifact_store_dir, &pending_ref).unwrap();
 
         let artifact = manager
             .import_artifact(&import_request(), &mut Cursor::new(bytes.as_slice()))
@@ -25424,6 +26820,22 @@ mod tests {
             .artifact_store_dir
             .write(&pending_ref, bytes)
             .unwrap();
+        let owner_epoch = manager.lease_epoch;
+        let receipt = manager.connection.transaction().unwrap();
+        insert_placement_receipt(
+            &receipt,
+            &pending_ref,
+            &hash,
+            u64::try_from(bytes.len()).unwrap(),
+            "IMPORT",
+            "T-artifact",
+            "test-recovery-path-swap",
+            &canonical_json(&import_request()).unwrap(),
+            owner_epoch,
+            None,
+        )
+        .unwrap();
+        receipt.commit().unwrap();
 
         let root = manager.artifact_store_root.clone();
         let expected_pending_ref = pending_ref.clone();
@@ -25440,10 +26852,11 @@ mod tests {
             }));
         });
 
-        assert!(matches!(
-            manager.reconcile_artifacts_startup(),
-            Err(TaskManagerError::InvalidRecord("ARTIFACT_HASH_MISMATCH"))
-        ));
+        let report = manager.reconcile_artifacts_startup().unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == ArtifactReconciliationKind::BlobOrphaned
+                && finding.content_hash.as_deref() == Some(hash.as_str())
+        }));
         assert!(!manager.artifact_store_root.join(&final_ref).exists());
         assert_eq!(
             std::fs::read(manager.artifact_store_root.join(&pending_ref)).unwrap(),
@@ -25463,23 +26876,20 @@ mod tests {
         );
         assert_no_created_artifact_metadata(&manager);
 
-        // A later recovery promotes the still-valid candidate and removes the
-        // invalid residue instead of wedging every future startup pass.
+        // A later pass removes the mismatched replacement without treating
+        // the displaced verified file as the receipted path.
         let report = manager.reconcile_artifacts_startup().unwrap();
         assert!(report.findings.iter().any(|finding| {
             finding.kind == ArtifactReconciliationKind::BlobOrphaned
                 && finding.content_hash.as_deref() == Some(hash.as_str())
         }));
-        assert_eq!(
-            std::fs::read(manager.artifact_store_root.join(&final_ref)).unwrap(),
-            bytes
-        );
+        assert!(!manager.artifact_store_root.join(&final_ref).exists());
         assert!(report.findings.iter().any(|finding| {
             finding.kind == ArtifactReconciliationKind::BlobCorrupt
                 && finding.content_hash.as_deref() == Some(hash.as_str())
         }));
         assert!(!manager.artifact_store_root.join(&pending_ref).exists());
-        assert!(!manager.artifact_store_root.join(&displaced_ref).exists());
+        assert!(manager.artifact_store_root.join(&displaced_ref).exists());
         assert_no_created_artifact_metadata(&manager);
     }
 
