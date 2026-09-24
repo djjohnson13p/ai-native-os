@@ -1,0 +1,12 @@
+{
+  "schema_version": "0.1",
+  "base_fixture": "candidate-reservation.json",
+  "negative_cases": [
+    {"id": "missing-output-port", "mutation": "remove resources[1].output_port", "expected": "schema-invalid"},
+    {"id": "finalized-at-creation", "mutation": "set status.state to FINALIZED", "expected": "schema-invalid"},
+    {"id": "unrequested-action", "mutation": "set resources[0].action to artifact.delete", "expected": "semantic-admission-denied"},
+    {"id": "alternate-artifact", "mutation": "set resources[0].resource_id to another Task Artifact", "expected": "semantic-admission-denied"},
+    {"id": "reused-binding-id", "mutation": "reserve binding_id already present in execution_bindings", "expected": "reservation-denied"},
+    {"id": "partial-resource-set", "mutation": "insert status after only one of two resources", "expected": "reservation-denied"}
+  ]
+}

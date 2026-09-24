@@ -30,11 +30,11 @@
       "maturity": "SPIKE_READY",
       "workstream": "Artifact handles/content identity/output allocation/publication",
       "issue": 4,
-      "artifacts": ["specs/artifact-handle.schema.json", "specs/artifact-output-allocation.schema.json", "specs/artifact-publication-request.schema.json", "specs/artifact-publication-result.schema.json", "specs/artifact-reason-codes.json", "docs/75-v0.1-artifact-store-content-identity-and-publication.md"],
+      "artifacts": ["specs/artifact-handle.schema.json", "specs/artifact-output-allocation.schema.json", "specs/artifact-publication-request.schema.json", "specs/artifact-publication-result.schema.json", "specs/artifact-reason-codes.json", "specs/persistence-v0.1-0020-artifact-placement-receipts.sql", "docs/75-v0.1-artifact-store-content-identity-and-publication.md"],
       "controlling_adrs": ["ADR-0037", "ADR-0042"],
       "fixture_paths": ["examples/artifact-store/"],
       "blocking_questions": [],
-      "notes": "Published Artifacts are immutable; staging/blob/metadata crash cases are specified."
+      "notes": "Published Artifacts are immutable; staging/blob/metadata crash cases are specified. Additive 0020 records immutable exact import/publication placement receipts. Recovery never infers admission from a pending filename, matching bytes, or a legacy file; no existing file is backfilled with receipt authority. Placement receipts are runtime persistence evidence and do not change semantic program identity."
     },
     {
       "id": "provenance-journal-v0.1",
@@ -63,11 +63,11 @@
       "maturity": "SPIKE_READY",
       "workstream": "Deterministic policy, approval, scoped runtime grant lifecycle",
       "issue": 3,
-      "artifacts": ["specs/authority-evaluation-request.schema.json", "specs/policy-decision.schema.json", "specs/policy-snapshot.schema.json", "specs/approval-request.schema.json", "specs/approval-decision.schema.json", "specs/authority-grant-record.schema.json", "specs/capability-token.schema.json", "specs/authority-reason-codes.json", "docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md"],
-      "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039"],
+      "artifacts": ["specs/authority-candidate-reservation.schema.json", "specs/authority-evaluation-request.schema.json", "specs/policy-decision.schema.json", "specs/policy-snapshot.schema.json", "specs/approval-request.schema.json", "specs/approval-decision.schema.json", "specs/authority-grant-record.schema.json", "specs/capability-token.schema.json", "specs/authority-reason-codes.json", "docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md"],
+      "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039", "ADR-0044"],
       "fixture_paths": ["examples/authority/", "examples/reference-task/policy-local-read.json"],
       "blocking_questions": [],
-      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency."
+      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency. Migration 0016 adds a non-executable pre-policy candidate reservation. Additive 0017 gives pending local Artifact candidates immutable builtin policy content, versioned activation, deterministic ALLOW/DENY/REQUIRE_APPROVAL evaluation, and fingerprint-bound one-shot approval, without issuing executable grants or bindings. The baseline SQL approval ledger's missing REVOKE/REVOKED and required decision scope remain a finalization/point-of-use reconciliation gate. Multi-output task.output resolution is pending an explicit broker contract."
     },
     {
       "id": "credential-broker-v0.1",

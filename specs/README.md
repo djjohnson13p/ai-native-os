@@ -76,6 +76,7 @@ No current AIOS contract is `STABLE`.
 | `task-reason-codes.json` | stable Task Manager reason codes |
 | `step-execution-record.schema.json` | mutable execution-attempt lifecycle state |
 | `persistence-v0.1.sql` | aligned SQLite draft for trusted-core durability/recovery |
+| `persistence-v0.1-0020-artifact-placement-receipts.sql` | additive immutable receipt for exact, admitted blob-placement recovery; legacy files receive no inferred receipt |
 
 ### Artifact/data substrate
 

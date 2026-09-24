@@ -21,6 +21,23 @@
     "new_binding_required": false
   },
   {
+    "name": "admitted-import-pending-blob-has-exact-recovery-receipt",
+    "certainty": "FAILED_PARTIAL_EFFECT",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_ORPHAN_BLOB",
+    "new_binding_required": false,
+    "receipt_required_for_pending_promotion": true
+  },
+  {
+    "name": "denied-or-legacy-pending-blob-has-no-admission-receipt",
+    "certainty": "FAILED_PARTIAL_EFFECT",
+    "safe_action": "RECONCILE_STATE",
+    "reason_code": "RECOVERY_ORPHAN_BLOB",
+    "new_binding_required": false,
+    "pending_remains_private": true,
+    "migration_backfills_receipt": false
+  },
+  {
     "name": "artifact-published-response-lost",
     "certainty": "COMPLETED",
     "safe_action": "RECONCILE_STATE",

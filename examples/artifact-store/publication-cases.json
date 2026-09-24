@@ -121,7 +121,36 @@
         "published_artifact_record_exists": false,
         "task_output_attached": false,
         "recovery_class": "ARTIFACT_BLOB_ORPHANED",
+        "startup_adoption_requires_exact_placement_receipt": true,
         "orphan_blob_may_be_reused_or_gc_after_safety_window": true
+      }
+    },
+    {
+      "name": "admitted-import-pending-placement-recovers-by-exact-receipt",
+      "fault_injection": "stop after verified synced import pending bytes and durable exact import receipt, before no-overwrite hard link",
+      "expected": {
+        "pending_promoted_after_restart": true,
+        "published_artifact_record_exists": false,
+        "receipt_path_hash_size_task_and_operation_must_match": true
+      }
+    },
+    {
+      "name": "denied-publication-hard-link-never-becomes-recovery-authority",
+      "fault_injection": "expire the pinned allocation after pending copy but before hard-link admission",
+      "expected": {
+        "hard_link_invoked": false,
+        "publication_receipt_inserted": false,
+        "pending_promoted_after_restart": false,
+        "unreceipted_pending_remains_private": true
+      }
+    },
+    {
+      "name": "legacy-or-path-swapped-pending-file-cannot-borrow-a-receipt",
+      "mutation": "upgrade an old pending file without a receipt or replace the exact receipted path after verification",
+      "expected": {
+        "pending_promoted_after_restart": false,
+        "published_artifact_record_exists": false,
+        "legacy_receipt_backfill": false
       }
     },
     {
@@ -158,6 +187,24 @@
         "artifact_id_unchanged": true,
         "content_hash_unchanged": true,
         "exports_are_separate_side_effects": true
+      }
+    },
+    {
+      "name": "export-writer-destructor-before-success",
+      "setup": "trusted destination writer has a destructor that appends a visible test byte",
+      "expected": {
+        "destructor_runs_under_distinct_admitted_marker": true,
+        "destructor_precedes_success_receipt": true,
+        "later_destination_drop_writes_again": false
+      }
+    },
+    {
+      "name": "export-destructor-denied-after-revocation",
+      "mutation": "revoke exact egress grant after finalize but before destructor entry, then drop the destination",
+      "expected": {
+        "unadmitted_destructor_runs": false,
+        "export_outcome": "OUTCOME_UNKNOWN",
+        "later_destination_drop_writes": false
       }
     }
   ]

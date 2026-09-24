@@ -13,6 +13,10 @@
 )]
 
 mod artifact_store;
+mod authority_candidate;
+mod authority_deadline;
+mod authority_policy;
+mod trusted_time;
 
 pub use aios_provenance::{
     CheckpointExpectation as ProvenanceCheckpointExpectation,
@@ -31,12 +35,13 @@ pub use artifact_store::{
     OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
     VerifiedArtifactExportNoEffect,
 };
+pub use trusted_time::{SecurityClockSample, TimeSource};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool};
 
 use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -48,6 +53,11 @@ use time::format_description::well_known::Rfc3339;
 
 const SCHEMA_VERSION: &str = "0.1";
 const MIGRATION: &str = include_str!("../../../specs/persistence-v0.1.sql");
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_STARTUP_AFTER_AUTHORITY_RETIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug)]
 pub enum TaskManagerError {
@@ -490,10 +500,18 @@ pub struct TaskManager {
     /// Persisted pending admissions can be rehydrated after process loss without allowing two
     /// simultaneous handles in one manager lifetime.
     delivered_reader_admissions: Arc<Mutex<BTreeSet<String>>>,
+    /// Shared with live Artifact handles so trusted export adapters cannot
+    /// recursively wait on the authority transaction held by their callback.
+    artifact_export_callback_active: Arc<AtomicBool>,
 }
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> String;
+
+    /// Security sample used for expiry decisions; unavailable samples fail closed.
+    fn security_sample(&self) -> Option<trusted_time::SecurityClockSample> {
+        None
+    }
 }
 
 struct SystemClock;
@@ -503,6 +521,16 @@ impl Clock for SystemClock {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    }
+
+    fn security_sample(&self) -> Option<trusted_time::SecurityClockSample> {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+        Some(trusted_time::SecurityClockSample {
+            wall: OffsetDateTime::now_utc().format(&Rfc3339).ok()?,
+            monotonic_nanos: u64::try_from(elapsed.as_nanos()).ok()?,
+            source: trusted_time::TimeSource::SystemClock,
+        })
     }
 }
 
@@ -580,6 +608,41 @@ fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) 
         ));
     }
     Ok(())
+}
+
+fn initialize_clock_session(
+    connection: &Connection,
+    clock: &Arc<dyn Clock>,
+    lease_owner: &str,
+    lease_epoch: i64,
+) -> Result<()> {
+    // Inspection remains available after an uncertain startup. No executable
+    // authority can be issued without a session row for this fresh lease.
+    let startup_time = trusted_time::startup_assess(connection, clock)?;
+    if startup_time.require_trusted_time().is_err() {
+        return Ok(());
+    }
+    let session = trusted_time::with_protected_observation(connection, clock, |tx, time| {
+        assert_manager_lease(tx, lease_owner, lease_epoch)?;
+        tx.execute(
+            "INSERT INTO authority_clock_sessions
+             (session_id,owner_id,owner_epoch,high_water_monotonic_nanos,
+              high_water_observed_unix_nanos,high_water_state_revision,revision)
+             VALUES (?1,?1,?2,?3,?4,?5,1)",
+            params![
+                lease_owner,
+                lease_epoch,
+                time.monotonic_nanos(),
+                time.observed_unix_nanos(),
+                time.state_revision()
+            ],
+        )?;
+        Ok(())
+    });
+    match session {
+        Ok(()) | Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN")) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 impl TaskManager {
@@ -836,6 +899,9 @@ impl TaskManager {
         preflight_migration_state(&connection)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
+        // Assess before any recovery path can make a protected expiry decision.
+        // An uncertain sample is durable but does not prevent ordinary inspection/recovery.
+        initialize_clock_session(&connection, &clock, &lease_owner, lease_epoch)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
             artifact_store::initialize_root(store_lock.as_deref(), &mut connection)?;
         let artifact_scope_issuer =
@@ -875,11 +941,13 @@ impl TaskManager {
             artifact_store_cleanup,
             artifact_export_verifiers,
             delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
+            artifact_export_callback_active: Arc::new(AtomicBool::new(false)),
         };
         manager.verify_all_provenance_chains()?;
         manager.migrate_legacy_keyed_import_receipts()?;
         manager.reconcile_export_operations_startup()?;
         manager.reconcile_artifacts_startup()?;
+        manager.retire_obsolete_prepared_authority_startup()?;
         manager.recover_startup()?;
         // Runtime registry writers are admitted only after the complete
         // Task Manager startup and recovery sequence has succeeded on this
@@ -1246,6 +1314,60 @@ impl TaskManager {
         &mut self,
         request: &CreateStepExecution,
     ) -> Result<StepExecutionRecord> {
+        Self::validate_create_step_execution_request(request)?;
+        let now = self.clock.now();
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        Self::create_step_execution_in(&transaction, request, &now)?;
+        transaction.commit()?;
+        self.get_step_execution(&request.attempt_id)?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "created step execution disappeared",
+            ))
+    }
+
+    /// Validates and inserts a step in the caller's existing transaction.
+    /// The caller owns the lease check and commit boundary.
+    fn create_step_execution_in(
+        transaction: &Transaction<'_>,
+        request: &CreateStepExecution,
+        now: &str,
+    ) -> Result<()> {
+        Self::validate_create_step_execution_request(request)?;
+        let duplicate_tuple = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM step_executions WHERE task_id = ?1 AND semantic_program_hash = ?2 AND node_id = ?3 AND attempt_number = ?4)",
+            params![request.task_id, request.semantic_program_hash, request.node_id, i64::from(request.attempt_number)],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if duplicate_tuple {
+            return Err(TaskManagerError::InvalidRecord(
+                "step attempt tuple already exists",
+            ));
+        }
+        if let Some(binding_id) = &request.binding_id {
+            let exact_binding = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_bindings WHERE binding_id = ?1 AND attempt_id = ?2 AND task_id = ?3 AND semantic_program_hash = ?4 AND registry_snapshot_id = ?5 AND node_id = ?6 AND provider_id = ?7 AND provider_version = ?8 AND attempt = ?9)",
+                params![binding_id, request.attempt_id, request.task_id, request.semantic_program_hash, request.registry_snapshot_id, request.node_id, request.provider_id, request.provider_version, i64::from(request.attempt_number)],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exact_binding {
+                return Err(TaskManagerError::InvalidRecord(
+                    "step execution binding tuple does not match its immutable receipt",
+                ));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, binding_id, provider_id, provider_version, attempt_number, revision, state, operation_id, idempotency_key, outcome_certainty, failure_json, input_artifacts_json, output_artifacts_json, started_at, finished_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
+            params![request.attempt_id, request.task_id, request.semantic_program_hash, request.registry_snapshot_id, request.node_id, request.binding_id, request.provider_id, request.provider_version, i64::from(request.attempt_number), request.state.as_str(), request.operation_id, request.idempotency_key, request.outcome_certainty.map(OutcomeCertainty::as_str), encode_optional(request.failure.as_ref())?, serde_json::to_string(&request.input_artifacts)?, serde_json::to_string(&request.output_artifacts)?, request.started_at, request.finished_at, now],
+        )?;
+        Ok(())
+    }
+
+    fn validate_create_step_execution_request(request: &CreateStepExecution) -> Result<()> {
         let unique_inputs = all_unique(&request.input_artifacts);
         let unique_outputs = all_unique(&request.output_artifacts);
         let valid_failure = request.failure.as_ref().is_none_or(|failure| {
@@ -1308,44 +1430,7 @@ impl TaskManager {
                 "step execution does not satisfy the v0.1 contract",
             ));
         }
-        let now = self.clock.now();
-        let lease_owner = self.lease_owner.clone();
-        let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let duplicate_tuple = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM step_executions WHERE task_id = ?1 AND semantic_program_hash = ?2 AND node_id = ?3 AND attempt_number = ?4)",
-            params![request.task_id, request.semantic_program_hash, request.node_id, i64::from(request.attempt_number)],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if duplicate_tuple {
-            return Err(TaskManagerError::InvalidRecord(
-                "step attempt tuple already exists",
-            ));
-        }
-        if let Some(binding_id) = &request.binding_id {
-            let exact_binding = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM execution_bindings WHERE binding_id = ?1 AND attempt_id = ?2 AND task_id = ?3 AND semantic_program_hash = ?4 AND registry_snapshot_id = ?5 AND node_id = ?6 AND provider_id = ?7 AND provider_version = ?8 AND attempt = ?9)",
-                params![binding_id, request.attempt_id, request.task_id, request.semantic_program_hash, request.registry_snapshot_id, request.node_id, request.provider_id, request.provider_version, i64::from(request.attempt_number)],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !exact_binding {
-                return Err(TaskManagerError::InvalidRecord(
-                    "step execution binding tuple does not match its immutable receipt",
-                ));
-            }
-        }
-        transaction.execute(
-            "INSERT INTO step_executions (attempt_id, task_id, semantic_program_hash, registry_snapshot_id, node_id, binding_id, provider_id, provider_version, attempt_number, revision, state, operation_id, idempotency_key, outcome_certainty, failure_json, input_artifacts_json, output_artifacts_json, started_at, finished_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
-            params![request.attempt_id, request.task_id, request.semantic_program_hash, request.registry_snapshot_id, request.node_id, request.binding_id, request.provider_id, request.provider_version, i64::from(request.attempt_number), request.state.as_str(), request.operation_id, request.idempotency_key, request.outcome_certainty.map(OutcomeCertainty::as_str), encode_optional(request.failure.as_ref())?, serde_json::to_string(&request.input_artifacts)?, serde_json::to_string(&request.output_artifacts)?, request.started_at, request.finished_at, now],
-        )?;
-        transaction.commit()?;
-        self.get_step_execution(&request.attempt_id)?
-            .ok_or(TaskManagerError::InvalidRecord(
-                "created step execution disappeared",
-            ))
+        Ok(())
     }
 
     /// Applies one idempotent CAS transition.
@@ -1355,6 +1440,145 @@ impl TaskManager {
     /// rejections are represented by a successful `TransitionResult` value.
     pub(crate) fn transition(&mut self, request: &TransitionRequest) -> Result<TransitionResult> {
         self.transition_impl(request, false, false)
+    }
+
+    /// Retire a previous clock session's unused, coordinator-issued preparation.
+    /// Historical candidates and bindings stay immutable; a RUNNABLE Task must
+    /// return to PLANNING before it can receive fresh executable authority.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps exact issuance and no-effect startup gates beside grant retirement and Task CAS"
+    )]
+    fn retire_obsolete_prepared_authority_startup(&mut self) -> Result<()> {
+        let candidates: Vec<(String, i64, String)> = {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT t.task_id,t.revision,t.state FROM tasks t
+                 JOIN authority_candidate_reservations c ON c.task_id=t.task_id
+                 JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+                    AND s.state='FINALIZED'
+                 JOIN authority_grant_deadlines d ON d.task_id=t.task_id
+                    AND d.execution_binding_id=c.binding_id AND d.attempt_id=c.attempt_id
+                 WHERE t.state IN ('PLANNING','WAITING_FOR_AUTH','RUNNABLE')
+                   AND d.session_id<>?1
+                 ORDER BY t.task_id",
+            )?;
+            statement
+                .query_map([&self.lease_owner], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (task_id, revision, state) in candidates {
+            let safe: bool = self.connection.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM authority_grants g
+                    LEFT JOIN authority_grant_deadlines d ON d.grant_id=g.grant_id
+                    LEFT JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+                    LEFT JOIN authority_candidate_reservations c ON c.binding_id=g.execution_binding_id
+                    LEFT JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+                    WHERE g.task_id=?1 AND g.state='ACTIVE' AND
+                      (d.grant_id IS NULL OR d.session_id=?2 OR
+                       i.grant_id IS NULL OR i.issuance_profile<>'coordinator-issued-v0.1' OR
+                       c.task_id IS NOT g.task_id OR s.state IS NOT 'FINALIZED')
+                 ) AND NOT EXISTS(
+                    SELECT 1 FROM authority_grants WHERE task_id=?1 AND uses_consumed<>0
+                 ) AND NOT EXISTS(
+                     SELECT 1 FROM operations WHERE task_id=?1 AND NOT
+                       (effect_class='ARTIFACT_IMPORT' AND transaction_class='reversible_local'
+                        AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
+                        AND binding_id IS NULL AND attempt_id IS NULL)
+                 )
+                   AND NOT EXISTS(SELECT 1 FROM provider_invocations WHERE task_id=?1)
+                   AND NOT EXISTS(SELECT 1 FROM credential_use_records WHERE task_id=?1)
+                   AND NOT EXISTS(SELECT 1 FROM artifact_publications WHERE task_id=?1)
+                   AND NOT EXISTS(
+                     SELECT 1 FROM artifact_output_allocations WHERE task_id=?1
+                       AND (state<>'ALLOCATED' OR writer_grant_id IS NOT NULL
+                            OR writer_session_id IS NOT NULL OR publication_id IS NOT NULL)
+                   ) AND NOT EXISTS(
+                     SELECT 1 FROM step_executions WHERE task_id=?1
+                       AND (state<>'READY' OR outcome_certainty IS NOT NULL
+                            OR started_at IS NOT NULL OR operation_id IS NOT NULL
+                            OR invocation_id IS NOT NULL)
+                   )",
+                params![task_id, self.lease_owner],
+                |row| row.get(0),
+            )?;
+            if !safe {
+                return Err(TaskManagerError::InvalidRecord(
+                    "obsolete prepared authority has possible effects or incomplete issuance",
+                ));
+            }
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+            transaction.execute(
+                "UPDATE authority_grants SET state='REVOKED',revoked_at=?1,
+                        revocation_reason_code='AUTHORITY_SESSION_RETIRED'
+                 WHERE task_id=?2 AND state='ACTIVE' AND uses_consumed=0
+                   AND EXISTS(SELECT 1 FROM authority_grant_deadlines d
+                     WHERE d.grant_id=authority_grants.grant_id AND d.session_id<>?3)",
+                params![self.clock.now(), task_id, self.lease_owner],
+            )?;
+            transaction.commit()?;
+            #[cfg(test)]
+            if FAIL_STARTUP_AFTER_AUTHORITY_RETIRE.with(|flag| flag.replace(false)) {
+                return Err(TaskManagerError::InvalidRecord(
+                    "injected failure after authority retirement",
+                ));
+            }
+            if !unresolved_execution_ids(&self.connection, &task_id)?.is_empty() {
+                return Err(TaskManagerError::InvalidRecord(
+                    "obsolete prepared authority still has unresolved execution",
+                ));
+            }
+            if state == "RUNNABLE" || state == "WAITING_FOR_AUTH" {
+                let revision = u64::try_from(revision)
+                    .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+                let previous_state = if state == "RUNNABLE" {
+                    TaskState::Runnable
+                } else {
+                    TaskState::WaitingForAuth
+                };
+                let result = self.transition_impl(
+                    &TransitionRequest {
+                        schema_version: SCHEMA_VERSION.to_owned(),
+                        transition_id: format!(
+                            "transition:startup-authority-replan:{task_id}:{revision}"
+                        ),
+                        task_id,
+                        expected_revision: revision,
+                        expected_state: previous_state,
+                        to_state: TaskState::Planning,
+                        requested_by: Actor {
+                            kind: "system-service".to_owned(),
+                            id: "service:recovery".to_owned(),
+                        },
+                        reason: TransitionReason {
+                            code: "TASK_TRANSITION_APPLIED".to_owned(),
+                            message: Some(
+                                "prior session authority retired before execution".to_owned(),
+                            ),
+                            related_ids: Vec::new(),
+                        },
+                        mutation: TaskMutation {
+                            waiting_on: (previous_state == TaskState::WaitingForAuth)
+                                .then(Vec::new),
+                            ..TaskMutation::default()
+                        },
+                    },
+                    false,
+                    false,
+                )?;
+                if !result.applied {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "startup authority replanning transition was not applied",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Moves uncertain pre-restart execution states into `RECOVERING` by using
@@ -2285,124 +2509,181 @@ impl TaskManager {
         internal_recovery: bool,
     ) -> Result<TransitionResult> {
         validate_transition_request(request, internal_recovery)?;
-        let resulted_at = self.clock.now();
+        let mut resulted_at = if request.to_state == TaskState::Running {
+            trusted_time::assess(&self.connection, &self.clock)?.require_trusted_time()?
+        } else {
+            self.clock.now()
+        };
         let request_json = canonical_json(request)?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        if let Some(stored_request) = transaction
-            .query_row(
-                "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
-                [&request.transition_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if stored_request == request_json {
-                return authenticated_transition_result(&transaction, &request.transition_id);
-            }
-            let observed = load_observed(&transaction, &request.task_id)?;
-            return Ok(rejected(
-                request,
-                "TASK_TRANSITION_ID_REUSE_CONFLICT",
-                observed,
-                &resulted_at,
-            ));
-        }
-
-        let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
-            load_transition_state(&transaction, &request.task_id)?
-        else {
-            let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
-            persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
-            transaction.commit()?;
-            return Ok(result);
-        };
-        let observed_state = TaskState::parse(&state)?;
-        let observed_revision = u64::try_from(revision)
-            .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
-        let observed = Some((observed_state, observed_revision));
-        let rejection = if request.expected_revision != observed_revision {
-            Some("TASK_REVISION_CONFLICT")
-        } else if request.expected_state != observed_state {
-            Some("TASK_STATE_CONFLICT")
-        } else if observed_state.terminal()
-            && !(observed_state == TaskState::Failed && request.to_state == TaskState::RollingBack)
-        {
-            Some("TASK_TERMINAL_STATE")
-        } else if !allowed_transition(observed_state, request.to_state) {
-            Some("TASK_ILLEGAL_TRANSITION")
-        } else {
-            guard_failure(
-                &transaction,
-                request,
-                &waiting_json,
-                &steps_json,
-                active_program,
-                &resulted_at,
-                internal_recovery,
-            )?
-        };
-        if let Some(code) = rejection {
-            let result = rejected(request, code, observed, &resulted_at);
-            persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
-            transaction.commit()?;
-            return Ok(result);
-        }
-
-        let new_revision = observed_revision
-            .checked_add(1)
-            .ok_or(TaskManagerError::InvalidRecord("Task revision overflow"))?;
-        let active_steps: Vec<String> = serde_json::from_str(&steps_json)?;
-        if request.to_state == TaskState::Running
-            && !admit_active_steps(&transaction, &request.task_id, &active_steps, &resulted_at)?
-        {
-            let result = rejected(
-                request,
-                "TASK_TRANSITION_GUARD_FAILED",
-                observed,
-                &resulted_at,
-            );
-            transaction.rollback()?;
-            let rejection_transaction = self
+        let mut locked_time = None;
+        let outcome = (|| -> Result<TransitionResult> {
+            let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            assert_manager_lease(&rejection_transaction, &lease_owner, lease_epoch)?;
-            persist_rejection(
-                &rejection_transaction,
-                request,
-                &request_json,
-                &result,
-                &resulted_at,
-            )?;
-            rejection_transaction.commit()?;
-            return Ok(result);
-        }
-        let waiting = match &request.mutation.waiting_on {
-            Some(waiting) => serde_json::to_string(waiting)?,
-            None => waiting_json,
-        };
-        let steps = match &request.mutation.active_step_ids {
-            Some(steps) => serde_json::to_string(steps)?,
-            None => steps_json,
-        };
-        let failure = request
-            .mutation
-            .failure
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .or(failure_json);
-        let recovery = request
-            .mutation
-            .recovery
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let active_program_row = active_program
+            locked_time = if request.to_state == TaskState::Running {
+                let fresh = trusted_time::capture_locked(&transaction, &self.clock)?;
+                resulted_at = match fresh.require_trusted_time() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        drop(transaction);
+                        fresh.commit(&self.connection)?;
+                        return Err(error);
+                    }
+                };
+                Some(fresh)
+            } else {
+                None
+            };
+            assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+            if let Some(stored_request) = transaction
+                .query_row(
+                    "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
+                    [&request.transition_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if stored_request == request_json {
+                    return authenticated_transition_result(&transaction, &request.transition_id);
+                }
+                let observed = load_observed(&transaction, &request.task_id)?;
+                return Ok(rejected(
+                    request,
+                    "TASK_TRANSITION_ID_REUSE_CONFLICT",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+
+            let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
+                load_transition_state(&transaction, &request.task_id)?
+            else {
+                let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
+                persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+                if let Some(fresh) = &locked_time {
+                    fresh.commit_in(&transaction)?.require_trusted_time()?;
+                }
+                transaction.commit()?;
+                locked_time = None;
+                return Ok(result);
+            };
+            let observed_state = TaskState::parse(&state)?;
+            let observed_revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let observed = Some((observed_state, observed_revision));
+            let rejection = if request.expected_revision != observed_revision {
+                Some("TASK_REVISION_CONFLICT")
+            } else if request.expected_state != observed_state {
+                Some("TASK_STATE_CONFLICT")
+            } else if observed_state.terminal()
+                && !(observed_state == TaskState::Failed
+                    && request.to_state == TaskState::RollingBack)
+            {
+                Some("TASK_TERMINAL_STATE")
+            } else if !allowed_transition(observed_state, request.to_state) {
+                Some("TASK_ILLEGAL_TRANSITION")
+            } else {
+                guard_failure(
+                    &transaction,
+                    request,
+                    &waiting_json,
+                    &steps_json,
+                    active_program,
+                    &resulted_at,
+                    internal_recovery,
+                )?
+            };
+            if let Some(code) = rejection {
+                let result = rejected(request, code, observed, &resulted_at);
+                persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+                if let Some(fresh) = &locked_time {
+                    fresh.commit_in(&transaction)?.require_trusted_time()?;
+                }
+                transaction.commit()?;
+                locked_time = None;
+                return Ok(result);
+            }
+
+            let new_revision = observed_revision
+                .checked_add(1)
+                .ok_or(TaskManagerError::InvalidRecord("Task revision overflow"))?;
+            let active_steps: Vec<String> = serde_json::from_str(&steps_json)?;
+            if request.to_state == TaskState::Running {
+                let time = locked_time
+                    .as_ref()
+                    .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?
+                    .commit_context_in(&transaction)?;
+                if !ready_coordinator_grants_valid_in(
+                    &transaction,
+                    &request.task_id,
+                    &active_steps,
+                    &lease_owner,
+                    lease_epoch,
+                    &time,
+                )? {
+                    let result = rejected(
+                        request,
+                        "TASK_TRANSITION_GUARD_FAILED",
+                        observed,
+                        &resulted_at,
+                    );
+                    persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+                    transaction.commit()?;
+                    locked_time = None;
+                    return Ok(result);
+                }
+            }
+            if request.to_state == TaskState::Running
+                && !admit_active_steps(&transaction, &request.task_id, &active_steps, &resulted_at)?
+            {
+                let result = rejected(
+                    request,
+                    "TASK_TRANSITION_GUARD_FAILED",
+                    observed,
+                    &resulted_at,
+                );
+                transaction.rollback()?;
+                if let Some(fresh) = locked_time.take() {
+                    fresh.commit(&self.connection)?;
+                }
+                let rejection_transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                assert_manager_lease(&rejection_transaction, &lease_owner, lease_epoch)?;
+                persist_rejection(
+                    &rejection_transaction,
+                    request,
+                    &request_json,
+                    &result,
+                    &resulted_at,
+                )?;
+                rejection_transaction.commit()?;
+                return Ok(result);
+            }
+            let waiting = match &request.mutation.waiting_on {
+                Some(waiting) => serde_json::to_string(waiting)?,
+                None => waiting_json,
+            };
+            let steps = match &request.mutation.active_step_ids {
+                Some(steps) => serde_json::to_string(steps)?,
+                None => steps_json,
+            };
+            let failure = request
+                .mutation
+                .failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .or(failure_json);
+            let recovery = request
+                .mutation
+                .recovery
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let active_program_row = active_program
             .map(|program_revision| {
                 transaction.query_row(
                     "SELECT p.program_id, p.ir_version, p.semantic_hash, p.registry_snapshot_id, p.validation_result_id, v.validated_at, v.validator_id, v.validator_version, p.program_json FROM semantic_program_revisions p LEFT JOIN validation_results v ON v.validation_result_id = p.validation_result_id WHERE p.task_id = ?1 AND p.program_revision = ?2 AND p.status = 'active'",
@@ -2423,157 +2704,166 @@ impl TaskManager {
                 )
             })
             .transpose()?;
-        let active_program_event = active_program_row
-            .map(
-                |(
-                    program_id,
-                    ir_version,
-                    semantic_hash,
-                    registry_snapshot_id,
-                    validation_result_id,
-                    validated_at,
-                    validator_id,
-                    validator_version,
-                    program_json,
-                )|
-                 -> Result<Value> {
-                    Ok(json!({
-                        "program_id": program_id,
-                        "ir_version": ir_version,
-                        "semantic_hash": semantic_hash,
-                        "registry_snapshot_id": registry_snapshot_id,
-                        "validation_result_id": validation_result_id,
-                        "validated_at": validated_at,
-                        "validator_id": validator_id,
-                        "validator_version": validator_version,
-                        "program_content_digest": program_content_digest(&program_json)?,
-                    }))
-                },
-            )
-            .transpose()?;
-        let intent_nonce = transaction.query_row(
-            "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
-            [&request.task_id],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
-        if intent_nonce.len() != 32 {
-            return Err(TaskManagerError::InvalidRecord(
-                "Task provenance commitment nonce is invalid",
-            ));
-        }
-        let provenance_waiting = request
-            .mutation
-            .waiting_on
-            .as_ref()
-            .map(|values| provenance_waiting_on(values));
-        let waiting_commitments = request
-            .mutation
-            .waiting_on
-            .as_ref()
-            .map(|values| provenance_waiting_commitments(values, &intent_nonce));
-        let provenance_failure = request.mutation.failure.as_ref().map(provenance_failure);
-        let failure_commitment = request
-            .mutation
-            .failure
-            .as_ref()
-            .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
-        let reason_message_ref = request.reason.message.as_ref().map(|message| {
-            task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
-        });
-        let event_id = transition_event_id(&request.transition_id);
-        let event = json!({
-            "schema_version": SCHEMA_VERSION,
-            "event_id": event_id,
-            "task_id": request.task_id,
-            "event_type": "task.transitioned",
-            "timestamp": resulted_at,
-            "actor": request.requested_by,
-            "status": "success",
-            "semantic_program_hash": active_program_event.as_ref().and_then(|value| value.get("semantic_hash")),
-            "ir_version": active_program_event.as_ref().and_then(|value| value.get("ir_version")),
-            "registry_snapshot_id": active_program_event.as_ref().and_then(|value| value.get("registry_snapshot_id")),
-            "validation_result_id": active_program_event.as_ref().and_then(|value| value.get("validation_result_id")),
-            "task_transition": {
-                "transition_id": request.transition_id,
-                "previous_state": observed_state,
-                "new_state": request.to_state,
-                "previous_revision": observed_revision,
-                "new_revision": new_revision,
-                "reason_code": request.reason.code,
-            },
-            "committed_mutation": {
-                "active_plan": request.mutation.active_plan,
-                "active_step_ids": request.mutation.active_step_ids,
-                "waiting_on": provenance_waiting,
-                "failure": provenance_failure,
-                "recovery": request.mutation.recovery,
-            },
-            "details": {
-                "related_ids": request.reason.related_ids,
-                "reason_message_ref": reason_message_ref,
-                "active_program": active_program_event,
-                "mutation_text_commitments": {
-                    "waiting_on": waiting_commitments,
-                    "failure_summary": failure_commitment,
-                }
+            let active_program_event = active_program_row
+                .map(
+                    |(
+                        program_id,
+                        ir_version,
+                        semantic_hash,
+                        registry_snapshot_id,
+                        validation_result_id,
+                        validated_at,
+                        validator_id,
+                        validator_version,
+                        program_json,
+                    )|
+                     -> Result<Value> {
+                        Ok(json!({
+                            "program_id": program_id,
+                            "ir_version": ir_version,
+                            "semantic_hash": semantic_hash,
+                            "registry_snapshot_id": registry_snapshot_id,
+                            "validation_result_id": validation_result_id,
+                            "validated_at": validated_at,
+                            "validator_id": validator_id,
+                            "validator_version": validator_version,
+                            "program_content_digest": program_content_digest(&program_json)?,
+                        }))
+                    },
+                )
+                .transpose()?;
+            let intent_nonce = transaction.query_row(
+                "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
+                [&request.task_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            if intent_nonce.len() != 32 {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Task provenance commitment nonce is invalid",
+                ));
             }
-        });
-        if fail_provenance {
-            return Ok(rejected(
-                request,
-                "TASK_PROVENANCE_APPEND_FAILED",
-                observed,
-                &resulted_at,
-            ));
-        }
-        let appended = append_event(&transaction, &request.task_id, &event)?;
-        let completed_at = request.to_state == TaskState::Completed;
-        let updated = transaction.execute(
+            let provenance_waiting = request
+                .mutation
+                .waiting_on
+                .as_ref()
+                .map(|values| provenance_waiting_on(values));
+            let waiting_commitments = request
+                .mutation
+                .waiting_on
+                .as_ref()
+                .map(|values| provenance_waiting_commitments(values, &intent_nonce));
+            let provenance_failure = request.mutation.failure.as_ref().map(provenance_failure);
+            let failure_commitment = request
+                .mutation
+                .failure
+                .as_ref()
+                .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
+            let reason_message_ref = request.reason.message.as_ref().map(|message| {
+                task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
+            });
+            let event_id = transition_event_id(&request.transition_id);
+            let event = json!({
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id,
+                "task_id": request.task_id,
+                "event_type": "task.transitioned",
+                "timestamp": resulted_at,
+                "actor": request.requested_by,
+                "status": "success",
+                "semantic_program_hash": active_program_event.as_ref().and_then(|value| value.get("semantic_hash")),
+                "ir_version": active_program_event.as_ref().and_then(|value| value.get("ir_version")),
+                "registry_snapshot_id": active_program_event.as_ref().and_then(|value| value.get("registry_snapshot_id")),
+                "validation_result_id": active_program_event.as_ref().and_then(|value| value.get("validation_result_id")),
+                "task_transition": {
+                    "transition_id": request.transition_id,
+                    "previous_state": observed_state,
+                    "new_state": request.to_state,
+                    "previous_revision": observed_revision,
+                    "new_revision": new_revision,
+                    "reason_code": request.reason.code,
+                },
+                "committed_mutation": {
+                    "active_plan": request.mutation.active_plan,
+                    "active_step_ids": request.mutation.active_step_ids,
+                    "waiting_on": provenance_waiting,
+                    "failure": provenance_failure,
+                    "recovery": request.mutation.recovery,
+                },
+                "details": {
+                    "related_ids": request.reason.related_ids,
+                    "reason_message_ref": reason_message_ref,
+                    "active_program": active_program_event,
+                    "mutation_text_commitments": {
+                        "waiting_on": waiting_commitments,
+                        "failure_summary": failure_commitment,
+                    }
+                }
+            });
+            if fail_provenance {
+                return Ok(rejected(
+                    request,
+                    "TASK_PROVENANCE_APPEND_FAILED",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+            let appended = append_event(&transaction, &request.task_id, &event)?;
+            let completed_at = request.to_state == TaskState::Completed;
+            let updated = transaction.execute(
             "UPDATE tasks SET revision = ?2, state = ?3, state_reason_json = ?4, active_step_ids_json = ?5, waiting_on_json = ?6, failure_json = ?7, recovery_json = COALESCE(?8, recovery_json), updated_at = ?9, completed_at = CASE WHEN ?10 THEN ?9 ELSE completed_at END WHERE task_id = ?1 AND revision = ?11 AND state = ?12",
             params![request.task_id, i64::try_from(new_revision).map_err(|_| TaskManagerError::InvalidRecord("Task revision exceeds SQLite range"))?, request.to_state.as_str(), json!({"code":request.reason.code,"message":request.reason.message,"provenance_event_id":appended.event_id}).to_string(), steps, waiting, failure, recovery, resulted_at, completed_at, revision, state],
         )?;
-        if updated != 1 {
-            return Ok(rejected(
-                request,
-                "TASK_REVISION_CONFLICT",
-                observed,
-                &resulted_at,
-            ));
-        }
-        if let Some(plan) = &request.mutation.active_plan {
-            let changed = transaction.execute(
+            if updated != 1 {
+                return Ok(rejected(
+                    request,
+                    "TASK_REVISION_CONFLICT",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+            if let Some(plan) = &request.mutation.active_plan {
+                let changed = transaction.execute(
                 "UPDATE tasks SET active_plan_revision = ?2 WHERE task_id = ?1 AND EXISTS (SELECT 1 FROM plan_revisions WHERE task_id = ?1 AND plan_revision = ?2 AND plan_id = ?3)",
                 params![request.task_id, i64::try_from(plan.revision).map_err(|_| TaskManagerError::InvalidRecord("active plan revision exceeds SQLite range"))?, plan.plan_id],
             )?;
-            if changed != 1 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "active plan mutation does not reference a persisted plan",
-                ));
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "active plan mutation does not reference a persisted plan",
+                    ));
+                }
             }
-        }
-        let result = TransitionResult {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            transition_id: request.transition_id.clone(),
-            task_id: request.task_id.clone(),
-            applied: true,
-            reason_code: "TASK_TRANSITION_APPLIED".to_owned(),
-            message: None,
-            previous_state: Some(observed_state),
-            current_state: Some(request.to_state),
-            previous_revision: Some(observed_revision),
-            current_revision: Some(new_revision),
-            observed_state: Some(request.to_state),
-            observed_revision: Some(new_revision),
-            provenance_event_id: Some(appended.event_id),
-            provenance_event_hash: Some(appended.event_hash),
-            resulted_at: resulted_at.clone(),
-        };
-        transaction.execute(
+            let result = TransitionResult {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                transition_id: request.transition_id.clone(),
+                task_id: request.task_id.clone(),
+                applied: true,
+                reason_code: "TASK_TRANSITION_APPLIED".to_owned(),
+                message: None,
+                previous_state: Some(observed_state),
+                current_state: Some(request.to_state),
+                previous_revision: Some(observed_revision),
+                current_revision: Some(new_revision),
+                observed_state: Some(request.to_state),
+                observed_revision: Some(new_revision),
+                provenance_event_id: Some(appended.event_id),
+                provenance_event_hash: Some(appended.event_hash),
+                resulted_at: resulted_at.clone(),
+            };
+            transaction.execute(
             "INSERT INTO task_transitions (transition_id, task_id, expected_revision, expected_state, to_state, result_revision, result_state, outcome, reason_code, request_json, result_json, provenance_event_id, requested_at, committed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, 'COMMITTED', ?7, ?8, ?9, ?10, ?11, ?11)",
             params![request.transition_id, request.task_id, i64::try_from(request.expected_revision).unwrap_or(i64::MAX), request.expected_state.as_str(), request.to_state.as_str(), i64::try_from(new_revision).unwrap_or(i64::MAX), result.reason_code, request_json, serde_json::to_string(&result)?, result.provenance_event_id, resulted_at],
         )?;
-        transaction.commit()?;
-        Ok(result)
+            if let Some(fresh) = &locked_time {
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+            }
+            transaction.commit()?;
+            locked_time = None;
+            Ok(result)
+        })();
+        if let Some(fresh) = locked_time {
+            fresh.commit(&self.connection)?;
+        }
+        outcome
     }
 
     /// Counts committed provenance events for a Task.
@@ -4423,6 +4713,361 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
     preflight_migration_state_with_mode(connection, true)
 }
 
+fn artifact_placement_receipt_objects_current(
+    connection: &Connection,
+    stamped: bool,
+) -> Result<bool> {
+    let canonical = if stamped {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(MIGRATION)?;
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0020-artifact-placement-receipts.sql"
+        ))?;
+        Some(db)
+    } else {
+        None
+    };
+    for name in [
+        "artifact_placement_receipts",
+        "artifact_placement_receipt_exact_insert",
+        "artifact_placement_receipt_no_update",
+        "artifact_placement_receipt_no_delete",
+    ] {
+        let actual: Option<String> = connection
+            .query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let expected = canonical
+            .as_ref()
+            .map(|db| {
+                db.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [name], |r| {
+                    r.get::<_, String>(0)
+                })
+            })
+            .transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    if stamped {
+        let invalid: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM artifact_placement_receipts a
+                LEFT JOIN tasks t ON t.task_id=a.task_id
+                LEFT JOIN trusted_time_effect_preparations p ON p.marker_id=a.placement_marker_id
+                LEFT JOIN trusted_time_effect_resolutions r ON r.marker_id=p.marker_id
+                WHERE t.task_id IS NULL
+                   OR (a.origin='PUBLICATION' AND (
+                       p.marker_id IS NULL OR p.subject_kind<>'ARTIFACT_PUBLICATION'
+                       OR p.subject_id<>a.operation_id OR p.task_id<>a.task_id
+                       OR p.owner_epoch<>a.owner_epoch OR r.resolution_kind IS NULL
+                       OR r.resolution_kind<>'EFFECT_INVOKED'))
+                   OR (a.origin='IMPORT' AND a.placement_marker_id IS NOT NULL)
+            )",
+            [],
+            |r| r.get(0),
+        )?;
+        if invalid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "checks all deadline schema objects and their persisted evidence"
+)]
+fn authority_grant_deadline_objects_current(
+    connection: &Connection,
+    stamped: bool,
+) -> Result<bool> {
+    const OBJECTS: &[&str] = &[
+        "authority_clock_sessions",
+        "authority_grant_deadlines",
+        "authority_grant_expiry_latches",
+        "authority_clock_session_exact_insert",
+        "authority_clock_session_monotone_update",
+        "authority_clock_session_no_delete",
+        "authority_grant_deadline_exact_insert",
+        "authority_grant_deadline_no_update",
+        "authority_grant_deadline_no_delete",
+        "authority_grant_expiry_exact_insert",
+        "authority_grant_expiry_no_update",
+        "authority_grant_expiry_no_delete",
+        "authority_grant_deadline_grant_no_replace",
+        "authority_grant_deadline_grant_identity_guard",
+        "authority_grant_deadline_grant_no_delete",
+        "authority_grant_deadline_receipt_no_replace",
+    ];
+    let canonical = if stamped {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(MIGRATION)?;
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))?;
+        db.execute_batch(trusted_time::MIGRATION)?;
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0021-authority-grant-deadlines.sql"
+        ))?;
+        Some(db)
+    } else {
+        None
+    };
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let expected =
+            canonical
+                .as_ref()
+                .map(|db| {
+                    db.query_row(
+            "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+            [name], |r| r.get::<_, String>(0))
+                })
+                .transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    if stamped {
+        let invalid: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM authority_clock_sessions c
+                LEFT JOIN trusted_time_observations o ON o.state_revision=c.high_water_state_revision
+                WHERE c.session_id IS NULL OR length(c.session_id)<>32
+                   OR c.session_id GLOB '*[^0-9a-f]*'
+                   OR typeof(c.owner_epoch)<>'integer' OR typeof(c.high_water_monotonic_nanos)<>'integer'
+                   OR typeof(c.high_water_observed_unix_nanos)<>'integer'
+                   OR typeof(c.high_water_state_revision)<>'integer' OR typeof(c.revision)<>'integer'
+                   OR o.state_revision IS NULL OR o.confidence<>'TRUSTED_LOCAL'
+                   OR o.monotonic_nanos IS NOT c.high_water_monotonic_nanos
+                   OR o.observed_unix_nanos IS NOT c.high_water_observed_unix_nanos
+                UNION ALL
+                SELECT 1 FROM authority_grant_deadlines d
+                LEFT JOIN authority_issuance_receipts r ON r.grant_id=d.grant_id
+                LEFT JOIN authority_grants g ON g.grant_id=d.grant_id
+                LEFT JOIN approval_requests a ON a.approval_id=d.approval_id
+                LEFT JOIN approval_decisions ad ON ad.decision_id=d.approval_decision_id
+                LEFT JOIN authority_clock_sessions c ON c.session_id=d.session_id
+                LEFT JOIN trusted_time_observations o ON o.state_revision=d.issued_state_revision
+                WHERE d.grant_id IS NULL OR typeof(d.grant_expiry_unix_nanos)<>'integer'
+                   OR (d.approval_id IS NULL AND
+                       (d.approval_request_expires_at IS NOT NULL
+                        OR d.approval_request_expiry_unix_nanos IS NOT NULL
+                        OR d.approval_decision_id IS NOT NULL OR d.approved_until IS NOT NULL
+                        OR d.approved_until_unix_nanos IS NOT NULL))
+                   OR (d.approval_id IS NOT NULL AND
+                       (d.approval_request_expires_at IS NULL OR d.approval_decision_id IS NULL
+                        OR d.approved_until IS NULL
+                        OR typeof(d.approval_request_expiry_unix_nanos)<>'integer'
+                        OR typeof(d.approved_until_unix_nanos)<>'integer'))
+                   OR typeof(d.owner_epoch)<>'integer'
+                   OR typeof(d.issued_state_revision)<>'integer'
+                   OR typeof(d.issued_monotonic_nanos)<>'integer'
+                   OR typeof(d.deadline_monotonic_nanos)<>'integer'
+                   OR typeof(d.issued_observed_unix_nanos)<>'integer'
+                   OR typeof(d.issued_effective_unix_nanos)<>'integer'
+                   OR typeof(d.effective_expiry_unix_nanos)<>'integer'
+                   OR r.grant_id IS NULL OR g.grant_id IS NULL OR c.session_id IS NULL
+                   OR r.token_id IS NOT d.token_id OR r.task_id IS NOT d.task_id
+                   OR r.execution_binding_id IS NOT d.execution_binding_id OR r.attempt_id IS NOT d.attempt_id
+                   OR r.policy_decision_id IS NOT d.policy_decision_id OR r.issued_at IS NOT d.issued_at
+                   OR g.token_id IS NOT d.token_id OR g.task_id IS NOT d.task_id
+                   OR g.execution_binding_id IS NOT d.execution_binding_id OR g.attempt_id IS NOT d.attempt_id
+                   OR g.policy_decision_id IS NOT d.policy_decision_id OR g.issued_at IS NOT d.issued_at
+                   OR g.expires_at IS NOT d.grant_expires_at OR g.approval_id IS NOT d.approval_id
+                   OR (d.approval_id IS NOT NULL AND
+                       (a.approval_id IS NULL OR ad.decision_id IS NULL
+                        OR ad.approval_id IS NOT d.approval_id OR ad.decision<>'APPROVE'
+                        OR a.expires_at IS NOT d.approval_request_expires_at
+                        OR ad.approved_until IS NOT d.approved_until))
+                   OR c.owner_id IS NOT d.owner_id OR c.owner_epoch IS NOT d.owner_epoch
+                   OR o.state_revision IS NULL OR o.confidence<>'TRUSTED_LOCAL'
+                   OR o.monotonic_nanos IS NOT d.issued_monotonic_nanos
+                   OR o.observed_unix_nanos IS NOT d.issued_observed_unix_nanos
+                   OR o.expiry_floor_unix_nanos IS NOT d.issued_effective_unix_nanos
+                   OR c.high_water_monotonic_nanos<d.issued_monotonic_nanos
+                   OR c.high_water_state_revision<d.issued_state_revision
+                   OR d.deadline_monotonic_nanos<=d.issued_monotonic_nanos
+                   OR d.effective_expiry_unix_nanos<=d.issued_effective_unix_nanos
+                   OR d.effective_expiry_unix_nanos>d.grant_expiry_unix_nanos
+                   OR (d.approval_id IS NOT NULL AND
+                       (d.effective_expiry_unix_nanos>d.approval_request_expiry_unix_nanos
+                        OR d.effective_expiry_unix_nanos>d.approved_until_unix_nanos))
+                   OR d.deadline_monotonic_nanos-d.issued_monotonic_nanos<>
+                      d.effective_expiry_unix_nanos-d.issued_effective_unix_nanos
+                UNION ALL
+                SELECT 1 FROM authority_grant_expiry_latches x
+                LEFT JOIN authority_grant_deadlines d ON d.grant_id=x.grant_id
+                LEFT JOIN trusted_time_observations o ON o.state_revision=x.observed_state_revision
+                WHERE x.grant_id IS NULL OR typeof(x.owner_epoch)<>'integer'
+                   OR typeof(x.observed_state_revision)<>'integer'
+                   OR typeof(x.observed_monotonic_nanos)<>'integer'
+                   OR typeof(x.observed_unix_nanos)<>'integer'
+                   OR typeof(x.observed_effective_unix_nanos)<>'integer'
+                   OR d.grant_id IS NULL OR o.state_revision IS NULL OR o.confidence<>'TRUSTED_LOCAL'
+                   OR d.session_id IS NOT x.session_id OR d.owner_id IS NOT x.owner_id OR d.owner_epoch IS NOT x.owner_epoch
+                   OR o.monotonic_nanos IS NOT x.observed_monotonic_nanos OR o.observed_unix_nanos IS NOT x.observed_unix_nanos
+                   OR o.expiry_floor_unix_nanos IS NOT x.observed_effective_unix_nanos
+                   OR (x.reason='MONOTONIC_DEADLINE' AND x.observed_monotonic_nanos<d.deadline_monotonic_nanos)
+                   OR (x.reason='WALL_EXPIRY' AND x.observed_effective_unix_nanos<d.effective_expiry_unix_nanos)
+            )", [], |r| r.get(0))?;
+        if invalid {
+            return Ok(false);
+        }
+        let mut statement = connection.prepare(
+            "SELECT grant_expires_at,grant_expiry_unix_nanos,
+                    approval_request_expires_at,approval_request_expiry_unix_nanos,
+                    approved_until,approved_until_unix_nanos
+             FROM authority_grant_deadlines",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let parse_expiry = |raw: &str| {
+            OffsetDateTime::parse(raw, &Rfc3339)
+                .ok()
+                .and_then(|value| i64::try_from(value.unix_timestamp_nanos()).ok())
+        };
+        for row in rows {
+            let (
+                grant_text,
+                grant_nanos,
+                request_text,
+                request_nanos,
+                approved_text,
+                approved_nanos,
+            ) = row?;
+            if parse_expiry(&grant_text) != Some(grant_nanos)
+                || request_text.as_deref().and_then(parse_expiry) != request_nanos
+                || approved_text.as_deref().and_then(parse_expiry) != approved_nanos
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn authority_fence_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
+    const OBJECTS: [&str; 4] = [
+        "authority_issuance_receipts",
+        "authority_issuance_receipt_exact_insert",
+        "authority_issuance_receipt_no_update",
+        "authority_issuance_receipt_no_delete",
+    ];
+    let canonical = if stamped {
+        let canonical = Connection::open_in_memory()?;
+        canonical.execute_batch(MIGRATION)?;
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))?;
+        Some(canonical)
+    } else {
+        None
+    };
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expected = canonical
+            .as_ref()
+            .map(|canonical| {
+                canonical.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn authority_candidate_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
+    const OBJECTS: [&str; 23] = [
+        "authority_candidate_reservations",
+        "authority_candidate_resources",
+        "ux_authority_candidate_output_identity",
+        "authority_candidate_status",
+        "authority_candidate_reservation_no_duplicate_insert",
+        "authority_candidate_resource_no_duplicate_insert",
+        "authority_candidate_status_no_duplicate_insert",
+        "authority_candidate_reservation_exact_insert",
+        "authority_candidate_binding_insert_guard",
+        "authority_candidate_step_insert_guard",
+        "authority_candidate_step_identity_update_guard",
+        "authority_candidate_step_no_delete",
+        "authority_candidate_allocation_insert_guard",
+        "authority_candidate_allocation_identity_update_guard",
+        "authority_candidate_allocation_no_delete",
+        "authority_candidate_resource_exact_insert",
+        "authority_candidate_status_exact_insert",
+        "authority_candidate_status_cas_update",
+        "authority_candidate_reservation_no_update",
+        "authority_candidate_reservation_no_delete",
+        "authority_candidate_resource_no_update",
+        "authority_candidate_resource_no_delete",
+        "authority_candidate_status_no_delete",
+    ];
+    let canonical = if stamped {
+        let canonical = Connection::open_in_memory()?;
+        canonical.execute_batch(MIGRATION)?;
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0016-authority-candidate-reservations.sql"
+        ))?;
+        Some(canonical)
+    } else {
+        None
+    };
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','index','trigger')",
+                [name], |row| row.get(0),
+            ).optional()?;
+        let expected = canonical.as_ref().map(|canonical| {
+            canonical.query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','index','trigger')",
+                [name], |row| row.get::<_,String>(0),
+            )
+        }).transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
@@ -4456,7 +5101,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time', '0020_artifact_placement_receipts', '0021_authority_grant_deadlines')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4535,6 +5180,33 @@ fn preflight_migration_state_with_mode(
         "0014_semantic_repair_fence",
         "semantic-repair-fence-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0015_authority_issuance_fence",
+        "authority-issuance-fence-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0016_authority_candidate_reservations",
+        "authority-candidate-reservations-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0017_authority_policy_evaluation",
+        "authority-policy-evaluation-v0.1",
+    )?;
+    verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
+    verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
+    verify_migration_checksum(
+        connection,
+        "0020_artifact_placement_receipts",
+        "artifact-placement-receipts-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0021_authority_grant_deadlines",
+        "authority-grant-deadlines-v0.1",
+    )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4592,6 +5264,75 @@ fn preflight_migration_state_with_mode(
                     "skills",
                 ],
             )?;
+        }
+        let has_authority_fence: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0015_authority_issuance_fence')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !authority_fence_objects_current(connection, has_authority_fence)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority issuance fence requires operator quarantine",
+            ));
+        }
+        let has_candidate_reservations: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0016_authority_candidate_reservations')",
+            [], |row| row.get(0),
+        )?;
+        if !authority_candidate_objects_current(connection, has_candidate_reservations)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority candidate reservation schema requires operator quarantine",
+            ));
+        }
+        let has_policy_evaluation: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0017_authority_policy_evaluation')",
+            [], |row| row.get(0),
+        )?;
+        if !authority_policy::policy_objects_current(connection, has_policy_evaluation)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority policy evaluation schema requires operator quarantine",
+            ));
+        }
+        let has_trusted_time: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0018_trusted_time')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !trusted_time::objects_current(connection, has_trusted_time)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "trusted time schema requires operator quarantine",
+            ));
+        }
+        let has_inflight_time: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0019_inflight_time')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !trusted_time::inflight_objects_current(connection, has_inflight_time)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "in-flight time marker schema requires operator quarantine",
+            ));
+        }
+        let has_placement_receipts: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts')",
+            [], |row| row.get(0),
+        )?;
+        if (has_placement_receipts && !has_inflight_time)
+            || !artifact_placement_receipt_objects_current(connection, has_placement_receipts)?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "artifact placement receipt schema requires operator quarantine",
+            ));
+        }
+        let has_grant_deadlines: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0021_authority_grant_deadlines')",
+            [], |row| row.get(0))?;
+        if (has_grant_deadlines && (!has_authority_fence || !has_trusted_time))
+            || !authority_grant_deadline_objects_current(connection, has_grant_deadlines)?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority grant deadline schema requires operator quarantine",
+            ));
         }
         let has_v3 = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0003_task_manager_recovery_fencing_privacy')",
@@ -4947,6 +5688,33 @@ fn migrate_task_manager_schema(
         connection,
         "0013_provider_registry",
         "provider-registry-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0015_authority_issuance_fence",
+        "authority-issuance-fence-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0016_authority_candidate_reservations",
+        "authority-candidate-reservations-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0017_authority_policy_evaluation",
+        "authority-policy-evaluation-v0.1",
+    )?;
+    verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
+    verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
+    verify_migration_checksum(
+        connection,
+        "0020_artifact_placement_receipts",
+        "artifact-placement-receipts-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0021_authority_grant_deadlines",
+        "authority-grant-deadlines-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5319,6 +6087,51 @@ fn migrate_task_manager_schema(
         }
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0015_authority_issuance_fence', 'authority-issuance-fence-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0016-authority-candidate-reservations.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0016_authority_candidate_reservations', 'authority-candidate-reservations-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0017-authority-policy-evaluation.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0017_authority_policy_evaluation', 'authority-policy-evaluation-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(trusted_time::MIGRATION)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0018_trusted_time', 'trusted-time-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(trusted_time::INFLIGHT_MIGRATION)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0019_inflight_time', 'inflight-time-v0.1', '2026-09-24T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0020-artifact-placement-receipts.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0020_artifact_placement_receipts', 'artifact-placement-receipts-v0.1', '2026-09-24T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0021-authority-grant-deadlines.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0021_authority_grant_deadlines', 'authority-grant-deadlines-v0.1', '2026-09-24T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -6748,6 +7561,87 @@ fn count_bound_active_steps(
     Ok(count)
 }
 
+/// Check coordinator grant deadlines before any READY step is changed to RUNNING.
+/// A denial commits the exact time, clock session, and expiry latches with the
+/// rejected transition, without committing a partial set of started steps.
+fn ready_coordinator_grants_valid_in(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    active_steps: &[String],
+    lease_owner: &str,
+    lease_epoch: i64,
+    time: &trusted_time::ProtectedTimeContext,
+) -> Result<bool> {
+    let mut grants = Vec::new();
+    for node_id in active_steps {
+        let candidate = transaction
+            .query_row(
+                "SELECT s.attempt_id,b.binding_id,b.grant_refs_json
+                 FROM step_executions s
+                 JOIN tasks t ON t.task_id=s.task_id
+                 JOIN semantic_program_revisions p ON p.task_id=t.task_id
+                   AND p.program_revision=t.active_program_revision
+                   AND p.semantic_hash=s.semantic_program_hash
+                   AND p.registry_snapshot_id=s.registry_snapshot_id
+                 JOIN execution_bindings b
+                   ON b.binding_id=s.binding_id AND b.attempt_id=s.attempt_id
+                  AND b.task_id=s.task_id AND b.semantic_program_hash=s.semantic_program_hash
+                  AND b.registry_snapshot_id=s.registry_snapshot_id AND b.node_id=s.node_id
+                 WHERE s.task_id=?1 AND s.node_id=?2 AND s.state='READY'
+                   AND s.attempt_number=(SELECT MAX(s2.attempt_number) FROM step_executions s2
+                     WHERE s2.task_id=s.task_id AND s2.node_id=s.node_id
+                       AND s2.semantic_program_hash=s.semantic_program_hash
+                       AND s2.registry_snapshot_id=s.registry_snapshot_id) LIMIT 1",
+                params![task_id, node_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((attempt_id, binding_id, grant_refs_json)) = candidate else {
+            continue;
+        };
+        let coordinator_binding: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+             WHERE c.task_id=?1 AND c.binding_id=?2 AND c.attempt_id=?3
+               AND s.state='FINALIZED')",
+            params![task_id, binding_id, attempt_id],
+            |row| row.get(0),
+        )?;
+        if coordinator_binding {
+            let refs: Vec<String> = serde_json::from_str(&grant_refs_json)?;
+            if refs.is_empty() || refs.len() > 64 || !all_unique(&refs) {
+                return Ok(false);
+            }
+            grants.extend(refs);
+        }
+    }
+    if grants.is_empty() {
+        return Ok(true);
+    }
+    trusted_time::advance_clock_session_in(transaction, lease_owner, lease_epoch, time)?;
+    let mut valid = true;
+    for grant_id in grants {
+        if !coordinator_grant_policy_current(transaction, &grant_id)?
+            || !authority_deadline::check_and_latch_grant_deadline(
+                transaction,
+                &grant_id,
+                lease_owner,
+                lease_epoch,
+                time,
+            )?
+        {
+            valid = false;
+        }
+    }
+    Ok(valid)
+}
+
 fn admit_active_steps(
     transaction: &Transaction<'_>,
     task_id: &str,
@@ -7858,6 +8752,92 @@ fn output_allocations_ready(
     Ok(actual == expected_ports)
 }
 
+pub(crate) fn approval_not_withdrawn(
+    connection: &Connection,
+    approval_id: Option<&str>,
+) -> Result<bool> {
+    let Some(approval_id) = approval_id else {
+        return Ok(true);
+    };
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM authority_approval_bindings
+         WHERE approval_id=?1 AND revoked_at IS NOT NULL)",
+            [approval_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+/// Coordinator-issued grants are usable only under the activation that
+/// evaluated their immutable policy decision. A missing candidate or
+/// fingerprint fails closed; grants without a coordinator issuance receipt
+/// retain their existing admission rules.
+pub(crate) fn coordinator_grant_policy_current(
+    connection: &Connection,
+    grant_id: &str,
+) -> Result<bool> {
+    #[cfg(test)]
+    if fixture_grant_activation_exempt(connection, grant_id)? {
+        return Ok(true);
+    }
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM authority_issuance_receipts i
+                WHERE i.grant_id=?1 AND i.issuance_profile='coordinator-issued-v0.1'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM authority_grants g
+                    JOIN authority_candidate_reservations c
+                      ON c.task_id=g.task_id AND c.semantic_program_hash=g.semantic_program_hash
+                     AND c.node_id=g.node_id AND c.binding_id=g.execution_binding_id
+                     AND c.attempt_id=g.attempt_id
+                    JOIN authority_evaluation_fingerprints e
+                      ON e.decision_id=g.policy_decision_id AND e.candidate_id=c.candidate_id
+                    WHERE g.grant_id=i.grant_id AND g.token_id=i.token_id
+                      AND g.task_id=i.task_id AND g.execution_binding_id=i.execution_binding_id
+                      AND g.attempt_id=i.attempt_id AND g.policy_decision_id=i.policy_decision_id
+                      AND g.issued_at=i.issued_at
+                      AND e.activation_revision=(
+                          SELECT MAX(revision) FROM authority_policy_activations)))",
+            [grant_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+fn fixture_grant_activation_exempt(connection: &Connection, grant_id: &str) -> Result<bool> {
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+         AND name='_test_fixture_grant_activation_exemptions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM _test_fixture_grant_activation_exemptions f
+                JOIN authority_issuance_receipts i
+                  ON i.grant_id=f.grant_id AND i.token_id=f.token_id
+                 AND i.task_id=f.task_id AND i.execution_binding_id=f.execution_binding_id
+                 AND i.attempt_id=f.attempt_id AND i.policy_decision_id=f.policy_decision_id
+                 AND i.issued_at=f.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+                JOIN authority_grants g
+                  ON g.grant_id=i.grant_id AND g.token_id=i.token_id
+                 AND g.task_id=i.task_id AND g.execution_binding_id=i.execution_binding_id
+                 AND g.attempt_id=i.attempt_id AND g.policy_decision_id=i.policy_decision_id
+                 AND g.issued_at=i.issued_at
+                WHERE f.grant_id=?1)",
+            [grant_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the exact semantic-request, policy-decision, and runtime-grant intersection auditable"
@@ -8112,9 +9092,12 @@ fn binding_grants_valid(
     let mut covered_requests = std::collections::BTreeSet::new();
     let mut covered_decisions = std::collections::BTreeSet::new();
     for grant_id in grant_ids {
+        if !coordinator_grant_policy_current(transaction, &grant_id)? {
+            return Ok(false);
+        }
         let grant = transaction
             .query_row(
-                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id, g.scope, d.decision_id, g.delegable, g.max_delegation_depth FROM authority_grants g JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
+                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id, g.scope, d.decision_id, g.delegable, g.max_delegation_depth FROM authority_grants g JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id AND i.token_id=g.token_id AND i.task_id=g.task_id AND i.execution_binding_id=g.execution_binding_id AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1' JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
                 params![grant_id, check.task_id, check.semantic_hash, check.node_id, check.binding_id, check.attempt_id],
                 |row| {
                     Ok((
@@ -8138,6 +9121,9 @@ fn binding_grants_valid(
         let Some(grant) = grant else {
             return Ok(false);
         };
+        if !approval_not_withdrawn(transaction, grant.17.as_deref())? {
+            return Ok(false);
+        }
         let Some(request) = durable_by_id.get(&grant.6) else {
             return Ok(false);
         };
@@ -9247,8 +10233,8 @@ fn guard_failure(
         })
         .transpose()?
         .flatten();
-    let valid_program = if let Some(active_program_hash) = active_program_hash {
-        active_program_validation_valid(transaction, &request.task_id, &active_program_hash)?
+    let valid_program = if let Some(active_program_hash) = active_program_hash.as_deref() {
+        active_program_validation_valid(transaction, &request.task_id, active_program_hash)?
     } else {
         false
     };
@@ -9260,6 +10246,14 @@ fn guard_failure(
         &["READY"],
         checked_at,
     )?;
+    let coordinator_prepared: bool = request.to_state == TaskState::Runnable
+        && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+             WHERE c.task_id=?1 AND c.semantic_program_hash=?2 AND s.state='FINALIZED')",
+            params![request.task_id, active_program_hash.as_deref()],
+            |row| row.get(0),
+        )?;
     let checked_instant = OffsetDateTime::parse(checked_at, &Rfc3339)
         .map_err(|_| TaskManagerError::InvalidRecord("trusted guard time is not RFC 3339"))?;
     let scoped_pending_approvals = {
@@ -9374,6 +10368,7 @@ fn guard_failure(
             if !valid_program
                 || active_steps.is_empty()
                 || ready_steps == 0
+                || (coordinator_prepared && bound_ready_steps == 0)
                 || effective_waiting
                 || pending_approvals > 0
                 || durable_nonapproval_blocker =>
@@ -9475,6 +10470,9 @@ mod tests {
         fn now(&self) -> String {
             T0.to_owned()
         }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
     }
 
     fn test_manager() -> TaskManager {
@@ -9493,6 +10491,470 @@ mod tests {
             normalized_intent: None,
             active_step_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers session startup, high-water advance, and migration fences together"
+    )]
+    fn grant_deadline_migration_is_empty_and_session_high_water_is_fenced() {
+        let manager = test_manager();
+        let count: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM authority_grant_deadlines", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0); // No historical grant receives inferred time evidence.
+        let session = manager.lease_owner.clone();
+        let stored: (String, i64) = manager
+            .connection
+            .query_row(
+                "SELECT session_id,owner_epoch FROM authority_clock_sessions WHERE owner_id=?1",
+                [&manager.lease_owner],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (session.clone(), manager.lease_epoch));
+        let advanced = trusted_time::with_protected_observation(
+            &manager.connection,
+            &manager.clock,
+            |transaction, time| {
+                trusted_time::advance_clock_session_in(
+                    transaction,
+                    &manager.lease_owner,
+                    manager.lease_epoch,
+                    time,
+                )?;
+                Ok((time.state_revision(), time.monotonic_nanos()))
+            },
+        )
+        .unwrap();
+        let current: (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT high_water_state_revision,high_water_monotonic_nanos
+                 FROM authority_clock_sessions WHERE session_id=?1",
+                [&session],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, advanced);
+        let insert = "INSERT INTO authority_clock_sessions
+            (session_id,owner_id,owner_epoch,high_water_monotonic_nanos,
+             high_water_observed_unix_nanos,high_water_state_revision,revision)
+            SELECT ?1,l.owner_id,l.fence_epoch,o.monotonic_nanos,
+                   o.observed_unix_nanos,o.state_revision,1
+            FROM task_manager_lease l JOIN trusted_time_state s ON s.singleton_id=1
+            JOIN trusted_time_observations o ON o.state_revision=s.revision";
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO authority_clock_sessions
+             (session_id,owner_id,owner_epoch,high_water_monotonic_nanos,
+              high_water_observed_unix_nanos,high_water_state_revision,revision)
+             SELECT NULL,l.owner_id,l.fence_epoch,o.monotonic_nanos,
+                    o.observed_unix_nanos,o.state_revision,1
+             FROM task_manager_lease l JOIN trusted_time_state s ON s.singleton_id=1
+             JOIN trusted_time_observations o ON o.state_revision=s.revision",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_clock_sessions SET session_id=NULL WHERE session_id=?1",
+                    [&session]
+                )
+                .is_err()
+        );
+        assert!(manager.connection.execute(insert, [&session]).is_err());
+        assert!(manager.connection.execute(
+            "UPDATE authority_clock_sessions SET high_water_monotonic_nanos=high_water_monotonic_nanos-1,
+             revision=revision+1 WHERE session_id=?1", [&session]).is_err());
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "DELETE FROM authority_clock_sessions WHERE session_id=?1",
+                    [&session]
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO authority_grant_deadlines
+             (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,
+              issued_at,session_id,owner_id,owner_epoch,issued_state_revision,
+              issued_monotonic_nanos,deadline_monotonic_nanos,issued_observed_unix_nanos,
+              issued_effective_unix_nanos,effective_expiry_unix_nanos)
+             SELECT 'missing','token','task','binding','attempt','decision','time',
+                    c.session_id,c.owner_id,c.owner_epoch,c.high_water_state_revision,
+                    c.high_water_monotonic_nanos,c.high_water_monotonic_nanos+1,
+                    c.high_water_observed_unix_nanos,c.high_water_observed_unix_nanos,
+                    c.high_water_observed_unix_nanos+1
+             FROM authority_clock_sessions c",
+                    []
+                )
+                .is_err()
+        );
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+    }
+
+    #[test]
+    fn grant_deadline_stamped_schema_damage_and_unstamped_lookalike_quarantine() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER authority_grant_deadline_no_delete")
+            .unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
+
+        let manager = test_manager();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM schema_migrations WHERE migration_id='0021_authority_grant_deadlines'",
+                [],
+            )
+            .unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
+    }
+
+    #[test]
+    fn clock_session_is_fresh_on_file_backed_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("clock-session.sqlite3");
+        let first = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let first_id = first.lease_owner.clone();
+        let first_epoch = first.lease_epoch;
+        let first_rows: i64 = first
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM authority_clock_sessions WHERE session_id=?1
+             AND owner_id=?1 AND owner_epoch=?2",
+                params![first_id, first_epoch],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_rows, 1);
+        drop(first);
+
+        let second = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_ne!(second.lease_owner, first_id);
+        assert_eq!(second.lease_epoch, first_epoch + 1);
+        let (old_rows, new_rows): (i64, i64) = second
+            .connection
+            .query_row(
+                "SELECT
+               (SELECT COUNT(*) FROM authority_clock_sessions WHERE session_id=?1),
+               (SELECT COUNT(*) FROM authority_clock_sessions WHERE session_id=?2
+                  AND owner_epoch=?3)",
+                params![first_id, second.lease_owner, second.lease_epoch],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((old_rows, new_rows), (1, 1));
+        assert!(preflight_migration_state(&second.connection).is_ok());
+    }
+
+    #[test]
+    fn uncertain_startup_has_no_executable_clock_session() {
+        struct NoSampleClock;
+        impl Clock for NoSampleClock {
+            fn now(&self) -> String {
+                T0.to_owned()
+            }
+            fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+                None
+            }
+        }
+        let manager = TaskManager::open_in_memory_with_clock(Box::new(NoSampleClock)).unwrap();
+        let count: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM authority_clock_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one synthetic receipt exercises related deadline and approval cutoff guards"
+    )]
+    fn grant_deadline_requires_effective_floor_and_exact_duration() {
+        // Isolate 0021's guards using a synthetic predecessor receipt. The
+        // 0015 receipt insert guard is tested separately against its full chain.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(MIGRATION).unwrap();
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))
+        .unwrap();
+        db.execute_batch("DROP TRIGGER authority_issuance_receipt_exact_insert")
+            .unwrap();
+        db.execute_batch(trusted_time::MIGRATION).unwrap();
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0021-authority-grant-deadlines.sql"
+        ))
+        .unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        db.execute_batch(
+            "INSERT INTO task_manager_lease VALUES (1,'owner',1,'now');
+             INSERT INTO trusted_time_observations
+             (observation_id,state_revision,observed_unix_nanos,monotonic_nanos,
+              high_water_unix_nanos,expiry_floor_unix_nanos,confidence,reason_code,source_class)
+             VALUES (1,1,1000,100,1000,1100,'TRUSTED_LOCAL','TIME_OK','INJECTED_CLOCK');
+             UPDATE trusted_time_state SET confidence='TRUSTED_LOCAL',
+              high_water_unix_nanos=1000,expiry_floor_unix_nanos=1100,
+              reason_code='TIME_OK',revision=1 WHERE singleton_id=1;",
+        )
+        .unwrap();
+        assert!(
+            db.execute_batch(
+                "INSERT INTO authority_clock_sessions VALUES (NULL,'owner',1,100,1000,1,1)"
+            )
+            .is_err()
+        );
+        db.execute_batch(
+            "
+             INSERT INTO authority_grants
+             (grant_id,token_id,task_id,semantic_program_hash,node_id,capability,
+              principal_kind,principal_id,execution_binding_id,attempt_id,
+              policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at)
+             VALUES ('grant','token','task','hash','node','cap','provider','principal',
+              'binding','attempt','decision','snapshot','[]','TIME_LIMITED','ACTIVE','issued',
+              '1970-01-01T00:00:00.0000012Z');
+             INSERT INTO authority_issuance_receipts VALUES
+             ('grant','token','task','binding','attempt','decision','issued','coordinator-issued-v0.1');
+             INSERT INTO authority_clock_sessions VALUES
+             ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,100,1000,1,1);"
+        ).unwrap();
+        let insert = "INSERT INTO authority_grant_deadlines
+            (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,
+             issued_at,grant_expires_at,grant_expiry_unix_nanos,session_id,owner_id,owner_epoch,
+             issued_state_revision,issued_monotonic_nanos,deadline_monotonic_nanos,
+             issued_observed_unix_nanos,issued_effective_unix_nanos,effective_expiry_unix_nanos)
+            VALUES ('grant','token','task','binding','attempt','decision','issued',
+             '1970-01-01T00:00:00.0000012Z',1200,
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,1,100,?1,1000,?2,1150)";
+        assert!(db.execute(insert, params![150, 1000]).is_err()); // raw wall is below expiry floor
+        assert!(db.execute(insert, params![151, 1100]).is_err()); // duration cannot be extended
+        assert!(db.execute(insert, params![150.5, 1100]).is_err()); // fractional ticks are not evidence
+        assert!(
+            db.execute_batch(
+                "INSERT INTO authority_grant_deadlines
+             (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,
+              issued_at,grant_expires_at,grant_expiry_unix_nanos,session_id,owner_id,owner_epoch,
+              issued_state_revision,issued_monotonic_nanos,deadline_monotonic_nanos,
+              issued_observed_unix_nanos,issued_effective_unix_nanos,effective_expiry_unix_nanos)
+             VALUES ('grant','token','task','binding','attempt','decision','issued',
+              '1970-01-01T00:00:00.0000012Z',1200,
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,1,100,201,1000,1100,1201)"
+            )
+            .is_err()
+        ); // exact arithmetic cannot exceed the grant's absolute expiry
+        assert!(
+            db.execute(
+                "INSERT INTO authority_grant_deadlines
+                 (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,
+                  issued_at,grant_expires_at,grant_expiry_unix_nanos,session_id,owner_id,owner_epoch,
+                  issued_state_revision,issued_monotonic_nanos,deadline_monotonic_nanos,
+                  issued_observed_unix_nanos,issued_effective_unix_nanos,effective_expiry_unix_nanos)
+                 VALUES ('grant','token','task','binding','attempt','decision','issued',
+                  '1970-01-01T00:00:00.0000012Z',1200,
+                  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,1,100,?1,1000,1100,?2)",
+                params![
+                    9_223_372_036_854_775_807_f64 + 100.0,
+                    9_223_372_036_854_775_807_f64 + 1100.0
+                ],
+            )
+            .is_err()
+        ); // rounded REAL endpoints could otherwise satisfy the duration check
+        db.execute(insert, params![150, 1100]).unwrap();
+        assert!(db.execute_batch("INSERT OR REPLACE INTO authority_grants SELECT * FROM authority_grants WHERE grant_id='grant'").is_err());
+        assert!(db.execute_batch("INSERT OR REPLACE INTO authority_issuance_receipts SELECT * FROM authority_issuance_receipts WHERE grant_id='grant'").is_err());
+        for mutation in [
+            "UPDATE authority_grants SET capability='different' WHERE grant_id='grant'",
+            "UPDATE authority_grants SET principal_id='different' WHERE grant_id='grant'",
+            "UPDATE authority_grants SET approval_id='different' WHERE grant_id='grant'",
+            "UPDATE authority_grants SET grants_json='[1]' WHERE grant_id='grant'",
+            "UPDATE authority_grants SET scope='TASK' WHERE grant_id='grant'",
+            "UPDATE authority_grants SET delegable=1 WHERE grant_id='grant'",
+            "UPDATE authority_grants SET state='CONSUMED',uses_consumed=1 WHERE grant_id='grant'",
+        ] {
+            assert!(db.execute_batch(mutation).is_err(), "{mutation}");
+        }
+        db.execute_batch(
+            "UPDATE authority_grants SET state='REVOKED',revoked_at='now' WHERE grant_id='grant'",
+        )
+        .unwrap();
+        assert!(
+            db.execute_batch("UPDATE authority_grants SET state='ACTIVE' WHERE grant_id='grant'")
+                .is_err()
+        );
+        assert!(
+            db.execute_batch("UPDATE authority_grant_deadlines SET deadline_monotonic_nanos=200")
+                .is_err()
+        );
+        assert!(
+            db.execute_batch("DELETE FROM authority_grant_deadlines")
+                .is_err()
+        );
+        assert!(
+            db.execute_batch(
+                "INSERT INTO authority_grant_expiry_latches VALUES
+             ('grant','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,1,100,1000,1100,'WALL_EXPIRY')"
+            )
+            .is_err()
+        );
+        assert!(authority_grant_deadline_objects_current(&db, true).unwrap());
+        db.execute_batch(
+            "INSERT INTO approval_requests
+             (approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,
+              status,request_json,created_at,expires_at)
+             VALUES ('approval','request','task','hash','node','artifact.read','APPROVED','{}',
+              'issued','1970-01-01T00:00:00.00000114Z');
+             INSERT INTO approval_decisions
+             (decision_id,approval_id,task_id,decision,decided_by_kind,decided_by_id,scope,
+              approved_until,decision_json,decided_at)
+             VALUES ('approval-decision','approval','task','APPROVE','user','owner','ONE_SHOT',
+              '1970-01-01T00:00:00.00000113Z','{}','issued');
+             INSERT INTO authority_grants
+             (grant_id,token_id,task_id,semantic_program_hash,node_id,capability,
+              principal_kind,principal_id,execution_binding_id,attempt_id,
+              policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,state,issued_at,expires_at)
+             VALUES ('approved-grant','approved-token','task','hash','node','cap','provider',
+              'principal','binding','attempt','decision','snapshot','approval','[]',
+              'TIME_LIMITED','ACTIVE','issued','1970-01-01T00:00:00.0000012Z');
+             INSERT INTO authority_issuance_receipts VALUES
+             ('approved-grant','approved-token','task','binding','attempt','decision','issued',
+              'coordinator-issued-v0.1');",
+        ).unwrap();
+        let approved_insert = "INSERT INTO authority_grant_deadlines
+             (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,
+              issued_at,grant_expires_at,grant_expiry_unix_nanos,approval_id,
+              approval_request_expires_at,approval_request_expiry_unix_nanos,
+              approval_decision_id,approved_until,approved_until_unix_nanos,
+              session_id,owner_id,owner_epoch,issued_state_revision,issued_monotonic_nanos,
+              deadline_monotonic_nanos,issued_observed_unix_nanos,issued_effective_unix_nanos,
+              effective_expiry_unix_nanos)
+             VALUES ('approved-grant','approved-token','task','binding','attempt','decision',
+              'issued','1970-01-01T00:00:00.0000012Z',1200,'approval',
+              '1970-01-01T00:00:00.00000114Z',1140,'approval-decision',
+              '1970-01-01T00:00:00.00000113Z',1130,
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','owner',1,1,100,?1,1000,1100,?2)";
+        assert!(db.execute(approved_insert, params![131, 1131]).is_err());
+        db.execute(approved_insert, params![130, 1130]).unwrap();
+        assert!(authority_grant_deadline_objects_current(&db, true).unwrap());
+        db.execute_batch(
+            "DROP TRIGGER authority_grant_deadline_no_update;
+             UPDATE authority_grant_deadlines SET grant_expiry_unix_nanos=1199
+             WHERE grant_id='approved-grant';",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0021-authority-grant-deadlines.sql"
+        ))
+        .unwrap();
+        assert!(!authority_grant_deadline_objects_current(&db, true).unwrap());
+    }
+
+    #[test]
+    fn artifact_placement_receipts_are_additive_exact_and_immutable() {
+        let mut manager = test_manager();
+        manager.create_task(&create("T-placement-receipt")).unwrap();
+        let stamped: bool = manager.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0020_artifact_placement_receipts')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(stamped);
+        let legacy_grants: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_placement_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_grants, 0);
+        let epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let insert = "INSERT INTO artifact_placement_receipts
+            (placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+             operation_id,operation_request_id,owner_epoch,placement_marker_id)
+            VALUES (?1,?2,?3,3,'IMPORT','T-placement-receipt','import-key','{}',?4,NULL)";
+        let hash = format!("sha256:{}", "a".repeat(64));
+        manager
+            .connection
+            .execute(
+                insert,
+                params!["a".repeat(32), "blobs/pending/unique", hash, epoch],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .connection
+                .execute(
+                    insert,
+                    params!["b".repeat(32), "blobs/pending/unique", hash, epoch]
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute("UPDATE artifact_placement_receipts SET payload_size=4", [])
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute("DELETE FROM artifact_placement_receipts", [])
+                .is_err()
+        );
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO artifact_placement_receipts
+             (placement_id,pending_ref,payload_hash,payload_size,origin,task_id,
+              operation_id,operation_request_id,owner_epoch,placement_marker_id)
+             VALUES (?1,'blobs/pending/publication',?2,3,'PUBLICATION',
+              'T-placement-receipt','publication-key','{}',?3,NULL)",
+                    params!["c".repeat(32), hash, epoch],
+                )
+                .is_err()
+        );
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER artifact_placement_receipt_no_delete")
+            .unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
     }
 
     fn remove_fixture_fence_schema(connection: &Connection) {
@@ -12941,4 +14403,112 @@ mod tests {
 }
 
 #[cfg(test)]
+pub(crate) fn admit_fixture_grant(connection: &Connection, grant_id: &str) -> Result<()> {
+    // Unit tests exercise downstream admission with synthetic trusted issuance.
+    // Its durable exact-tuple marker bypasses only the coordinator activation
+    // check in test builds. Production issuance has no such bypass.
+    let token_id = format!("fixture-token:{grant_id}");
+    connection.execute(
+        "UPDATE authority_grants SET token_id=?2 WHERE grant_id=?1",
+        params![grant_id, token_id],
+    )?;
+    connection.execute(
+        "INSERT INTO authority_issuance_receipts(
+            grant_id,token_id,task_id,execution_binding_id,attempt_id,
+            policy_decision_id,issued_at,issuance_profile)
+         SELECT grant_id,token_id,task_id,execution_binding_id,attempt_id,
+                policy_decision_id,issued_at,'coordinator-issued-v0.1'
+         FROM authority_grants WHERE grant_id=?1",
+        [grant_id],
+    )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _test_fixture_grant_activation_exemptions (
+            grant_id TEXT PRIMARY KEY,
+            token_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            execution_binding_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            policy_decision_id TEXT NOT NULL,
+            issued_at TEXT NOT NULL
+        ) WITHOUT ROWID;",
+    )?;
+    connection.execute(
+        "INSERT INTO _test_fixture_grant_activation_exemptions
+            (grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,issued_at)
+         SELECT grant_id,token_id,task_id,execution_binding_id,attempt_id,policy_decision_id,issued_at
+         FROM authority_issuance_receipts WHERE grant_id=?1",
+        [grant_id],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod adversarial_tests;
+
+#[cfg(test)]
+mod step_creation_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn step_insert_joins_caller_transaction_and_rolls_back() {
+        let mut manager = TaskManager::open_in_memory().unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-step-transaction".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "Run one step.".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        let request = CreateStepExecution {
+            attempt_id: "attempt-step-transaction".to_owned(),
+            task_id: "T-step-transaction".to_owned(),
+            semantic_program_hash: format!("sha256:{}", "a".repeat(64)),
+            registry_snapshot_id: None,
+            node_id: "node-step-transaction".to_owned(),
+            binding_id: None,
+            provider_id: None,
+            provider_version: None,
+            attempt_number: 1,
+            state: StepState::Ready,
+            operation_id: None,
+            idempotency_key: None,
+            outcome_certainty: Some(OutcomeCertainty::NotStarted),
+            input_artifacts: Vec::new(),
+            output_artifacts: Vec::new(),
+            failure: None,
+            started_at: None,
+            finished_at: None,
+        };
+        let now = manager.clock.now();
+        let transaction = manager
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        TaskManager::create_step_execution_in(&transaction, &request, &now).unwrap();
+        assert_eq!(
+            transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM step_executions WHERE attempt_id=?1",
+                    [&request.attempt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        transaction.rollback().unwrap();
+        assert!(
+            manager
+                .get_step_execution(&request.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        let created = manager.create_step_execution(&request).unwrap();
+        assert_eq!(created.attempt_id, request.attempt_id);
+    }
+}
