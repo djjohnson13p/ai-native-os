@@ -54,6 +54,33 @@ use time::format_description::well_known::Rfc3339;
 const SCHEMA_VERSION: &str = "0.1";
 const MIGRATION: &str = include_str!("../../../specs/persistence-v0.1.sql");
 
+/// A bounded diagnostic produced by the trusted authority boundary itself.
+/// It contains no untrusted selector, provider text, or resource identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityDenial {
+    pub stage: AuthorityDenialStage,
+    pub reason: AuthorityDenialReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityDenialStage {
+    CandidateReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityDenialReason {
+    SemanticRequestMismatch,
+}
+
+impl AuthorityDenialReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SemanticRequestMismatch => "AUTH_SEMANTIC_REQUEST_MISMATCH",
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_STARTUP_AFTER_AUTHORITY_RETIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -69,6 +96,18 @@ pub enum TaskManagerError {
     Registry(aios_registry::RegistryStoreError),
     Provider(aios_registry::ProviderStoreError),
     InvalidRecord(&'static str),
+    AuthorityDenied(AuthorityDenial),
+}
+
+impl TaskManagerError {
+    /// Returns a trusted reason without changing the safe outer error text.
+    #[must_use]
+    pub const fn authority_denial(&self) -> Option<AuthorityDenial> {
+        match self {
+            Self::AuthorityDenied(denial) => Some(*denial),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TaskManagerError {
@@ -84,6 +123,9 @@ impl fmt::Display for TaskManagerError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Provider(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
+            Self::AuthorityDenied(_) => {
+                formatter.write_str("authority candidate reservation is not admissible")
+            }
         }
     }
 }

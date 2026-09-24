@@ -156,6 +156,8 @@ pub(crate) struct CandidatePolicyDecision {
     pub authority_request_id: String,
     pub decision_id: String,
     pub effect: PolicyEffect,
+    /// The same deterministic reason persisted in this decision's receipt.
+    pub reason_code: &'static str,
     pub approval_id: Option<String>,
     pub evaluation_fingerprint: String,
 }
@@ -1883,6 +1885,7 @@ impl TaskManager {
                 authority_request_id: request_id,
                 decision_id,
                 effect,
+                reason_code: reason,
                 approval_id,
                 evaluation_fingerprint: fingerprint,
             });

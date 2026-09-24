@@ -1,9 +1,9 @@
 //! Non-executable reservations for deterministic authority evaluation.
 
 use super::{
-    CreateStepExecution, Result, StepState, TaskManager, TaskManagerError,
-    active_program_validation_valid, all_unique, assert_manager_lease, canonical_json,
-    program_node,
+    AuthorityDenial, AuthorityDenialReason, AuthorityDenialStage, CreateStepExecution, Result,
+    StepState, TaskManager, TaskManagerError, active_program_validation_valid, all_unique,
+    assert_manager_lease, canonical_json, program_node,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,11 @@ pub(crate) enum CandidateResourceHandle {
         operation_id: String,
         purpose: String,
         max_size_bytes: u64,
+    },
+    /// An untrusted proposed service claim. This Stage-1 local profile never
+    /// resolves or issues network authority from this handle.
+    NetworkService {
+        service_id: String,
     },
 }
 
@@ -77,6 +82,13 @@ pub(crate) struct PendingAuthorityCandidate {
 
 fn reject() -> TaskManagerError {
     TaskManagerError::InvalidRecord("authority candidate reservation is not admissible")
+}
+
+fn semantic_request_mismatch() -> TaskManagerError {
+    TaskManagerError::AuthorityDenied(AuthorityDenial {
+        stage: AuthorityDenialStage::CandidateReservation,
+        reason: AuthorityDenialReason::SemanticRequestMismatch,
+    })
 }
 
 fn valid_id(value: &str) -> bool {
@@ -503,6 +515,7 @@ fn replay_existing(
                 }
                 continue;
             }
+            CandidateResourceHandle::NetworkService { .. } => return Err(reject()),
         };
         requested.push((
             choice.action.clone(),
@@ -1327,6 +1340,26 @@ impl TaskManager {
             .get("authority_requests")
             .and_then(Value::as_array)
             .ok_or_else(reject)?;
+        let declared_pairs = declared
+            .iter()
+            .map(|request| {
+                Ok((
+                    request
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .ok_or_else(reject)?,
+                    request
+                        .get("resource")
+                        .and_then(Value::as_str)
+                        .ok_or_else(reject)?,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if request.resources.iter().any(|claim| {
+            !declared_pairs.contains(&(claim.action.as_str(), claim.semantic_selector.as_str()))
+        }) {
+            return Err(semantic_request_mismatch());
+        }
         if declared.len() != request.resources.len() {
             return Err(reject());
         }
@@ -2106,6 +2139,108 @@ mod tests {
         choices_with_source("artifact:source")
     }
 
+    #[test]
+    fn fixture_undeclared_network_claim_is_typed_denial_before_any_authority() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../examples/authority/authority-cases.json"
+        ))
+        .unwrap();
+        let matching: Vec<&Value> = cases
+            .iter()
+            .filter(|case| case["name"] == "provider-invents-network-action-not-in-semantic-ir")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let case = matching[0];
+        assert_eq!(case["expected"], "DENY");
+        let semantic_claim = case["facts"]["validated_semantic_request"]
+            .as_str()
+            .unwrap();
+        let runtime_claim = case["facts"]["runtime_request"].as_str().unwrap();
+        let (semantic_action, semantic_selector) = semantic_claim.split_once(' ').unwrap();
+        let (runtime_action, runtime_service) = runtime_claim.split_once(' ').unwrap();
+        assert_eq!(runtime_action, "network.connect");
+        assert!(runtime_service.starts_with("service://"));
+
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let program_json: String = manager.connection.query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-candidate' AND semantic_hash=?1",
+            [&hash], |row| row.get(0),
+        ).unwrap();
+        let program: Value = serde_json::from_str(&program_json).unwrap();
+        let node = program_node(&program, "copy").unwrap();
+        let declared = node["authority_requests"].as_array().unwrap();
+        assert!(declared.iter().any(|claim| {
+            claim["action"] == semantic_action && claim["resource"] == semantic_selector
+        }));
+        assert!(
+            !declared
+                .iter()
+                .any(|claim| claim["action"] == runtime_action)
+        );
+
+        let authority_counts = |manager: &TaskManager| {
+            [
+                "authority_candidate_reservations",
+                "authority_candidate_resources",
+                "policy_decisions",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before = authority_counts(&manager);
+        let mut choices = choices();
+        choices.push(CandidateResourceChoice {
+            action: runtime_action.to_owned(),
+            semantic_selector: runtime_service.to_owned(),
+            handle: CandidateResourceHandle::NetworkService {
+                service_id: runtime_service.to_owned(),
+            },
+        });
+        let error = manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:undeclared-network",
+                binding_id: "binding:undeclared-network",
+                attempt_id: "attempt:undeclared-network",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices,
+            })
+            .unwrap_err();
+        let denial = error
+            .authority_denial()
+            .expect("reservation emitted a typed diagnostic");
+        assert_eq!(denial.stage, AuthorityDenialStage::CandidateReservation);
+        assert_eq!(
+            denial.reason,
+            AuthorityDenialReason::SemanticRequestMismatch
+        );
+        assert_eq!(case["reason_code"], denial.reason.code());
+        assert_catalog_reason(denial.reason.code());
+        assert_eq!(
+            error.to_string(),
+            "authority candidate reservation is not admissible"
+        );
+        let after = authority_counts(&manager);
+        assert_eq!(
+            after, before,
+            "denial cannot reserve or issue authority or an effect"
+        );
+    }
+
     fn choices_with_source(artifact_id: &str) -> Vec<CandidateResourceChoice> {
         choices_with_source_and_output(artifact_id, "allocation:copy")
     }
@@ -2339,6 +2474,7 @@ mod tests {
             .unwrap();
         assert_eq!(evaluated.decisions.len(), 3);
         assert_eq!(evaluated.decisions[2].effect, PolicyEffect::RequireApproval);
+        assert_eq!(evaluated.decisions[2].reason_code, "AUTH_REQUIRE_APPROVAL");
         let approval = evaluated.decisions[2].approval_id.as_deref().unwrap();
         manager
             .transition(&TransitionRequest {
@@ -3777,6 +3913,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![PolicyEffect::Allow, PolicyEffect::RequireApproval]
         );
+        assert_eq!(initial.decisions[0].reason_code, "AUTH_ALLOW");
+        assert_eq!(initial.decisions[1].reason_code, "AUTH_REQUIRE_APPROVAL");
         assert_policy_decision_reason(
             &manager,
             &initial.decisions[0].decision_id,
@@ -3964,6 +4102,7 @@ mod tests {
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(hard.decisions[1].effect, PolicyEffect::Deny);
+        assert_eq!(hard.decisions[1].reason_code, "AUTH_DENY_POLICY");
         assert_policy_decision_reason(
             &manager,
             &hard.decisions[1].decision_id,
