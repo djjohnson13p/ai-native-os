@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool};
 
 use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -494,6 +494,9 @@ pub struct TaskManager {
     /// Persisted pending admissions can be rehydrated after process loss without allowing two
     /// simultaneous handles in one manager lifetime.
     delivered_reader_admissions: Arc<Mutex<BTreeSet<String>>>,
+    /// Shared with live Artifact handles so trusted export adapters cannot
+    /// recursively wait on the authority transaction held by their callback.
+    artifact_export_callback_active: Arc<AtomicBool>,
 }
 
 pub trait Clock: Send + Sync {
@@ -897,6 +900,7 @@ impl TaskManager {
             artifact_store_cleanup,
             artifact_export_verifiers,
             delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
+            artifact_export_callback_active: Arc::new(AtomicBool::new(false)),
         };
         manager.verify_all_provenance_chains()?;
         manager.migrate_legacy_keyed_import_receipts()?;

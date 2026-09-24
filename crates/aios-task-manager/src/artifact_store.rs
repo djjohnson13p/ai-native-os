@@ -10,7 +10,10 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(not(unix))]
 use cap_std::ambient_authority;
@@ -920,6 +923,40 @@ impl ArtifactExportWriter for Vec<u8> {
     }
 }
 
+/// A trusted destination callback may not synchronously use another live
+/// handle from this store: that handle would wait on the callback's `SQLite`
+/// authority transaction. The guard is process-local and does not grant
+/// authority or replace the durable external-effect marker.
+struct ExportCallbackGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl<'a> ExportCallbackGuard<'a> {
+    fn enter(active: &'a AtomicBool) -> Result<Self> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_REENTRY_DENIED"))?;
+        Ok(Self { active })
+    }
+}
+
+impl Drop for ExportCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+fn deny_export_callback_reentry(active: &AtomicBool) -> std::io::Result<()> {
+    if active.load(Ordering::Acquire) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ARTIFACT_EXPORT_REENTRY_DENIED",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// An opaque, single-use export destination prepared by the trusted control plane.
 ///
 /// The destination class and exact egress admission are sealed into this handle, so callers of
@@ -1121,6 +1158,7 @@ pub struct ArtifactReader {
     recovery_replay_revision: Option<i64>,
     export_operation_exemption: Option<String>,
     live_reader_admissions: Arc<Mutex<BTreeSet<String>>>,
+    export_callback_active: Arc<AtomicBool>,
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
 
@@ -1143,6 +1181,7 @@ impl Read for ArtifactReader {
         reason = "the serialized authority fence, byte read, delivery receipt, and response-loss recovery are kept together so their ordering remains auditable"
     )]
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        deny_export_callback_reentry(&self.export_callback_active)?;
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -1331,6 +1370,7 @@ impl Read for ArtifactReader {
 
 impl Seek for ArtifactReader {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        deny_export_callback_reentry(&self.export_callback_active)?;
         validate_reader_fence(self)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
         self.file.seek(position)
@@ -1364,6 +1404,7 @@ pub struct ArtifactStagingWriter {
     maximum: u64,
     written: u64,
     poisoned: bool,
+    export_callback_active: Arc<AtomicBool>,
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
 
@@ -1472,6 +1513,11 @@ impl ArtifactStagingWriter {
         reason = "both serialized writer finish phases must preserve captured time on every exit"
     )]
     pub fn finish(mut self) -> Result<u64> {
+        if self.export_callback_active.load(Ordering::Acquire) {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_REENTRY_DENIED",
+            ));
+        }
         if self.poisoned {
             return Err(TaskManagerError::InvalidRecord(
                 "Artifact staging writer outcome is uncertain",
@@ -1516,6 +1562,7 @@ impl ArtifactStagingWriter {
 
 impl Write for ArtifactStagingWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        deny_export_callback_reentry(&self.export_callback_active)?;
         if self.poisoned {
             return Err(std::io::Error::other("staging write outcome is uncertain"));
         }
@@ -1617,6 +1664,7 @@ impl Write for ArtifactStagingWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        deny_export_callback_reentry(&self.export_callback_active)?;
         if self.poisoned {
             return Err(std::io::Error::other("staging write outcome is uncertain"));
         }
@@ -3242,6 +3290,7 @@ impl TaskManager {
                     maximum,
                     written,
                     poisoned: false,
+                    export_callback_active: Arc::clone(&self.artifact_export_callback_active),
                     _store_cleanup: self.artifact_store_cleanup.clone(),
                 });
             }
@@ -3428,6 +3477,7 @@ impl TaskManager {
                     .min(IMPORT_LIMIT),
                 written: 0,
                 poisoned: false,
+                export_callback_active: Arc::clone(&self.artifact_export_callback_active),
                 _store_cleanup: self.artifact_store_cleanup.clone(),
             })
         })();
@@ -4230,6 +4280,7 @@ impl TaskManager {
             recovery_replay_revision: None,
             export_operation_exemption: None,
             live_reader_admissions: Arc::clone(&self.delivered_reader_admissions),
+            export_callback_active: Arc::clone(&self.artifact_export_callback_active),
             _store_cleanup: self.artifact_store_cleanup.clone(),
         })
     }
@@ -4949,11 +5000,19 @@ impl TaskManager {
                 }
                 Ok(())
             })();
-            if let Err(error) = pre_call {
-                super::trusted_time::resolve_external_no_effect_in(&construction_permit, entry)?;
-                transaction.commit()?;
-                return Err(error);
-            }
+            let _callback_guard = match pre_call
+                .and_then(|()| ExportCallbackGuard::enter(&self.artifact_export_callback_active))
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    super::trusted_time::resolve_external_no_effect_in(
+                        &construction_permit,
+                        entry,
+                    )?;
+                    transaction.commit()?;
+                    return Err(error);
+                }
+            };
             callback_invoked = true;
             let writer = writer_factory();
             super::trusted_time::resolve_external_entry_in(&construction_permit, entry)?;
@@ -4997,6 +5056,7 @@ impl TaskManager {
             recovery_replay_revision: None,
             export_operation_exemption: Some(destination.operation_id.clone()),
             live_reader_admissions: Arc::clone(&self.delivered_reader_admissions),
+            export_callback_active: Arc::clone(&self.artifact_export_callback_active),
             _store_cleanup: self.artifact_store_cleanup.clone(),
         };
         let (exported, exported_hash) = match copy_export_bounded(
@@ -5014,6 +5074,7 @@ impl TaskManager {
             &self.lease_owner,
             self.lease_epoch,
             &destination.operation_id,
+            &self.artifact_export_callback_active,
             &destination.task_id,
             &destination.authority,
             &destination.destination_class,
@@ -5095,11 +5156,16 @@ impl TaskManager {
                     destination.grant_admission.as_ref(),
                 )
             });
-            if let Err(error) = pre_call {
-                super::trusted_time::resolve_external_no_effect_in(&finalize_permit, entry)?;
-                transaction.commit()?;
-                return Err(error);
-            }
+            let _callback_guard = match pre_call
+                .and_then(|()| ExportCallbackGuard::enter(&self.artifact_export_callback_active))
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    super::trusted_time::resolve_external_no_effect_in(&finalize_permit, entry)?;
+                    transaction.commit()?;
+                    return Err(error);
+                }
+            };
             // Destination finalization may itself make bytes externally
             // visible. Keep the same serialized authority fence held across
             // that irreversible callback; a concurrent revocation or recovery
@@ -11120,6 +11186,7 @@ fn with_fresh_export_fence<T, F>(
     lease_owner: &str,
     lease_epoch: i64,
     operation_id: &str,
+    callback_active: &AtomicBool,
     task_id: &str,
     authority: &ReadAuthority,
     destination_class: &str,
@@ -11160,11 +11227,15 @@ where
             grant_admission,
         )
     });
-    if let Err(error) = pre_call {
-        super::trusted_time::resolve_external_no_effect_in(&permit, entry).map_err(map)?;
-        transaction.commit().map_err(|error| map(error.into()))?;
-        return Err(map(error));
-    }
+    let _callback_guard = match pre_call.and_then(|()| ExportCallbackGuard::enter(callback_active))
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            super::trusted_time::resolve_external_no_effect_in(&permit, entry).map_err(map)?;
+            transaction.commit().map_err(|error| map(error.into()))?;
+            return Err(map(error));
+        }
+    };
     // The callback can change the destination even when it returns Err.
     let result = callback();
     super::trusted_time::resolve_external_entry_in(&permit, entry).map_err(map)?;
@@ -11187,6 +11258,7 @@ fn copy_export_bounded<R: Read, W: Write>(
     lease_owner: &str,
     lease_epoch: i64,
     operation_id: &str,
+    callback_active: &AtomicBool,
     task_id: &str,
     authority: &ReadAuthority,
     destination_class: &str,
@@ -11233,6 +11305,7 @@ fn copy_export_bounded<R: Read, W: Write>(
                 lease_owner,
                 lease_epoch,
                 operation_id,
+                callback_active,
                 task_id,
                 authority,
                 destination_class,
@@ -11263,6 +11336,7 @@ fn copy_export_bounded<R: Read, W: Write>(
         lease_owner,
         lease_epoch,
         operation_id,
+        callback_active,
         task_id,
         authority,
         destination_class,
@@ -14175,6 +14249,38 @@ mod tests {
         }
     }
 
+    struct ReenteringExportWriter {
+        reader: ArtifactReader,
+        denied: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ReenteringExportWriter {
+        fn probe(&mut self) {
+            let mut byte = [0];
+            let error = self.reader.read(&mut byte).unwrap_err();
+            self.denied.lock().unwrap().push(error.to_string());
+        }
+    }
+
+    impl Write for ReenteringExportWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.probe();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.probe();
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for ReenteringExportWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            self.probe();
+            Ok(())
+        }
+    }
+
     struct CoordinatedFinalizeWriter {
         finalize_ready: Arc<Barrier>,
         lock_conflict_observed: Arc<Barrier>,
@@ -16973,6 +17079,54 @@ mod tests {
                 )
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn export_adapter_reentry_into_live_reader_fails_before_sqlite_lock() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"private".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let denied = Arc::new(Mutex::new(Vec::new()));
+        let denied_for_writer = Arc::clone(&denied);
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-adapter-reentry",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    let mut writer = ReenteringExportWriter {
+                        reader,
+                        denied: denied_for_writer,
+                    };
+                    writer.probe();
+                    Ok(writer)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            7
+        );
+        let denied = denied.lock().unwrap();
+        assert_eq!(denied.len(), 4);
+        assert!(
+            denied
+                .iter()
+                .all(|error| error.contains("ARTIFACT_EXPORT_REENTRY_DENIED"))
         );
     }
 
