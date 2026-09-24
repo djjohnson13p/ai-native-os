@@ -1600,6 +1600,14 @@ fn projected_placeholder(
         .get("alias")
         .and_then(Value::as_str)
         .expect("validated alias has a digest");
+    if path.iter().any(|part| part == "export_authority") {
+        if key == "service_id" {
+            return format!("service://{digest}");
+        }
+        if key == "sensitivity" {
+            return "private".to_owned();
+        }
+    }
     if matches!(
         key,
         "semantic_program_hash"
@@ -2156,7 +2164,7 @@ fn allowed_detail_key(event_type: &str, key: &str) -> bool {
                 | "blob_reused"
                 | "type"
         ),
-        "artifact.exported" => matches!(key, "operation_id" | "size_bytes"),
+        "artifact.exported" => matches!(key, "operation_id" | "size_bytes" | "export_authority"),
         "artifact.integrity-failed" => matches!(
             key,
             "content_hash"
@@ -2288,6 +2296,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         }
         ("artifact.created", "type") => expect_token(value, 256),
         ("artifact.exported", "operation_id") => expect_artifact_identifier(value),
+        ("artifact.exported", "export_authority") => validate_exact_export_authority(value),
         ("artifact.integrity-failed", "observation_ordinal") => expect_integer(value, 1, None),
         ("artifact.integrity-failed", "previous_durability_state") => {
             expect_nullable_durability_state(value)
@@ -2426,6 +2435,45 @@ fn validate_export_reconciliation(value: &Value) -> Result<()> {
     expect_timestamp(&object["observed_at"])?;
     expect_digest(&object["subject_hash"])?;
     expect_identifier(&object["recovery_ref"], 256)
+}
+
+fn validate_exact_export_authority(value: &Value) -> Result<()> {
+    let object = expect_exact_object(
+        value,
+        &[
+            "selector",
+            "service_id",
+            "destination_class",
+            "descriptor_hash",
+            "adapter_id",
+            "operation_id",
+            "source_artifact_id",
+            "source_content_hash",
+            "purpose",
+            "sensitivity",
+            "max_size_bytes",
+        ],
+    )?;
+    expect_identifier(&object["selector"], 512)?;
+    expect_identifier(&object["service_id"], 512)?;
+    if !object["service_id"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("service://"))
+    {
+        return Err(invalid_details("export service identity is invalid"));
+    }
+    expect_identifier(&object["destination_class"], 128)?;
+    expect_digest(&object["descriptor_hash"])?;
+    expect_identifier(&object["adapter_id"], 256)?;
+    expect_artifact_identifier(&object["operation_id"])?;
+    expect_artifact_identifier(&object["source_artifact_id"])?;
+    expect_digest(&object["source_content_hash"])?;
+    expect_task_string(&object["purpose"], 256, true)?;
+    expect_one_of(
+        &object["sensitivity"],
+        &["public", "local", "private", "confidential", "secret"],
+    )?;
+    expect_integer(&object["max_size_bytes"], 1, Some(8 * 1024 * 1024))
 }
 
 fn validate_commitment(value: &Value, expected_field: &str, nullable: bool) -> Result<()> {
@@ -3981,6 +4029,38 @@ mod tests {
                 NOW,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_export_authority_is_typed_and_privacy_projectable() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let event = json!({
+            "schema_version":"0.1","event_id":"event:exact-export",
+            "task_id":"T-exact-export","event_type":"artifact.exported",
+            "timestamp":NOW,"actor":{"kind":"provider","id":"provider:fixture"},
+            "input_artifacts":["artifact:source"],"output_artifacts":[],
+            "external_transfer":{"destination":"service://fixture/a",
+                "data_refs":["artifact:source"],"purpose":"fixture evaluation"},
+            "status":"success","details":{"operation_id":"export:fixture",
+                "size_bytes":7,"export_authority":{
+                    "selector":"destination:fixture_remote","service_id":"service://fixture/a",
+                    "destination_class":"fixture_remote","descriptor_hash":hash.clone(),
+                    "adapter_id":"adapter:memory","operation_id":"export:fixture",
+                    "source_artifact_id":"artifact:source","source_content_hash":hash,
+                    "purpose":"fixture evaluation","sensitivity":"private","max_size_bytes":1024
+                }}
+        });
+        validate_stored_event(&event).unwrap();
+        let projected = project_event(&event, &[7_u8; 32]).unwrap();
+        validate_projected_event(&projected).unwrap();
+        assert_ne!(
+            projected["details"]["export_authority"]["service_id"],
+            event["details"]["export_authority"]["service_id"]
+        );
+        assert_ne!(
+            projected["details"]["export_authority"]["purpose"],
+            event["details"]["export_authority"]["purpose"]
         );
     }
 

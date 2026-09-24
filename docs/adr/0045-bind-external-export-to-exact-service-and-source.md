@@ -19,8 +19,16 @@ selected profile for **local execution with mediated external export**. Local
 provider placement grants neither network access nor export authority. Only a
 trusted coordinator may resolve and reserve an export request only when the
 validated node has `egress.mode=policy` and a matching declared `data.egress`
-selector/destination class, Task privacy and residency constraints permit the
-transfer, and the source has independently valid `artifact.read` authority.
+selector/destination class, Task privacy is explicitly `local-first` or
+`remote-allowed`, and the same
+candidate contains an independently validated `artifact.read` request for the
+exact source. Finalization issues both grants atomically; export use checks the
+issued read grant again. The Task contract has no residency constraint field in
+v0.1. This first profile therefore admits only Tasks with no residency
+restriction; a caller cannot express or infer a residency exemption from the
+`privacy` field. A later profile needs a typed Task residency field, a trusted
+service-region resolver, and an admission/finalization/use check before any
+residency-restricted export can be enabled.
 `local-only` data is ineligible even when provider execution remains local.
 The first profile seals one exact source Artifact/content revision, one exact
 service, one trusted export adapter, one purpose/sensitivity, and one export
@@ -58,6 +66,20 @@ provider execution, ambient sockets, organization policy distribution, or
 credential delivery.
 
 ## Verification
+
+The public-path evidence map for this decision is:
+
+| Boundary | State transition and adversarial check | Observable evidence |
+| --- | --- | --- |
+| Candidate admission | Validated IR and trusted Task, source Artifact, service, and adapter resolution reserve one immutable export tuple. Reject undeclared egress, local-only data, a missing pinned source-read request, and same-class service substitution. | No candidate, writer-factory call, or released byte on rejection. |
+| Policy and approval | Evaluate the entire tuple under one policy activation; approval fingerprints the same tuple. Reject hard deny and changed service, source, program, provider/build, binding, or policy activation. | Typed decision reason and no issued egress grant. |
+| Finalization | Recheck fresh evidence and approval before atomically issuing an exact `external-destination` grant with the binding. | No grant or runnable binding on stale or denied authority. |
+| Export use | The trusted destination issuer, writer construction, write/flush, and completion check the same tuple, source-read authority, expiry, revocation, and whole-operation byte ceiling. | An unauthorized request invokes no writer and releases zero bytes; withdrawal after an external effect prevents further bytes and records an unknown outcome when appropriate. |
+| Recovery | Authenticated intent, effect marker, provenance, and reconciliation retain the exact tuple. Historical class-only intents cannot acquire it by replay. | Response-loss replay creates no second writer or transfer; uncertain effects remain fenced until trusted reconciliation. |
+
+Tests must enter through the coordinator's real reservation, evaluation,
+finalization, and Artifact export APIs. A helper-level grant check or synthetic
+grant insertion alone cannot prove any row above.
 
 Run every `examples/authority/authority-cases.json` case against production
 decision, issuance, and use paths. In particular, a same-class different

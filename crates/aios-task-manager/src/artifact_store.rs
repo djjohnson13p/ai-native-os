@@ -35,6 +35,7 @@ const IMPORT_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const SEALED_STAGING_VERSION: u8 = 1;
 const PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION: u8 = 2;
+const EXACT_EXPORT_INTENT_VERSION: u8 = 3;
 
 fn deserialize_omittable_non_null<'de, D, T>(
     deserializer: D,
@@ -1059,6 +1060,8 @@ struct ArtifactExportIntent {
     binding_id: Option<String>,
     attempt_id: Option<String>,
     grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exact_export: Option<super::authority_candidate::ExportPin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1129,6 +1132,18 @@ pub struct ArtifactExportReconciliationSubject {
     pub binding_id: Option<String>,
     pub attempt_id: Option<String>,
     pub grant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_service_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descriptor_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_selector: Option<String>,
 }
 
 /// Authenticated durable observation returned only by a trusted reconciliation adapter.
@@ -1174,6 +1189,15 @@ impl ArtifactExportReconciliationSubject {
             binding_id: intent.binding_id.clone(),
             attempt_id: intent.attempt_id.clone(),
             grant_id: intent.grant_id.clone(),
+            exact_service_id: intent.exact_export.as_ref().map(|p| p.service_id.clone()),
+            adapter_id: intent.exact_export.as_ref().map(|p| p.adapter_id.clone()),
+            descriptor_hash: intent
+                .exact_export
+                .as_ref()
+                .map(|p| p.descriptor_hash.clone()),
+            purpose: intent.exact_export.as_ref().map(|p| p.purpose.clone()),
+            sensitivity: intent.exact_export.as_ref().map(|p| p.sensitivity.clone()),
+            exact_selector: intent.exact_export.as_ref().map(|p| p.selector.clone()),
         }
     }
 }
@@ -1833,7 +1857,7 @@ fn artifact_exported_event(
     timestamp: &str,
 ) -> serde_json::Value {
     let provider = (intent.principal_kind == "provider").then(|| intent.principal_id.clone());
-    json!({
+    let mut event = json!({
         "schema_version": SCHEMA_VERSION,
         "event_id": event_id("artifact-exported", operation_id),
         "task_id": intent.task_id,
@@ -1846,13 +1870,18 @@ fn artifact_exported_event(
         "input_artifacts": [intent.artifact_id],
         "output_artifacts": [],
         "external_transfer": {
-            "destination": intent.destination_class,
+            "destination": intent.exact_export.as_ref().map_or(intent.destination_class.as_str(),
+                |pin|pin.service_id.as_str()),
             "data_refs": [intent.artifact_id],
-            "purpose": null,
+            "purpose": intent.exact_export.as_ref().map(|pin|pin.purpose.as_str()),
         },
         "status": "success",
         "details": {"operation_id": operation_id, "size_bytes": size_bytes},
-    })
+    });
+    if let Some(pin) = &intent.exact_export {
+        event["details"]["export_authority"] = json!(pin);
+    }
+    event
 }
 
 #[allow(
@@ -4807,9 +4836,10 @@ impl TaskManager {
         })
     }
 
-    /// Seals a provider export writer to the exact Artifact, destination class, attempt, and
-    /// `data.egress` grant selected by the trusted control plane.
+    /// Rejects the historical class-only provider export entry point in every build.
+    /// An exact service pin is required for new provider data egress.
     #[allow(
+        dead_code,
         clippy::too_many_lines,
         clippy::too_many_arguments,
         reason = "the trusted destination issuer binds the complete export operation tuple"
@@ -4822,6 +4852,118 @@ impl TaskManager {
         artifact_id: &str,
         destination_class: &str,
         max_size_bytes: u64,
+        writer_factory: F,
+    ) -> Result<ArtifactExportDestination<W>>
+    where
+        W: ArtifactExportWriter,
+        F: FnOnce() -> std::io::Result<W> + 'static,
+    {
+        let _ = (
+            self,
+            session,
+            scope,
+            operation_id,
+            artifact_id,
+            destination_class,
+            max_size_bytes,
+            writer_factory,
+        );
+        Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+    }
+
+    /// Historical class-only fixture path, unavailable in production builds.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn issue_legacy_fixture_artifact_export_destination<W, F>(
+        &self,
+        session: &ProviderArtifactSession,
+        scope: &ArtifactReadScope,
+        operation_id: &str,
+        artifact_id: &str,
+        destination_class: &str,
+        max_size_bytes: u64,
+        writer_factory: F,
+    ) -> Result<ArtifactExportDestination<W>>
+    where
+        W: ArtifactExportWriter,
+        F: FnOnce() -> std::io::Result<W> + 'static,
+    {
+        self.issue_bound_artifact_export_destination_inner(
+            session,
+            scope,
+            operation_id,
+            artifact_id,
+            destination_class,
+            max_size_bytes,
+            None,
+            writer_factory,
+        )
+    }
+
+    /// Opens the only new provider export path. The service and adapter are
+    /// resolved from a finalized coordinator pin, never from provider text.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue_exact_bound_artifact_export_destination<W, F>(
+        &self,
+        session: &ProviderArtifactSession,
+        scope: &ArtifactReadScope,
+        operation_id: &str,
+        artifact_id: &str,
+        service_id: &str,
+        adapter_id: &str,
+        writer_factory: F,
+    ) -> Result<ArtifactExportDestination<W>>
+    where
+        W: ArtifactExportWriter,
+        F: FnOnce() -> std::io::Result<W> + 'static,
+    {
+        let candidate_id: String = self
+            .connection
+            .query_row(
+                "SELECT c.candidate_id FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s USING(candidate_id)
+             JOIN authority_candidate_export_pins p USING(candidate_id)
+             WHERE c.binding_id=?1 AND c.task_id=?2 AND s.state='FINALIZED'
+               AND p.operation_id=?3 AND p.service_id=?4 AND p.adapter_id=?5",
+                params![
+                    session.authority.binding_id,
+                    session.task_id,
+                    operation_id,
+                    service_id,
+                    adapter_id
+                ],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let pin =
+            super::authority_candidate::load_current_export_pin(&self.connection, &candidate_id)?
+                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if pin.source_artifact_id != artifact_id {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        self.issue_bound_artifact_export_destination_inner(
+            session,
+            scope,
+            operation_id,
+            artifact_id,
+            &pin.destination_class,
+            pin.max_size_bytes,
+            Some(pin.clone()),
+            writer_factory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn issue_bound_artifact_export_destination_inner<W, F>(
+        &self,
+        session: &ProviderArtifactSession,
+        scope: &ArtifactReadScope,
+        operation_id: &str,
+        artifact_id: &str,
+        destination_class: &str,
+        max_size_bytes: u64,
+        exact_pin: Option<super::authority_candidate::ExportPin>,
         writer_factory: F,
     ) -> Result<ArtifactExportDestination<W>>
     where
@@ -4874,8 +5016,11 @@ impl TaskManager {
             let stored: ArtifactExportIntent = serde_json::from_str(&stored_intent_json)?;
             if !matches!(
                 stored.version,
-                1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
-            ) || stored.task_id != scope.task_id
+                1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
+            ) || stored.exact_export != exact_pin
+                || (exact_pin.is_some() && stored.version != EXACT_EXPORT_INTENT_VERSION)
+                || (exact_pin.is_none() && stored.version == EXACT_EXPORT_INTENT_VERSION)
+                || stored.task_id != scope.task_id
                 || stored.artifact_id != artifact_id
                 || stored.destination_class != destination_class
                 || stored.max_size_bytes != max_size_bytes
@@ -4931,12 +5076,23 @@ impl TaskManager {
             &scope.task_id,
             execution,
             "data.egress",
-            "destination",
-            destination_class,
+            if exact_pin.is_some() {
+                "external-destination"
+            } else {
+                "destination"
+            },
+            exact_pin
+                .as_ref()
+                .map_or(destination_class, |p| p.service_id.as_str()),
             &now,
             None,
         )?
         .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if let Some(pin) = &exact_pin {
+            if !exact_export_grant_matches_pin(&self.connection, &grant.grant_id, pin)? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+        }
         let artifact = self
             .get_artifact(artifact_id)?
             .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_NOT_FOUND"))?;
@@ -4944,7 +5100,11 @@ impl TaskManager {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
         }
         let intent_json = canonical_json(&ArtifactExportIntent {
-            version: PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION,
+            version: if exact_pin.is_some() {
+                EXACT_EXPORT_INTENT_VERSION
+            } else {
+                PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            },
             task_id: scope.task_id.clone(),
             artifact_id: artifact_id.to_owned(),
             content_hash: artifact.stored_content_hash()?.tagged().clone(),
@@ -4957,6 +5117,7 @@ impl TaskManager {
             binding_id: Some(execution.binding_id.clone()),
             attempt_id: Some(execution.attempt_id.clone()),
             grant_id: Some(grant.grant_id.clone()),
+            exact_export: exact_pin,
         })?;
         Ok(ArtifactExportDestination {
             writer_factory: Some(writer_factory),
@@ -5004,7 +5165,7 @@ impl TaskManager {
         let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
         if !matches!(
             intent.version,
-            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
         ) || canonical_json(&intent)? != intent_json
             || intent.task_id != session.task_id
             || intent.principal_kind != "provider"
@@ -5055,7 +5216,7 @@ impl TaskManager {
         let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
         if !matches!(
             intent.version,
-            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
         ) || canonical_json(&intent)? != intent_json
             || intent.task_id != task_id
             || intent.principal_kind != principal_kind
@@ -5127,7 +5288,7 @@ impl TaskManager {
             let stored: ArtifactExportIntent = serde_json::from_str(&stored_intent_json)?;
             if !matches!(
                 stored.version,
-                1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+                1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
             ) || stored.task_id != scope.task_id
                 || stored.artifact_id != artifact_id
                 || stored.destination_class != destination_class
@@ -5199,6 +5360,7 @@ impl TaskManager {
             binding_id: None,
             attempt_id: None,
             grant_id: None,
+            exact_export: None,
         })?;
         Ok(ArtifactExportDestination {
             writer_factory: Some(writer_factory),
@@ -5357,8 +5519,17 @@ impl TaskManager {
                             &scope.task_id,
                             execution,
                             "data.egress",
-                            "destination",
-                            &destination.destination_class,
+                            if intent.exact_export.is_some() {
+                                "external-destination"
+                            } else {
+                                "destination"
+                            },
+                            intent
+                                .exact_export
+                                .as_ref()
+                                .map_or(destination.destination_class.as_str(), |pin| {
+                                    pin.service_id.as_str()
+                                }),
                             &admitted_at,
                             grant_id,
                         )?;
@@ -5438,6 +5609,9 @@ impl TaskManager {
         )?;
         export_after_arm_step()?;
         destination.consumed = true;
+        let export_read_admission = reader_admission
+            .as_ref()
+            .map(|admission| admission.grant_admission.clone());
         if destination.writer_factory.is_none() {
             return Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
@@ -5481,8 +5655,12 @@ impl TaskManager {
                     &construction_at,
                     &intent.task_id,
                     &scope.authority,
+                    &destination.operation_id,
                     &intent.destination_class,
                     destination.grant_admission.as_ref(),
+                    reader_admission
+                        .as_ref()
+                        .map(|admission| &admission.grant_admission),
                 )?;
                 match (
                     &scope.authority.execution,
@@ -5615,6 +5793,7 @@ impl TaskManager {
             &destination.authority,
             &destination.destination_class,
             destination.grant_admission.as_ref(),
+            export_read_admission.as_ref(),
         ) {
             Ok(exported) => exported,
             Err(failure) => {
@@ -5690,8 +5869,10 @@ impl TaskManager {
                         &finalize_at,
                         &destination.task_id,
                         &destination.authority,
+                        &destination.operation_id,
                         &destination.destination_class,
                         destination.grant_admission.as_ref(),
+                        export_read_admission.as_ref(),
                     )
                 });
                 let _callback_guard = match pre_call.and_then(|()| {
@@ -5762,8 +5943,10 @@ impl TaskManager {
                     &dispose_at,
                     &destination.task_id,
                     &destination.authority,
+                    &destination.operation_id,
                     &destination.destination_class,
                     destination.grant_admission.as_ref(),
+                    export_read_admission.as_ref(),
                 )
             });
             let _callback_guard = match pre_call
@@ -5917,8 +6100,10 @@ impl TaskManager {
                 &armed_at,
                 &intent.task_id,
                 authority,
+                operation_id,
                 &intent.destination_class,
                 egress_grant_admission,
+                reader_grant_admission,
             )?;
             match (&authority.execution, reader_grant_admission) {
                 (Some(execution), Some(admission))
@@ -9166,6 +9351,48 @@ fn exact_operation_grant(
     } else {
         Ok(None)
     }
+}
+
+fn exact_export_grant_matches_pin(
+    connection: &Connection,
+    grant_id: &str,
+    pin: &super::authority_candidate::ExportPin,
+) -> Result<bool> {
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT grants_json,scope FROM authority_grants WHERE grant_id=?1",
+            [grant_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((grant_json, scope)) = row else {
+        return Ok(false);
+    };
+    if scope != "ONE_SHOT" {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_str(&grant_json)?;
+    let Some([item]) = value.as_array().map(Vec::as_slice) else {
+        return Ok(false);
+    };
+    let Some(exact) = item.get("external_export") else {
+        return Ok(false);
+    };
+    Ok(
+        serde_json::from_value::<super::authority_candidate::ExportPin>(exact.clone())
+            .is_ok_and(|stored| stored == *pin)
+            && item.get("action").and_then(serde_json::Value::as_str) == Some("data.egress")
+            && item
+                .get("resource_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("external-destination")
+            && item.get("resource_id").and_then(serde_json::Value::as_str)
+                == Some(pin.service_id.as_str())
+            && item
+                .get("semantic_selector")
+                .and_then(serde_json::Value::as_str)
+                == Some(pin.selector.as_str()),
+    )
 }
 
 fn operation_approval_current(
@@ -12676,6 +12903,7 @@ fn with_fresh_export_fence<T, F>(
     authority: &ReadAuthority,
     destination_class: &str,
     grant_admission: Option<&GrantAdmission>,
+    reader_grant_admission: Option<&GrantAdmission>,
     external_effect_possible: bool,
     callback: F,
 ) -> std::result::Result<T, ExportCopyFailure>
@@ -12708,8 +12936,10 @@ where
             &checked_at,
             task_id,
             authority,
+            operation_id,
             destination_class,
             grant_admission,
+            reader_grant_admission,
         )
     });
     let _callback_guard = match pre_call.and_then(|()| ExportCallbackGuard::enter(callback_active))
@@ -12754,6 +12984,7 @@ fn copy_export_bounded<R: Read, W: Write>(
     authority: &ReadAuthority,
     destination_class: &str,
     grant_admission: Option<&GrantAdmission>,
+    reader_grant_admission: Option<&GrantAdmission>,
 ) -> std::result::Result<(u64, String), ExportCopyFailure> {
     let mut size = 0_u64;
     let mut hasher = Sha256::new();
@@ -12801,6 +13032,7 @@ fn copy_export_bounded<R: Read, W: Write>(
                 authority,
                 destination_class,
                 grant_admission,
+                reader_grant_admission,
                 external_effect_possible,
                 || writer.write(&buffer[offset..count]),
             )?;
@@ -12832,23 +13064,87 @@ fn copy_export_bounded<R: Read, W: Write>(
         authority,
         destination_class,
         grant_admission,
+        reader_grant_admission,
         external_effect_possible,
         || writer.flush(),
     )?;
     Ok((size, tagged_digest(hasher)))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "export fence checks the full bound read and egress authority at each use"
+)]
 fn validate_export_destination_fence(
     connection: &Connection,
     now: &str,
     task_id: &str,
     authority: &ReadAuthority,
+    operation_id: &str,
     destination_class: &str,
     grant_admission: Option<&GrantAdmission>,
+    reader_grant_admission: Option<&GrantAdmission>,
 ) -> Result<()> {
     ensure_task_is_not_recovering(connection, task_id)?;
     match (&authority.execution, grant_admission) {
         (Some(execution), Some(admission)) => {
+            let raw: String = connection
+                .query_row(
+                    "SELECT details_json FROM operations WHERE operation_id=?1 AND task_id=?2
+                 AND effect_class='DATA_EGRESS'",
+                    params![operation_id, task_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+            let intent: ArtifactExportIntent = serde_json::from_str(&raw)?;
+            if intent.destination_class != destination_class
+                || intent.task_id != task_id
+                || intent.binding_id.as_deref() != Some(execution.binding_id.as_str())
+            {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            let (kind, id) = if let Some(pin) = &intent.exact_export {
+                let candidate_id:String=connection.query_row(
+                    "SELECT candidate_id FROM authority_candidate_export_pins WHERE operation_id=?1",
+                    [operation_id],|r|r.get(0)).optional()?
+                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                if super::authority_candidate::load_current_export_pin(connection, &candidate_id)?
+                    .as_ref()
+                    != Some(pin)
+                    || pin.source_artifact_id != intent.artifact_id
+                    || pin.source_content_hash != intent.content_hash
+                    || pin.max_size_bytes != intent.max_size_bytes
+                    || pin.operation_id != operation_id
+                    || !exact_export_grant_matches_pin(connection, &admission.grant_id, pin)?
+                {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+                if exact_operation_grant(
+                    connection,
+                    task_id,
+                    execution,
+                    "artifact.read",
+                    "artifact",
+                    &pin.source_artifact_id,
+                    now,
+                    reader_grant_admission,
+                )?
+                .is_none()
+                {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+                ("external-destination", pin.service_id.as_str())
+            } else {
+                #[cfg(not(test))]
+                {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                }
+                #[cfg(test)]
+                {
+                    ("destination", destination_class)
+                }
+            };
             if load_execution_authority(connection, task_id, &execution.binding_id, now)?
                 != *execution
                 || exact_operation_grant(
@@ -12856,8 +13152,8 @@ fn validate_export_destination_fence(
                     task_id,
                     execution,
                     "data.egress",
-                    "destination",
-                    destination_class,
+                    kind,
+                    id,
                     now,
                     Some(admission),
                 )?
@@ -12886,7 +13182,7 @@ fn unresolved_export_effect_exists(
              WHERE task_id=?1
                AND transaction_class='irreversible_external'
                AND effect_class='DATA_EGRESS'
-               AND json_extract(details_json,'$.version') IN (1,2)
+               AND json_extract(details_json,'$.version') IN (1,2,3)
                AND json_extract(details_json,'$.task_id')=?1
                AND json_extract(details_json,'$.artifact_id')=?2
                AND json_extract(details_json,'$.content_hash')=?3
@@ -12990,7 +13286,7 @@ fn ensure_no_unknown_artifact_export_except_publication(
                AND effect_class='DATA_EGRESS'
                AND ((state='UNKNOWN' AND outcome_certainty='OUTCOME_UNKNOWN')
                     OR (state='STARTED' AND outcome_certainty IS NULL))
-               AND json_extract(details_json,'$.version') IN (1,2)
+               AND json_extract(details_json,'$.version') IN (1,2,3)
                AND json_type(details_json,'$.artifact_id')='text'
                AND json_type(details_json,'$.destination_class')='text'
              ORDER BY operation_id",
@@ -13079,7 +13375,7 @@ fn reconcile_started_export_operation(
     if canonical_json(&intent)? != intent_json
         || !matches!(
             intent.version,
-            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
         )
     {
         return Err(TaskManagerError::InvalidRecord(
@@ -13087,7 +13383,10 @@ fn reconcile_started_export_operation(
         ));
     }
     let phase_history = export_phase_history_exists(transaction, &intent.task_id, operation_id)?;
-    let phase_aware = intent.version == PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION || phase_history;
+    let phase_aware = matches!(
+        intent.version,
+        PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
+    ) || phase_history;
     if !phase_aware {
         if !super::verify_provenance_through(transaction, &intent.task_id, None)?
             || !matches!(
@@ -13199,7 +13498,7 @@ fn authenticate_export_operation(
     if row.0 != intent.task_id
         || !matches!(
             intent.version,
-            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION
+            1 | PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
         )
         || row.1 != intent.semantic_program_hash
         || row.2 != intent.node_id
@@ -13215,7 +13514,10 @@ fn authenticate_export_operation(
         ));
     }
     let phase_history = export_phase_history_exists(connection, &intent.task_id, operation_id)?;
-    let phase_aware = intent.version == PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION || phase_history;
+    let phase_aware = matches!(
+        intent.version,
+        PHASE_AUTHENTICATED_EXPORT_INTENT_VERSION | EXACT_EXPORT_INTENT_VERSION
+    ) || phase_history;
     let pre_destination_admission = if phase_aware {
         row.10.as_deref().map_or(Ok(false), |receipt| {
             authenticate_pre_destination_export_admission(
@@ -17665,7 +17967,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "bound export 1",
@@ -17728,7 +18030,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         assert!(matches!(
-            manager.issue_bound_artifact_export_destination(
+            manager.issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-operation-wrong-destination",
@@ -17741,7 +18043,7 @@ mod tests {
         ));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-operation-authorized",
@@ -18954,7 +19256,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut first = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-consumed-replay",
@@ -19013,7 +19315,7 @@ mod tests {
         let opened = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&opened);
         let mut replay = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-consumed-replay",
@@ -19104,7 +19406,7 @@ mod tests {
         let factory_opens = Arc::new(AtomicUsize::new(0));
         let observed_opens = Arc::clone(&factory_opens);
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-operation-revoked",
@@ -19184,7 +19486,7 @@ mod tests {
         let factory_opens = Arc::new(AtomicUsize::new(0));
         let observed_opens = Arc::clone(&factory_opens);
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-after-attempt-success",
@@ -19479,7 +19781,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut losing_destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-race-loser",
@@ -19988,7 +20290,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-finalize-recovery",
@@ -20167,7 +20469,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-handoff-failure",
@@ -23051,7 +23353,7 @@ mod tests {
             .scope_artifact_reads(&session, std::slice::from_ref(&artifact.artifact_id))
             .unwrap();
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 "export-crash-window",
@@ -32440,7 +32742,7 @@ mod tests {
         for index in 0..2 {
             let operation_id = format!("export-finite-reader-{index}");
             let mut destination = manager
-                .issue_bound_artifact_export_destination(
+                .issue_legacy_fixture_artifact_export_destination(
                     &session,
                     &scope,
                     &operation_id,
@@ -33198,6 +33500,7 @@ mod tests {
             binding_id: None,
             attempt_id: None,
             grant_id: None,
+            exact_export: None,
         })
         .unwrap();
         manager
@@ -33276,6 +33579,7 @@ mod tests {
             binding_id: None,
             attempt_id: None,
             grant_id: None,
+            exact_export: None,
         })
         .unwrap();
         manager
@@ -33365,6 +33669,7 @@ mod tests {
             binding_id: None,
             attempt_id: None,
             grant_id: None,
+            exact_export: None,
         })
         .unwrap();
         let transaction = manager
@@ -33615,7 +33920,7 @@ mod tests {
         let calls = Arc::clone(&factory_calls);
         let operation_id = "export-delivery-first";
         let mut destination = manager
-            .issue_bound_artifact_export_destination(
+            .issue_legacy_fixture_artifact_export_destination(
                 &session,
                 &scope,
                 operation_id,
@@ -33950,7 +34255,7 @@ mod tests {
             let factory_calls = Arc::new(AtomicUsize::new(0));
             let calls = Arc::clone(&factory_calls);
             let mut destination = manager
-                .issue_bound_artifact_export_destination(
+                .issue_legacy_fixture_artifact_export_destination(
                     &session,
                     &scope,
                     &format!("export-arm-{scenario}"),

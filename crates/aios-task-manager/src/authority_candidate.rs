@@ -6,7 +6,9 @@ use super::{
     program_node,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -18,6 +20,15 @@ pub(crate) enum CandidateResourceHandle {
     OutputAllocation {
         allocation_id: String,
         output_port: String,
+    },
+    /// Resolved only against the coordinator-owned service catalog. The source
+    /// must also appear as an exact `artifact.read` choice in this candidate.
+    ExternalExport {
+        service_id: String,
+        source_artifact_id: String,
+        operation_id: String,
+        purpose: String,
+        max_size_bytes: u64,
     },
 }
 
@@ -70,6 +81,158 @@ fn reject() -> TaskManagerError {
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256
+}
+
+fn valid_export_identifier(value: &str) -> bool {
+    valid_id(value) && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn export_service_hash(service_id: &str, class: &str, adapter_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"AIOS-TRUSTED-EXPORT-SERVICE\0v1\0");
+    for field in [service_id, class, adapter_id] {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+    }
+    let mut hash = String::from("sha256:");
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+        write!(&mut hash, "{byte:02x}").expect("string write");
+    }
+    hash
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExportPin {
+    pub selector: String,
+    pub service_id: String,
+    pub destination_class: String,
+    pub descriptor_hash: String,
+    pub adapter_id: String,
+    pub operation_id: String,
+    pub source_artifact_id: String,
+    pub source_content_hash: String,
+    pub purpose: String,
+    pub sensitivity: String,
+    pub max_size_bytes: u64,
+}
+
+pub(super) fn load_export_pin(
+    connection: &Connection,
+    candidate_id: &str,
+) -> Result<Option<ExportPin>> {
+    let pin = connection
+        .query_row(
+            "SELECT p.semantic_selector,p.service_id,p.destination_class,p.descriptor_hash,
+                p.adapter_id,p.operation_id,p.source_artifact_id,p.source_content_hash,
+                p.purpose,p.sensitivity,p.max_size_bytes
+         FROM authority_candidate_export_pins p WHERE p.candidate_id=?1",
+            [candidate_id],
+            |r| {
+                Ok(ExportPin {
+                    selector: r.get(0)?,
+                    service_id: r.get(1)?,
+                    destination_class: r.get(2)?,
+                    descriptor_hash: r.get(3)?,
+                    adapter_id: r.get(4)?,
+                    operation_id: r.get(5)?,
+                    source_artifact_id: r.get(6)?,
+                    source_content_hash: r.get(7)?,
+                    purpose: r.get(8)?,
+                    sensitivity: r.get(9)?,
+                    max_size_bytes: u64::try_from(r.get::<_, i64>(10)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, -1))?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(pin)
+}
+
+pub(super) fn load_current_export_pin(
+    connection: &Connection,
+    candidate_id: &str,
+) -> Result<Option<ExportPin>> {
+    let Some(pin) = load_export_pin(connection, candidate_id)? else {
+        return Ok(None);
+    };
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authority_export_services s
+         JOIN authority_export_service_states st USING(service_id)
+         JOIN authority_candidate_export_pins p ON p.service_id=s.service_id
+         JOIN authority_candidate_reservations c ON c.candidate_id=p.candidate_id
+         JOIN tasks t ON t.task_id=c.task_id
+         JOIN artifacts a ON a.artifact_id=?5
+         WHERE p.candidate_id=?9 AND s.service_id=?1 AND s.destination_class=?2 AND s.descriptor_hash=?3
+           AND s.adapter_id=?4 AND st.state='READY'
+           AND json_extract(t.constraints_json,'$.privacy') IN ('local-first','remote-allowed')
+           AND a.content_hash=?6 AND a.sensitivity=?7 AND a.integrity_state='verified'
+           AND a.size_bytes<=?8)",
+        params![pin.service_id,pin.destination_class,pin.descriptor_hash,pin.adapter_id,
+            pin.source_artifact_id,pin.source_content_hash,pin.sensitivity,
+            i64::try_from(pin.max_size_bytes).map_err(|_|reject())?,candidate_id],
+        |r| r.get(0),
+    )?;
+    if !current
+        || !valid_export_identifier(&pin.service_id)
+        || !valid_export_identifier(&pin.adapter_id)
+        || !valid_export_identifier(&pin.operation_id)
+        || export_service_hash(&pin.service_id, &pin.destination_class, &pin.adapter_id)
+            != pin.descriptor_hash
+    {
+        return Err(reject());
+    }
+    Ok(Some(pin))
+}
+
+impl TaskManager {
+    /// Privileged control-plane registration. Provider sessions cannot call this
+    /// crate-private API or select catalog identity facts at export use.
+    pub(crate) fn register_trusted_export_service(
+        &mut self,
+        service_id: &str,
+        destination_class: &str,
+        adapter_id: &str,
+    ) -> Result<()> {
+        if !service_id.starts_with("service://")
+            || !valid_export_identifier(service_id)
+            || !valid_export_identifier(destination_class)
+            || !valid_export_identifier(adapter_id)
+            || !destination_class
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(reject());
+        }
+        let hash = export_service_hash(service_id, destination_class, adapter_id);
+        let now = self.clock.now();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+        tx.execute("INSERT INTO authority_export_services(service_id,destination_class,adapter_id,descriptor_hash,registered_at)
+            VALUES (?1,?2,?3,?4,?5)",params![service_id,destination_class,adapter_id,hash,now])?;
+        tx.execute(
+            "INSERT INTO authority_export_service_states(service_id,state,revision,updated_at)
+            VALUES (?1,'READY',1,?2)",
+            params![service_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn disable_trusted_export_service(&mut self, service_id: &str) -> Result<()> {
+        let now = self.clock.now();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+        if tx.execute("UPDATE authority_export_service_states SET state='DISABLED',revision=revision+1,updated_at=?2
+            WHERE service_id=?1 AND state='READY'",params![service_id,now])? != 1 { return Err(reject()); }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn task_constraints_allow_local(raw: Option<&str>, checked: OffsetDateTime) -> bool {
@@ -240,6 +403,10 @@ pub(super) fn evidence_still_current(
     ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "candidate replay compares the entire persisted reservation and exact export pin"
+)]
 fn replay_existing(
     connection: &Connection,
     request: &ReserveAuthorityCandidate<'_>,
@@ -267,7 +434,15 @@ fn replay_existing(
         || row.7 != request.capability_contract_hash
         || row.8 != request.provider_registration_id
         || row.12 != i64::from(request.attempt_number)
-        || row.13 != i64::try_from(request.resources.len()).map_err(|_| reject())?
+        || row.13
+            != i64::try_from(
+                request
+                    .resources
+                    .iter()
+                    .filter(|r| !matches!(r.handle, CandidateResourceHandle::ExternalExport { .. }))
+                    .count(),
+            )
+            .map_err(|_| reject())?
         || row.14 != "PENDING"
     {
         return Err(reject());
@@ -288,6 +463,7 @@ fn replay_existing(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut requested = Vec::with_capacity(request.resources.len());
+    let mut requested_export = None;
     for choice in request.resources {
         let (kind, id, port) = match &choice.handle {
             CandidateResourceHandle::InputArtifact { artifact_id } => {
@@ -301,6 +477,28 @@ fn replay_existing(
                 allocation_id.as_str(),
                 Some(output_port.as_str()),
             ),
+            CandidateResourceHandle::ExternalExport {
+                service_id,
+                source_artifact_id,
+                operation_id,
+                purpose,
+                max_size_bytes,
+            } => {
+                if requested_export
+                    .replace((
+                        choice.semantic_selector.as_str(),
+                        service_id.as_str(),
+                        source_artifact_id.as_str(),
+                        operation_id.as_str(),
+                        purpose.as_str(),
+                        *max_size_bytes,
+                    ))
+                    .is_some()
+                {
+                    return Err(reject());
+                }
+                continue;
+            }
         };
         requested.push((
             choice.action.clone(),
@@ -315,6 +513,18 @@ fn replay_existing(
     requested.sort();
     if stored != requested {
         return Err(reject());
+    }
+    let stored_export = load_current_export_pin(connection, request.candidate_id)?;
+    match (requested_export, stored_export) {
+        (None, None) => {}
+        (Some((selector, service, source, operation, purpose, ceiling)), Some(pin))
+            if pin.selector == selector
+                && pin.service_id == service
+                && pin.source_artifact_id == source
+                && pin.operation_id == operation
+                && pin.purpose == purpose
+                && pin.max_size_bytes == ceiling => {}
+        _ => return Err(reject()),
     }
     let (profile, isolation, placement): (String, String, String) = connection.query_row(
         "SELECT execution_profile_ref,isolation_class,placement_locality
@@ -450,13 +660,15 @@ pub(super) fn insert_reserved_binding_in(
         )
         .optional()?
         .ok_or_else(reject)?;
-    if pins.resource_count != i64::try_from(policy_decision_ids.len()).map_err(|_| reject())?
+    let export_pin = load_current_export_pin(transaction, candidate_id)?;
+    if pins.resource_count + i64::from(export_pin.is_some())
+        != i64::try_from(policy_decision_ids.len()).map_err(|_| reject())?
         || OffsetDateTime::parse(&pins.reserved_at, &Rfc3339).map_err(|_| reject())? > created
         || pins.locality != "local"
     {
         return Err(reject());
     }
-    let resources = {
+    let mut resources = {
         let mut statement = transaction.prepare(
             "SELECT action,semantic_selector,resource_kind,resource_id,output_port,
                     expected_semantic_type FROM authority_candidate_resources
@@ -475,6 +687,16 @@ pub(super) fn insert_reserved_binding_in(
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    if let Some(pin) = &export_pin {
+        resources.push(BindingResource {
+            action: "data.egress".into(),
+            selector: pin.selector.clone(),
+            kind: "external-destination".into(),
+            id: pin.service_id.clone(),
+            port: None,
+            semantic_type: "external.export@1".into(),
+        });
+    }
     if resources.len() != policy_decision_ids.len() {
         return Err(reject());
     }
@@ -491,11 +713,17 @@ pub(super) fn insert_reserved_binding_in(
             .query_row(
                 "SELECT r.action,r.semantic_selector FROM policy_decisions d
              JOIN authority_requests r ON r.request_id=d.authority_request_id
-             JOIN authority_candidate_resources cr ON cr.candidate_id=?2
-               AND cr.action=r.action AND cr.semantic_selector=r.semantic_selector
-               AND cr.resource_kind=r.resolved_resource_kind
-               AND cr.resource_id=r.resolved_resource_id
              WHERE d.decision_id=?1 AND d.decision='ALLOW'
+               AND (EXISTS(SELECT 1 FROM authority_candidate_resources cr
+                    WHERE cr.candidate_id=?2 AND cr.action=r.action
+                      AND cr.semantic_selector=r.semantic_selector
+                      AND cr.resource_kind=r.resolved_resource_kind
+                      AND cr.resource_id=r.resolved_resource_id)
+                  OR EXISTS(SELECT 1 FROM authority_candidate_export_pins p
+                    WHERE p.candidate_id=?2 AND r.action='data.egress'
+                      AND r.semantic_selector=p.semantic_selector
+                      AND r.resolved_resource_kind='external-destination'
+                      AND r.resolved_resource_id=p.service_id))
                AND r.task_id=?3 AND r.semantic_program_hash=?4
                AND r.registry_snapshot_id=?5 AND r.node_id=?6
                AND r.execution_binding_id=?7 AND r.attempt_id=?8
@@ -648,7 +876,7 @@ pub(super) fn insert_reserved_binding_in(
     let grants_json = canonical_json(&grant_ids)?;
     let placement = json!({"locality":pins.locality});
     let placement_json = canonical_json(&placement)?;
-    let receipt = canonical_json(&json!({
+    let mut receipt_value = json!({
         "schema_version":"0.1","binding_id":pins.binding_id,"attempt_id":pins.attempt_id,
         "task_id":pins.task_id,"semantic_program_hash":pins.hash,
         "registry_snapshot_id":pins.snapshot,"ir_version":pins.ir_version,
@@ -662,7 +890,11 @@ pub(super) fn insert_reserved_binding_in(
         "authority":{"grant_refs":grant_ids},
         "execution_profile":{"profile_ref":pins.profile_ref},"placement":placement,
         "attempt":pins.attempt,"created_at":created_at,
-    }))?;
+    });
+    if let Some(pin) = &export_pin {
+        receipt_value["external_export"] = json!(pin);
+    }
+    let receipt = canonical_json(&receipt_value)?;
     transaction.execute(
         "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
          registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
@@ -1007,7 +1239,10 @@ impl TaskManager {
         });
         let claim = claims.next().ok_or_else(reject)?;
         if claims.next().is_some()
-            || node.pointer("/egress/mode").and_then(Value::as_str) != Some("deny")
+            || !matches!(
+                node.pointer("/egress/mode").and_then(Value::as_str),
+                Some("deny" | "policy")
+            )
             || claim
                 .pointer("/execution/network_default")
                 .and_then(Value::as_str)
@@ -1091,6 +1326,7 @@ impl TaskManager {
             return Err(reject());
         }
         let mut resolved = Vec::new();
+        let mut export_pin: Option<ExportPin> = None;
         for semantic in declared {
             let action = semantic
                 .get("action")
@@ -1113,6 +1349,83 @@ impl TaskManager {
                 )
             {
                 return Err(reject());
+            }
+            if let (
+                "data.egress",
+                CandidateResourceHandle::ExternalExport {
+                    service_id,
+                    source_artifact_id,
+                    operation_id,
+                    purpose,
+                    max_size_bytes,
+                },
+            ) = (action, &choice.handle)
+            {
+                let class = selector.strip_prefix("destination:").ok_or_else(reject)?;
+                let classes = node
+                    .pointer("/egress/destination_classes")
+                    .and_then(Value::as_array)
+                    .ok_or_else(reject)?;
+                let privacy = current.2.as_deref().unwrap_or("{}");
+                let constraints = aios_registry::parse_strict_value(
+                    privacy.as_bytes(),
+                    aios_registry::StrictJsonLimits::default(),
+                )
+                .map_err(|_| reject())?;
+                if export_pin.is_some()
+                    || node.pointer("/egress/mode").and_then(Value::as_str)!=Some("policy")
+                    || !classes.iter().any(|v|v.as_str()==Some(class))
+                    || !matches!(constraints.pointer("/privacy").and_then(Value::as_str),
+                        Some("local-first"|"remote-allowed"))
+                    || !valid_export_identifier(operation_id) || !valid_id(purpose)
+                    || *max_size_bytes==0 || *max_size_bytes>8*1024*1024
+                    || !request.resources.iter().any(|r| r.action=="artifact.read"
+                        && matches!(&r.handle,CandidateResourceHandle::InputArtifact{artifact_id}
+                            if artifact_id==source_artifact_id))
+                { return Err(reject()); }
+                let service:Option<(String,String,String,String)>=tx.query_row(
+                    "SELECT s.destination_class,s.adapter_id,s.descriptor_hash,st.state
+                     FROM authority_export_services s JOIN authority_export_service_states st USING(service_id)
+                     WHERE s.service_id=?1",[service_id],
+                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                let (registered_class, adapter_id, descriptor_hash, state) =
+                    service.ok_or_else(reject)?;
+                if registered_class != class
+                    || state != "READY"
+                    || export_service_hash(service_id, class, &adapter_id) != descriptor_hash
+                {
+                    return Err(reject());
+                }
+                let artifact: Option<(String, String, i64, String)> = tx
+                    .query_row(
+                        "SELECT a.content_hash,a.sensitivity,a.size_bytes,a.integrity_state
+                     FROM artifacts a JOIN task_artifacts ta USING(artifact_id)
+                     WHERE ta.task_id=?1 AND ta.role='input' AND a.artifact_id=?2",
+                        params![request.task_id, source_artifact_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                let (source_content_hash, sensitivity, size, integrity) =
+                    artifact.ok_or_else(reject)?;
+                if integrity != "verified"
+                    || u64::try_from(size).map_or(true, |size| size > *max_size_bytes)
+                {
+                    return Err(reject());
+                }
+                export_pin = Some(ExportPin {
+                    selector: selector.to_owned(),
+                    service_id: service_id.clone(),
+                    destination_class: class.to_owned(),
+                    descriptor_hash,
+                    adapter_id,
+                    operation_id: operation_id.clone(),
+                    source_artifact_id: source_artifact_id.clone(),
+                    source_content_hash,
+                    purpose: purpose.clone(),
+                    sensitivity,
+                    max_size_bytes: *max_size_bytes,
+                });
+                continue;
             }
             let (kind, id, port, semantic_type) = match (&choice.handle, action, selector) {
                 (
@@ -1206,6 +1519,11 @@ impl TaskManager {
                 semantic_type.to_owned(),
             ));
         }
+        if (node.pointer("/egress/mode").and_then(Value::as_str) == Some("policy"))
+            != export_pin.is_some()
+        {
+            return Err(reject());
+        }
         tx.execute("INSERT INTO authority_candidate_reservations(
             candidate_id,binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
@@ -1235,6 +1553,16 @@ impl TaskManager {
                     semantic_type
                 ],
             )?;
+        }
+        if let Some(pin) = &export_pin {
+            tx.execute("INSERT INTO authority_candidate_export_pins(candidate_id,semantic_selector,
+                service_id,destination_class,descriptor_hash,adapter_id,operation_id,
+                source_artifact_id,source_content_hash,purpose,sensitivity,max_size_bytes,reserved_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![request.candidate_id,pin.selector,pin.service_id,pin.destination_class,
+                    pin.descriptor_hash,pin.adapter_id,pin.operation_id,pin.source_artifact_id,
+                    pin.source_content_hash,pin.purpose,pin.sensitivity,
+                    i64::try_from(pin.max_size_bytes).map_err(|_|reject())?,checked_at])?;
         }
         tx.execute(
             "INSERT INTO authority_candidate_status(candidate_id,revision,state,updated_at)
@@ -1459,7 +1787,12 @@ mod tests {
         manager
             .connection
             .execute_batch(
-                "DROP TABLE authority_candidate_status;
+                "DROP TABLE authority_candidate_export_pins;
+             DROP TABLE authority_export_service_states;
+             DROP TABLE authority_export_services;
+             DELETE FROM schema_migrations
+             WHERE migration_id='0022_exact_export_authority';
+             DROP TABLE authority_candidate_status;
              DROP TABLE authority_candidate_resources;
              DROP TABLE authority_candidate_reservations;
              DELETE FROM schema_migrations
@@ -1494,11 +1827,11 @@ mod tests {
     }
 
     fn coherent_planning_fixture(path: &Path) -> (TaskManager, String, String, String) {
-        fixture_at_mode(Some(path), true)
+        fixture_at_mode(Some(path), true, false)
     }
 
     fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
-        fixture_at_mode(path, false)
+        fixture_at_mode(path, false, false)
     }
 
     #[allow(
@@ -1508,6 +1841,7 @@ mod tests {
     fn fixture_at_mode(
         path: Option<&Path>,
         coherent_planning: bool,
+        export: bool,
     ) -> (TaskManager, String, String, String) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
@@ -1535,6 +1869,10 @@ mod tests {
                 [],
             ).unwrap();
         }
+        if export {
+            manager.connection.execute("UPDATE tasks SET constraints_json='{\"privacy\":\"remote-allowed\",\"preserve_inputs\":true}'
+                WHERE task_id='T-candidate'",[]).unwrap();
+        }
         let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
             "../../../examples/aios-ir/registry-snapshot.json"
         ))
@@ -1552,6 +1890,17 @@ mod tests {
             .find(|contract| contract.capability == "artifact.copy")
             .unwrap();
         selected.conformance.suite_hash = Some(SUITE.into());
+        if export {
+            selected
+                .allowed_effect_classes
+                .push(aios_contracts::EffectClass::DataEgress);
+            selected
+                .allowed_authority_classes
+                .push("data.egress".into());
+            selected
+                .allowed_egress_modes
+                .push(aios_contracts::EgressMode::Policy);
+        }
         let contract_hash = aios_registry::capability_contract_hash(selected)
             .unwrap()
             .to_string();
@@ -1601,6 +1950,12 @@ mod tests {
         manifest["provides"][0]["effect_classes"] = json!(["ARTIFACT_READ", "ARTIFACT_WRITE"]);
         manifest["provides"][0]["authority"]["actions"] =
             json!(["artifact.read", "artifact.write"]);
+        if export {
+            manifest["provides"][0]["effect_classes"] =
+                json!(["ARTIFACT_READ", "ARTIFACT_WRITE", "DATA_EGRESS"]);
+            manifest["provides"][0]["authority"]["actions"] =
+                json!(["artifact.read", "artifact.write", "data.egress"]);
+        }
         let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let registration = manager
             .provider_store_writer()
@@ -1637,7 +1992,7 @@ mod tests {
             .unwrap()
             .enable(&registration.registration_id, NOW)
             .unwrap();
-        let program = json!({
+        let mut program = json!({
             "ir_version":"0.1","program_id":"program-candidate","kind":"task_graph",
             "inputs":{"source":{"type":"artifact.file@1"}},
             "nodes":[{"id":"copy","operation":{"kind":"invoke","capability":"artifact.copy@1"},
@@ -1648,6 +2003,14 @@ mod tests {
                 "egress":{"mode":"deny"},"failure":{"on_error":"stop"},"cache":"never"}],
             "outputs":{"copy":{"source":"node","node":"copy","port":"copy"}}
         });
+        if export {
+            program["nodes"][0]["authority_requests"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"action":"data.egress","resource":"destination:fixture_remote"}));
+            program["nodes"][0]["egress"] = json!({"mode":"policy",
+                "destination_classes":["fixture_remote"]});
+        }
         let program_json = program.to_string();
         let hash = aios_ir::recompute_semantic_hash(program_json.as_bytes()).unwrap();
         let validation = json!({
@@ -1763,6 +2126,638 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "public-path fixture covers admission, approval, issuance, export, and adversarial substitutions"
+    )]
+    fn exact_export_candidate_requires_trusted_service_and_pinned_source_read() {
+        use crate::artifact_store::ArtifactExportWriter;
+        use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
+        struct MemorySink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for MemorySink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl ArtifactExportWriter for MemorySink {
+            fn finalize(&mut self) -> std::io::Result<()> {
+                self.flush()
+            }
+        }
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let bytes = b"private fixture export";
+        let imported = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:export-source".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(bytes),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM task_artifacts WHERE task_id='T-candidate'
+            AND artifact_id='artifact:source'",
+                [],
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://fixture/a",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://fixture/b",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        assert!(
+            manager
+                .register_trusted_export_service(
+                    "service://fixture/bad",
+                    "fixture_remote",
+                    "adapter:memory sink"
+                )
+                .is_err()
+        );
+        let mut choices =
+            choices_with_source_and_output(&imported.artifact_id, "allocation:export");
+        choices.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: "service://fixture/a".into(),
+                source_artifact_id: imported.artifact_id.clone(),
+                operation_id: "export:exact-a".into(),
+                purpose: "fixture evaluation".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        let contract = contract_hash(&manager, &snapshot);
+        let request = ReserveAuthorityCandidate {
+            candidate_id: "candidate:exact-export",
+            binding_id: "binding:exact-export",
+            attempt_id: "attempt:exact-export",
+            task_id: "T-candidate",
+            semantic_program_hash: &hash,
+            registry_snapshot_id: &snapshot,
+            node_id: "copy",
+            capability_contract_hash: &contract,
+            provider_registration_id: &registration,
+            attempt_number: 1,
+            resources: &choices,
+        };
+        let mut missing_read = choices.clone();
+        missing_read.remove(0);
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &missing_read,
+                    ..request
+                })
+                .is_err()
+        );
+        let mut low_cap = choices.clone();
+        if let CandidateResourceHandle::ExternalExport { max_size_bytes, .. } =
+            &mut low_cap[2].handle
+        {
+            *max_size_bytes = 1;
+        }
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &low_cap,
+                    ..request
+                })
+                .is_err()
+        );
+        let mut unregistered = choices.clone();
+        if let CandidateResourceHandle::ExternalExport { service_id, .. } =
+            &mut unregistered[2].handle
+        {
+            *service_id = "service://fixture/unregistered".into();
+        }
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &unregistered,
+                    ..request
+                })
+                .is_err()
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE tasks SET constraints_json='{\"privacy\":\"local-only\"}'
+            WHERE task_id='T-candidate'",
+                [],
+            )
+            .unwrap();
+        assert!(manager.reserve_authority_candidate(&request).is_err());
+        manager.connection.execute("UPDATE tasks SET constraints_json='{\"privacy\":\"remote-allowed\",\"preserve_inputs\":true}'
+            WHERE task_id='T-candidate'",[]).unwrap();
+        let mut substituted = choices.clone();
+        if let CandidateResourceHandle::ExternalExport { service_id, .. } =
+            &mut substituted[2].handle
+        {
+            *service_id = "service://fixture/b".into();
+        }
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &substituted,
+                    ..request
+                })
+                .is_ok()
+        );
+        assert!(
+            manager.reserve_authority_candidate(&request).is_err(),
+            "same-class service change cannot replay the pending identity"
+        );
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:exact-export")
+            .unwrap();
+        assert_eq!(evaluated.decisions.len(), 3);
+        assert_eq!(evaluated.decisions[2].effect, PolicyEffect::RequireApproval);
+        let approval = evaluated.decisions[2].approval_id.as_deref().unwrap();
+        manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:export-waiting".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: vec![approval.into()],
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(vec![WaitingOn {
+                        kind: WaitingKind::Approval,
+                        id: approval.into(),
+                        message: None,
+                    }]),
+                    ..TaskMutation::default()
+                },
+            })
+            .unwrap();
+        manager
+            .decide_candidate_approval(
+                approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:exact-export")
+            .unwrap();
+        assert_eq!(finalized.grant_ids.len(), 3);
+        for (transition_id, revision, from, to) in [
+            (
+                "transition:export-runnable",
+                3,
+                TaskState::WaitingForAuth,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:export-running",
+                4,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: transition_id.into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: revision,
+                    expected_state: from,
+                    to_state: to,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "AUTHORITY_READY".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation::default(),
+                })
+                .unwrap();
+        }
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:exact-export")
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&imported.artifact_id))
+            .unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        assert!(
+            manager
+                .issue_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    "export:class-only",
+                    &imported.artifact_id,
+                    "fixture_remote",
+                    1024,
+                    {
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(MemorySink(Arc::new(std::sync::Mutex::new(Vec::new()))))
+                        }
+                    }
+                )
+                .is_err(),
+            "the production class-only issuer must deny in test builds too"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert!(
+            manager
+                .issue_exact_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    "export:exact-a",
+                    &imported.artifact_id,
+                    "service://fixture/a",
+                    "adapter:memory",
+                    {
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(MemorySink(Arc::new(std::sync::Mutex::new(Vec::new()))))
+                        }
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut destination = manager
+            .issue_exact_bound_artifact_export_destination(
+                &session,
+                &scope,
+                "export:exact-a",
+                &imported.artifact_id,
+                "service://fixture/b",
+                "adapter:memory",
+                {
+                    let sink = Arc::clone(&sink);
+                    let opens = Arc::clone(&opens);
+                    move || {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(MemorySink(sink))
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &imported.artifact_id, &mut destination)
+                .unwrap(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert_eq!(*sink.lock().unwrap(), bytes);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        for (query, schema) in [
+            (
+                "SELECT request_json FROM authority_requests WHERE action='data.egress'",
+                include_str!("../../../specs/authority-evaluation-request.schema.json"),
+            ),
+            (
+                "SELECT decision_json FROM policy_decisions WHERE action='data.egress'",
+                include_str!("../../../specs/policy-decision.schema.json"),
+            ),
+            (
+                "SELECT request_json FROM approval_requests WHERE action='data.egress'",
+                include_str!("../../../specs/approval-request.schema.json"),
+            ),
+            (
+                "SELECT binding_json FROM execution_bindings WHERE binding_id='binding:exact-export'",
+                include_str!("../../../specs/execution-binding.schema.json"),
+            ),
+            (
+                "SELECT event_json FROM provenance_events WHERE event_type='artifact.exported'",
+                include_str!("../../../specs/provenance-event.schema.json"),
+            ),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+            let validator = jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .unwrap();
+            let mut statement = manager.connection.prepare(query).unwrap();
+            let documents = statement
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(!documents.is_empty(), "{query}");
+            for document in documents {
+                let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+                assert!(validator.is_valid(&value), "{query}: {value}");
+            }
+        }
+        assert_eq!(
+            manager
+                .replay_bound_artifact_export(&session, "export:exact-a")
+                .unwrap(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        manager
+            .disable_trusted_export_service("service://fixture/b")
+            .unwrap();
+        assert!(
+            manager
+                .issue_exact_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    "export:exact-a",
+                    &imported.artifact_id,
+                    "service://fixture/b",
+                    "adapter:memory",
+                    {
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(MemorySink(Arc::new(std::sync::Mutex::new(Vec::new()))))
+                        }
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .replay_bound_artifact_export(&session, "export:exact-a")
+                .unwrap(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "retained handles are checked against each independently withdrawn authority"
+    )]
+    fn retained_exact_export_denies_changed_service_approval_policy_or_read_grant() {
+        use crate::authority_policy::AuthenticatedApprover;
+        for scenario in ["service", "approval", "policy", "read-grant"] {
+            let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+            let imported = manager
+                .import_artifact(
+                    &ImportArtifactRequest {
+                        schema_version: "0.1".into(),
+                        import_id: Some(format!("import:{scenario}")),
+                        task_id: "T-candidate".into(),
+                        origin_kind: ArtifactOriginKind::User,
+                        semantic_type: Some("artifact.file@1".into()),
+                        media_type: "text/plain".into(),
+                        format: None,
+                        sensitivity: Sensitivity::Private,
+                        retention: RetentionClass::Task,
+                        expires_at: None,
+                        labels: vec![],
+                        max_size_bytes: Some(1024),
+                    },
+                    &mut Cursor::new(b"retained private data"),
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "DELETE FROM task_artifacts WHERE task_id='T-candidate'
+                AND artifact_id='artifact:source'",
+                    [],
+                )
+                .unwrap();
+            manager
+                .register_trusted_export_service(
+                    "service://fixture/retained",
+                    "fixture_remote",
+                    "adapter:memory",
+                )
+                .unwrap();
+            let mut resources =
+                choices_with_source_and_output(&imported.artifact_id, "allocation:retained");
+            resources.push(CandidateResourceChoice {
+                action: "data.egress".into(),
+                semantic_selector: "destination:fixture_remote".into(),
+                handle: CandidateResourceHandle::ExternalExport {
+                    service_id: "service://fixture/retained".into(),
+                    source_artifact_id: imported.artifact_id.clone(),
+                    operation_id: format!("export:retained:{scenario}"),
+                    purpose: "retained fixture".into(),
+                    max_size_bytes: 1024,
+                },
+            });
+            let contract = contract_hash(&manager, &snapshot);
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    candidate_id: "candidate:retained",
+                    binding_id: "binding:retained",
+                    attempt_id: "attempt:retained",
+                    task_id: "T-candidate",
+                    semantic_program_hash: &hash,
+                    registry_snapshot_id: &snapshot,
+                    node_id: "copy",
+                    capability_contract_hash: &contract,
+                    provider_registration_id: &registration,
+                    attempt_number: 1,
+                    resources: &resources,
+                })
+                .unwrap();
+            manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+            ]}).to_string().as_bytes()).unwrap();
+            let evaluation = manager
+                .evaluate_pending_authority_candidate("candidate:retained")
+                .unwrap();
+            let approval = evaluation.decisions[2].approval_id.as_deref().unwrap();
+            manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:retained-waiting".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 2,
+                    expected_state: TaskState::Planning,
+                    to_state: TaskState::WaitingForAuth,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "APPROVAL_REQUIRED".into(),
+                        message: None,
+                        related_ids: vec![approval.into()],
+                    },
+                    mutation: TaskMutation {
+                        waiting_on: Some(vec![WaitingOn {
+                            kind: WaitingKind::Approval,
+                            id: approval.into(),
+                            message: None,
+                        }]),
+                        ..TaskMutation::default()
+                    },
+                })
+                .unwrap();
+            manager
+                .decide_candidate_approval(
+                    approval,
+                    &AuthenticatedApprover {
+                        principal_id: "user:test",
+                    },
+                    true,
+                )
+                .unwrap();
+            let finalized = manager
+                .finalize_pending_authority_candidate("candidate:retained")
+                .unwrap();
+            for (id, revision, from, to) in [
+                (
+                    "transition:retained-runnable",
+                    3,
+                    TaskState::WaitingForAuth,
+                    TaskState::Runnable,
+                ),
+                (
+                    "transition:retained-running",
+                    4,
+                    TaskState::Runnable,
+                    TaskState::Running,
+                ),
+            ] {
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: from,
+                        to_state: to,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into(),
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![],
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap();
+            }
+            let session = manager
+                .issue_provider_artifact_session("T-candidate", "binding:retained")
+                .unwrap();
+            let scope = manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&imported.artifact_id))
+                .unwrap();
+            let opens = Arc::new(AtomicUsize::new(0));
+            let mut destination = manager
+                .issue_exact_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    &format!("export:retained:{scenario}"),
+                    &imported.artifact_id,
+                    "service://fixture/retained",
+                    "adapter:memory",
+                    {
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(Vec::<u8>::new())
+                        }
+                    },
+                )
+                .unwrap();
+            match scenario {
+                "service" => manager
+                    .disable_trusted_export_service("service://fixture/retained")
+                    .unwrap(),
+                "approval" => manager
+                    .revoke_candidate_approval(
+                        approval,
+                        &AuthenticatedApprover {
+                            principal_id: "user:test",
+                        },
+                    )
+                    .unwrap(),
+                "policy" => {
+                    manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                    {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                    {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                    {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+                ]}).to_string().as_bytes()).unwrap();
+                }
+                "read-grant" => {
+                    let read_grant = &finalized.grant_ids[0];
+                    manager
+                        .connection
+                        .execute(
+                            "UPDATE authority_grants SET state='REVOKED',
+                        revoked_at=?2,revocation_reason_code='TEST_REVOKED' WHERE grant_id=?1",
+                            params![read_grant, NOW],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .export_artifact(&scope, &imported.artifact_id, &mut destination)
+                    .is_err(),
+                "{scenario} must stop a retained export before any destination effect"
+            );
+            assert_eq!(
+                opens.load(Ordering::SeqCst),
+                0,
+                "{scenario} opened a destination"
+            );
+        }
     }
 
     fn assert_catalog_reason(code: &str) {
@@ -3770,7 +4765,7 @@ mod tests {
         reason = "proves coordinator grant admission, active use, and durable expiry under one frozen wall fixture"
     )]
     fn run_frozen_wall_coordinator_grant(expire_before_running: bool) {
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true);
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, false);
         let contract = contract_hash(&manager, &snapshot);
         manager
             .reserve_authority_candidate(&ReserveAuthorityCandidate {
