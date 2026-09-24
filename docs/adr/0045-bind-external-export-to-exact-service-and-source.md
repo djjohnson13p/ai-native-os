@@ -55,6 +55,8 @@ writer and again at protected use. Its intent, effect marker, provenance, and
 recovery evidence must carry the service identity and source identity. Existing
 class-only export intents remain historical records under their original
 version; they cannot be upgraded into the new exact-service grant by inference.
+This exact-service admission is the provider/coordinator-issued grant profile;
+authenticated owner-mediated Artifact export remains a separate existing authority path.
 An in-memory trusted sink can prove the authorization and byte-release path
 without implementing a network transport in Issue #3. A later real transport
 must independently satisfy `network.connect` authority; `data.egress` alone

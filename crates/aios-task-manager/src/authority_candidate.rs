@@ -2535,6 +2535,338 @@ mod tests {
         );
     }
 
+    struct ExactExportFixture {
+        _directory: tempfile::TempDir,
+        path: std::path::PathBuf,
+        manager: TaskManager,
+        artifact_id: String,
+        grant_ids: Vec<String>,
+        session: crate::artifact_store::ProviderArtifactSession,
+        scope: crate::artifact_store::ArtifactReadScope,
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sets up one real approved exact export on disk"
+    )]
+    fn exact_export_fixture() -> ExactExportFixture {
+        use crate::authority_policy::AuthenticatedApprover;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("exact-export.sqlite3");
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(Some(&path), true, true);
+        let imported = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:exact-adversarial".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"exact private payload"),
+            )
+            .unwrap();
+        manager.connection.execute(
+            "DELETE FROM task_artifacts WHERE task_id='T-candidate' AND artifact_id='artifact:source'",
+            [],
+        ).unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://fixture/exact",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&imported.artifact_id, "allocation:exact-adversarial");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: "service://fixture/exact".into(),
+                source_artifact_id: imported.artifact_id.clone(),
+                operation_id: "export:exact-adversarial".into(),
+                purpose: "adversarial fixture".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:exact-adversarial",
+                binding_id: "binding:exact-adversarial",
+                attempt_id: "attempt:exact-adversarial",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluation = manager
+            .evaluate_pending_authority_candidate("candidate:exact-adversarial")
+            .unwrap();
+        let approval_id = evaluation.decisions[2].approval_id.clone().unwrap();
+        manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:exact-waiting".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: vec![approval_id.clone()],
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(vec![WaitingOn {
+                        kind: WaitingKind::Approval,
+                        id: approval_id.clone(),
+                        message: None,
+                    }]),
+                    ..TaskMutation::default()
+                },
+            })
+            .unwrap();
+        manager
+            .decide_candidate_approval(
+                &approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:exact-adversarial")
+            .unwrap();
+        for (id, revision, from, to) in [
+            (
+                "transition:exact-runnable",
+                3,
+                TaskState::WaitingForAuth,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:exact-running",
+                4,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: id.into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: revision,
+                    expected_state: from,
+                    to_state: to,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "AUTHORITY_READY".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation::default(),
+                })
+                .unwrap();
+        }
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:exact-adversarial")
+            .unwrap();
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&imported.artifact_id))
+            .unwrap();
+        ExactExportFixture {
+            _directory: directory,
+            path,
+            manager,
+            artifact_id: imported.artifact_id,
+            grant_ids: finalized.grant_ids,
+            session,
+            scope,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prepares a real exact candidate through authenticated approval before issuance"
+    )]
+    fn pending_exact_export_fixture() -> (TaskManager, String) {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let imported = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:pending-exact".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"pending exact export"),
+            )
+            .unwrap();
+        manager.connection.execute("DELETE FROM task_artifacts WHERE task_id='T-candidate' AND artifact_id='artifact:source'", []).unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://fixture/pending",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&imported.artifact_id, "allocation:pending-exact");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: "service://fixture/pending".into(),
+                source_artifact_id: imported.artifact_id,
+                operation_id: "export:pending-exact".into(),
+                purpose: "pending fixture".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:pending-exact",
+                binding_id: "binding:pending-exact",
+                attempt_id: "attempt:pending-exact",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:pending-exact")
+            .unwrap();
+        let approval = evaluated.decisions[2].approval_id.clone().unwrap();
+        manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:pending-exact-waiting".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 2,
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: vec![approval.clone()],
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(vec![WaitingOn {
+                        kind: WaitingKind::Approval,
+                        id: approval.clone(),
+                        message: None,
+                    }]),
+                    ..TaskMutation::default()
+                },
+            })
+            .unwrap();
+        manager
+            .decide_candidate_approval(
+                &approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        (manager, approval)
+    }
+
+    #[test]
+    fn exact_export_finalization_rechecks_policy_and_approval_freshness() {
+        use crate::authority_policy::AuthenticatedApprover;
+        for scenario in ["policy", "approval"] {
+            let (mut manager, approval) = pending_exact_export_fixture();
+            match scenario {
+                "policy" => {
+                    manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                    {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                    {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                    {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+                ]}).to_string().as_bytes()).unwrap();
+                }
+                "approval" => {
+                    manager
+                        .revoke_candidate_approval(
+                            &approval,
+                            &AuthenticatedApprover {
+                                principal_id: "user:test",
+                            },
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .finalize_pending_authority_candidate("candidate:pending-exact")
+                    .is_err(),
+                "{scenario}"
+            );
+            for table in ["authority_grants", "execution_bindings"] {
+                let count: i64 = manager
+                    .connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE task_id='T-candidate'"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "{scenario} issued {table}");
+            }
+        }
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -2758,6 +3090,437 @@ mod tests {
                 "{scenario} opened a destination"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "real export callbacks prove withdrawal after an external effect"
+    )]
+    fn exact_export_withdrawal_after_construction_and_bytes_stops_later_callbacks() {
+        use crate::artifact_store::{
+            ArtifactExportWriter, ExactExportTestPhase, install_exact_export_test_hook,
+        };
+        struct CountingSink {
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+            flushes: Arc<AtomicUsize>,
+            finalizes: Arc<AtomicUsize>,
+            partial: bool,
+        }
+        impl Write for CountingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = if self.partial { 1 } else { bytes.len() };
+                self.bytes
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        impl ArtifactExportWriter for CountingSink {
+            fn finalize(&mut self) -> std::io::Result<()> {
+                self.finalizes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        for phase in ["after-write", "pre-flush", "pre-finalize"] {
+            let mut fixture = exact_export_fixture();
+            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let finalizes = Arc::new(AtomicUsize::new(0));
+            let opens = Arc::new(AtomicUsize::new(0));
+            let mut destination = fixture
+                .manager
+                .issue_exact_bound_artifact_export_destination(
+                    &fixture.session,
+                    &fixture.scope,
+                    "export:exact-adversarial",
+                    &fixture.artifact_id,
+                    "service://fixture/exact",
+                    "adapter:memory",
+                    {
+                        let bytes = Arc::clone(&bytes);
+                        let flushes = Arc::clone(&flushes);
+                        let finalizes = Arc::clone(&finalizes);
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(CountingSink {
+                                bytes,
+                                flushes,
+                                finalizes,
+                                partial: phase == "after-write",
+                            })
+                        }
+                    },
+                )
+                .unwrap();
+            let path = fixture.path.clone();
+            let grant = fixture.grant_ids[0].clone();
+            install_exact_export_test_hook(
+                match phase {
+                    "after-write" => ExactExportTestPhase::AfterWrite,
+                    "pre-flush" => ExactExportTestPhase::PreFlush,
+                    "pre-finalize" => ExactExportTestPhase::PreFinalize,
+                    _ => unreachable!(),
+                },
+                move || {
+                    rusqlite::Connection::open(path)?.execute(
+                        "UPDATE authority_grants SET state='REVOKED',revoked_at=?2,
+                     revocation_reason_code='TEST_REVOKED' WHERE grant_id=?1",
+                        rusqlite::params![grant, NOW],
+                    )?;
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    fixture.manager.export_artifact(
+                        &fixture.scope,
+                        &fixture.artifact_id,
+                        &mut destination
+                    ),
+                    Err(crate::TaskManagerError::InvalidRecord(
+                        "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                    ))
+                ),
+                "{phase}"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 1, "{phase}");
+            assert_eq!(
+                bytes.lock().unwrap().len(),
+                if phase == "after-write" {
+                    1
+                } else {
+                    b"exact private payload".len()
+                },
+                "{phase}"
+            );
+            assert_eq!(
+                flushes.load(Ordering::SeqCst),
+                usize::from(phase == "pre-finalize"),
+                "{phase}"
+            );
+            assert_eq!(finalizes.load(Ordering::SeqCst), 0, "{phase}");
+            let state: String = fixture.manager.connection.query_row(
+                "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export:exact-adversarial'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(state, "UNKNOWN:OUTCOME_UNKNOWN", "{phase}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks the exact authority tuple in each durable artifact and at writer use"
+    )]
+    fn exact_export_grant_tuple_substitution_never_opens_writer() {
+        for field in [
+            "source_artifact_id",
+            "operation_id",
+            "adapter_id",
+            "max_size_bytes",
+        ] {
+            let mut fixture = exact_export_fixture();
+            let expected = json!(
+                load_current_export_pin(&fixture.manager.connection, "candidate:exact-adversarial")
+                    .unwrap()
+                    .unwrap()
+            );
+            for (query, key) in [
+                (
+                    "SELECT decision_json FROM policy_decisions WHERE action='data.egress'",
+                    "resource",
+                ),
+                (
+                    "SELECT request_json FROM approval_requests WHERE action='data.egress'",
+                    "export",
+                ),
+                (
+                    "SELECT grants_json FROM authority_grants WHERE grant_id=?1",
+                    "grant",
+                ),
+            ] {
+                let raw: String = if key == "grant" {
+                    fixture
+                        .manager
+                        .connection
+                        .query_row(query, [&fixture.grant_ids[2]], |row| row.get(0))
+                        .unwrap()
+                } else {
+                    fixture
+                        .manager
+                        .connection
+                        .query_row(query, [], |row| row.get(0))
+                        .unwrap()
+                };
+                let value: Value = serde_json::from_str(&raw).unwrap();
+                let actual = match key {
+                    "resource" => &value["resource"]["external_export"],
+                    "export" => &value["export"],
+                    "grant" => &value[0]["external_export"],
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, &expected, "{key} must seal the entire tuple");
+            }
+            let opens = Arc::new(AtomicUsize::new(0));
+            let mut destination = fixture
+                .manager
+                .issue_exact_bound_artifact_export_destination(
+                    &fixture.session,
+                    &fixture.scope,
+                    "export:exact-adversarial",
+                    &fixture.artifact_id,
+                    "service://fixture/exact",
+                    "adapter:memory",
+                    {
+                        let opens = Arc::clone(&opens);
+                        move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(Vec::<u8>::new())
+                        }
+                    },
+                )
+                .unwrap();
+            let raw: String = fixture
+                .manager
+                .connection
+                .query_row(
+                    "SELECT grants_json FROM authority_grants WHERE grant_id=?1",
+                    [&fixture.grant_ids[2]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut grant: Value = serde_json::from_str(&raw).unwrap();
+            grant[0]["external_export"][field] = match field {
+                "source_artifact_id" => json!("artifact:substituted"),
+                "operation_id" => json!("export:substituted"),
+                "adapter_id" => json!("adapter:substituted"),
+                "max_size_bytes" => json!(2048),
+                _ => unreachable!(),
+            };
+            let replacement = canonical_json(&grant).unwrap();
+            assert!(
+                fixture
+                    .manager
+                    .connection
+                    .execute(
+                        "UPDATE authority_grants SET grants_json=?2 WHERE grant_id=?1",
+                        rusqlite::params![fixture.grant_ids[2], replacement],
+                    )
+                    .is_err(),
+                "durable grant guard must reject {field}"
+            );
+            // Deliberately disable the storage guard to probe the independent use fence.
+            fixture
+                .manager
+                .connection
+                .execute_batch("DROP TRIGGER authority_grant_deadline_grant_identity_guard")
+                .unwrap();
+            fixture
+                .manager
+                .connection
+                .execute(
+                    "UPDATE authority_grants SET grants_json=?2 WHERE grant_id=?1",
+                    rusqlite::params![fixture.grant_ids[2], replacement],
+                )
+                .unwrap();
+            assert!(
+                fixture
+                    .manager
+                    .export_artifact(&fixture.scope, &fixture.artifact_id, &mut destination)
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 0, "{field}");
+        }
+    }
+
+    #[test]
+    fn exact_export_response_loss_replays_after_disk_restart_without_second_writer() {
+        use crate::artifact_store::{ExactExportTestPhase, install_exact_export_test_hook};
+        let mut fixture = exact_export_fixture();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut destination = fixture
+            .manager
+            .issue_exact_bound_artifact_export_destination(
+                &fixture.session,
+                &fixture.scope,
+                "export:exact-adversarial",
+                &fixture.artifact_id,
+                "service://fixture/exact",
+                "adapter:memory",
+                {
+                    let opens = Arc::clone(&opens);
+                    move || {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(Vec::<u8>::new())
+                    }
+                },
+            )
+            .unwrap();
+        install_exact_export_test_hook(ExactExportTestPhase::CompletionCommitResult, || {
+            Err(crate::TaskManagerError::InvalidRecord(
+                "injected response loss",
+            ))
+        });
+        assert_eq!(
+            fixture
+                .manager
+                .export_artifact(&fixture.scope, &fixture.artifact_id, &mut destination)
+                .unwrap(),
+            21
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .manager
+                .replay_bound_artifact_export(&fixture.session, "export:exact-adversarial")
+                .unwrap(),
+            21
+        );
+        // fixture_at_mode sets Task privacy by direct SQL for export admission, while the
+        // pre-existing creation provenance records null. Restore that original provenanced
+        // value only after export; completed-operation replay cannot renew export authority.
+        fixture
+            .manager
+            .connection
+            .execute(
+                "UPDATE tasks SET constraints_json=NULL WHERE task_id='T-candidate'",
+                [],
+            )
+            .unwrap();
+        let path = fixture.path.clone();
+        let artifact_id = fixture.artifact_id.clone();
+        drop(destination);
+        let ExactExportFixture {
+            _directory,
+            manager,
+            session,
+            scope,
+            ..
+        } = fixture;
+        drop(scope);
+        drop(session);
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let session = reopened
+            .issue_provider_artifact_session("T-candidate", "binding:exact-adversarial")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .replay_bound_artifact_export(&session, "export:exact-adversarial")
+                .unwrap(),
+            21
+        );
+        assert!(
+            reopened
+                .scope_artifact_reads(&session, &[artifact_id])
+                .is_err(),
+            "one-shot read is consumed"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancelling_exact_export_revokes_issued_grants_but_cannot_hide_unresolved_export() {
+        use crate::artifact_store::{ExactExportTestPhase, install_exact_export_test_hook};
+        let cancel = |revision, state| TransitionRequest {
+            schema_version: "0.1".into(),
+            transition_id: "transition:exact-cancel".into(),
+            task_id: "T-candidate".into(),
+            expected_revision: revision,
+            expected_state: state,
+            to_state: TaskState::Cancelled,
+            requested_by: Actor {
+                kind: "system-service".into(),
+                id: "aiosd.coordinator".into(),
+            },
+            reason: TransitionReason {
+                code: "TASK_CANCELLED".into(),
+                message: None,
+                related_ids: vec![],
+            },
+            mutation: TaskMutation::default(),
+        };
+        let (mut ready, _) = pending_exact_export_fixture();
+        let finalized = ready
+            .finalize_pending_authority_candidate("candidate:pending-exact")
+            .unwrap();
+        assert_eq!(finalized.grant_ids.len(), 3);
+        let cancelled = ready
+            .transition(&cancel(3, TaskState::WaitingForAuth))
+            .unwrap();
+        assert!(cancelled.applied, "{cancelled:?}");
+        let revoked: i64 = ready.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='REVOKED' AND revoked_at IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(revoked, 3);
+
+        let mut fixture = exact_export_fixture();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut destination = fixture
+            .manager
+            .issue_exact_bound_artifact_export_destination(
+                &fixture.session,
+                &fixture.scope,
+                "export:exact-adversarial",
+                &fixture.artifact_id,
+                "service://fixture/exact",
+                "adapter:memory",
+                {
+                    let opens = Arc::clone(&opens);
+                    move || {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(Vec::<u8>::new())
+                    }
+                },
+            )
+            .unwrap();
+        install_exact_export_test_hook(ExactExportTestPhase::AfterArm, || {
+            Err(crate::TaskManagerError::InvalidRecord(
+                "injected response loss after arm",
+            ))
+        });
+        assert!(
+            fixture
+                .manager
+                .export_artifact(&fixture.scope, &fixture.artifact_id, &mut destination)
+                .is_err()
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        let state: String = fixture
+            .manager
+            .connection
+            .query_row(
+                "SELECT state FROM operations WHERE operation_id='export:exact-adversarial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "STARTED");
+        let rejected = fixture
+            .manager
+            .transition(&cancel(5, TaskState::Running))
+            .unwrap();
+        assert!(!rejected.applied);
+        assert_eq!(rejected.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+        let active: i64 = fixture.manager.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='ACTIVE'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(active, 2);
+        let consumed: i64 = fixture.manager.connection.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='CONSUMED'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(consumed, 1);
     }
 
     fn assert_catalog_reason(code: &str) {

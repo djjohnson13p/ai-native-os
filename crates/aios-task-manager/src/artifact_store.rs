@@ -13051,8 +13051,16 @@ fn copy_export_bounded<R: Read, W: Write>(
                 });
             }
             offset += written;
+            export_after_write_step().map_err(|error| ExportCopyFailure {
+                error,
+                external_effect_possible,
+            })?;
         }
     }
+    export_pre_flush_step().map_err(|error| ExportCopyFailure {
+        error,
+        external_effect_possible,
+    })?;
     with_fresh_export_fence(
         connection,
         clock,
@@ -15186,6 +15194,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static EXPORT_COPY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static EXPORT_AFTER_WRITE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static EXPORT_PRE_FLUSH_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_PRE_FINALIZE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_PRE_DISPOSE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -15765,6 +15777,61 @@ fn export_copy_step() -> Result<()> {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum ExactExportTestPhase {
+    AfterArm,
+    AfterWrite,
+    PreFlush,
+    PreFinalize,
+    CompletionCommitResult,
+}
+
+#[cfg(test)]
+pub(crate) fn install_exact_export_test_hook(
+    phase: ExactExportTestPhase,
+    hook: impl FnOnce() -> Result<()> + 'static,
+) {
+    let hook: ExportCompletionTestHook = Box::new(hook);
+    match phase {
+        ExactExportTestPhase::AfterArm => {
+            EXPORT_AFTER_ARM_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+        ExactExportTestPhase::AfterWrite => {
+            EXPORT_AFTER_WRITE_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+        ExactExportTestPhase::PreFlush => {
+            EXPORT_PRE_FLUSH_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+        ExactExportTestPhase::PreFinalize => {
+            EXPORT_PRE_FINALIZE_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+        ExactExportTestPhase::CompletionCommitResult => {
+            EXPORT_COMPLETION_COMMIT_RESULT_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+    }
+}
+
+#[cfg(test)]
+fn export_after_write_step() -> Result<()> {
+    EXPORT_AFTER_WRITE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn export_pre_flush_step() -> Result<()> {
+    EXPORT_PRE_FLUSH_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn export_completion_step() -> Result<()> {
     EXPORT_COMPLETION_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -15868,6 +15935,24 @@ fn export_reservation_race_step() -> Result<()> {
     reason = "test failure injection shares the production copy boundary"
 )]
 fn export_copy_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test-only authority withdrawal after a write"
+)]
+fn export_after_write_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test-only authority withdrawal before flush"
+)]
+fn export_pre_flush_step() -> Result<()> {
     Ok(())
 }
 
@@ -19272,6 +19357,28 @@ mod tests {
                 .unwrap(),
             22
         );
+        let class_only_opens = Arc::new(AtomicUsize::new(0));
+        assert!(
+            manager
+                .issue_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    "export-consumed-replay",
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    {
+                        let opened = Arc::clone(&class_only_opens);
+                        move || {
+                            opened.fetch_add(1, Ordering::SeqCst);
+                            Ok(Vec::<u8>::new())
+                        }
+                    },
+                )
+                .is_err(),
+            "historical class-only operation cannot issue a fresh writer"
+        );
+        assert_eq!(class_only_opens.load(Ordering::SeqCst), 0);
         assert_eq!(
             manager
                 .connection
