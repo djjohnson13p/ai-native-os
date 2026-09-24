@@ -4874,83 +4874,92 @@ impl TaskManager {
         // truncate, or otherwise affect it, even when the callback returns an
         // error before yielding a writer. Failures before that callback are
         // still deterministically no-effect.
-        let _ = super::trusted_time::protected_now(&self.connection, &self.clock)?;
+        let construction_permit = super::trusted_time::prepare_external_effect(
+            &self.connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &intent.task_id,
+            super::trusted_time::ExternalEffectKind::ExportConstruction,
+            &destination.operation_id,
+        )?;
         let mut callback_invoked = false;
-        let mut construction_time = None;
         let construction = (|| -> Result<W> {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-            let construction_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    fresh.commit(&self.connection)?;
-                    return Err(error);
+            let entry = super::trusted_time::capture_external_entry(
+                &transaction,
+                &self.clock,
+                &construction_permit,
+            )?;
+            let pre_call = (|| -> Result<()> {
+                let construction_at = entry.require_trusted_time()?;
+                assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+                ensure_task_is_not_recovering(&transaction, &intent.task_id)?;
+                ensure_no_unknown_artifact_export_except(
+                    &transaction,
+                    &intent.task_id,
+                    Some(&destination.operation_id),
+                )?;
+                ensure_artifact_integrity_durable(&transaction, &intent.artifact_id)?;
+                validate_export_destination_fence(
+                    &transaction,
+                    &construction_at,
+                    &intent.task_id,
+                    &scope.authority,
+                    &intent.destination_class,
+                    destination.grant_admission.as_ref(),
+                )?;
+                match (
+                    &scope.authority.execution,
+                    reader_admission
+                        .as_ref()
+                        .map(|admission| &admission.grant_admission),
+                ) {
+                    (Some(execution), Some(admission))
+                        if exact_operation_grant(
+                            &transaction,
+                            &intent.task_id,
+                            execution,
+                            "artifact.read",
+                            "artifact",
+                            &intent.artifact_id,
+                            &construction_at,
+                            Some(admission),
+                        )?
+                        .is_some() => {}
+                    (None, None) => {}
+                    _ => return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
                 }
-            };
-            construction_time = Some(fresh);
-            assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
-            ensure_task_is_not_recovering(&transaction, &intent.task_id)?;
-            ensure_no_unknown_artifact_export_except(
-                &transaction,
-                &intent.task_id,
-                Some(&destination.operation_id),
-            )?;
-            ensure_artifact_integrity_durable(&transaction, &intent.artifact_id)?;
-            validate_export_destination_fence(
-                &transaction,
-                &construction_at,
-                &intent.task_id,
-                &scope.authority,
-                &intent.destination_class,
-                destination.grant_admission.as_ref(),
-            )?;
-            match (
-                &scope.authority.execution,
-                reader_admission
-                    .as_ref()
-                    .map(|admission| &admission.grant_admission),
-            ) {
-                (Some(execution), Some(admission))
-                    if exact_operation_grant(
-                        &transaction,
-                        &intent.task_id,
-                        execution,
-                        "artifact.read",
-                        "artifact",
-                        &intent.artifact_id,
-                        &construction_at,
-                        Some(admission),
-                    )?
-                    .is_some() => {}
-                (None, None) => {}
-                _ => return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")),
-            }
-            let armed_receipt = transaction.query_row(
-                "SELECT external_receipt FROM operations WHERE operation_id=?1",
-                [&destination.operation_id],
-                |row| row.get::<_, String>(0),
-            )?;
-            if !authenticate_armed_export_operation(
-                &transaction,
-                &destination.operation_id,
-                &destination.intent_json,
-                &armed_receipt,
-            )? {
-                return Err(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
-                ));
+                let armed_receipt = transaction.query_row(
+                    "SELECT external_receipt FROM operations WHERE operation_id=?1",
+                    [&destination.operation_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                if !authenticate_armed_export_operation(
+                    &transaction,
+                    &destination.operation_id,
+                    &destination.intent_json,
+                    &armed_receipt,
+                )? {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = pre_call {
+                super::trusted_time::resolve_external_no_effect_in(&construction_permit, entry)?;
+                transaction.commit()?;
+                return Err(error);
             }
             callback_invoked = true;
-            let writer = writer_factory()?;
+            let writer = writer_factory();
+            super::trusted_time::resolve_external_entry_in(&construction_permit, entry)?;
             transaction.commit()?;
-            Ok(writer)
+            Ok(writer?)
         })();
-        if let Some(observation) = construction_time {
-            observation.commit(&self.connection)?;
-        }
         destination.external_effect_possible = callback_invoked;
         destination.writer = if let Ok(writer) = construction {
             Some(writer)
@@ -5002,6 +5011,9 @@ impl TaskManager {
             intent.max_size_bytes,
             &mut self.connection,
             &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &destination.operation_id,
             &destination.task_id,
             &destination.authority,
             &destination.destination_class,
@@ -5054,41 +5066,49 @@ impl TaskManager {
                 "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
             ))?;
         export_pre_finalize_step()?;
-        let _ = super::trusted_time::protected_now(&self.connection, &self.clock)?;
-        let mut finalize_time = None;
+        let finalize_permit = super::trusted_time::prepare_external_effect(
+            &self.connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &destination.task_id,
+            super::trusted_time::ExternalEffectKind::ExportFinalize,
+            &destination.operation_id,
+        )?;
         let finalize = (|| -> Result<()> {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-            let finalize_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    fresh.commit(&self.connection)?;
-                    return Err(error);
-                }
-            };
-            finalize_time = Some(fresh);
-            validate_export_destination_fence(
+            let entry = super::trusted_time::capture_external_entry(
                 &transaction,
-                &finalize_at,
-                &destination.task_id,
-                &destination.authority,
-                &destination.destination_class,
-                destination.grant_admission.as_ref(),
+                &self.clock,
+                &finalize_permit,
             )?;
+            let pre_call = entry.require_trusted_time().and_then(|finalize_at| {
+                assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+                validate_export_destination_fence(
+                    &transaction,
+                    &finalize_at,
+                    &destination.task_id,
+                    &destination.authority,
+                    &destination.destination_class,
+                    destination.grant_admission.as_ref(),
+                )
+            });
+            if let Err(error) = pre_call {
+                super::trusted_time::resolve_external_no_effect_in(&finalize_permit, entry)?;
+                transaction.commit()?;
+                return Err(error);
+            }
             // Destination finalization may itself make bytes externally
             // visible. Keep the same serialized authority fence held across
             // that irreversible callback; a concurrent revocation or recovery
             // transition cannot commit until finalization is complete.
-            writer.finalize()?;
+            let result = writer.finalize();
+            super::trusted_time::resolve_external_entry_in(&finalize_permit, entry)?;
             transaction.commit()?;
-            Ok(())
+            Ok(result?)
         })();
-        if let Some(observation) = finalize_time {
-            observation.commit(&self.connection)?;
-        }
         if finalize.is_err() {
             self.finish_unknown_export_operation(
                 &destination.operation_id,
@@ -11094,37 +11114,43 @@ struct ExportCopyFailure {
     clippy::too_many_arguments,
     reason = "each external callback needs the complete sealed export fence"
 )]
-fn with_fresh_export_fence<F>(
+fn with_fresh_export_fence<T, F>(
     connection: &mut Connection,
     clock: &Arc<dyn Clock>,
+    lease_owner: &str,
+    lease_epoch: i64,
+    operation_id: &str,
     task_id: &str,
     authority: &ReadAuthority,
     destination_class: &str,
     grant_admission: Option<&GrantAdmission>,
     external_effect_possible: bool,
     callback: F,
-) -> std::result::Result<(), ExportCopyFailure>
+) -> std::result::Result<T, ExportCopyFailure>
 where
-    F: FnOnce() -> std::io::Result<()>,
+    F: FnOnce() -> std::io::Result<T>,
 {
     let map = |error| ExportCopyFailure {
         error,
         external_effect_possible,
     };
-    super::trusted_time::protected_now(connection, clock).map_err(map)?;
+    let permit = super::trusted_time::prepare_external_effect(
+        connection,
+        clock,
+        lease_owner,
+        lease_epoch,
+        task_id,
+        super::trusted_time::ExternalEffectKind::ExportCopy,
+        operation_id,
+    )
+    .map_err(map)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| map(error.into()))?;
-    let fresh = super::trusted_time::capture_locked(&transaction, clock).map_err(map)?;
-    let checked_at = match fresh.require_trusted_time() {
-        Ok(now) => now,
-        Err(error) => {
-            drop(transaction);
-            fresh.commit(connection).map_err(map)?;
-            return Err(map(error));
-        }
-    };
-    let result = (|| -> Result<()> {
+    let entry =
+        super::trusted_time::capture_external_entry(&transaction, clock, &permit).map_err(map)?;
+    let pre_call = entry.require_trusted_time().and_then(|checked_at| {
+        assert_manager_lease(&transaction, lease_owner, lease_epoch)?;
         validate_export_destination_fence(
             &transaction,
             &checked_at,
@@ -11132,13 +11158,18 @@ where
             authority,
             destination_class,
             grant_admission,
-        )?;
-        callback()?;
-        transaction.commit()?;
-        Ok(())
-    })();
-    fresh.commit(connection).map_err(map)?;
-    result.map_err(map)
+        )
+    });
+    if let Err(error) = pre_call {
+        super::trusted_time::resolve_external_no_effect_in(&permit, entry).map_err(map)?;
+        transaction.commit().map_err(|error| map(error.into()))?;
+        return Err(map(error));
+    }
+    // The callback can change the destination even when it returns Err.
+    let result = callback();
+    super::trusted_time::resolve_external_entry_in(&permit, entry).map_err(map)?;
+    transaction.commit().map_err(|error| map(error.into()))?;
+    result.map_err(|error| map(error.into()))
 }
 
 #[allow(
@@ -11153,6 +11184,9 @@ fn copy_export_bounded<R: Read, W: Write>(
     maximum: u64,
     connection: &mut Connection,
     clock: &Arc<dyn Clock>,
+    lease_owner: &str,
+    lease_epoch: i64,
+    operation_id: &str,
     task_id: &str,
     authority: &ReadAuthority,
     destination_class: &str,
@@ -11191,20 +11225,44 @@ fn copy_export_bounded<R: Read, W: Write>(
             });
         }
         hasher.update(&buffer[..count]);
-        with_fresh_export_fence(
-            connection,
-            clock,
-            task_id,
-            authority,
-            destination_class,
-            grant_admission,
-            external_effect_possible,
-            || writer.write_all(&buffer[..count]),
-        )?;
+        let mut offset = 0;
+        while offset < count {
+            let written = with_fresh_export_fence(
+                connection,
+                clock,
+                lease_owner,
+                lease_epoch,
+                operation_id,
+                task_id,
+                authority,
+                destination_class,
+                grant_admission,
+                external_effect_possible,
+                || writer.write(&buffer[offset..count]),
+            )?;
+            if written == 0 || written > count - offset {
+                return Err(ExportCopyFailure {
+                    error: std::io::Error::new(
+                        if written == 0 {
+                            std::io::ErrorKind::WriteZero
+                        } else {
+                            std::io::ErrorKind::InvalidData
+                        },
+                        "export destination returned an invalid write count",
+                    )
+                    .into(),
+                    external_effect_possible,
+                });
+            }
+            offset += written;
+        }
     }
     with_fresh_export_fence(
         connection,
         clock,
+        lease_owner,
+        lease_epoch,
+        operation_id,
         task_id,
         authority,
         destination_class,
@@ -16427,6 +16485,25 @@ mod tests {
                     .unwrap(),
                 "UNKNOWN:OUTCOME_UNKNOWN"
             );
+            let invoked: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_COPY'
+                       AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
+                    [operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                invoked,
+                if operation_id == "export-empty-flush-failure" {
+                    1
+                } else {
+                    2
+                },
+                "each attempted writer call, including a failing write or flush, is durable"
+            );
         }
         for connection in [
             &manager.connection,
@@ -16874,6 +16951,22 @@ mod tests {
             manager
                 .connection
                 .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_CONSTRUCTION'
+                       AND p.subject_id='export-factory-effect-error'
+                       AND r.resolution_kind='EFFECT_INVOKED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "factory truncation is durably marked despite the callback error"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
                     "SELECT state || ':' || outcome_certainty FROM operations WHERE operation_id='export-factory-effect-error'",
                     [],
                     |row| row.get::<_, String>(0),
@@ -16946,6 +17039,22 @@ mod tests {
                 )
                 .unwrap(),
             "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-finalize-recovery'
+                       AND r.resolution_kind='EFFECT_INVOKED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "a failing finalize callback is still an invoked external effect"
         );
         assert_eq!(
             manager
@@ -19152,6 +19261,22 @@ mod tests {
             ))
         ));
         assert_eq!(finalized.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-pre-finalize-fence'
+                       AND r.resolution_kind='NO_EFFECT'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "revoked finalization is recorded as a denied, no-effect entry"
+        );
     }
 
     #[test]
