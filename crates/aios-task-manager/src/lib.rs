@@ -2315,143 +2315,148 @@ impl TaskManager {
         let request_json = canonical_json(request)?;
         let lease_owner = self.lease_owner.clone();
         let lease_epoch = self.lease_epoch;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut locked_time = if request.to_state == TaskState::Running {
-            let fresh = trusted_time::capture_locked(&transaction, &self.clock)?;
-            resulted_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    fresh.commit(&self.connection)?;
-                    return Err(error);
-                }
-            };
-            Some(fresh)
-        } else {
-            None
-        };
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        if let Some(stored_request) = transaction
-            .query_row(
-                "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
-                [&request.transition_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if stored_request == request_json {
-                return authenticated_transition_result(&transaction, &request.transition_id);
-            }
-            let observed = load_observed(&transaction, &request.task_id)?;
-            return Ok(rejected(
-                request,
-                "TASK_TRANSITION_ID_REUSE_CONFLICT",
-                observed,
-                &resulted_at,
-            ));
-        }
-
-        let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
-            load_transition_state(&transaction, &request.task_id)?
-        else {
-            let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
-            persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
-            if let Some(fresh) = &locked_time {
-                fresh.commit_in(&transaction)?.require_trusted_time()?;
-            }
-            transaction.commit()?;
-            return Ok(result);
-        };
-        let observed_state = TaskState::parse(&state)?;
-        let observed_revision = u64::try_from(revision)
-            .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
-        let observed = Some((observed_state, observed_revision));
-        let rejection = if request.expected_revision != observed_revision {
-            Some("TASK_REVISION_CONFLICT")
-        } else if request.expected_state != observed_state {
-            Some("TASK_STATE_CONFLICT")
-        } else if observed_state.terminal()
-            && !(observed_state == TaskState::Failed && request.to_state == TaskState::RollingBack)
-        {
-            Some("TASK_TERMINAL_STATE")
-        } else if !allowed_transition(observed_state, request.to_state) {
-            Some("TASK_ILLEGAL_TRANSITION")
-        } else {
-            guard_failure(
-                &transaction,
-                request,
-                &waiting_json,
-                &steps_json,
-                active_program,
-                &resulted_at,
-                internal_recovery,
-            )?
-        };
-        if let Some(code) = rejection {
-            let result = rejected(request, code, observed, &resulted_at);
-            persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
-            if let Some(fresh) = &locked_time {
-                fresh.commit_in(&transaction)?.require_trusted_time()?;
-            }
-            transaction.commit()?;
-            return Ok(result);
-        }
-
-        let new_revision = observed_revision
-            .checked_add(1)
-            .ok_or(TaskManagerError::InvalidRecord("Task revision overflow"))?;
-        let active_steps: Vec<String> = serde_json::from_str(&steps_json)?;
-        if request.to_state == TaskState::Running
-            && !admit_active_steps(&transaction, &request.task_id, &active_steps, &resulted_at)?
-        {
-            let result = rejected(
-                request,
-                "TASK_TRANSITION_GUARD_FAILED",
-                observed,
-                &resulted_at,
-            );
-            transaction.rollback()?;
-            if let Some(fresh) = locked_time.take() {
-                fresh.commit(&self.connection)?;
-            }
-            let rejection_transaction = self
+        let mut locked_time = None;
+        let outcome = (|| -> Result<TransitionResult> {
+            let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            assert_manager_lease(&rejection_transaction, &lease_owner, lease_epoch)?;
-            persist_rejection(
-                &rejection_transaction,
-                request,
-                &request_json,
-                &result,
-                &resulted_at,
-            )?;
-            rejection_transaction.commit()?;
-            return Ok(result);
-        }
-        let waiting = match &request.mutation.waiting_on {
-            Some(waiting) => serde_json::to_string(waiting)?,
-            None => waiting_json,
-        };
-        let steps = match &request.mutation.active_step_ids {
-            Some(steps) => serde_json::to_string(steps)?,
-            None => steps_json,
-        };
-        let failure = request
-            .mutation
-            .failure
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .or(failure_json);
-        let recovery = request
-            .mutation
-            .recovery
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let active_program_row = active_program
+            locked_time = if request.to_state == TaskState::Running {
+                let fresh = trusted_time::capture_locked(&transaction, &self.clock)?;
+                resulted_at = match fresh.require_trusted_time() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        drop(transaction);
+                        fresh.commit(&self.connection)?;
+                        return Err(error);
+                    }
+                };
+                Some(fresh)
+            } else {
+                None
+            };
+            assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+            if let Some(stored_request) = transaction
+                .query_row(
+                    "SELECT request_json FROM task_transitions WHERE transition_id = ?1",
+                    [&request.transition_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if stored_request == request_json {
+                    return authenticated_transition_result(&transaction, &request.transition_id);
+                }
+                let observed = load_observed(&transaction, &request.task_id)?;
+                return Ok(rejected(
+                    request,
+                    "TASK_TRANSITION_ID_REUSE_CONFLICT",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+
+            let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
+                load_transition_state(&transaction, &request.task_id)?
+            else {
+                let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
+                persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+                if let Some(fresh) = &locked_time {
+                    fresh.commit_in(&transaction)?.require_trusted_time()?;
+                }
+                transaction.commit()?;
+                locked_time = None;
+                return Ok(result);
+            };
+            let observed_state = TaskState::parse(&state)?;
+            let observed_revision = u64::try_from(revision)
+                .map_err(|_| TaskManagerError::InvalidRecord("stored revision is invalid"))?;
+            let observed = Some((observed_state, observed_revision));
+            let rejection = if request.expected_revision != observed_revision {
+                Some("TASK_REVISION_CONFLICT")
+            } else if request.expected_state != observed_state {
+                Some("TASK_STATE_CONFLICT")
+            } else if observed_state.terminal()
+                && !(observed_state == TaskState::Failed
+                    && request.to_state == TaskState::RollingBack)
+            {
+                Some("TASK_TERMINAL_STATE")
+            } else if !allowed_transition(observed_state, request.to_state) {
+                Some("TASK_ILLEGAL_TRANSITION")
+            } else {
+                guard_failure(
+                    &transaction,
+                    request,
+                    &waiting_json,
+                    &steps_json,
+                    active_program,
+                    &resulted_at,
+                    internal_recovery,
+                )?
+            };
+            if let Some(code) = rejection {
+                let result = rejected(request, code, observed, &resulted_at);
+                persist_rejection(&transaction, request, &request_json, &result, &resulted_at)?;
+                if let Some(fresh) = &locked_time {
+                    fresh.commit_in(&transaction)?.require_trusted_time()?;
+                }
+                transaction.commit()?;
+                locked_time = None;
+                return Ok(result);
+            }
+
+            let new_revision = observed_revision
+                .checked_add(1)
+                .ok_or(TaskManagerError::InvalidRecord("Task revision overflow"))?;
+            let active_steps: Vec<String> = serde_json::from_str(&steps_json)?;
+            if request.to_state == TaskState::Running
+                && !admit_active_steps(&transaction, &request.task_id, &active_steps, &resulted_at)?
+            {
+                let result = rejected(
+                    request,
+                    "TASK_TRANSITION_GUARD_FAILED",
+                    observed,
+                    &resulted_at,
+                );
+                transaction.rollback()?;
+                if let Some(fresh) = locked_time.take() {
+                    fresh.commit(&self.connection)?;
+                }
+                let rejection_transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                assert_manager_lease(&rejection_transaction, &lease_owner, lease_epoch)?;
+                persist_rejection(
+                    &rejection_transaction,
+                    request,
+                    &request_json,
+                    &result,
+                    &resulted_at,
+                )?;
+                rejection_transaction.commit()?;
+                return Ok(result);
+            }
+            let waiting = match &request.mutation.waiting_on {
+                Some(waiting) => serde_json::to_string(waiting)?,
+                None => waiting_json,
+            };
+            let steps = match &request.mutation.active_step_ids {
+                Some(steps) => serde_json::to_string(steps)?,
+                None => steps_json,
+            };
+            let failure = request
+                .mutation
+                .failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .or(failure_json);
+            let recovery = request
+                .mutation
+                .recovery
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let active_program_row = active_program
             .map(|program_revision| {
                 transaction.query_row(
                     "SELECT p.program_id, p.ir_version, p.semantic_hash, p.registry_snapshot_id, p.validation_result_id, v.validated_at, v.validator_id, v.validator_version, p.program_json FROM semantic_program_revisions p LEFT JOIN validation_results v ON v.validation_result_id = p.validation_result_id WHERE p.task_id = ?1 AND p.program_revision = ?2 AND p.status = 'active'",
@@ -2472,160 +2477,166 @@ impl TaskManager {
                 )
             })
             .transpose()?;
-        let active_program_event = active_program_row
-            .map(
-                |(
-                    program_id,
-                    ir_version,
-                    semantic_hash,
-                    registry_snapshot_id,
-                    validation_result_id,
-                    validated_at,
-                    validator_id,
-                    validator_version,
-                    program_json,
-                )|
-                 -> Result<Value> {
-                    Ok(json!({
-                        "program_id": program_id,
-                        "ir_version": ir_version,
-                        "semantic_hash": semantic_hash,
-                        "registry_snapshot_id": registry_snapshot_id,
-                        "validation_result_id": validation_result_id,
-                        "validated_at": validated_at,
-                        "validator_id": validator_id,
-                        "validator_version": validator_version,
-                        "program_content_digest": program_content_digest(&program_json)?,
-                    }))
-                },
-            )
-            .transpose()?;
-        let intent_nonce = transaction.query_row(
-            "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
-            [&request.task_id],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
-        if intent_nonce.len() != 32 {
-            return Err(TaskManagerError::InvalidRecord(
-                "Task provenance commitment nonce is invalid",
-            ));
-        }
-        let provenance_waiting = request
-            .mutation
-            .waiting_on
-            .as_ref()
-            .map(|values| provenance_waiting_on(values));
-        let waiting_commitments = request
-            .mutation
-            .waiting_on
-            .as_ref()
-            .map(|values| provenance_waiting_commitments(values, &intent_nonce));
-        let provenance_failure = request.mutation.failure.as_ref().map(provenance_failure);
-        let failure_commitment = request
-            .mutation
-            .failure
-            .as_ref()
-            .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
-        let reason_message_ref = request.reason.message.as_ref().map(|message| {
-            task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
-        });
-        let event_id = transition_event_id(&request.transition_id);
-        let event = json!({
-            "schema_version": SCHEMA_VERSION,
-            "event_id": event_id,
-            "task_id": request.task_id,
-            "event_type": "task.transitioned",
-            "timestamp": resulted_at,
-            "actor": request.requested_by,
-            "status": "success",
-            "semantic_program_hash": active_program_event.as_ref().and_then(|value| value.get("semantic_hash")),
-            "ir_version": active_program_event.as_ref().and_then(|value| value.get("ir_version")),
-            "registry_snapshot_id": active_program_event.as_ref().and_then(|value| value.get("registry_snapshot_id")),
-            "validation_result_id": active_program_event.as_ref().and_then(|value| value.get("validation_result_id")),
-            "task_transition": {
-                "transition_id": request.transition_id,
-                "previous_state": observed_state,
-                "new_state": request.to_state,
-                "previous_revision": observed_revision,
-                "new_revision": new_revision,
-                "reason_code": request.reason.code,
-            },
-            "committed_mutation": {
-                "active_plan": request.mutation.active_plan,
-                "active_step_ids": request.mutation.active_step_ids,
-                "waiting_on": provenance_waiting,
-                "failure": provenance_failure,
-                "recovery": request.mutation.recovery,
-            },
-            "details": {
-                "related_ids": request.reason.related_ids,
-                "reason_message_ref": reason_message_ref,
-                "active_program": active_program_event,
-                "mutation_text_commitments": {
-                    "waiting_on": waiting_commitments,
-                    "failure_summary": failure_commitment,
-                }
+            let active_program_event = active_program_row
+                .map(
+                    |(
+                        program_id,
+                        ir_version,
+                        semantic_hash,
+                        registry_snapshot_id,
+                        validation_result_id,
+                        validated_at,
+                        validator_id,
+                        validator_version,
+                        program_json,
+                    )|
+                     -> Result<Value> {
+                        Ok(json!({
+                            "program_id": program_id,
+                            "ir_version": ir_version,
+                            "semantic_hash": semantic_hash,
+                            "registry_snapshot_id": registry_snapshot_id,
+                            "validation_result_id": validation_result_id,
+                            "validated_at": validated_at,
+                            "validator_id": validator_id,
+                            "validator_version": validator_version,
+                            "program_content_digest": program_content_digest(&program_json)?,
+                        }))
+                    },
+                )
+                .transpose()?;
+            let intent_nonce = transaction.query_row(
+                "SELECT intent_commitment_nonce FROM tasks WHERE task_id=?1",
+                [&request.task_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            if intent_nonce.len() != 32 {
+                return Err(TaskManagerError::InvalidRecord(
+                    "Task provenance commitment nonce is invalid",
+                ));
             }
-        });
-        if fail_provenance {
-            return Ok(rejected(
-                request,
-                "TASK_PROVENANCE_APPEND_FAILED",
-                observed,
-                &resulted_at,
-            ));
-        }
-        let appended = append_event(&transaction, &request.task_id, &event)?;
-        let completed_at = request.to_state == TaskState::Completed;
-        let updated = transaction.execute(
+            let provenance_waiting = request
+                .mutation
+                .waiting_on
+                .as_ref()
+                .map(|values| provenance_waiting_on(values));
+            let waiting_commitments = request
+                .mutation
+                .waiting_on
+                .as_ref()
+                .map(|values| provenance_waiting_commitments(values, &intent_nonce));
+            let provenance_failure = request.mutation.failure.as_ref().map(provenance_failure);
+            let failure_commitment = request
+                .mutation
+                .failure
+                .as_ref()
+                .map(|failure| provenance_failure_commitment(failure, &intent_nonce));
+            let reason_message_ref = request.reason.message.as_ref().map(|message| {
+                task_field_commitment(&intent_nonce, "reason_message", message.as_bytes())
+            });
+            let event_id = transition_event_id(&request.transition_id);
+            let event = json!({
+                "schema_version": SCHEMA_VERSION,
+                "event_id": event_id,
+                "task_id": request.task_id,
+                "event_type": "task.transitioned",
+                "timestamp": resulted_at,
+                "actor": request.requested_by,
+                "status": "success",
+                "semantic_program_hash": active_program_event.as_ref().and_then(|value| value.get("semantic_hash")),
+                "ir_version": active_program_event.as_ref().and_then(|value| value.get("ir_version")),
+                "registry_snapshot_id": active_program_event.as_ref().and_then(|value| value.get("registry_snapshot_id")),
+                "validation_result_id": active_program_event.as_ref().and_then(|value| value.get("validation_result_id")),
+                "task_transition": {
+                    "transition_id": request.transition_id,
+                    "previous_state": observed_state,
+                    "new_state": request.to_state,
+                    "previous_revision": observed_revision,
+                    "new_revision": new_revision,
+                    "reason_code": request.reason.code,
+                },
+                "committed_mutation": {
+                    "active_plan": request.mutation.active_plan,
+                    "active_step_ids": request.mutation.active_step_ids,
+                    "waiting_on": provenance_waiting,
+                    "failure": provenance_failure,
+                    "recovery": request.mutation.recovery,
+                },
+                "details": {
+                    "related_ids": request.reason.related_ids,
+                    "reason_message_ref": reason_message_ref,
+                    "active_program": active_program_event,
+                    "mutation_text_commitments": {
+                        "waiting_on": waiting_commitments,
+                        "failure_summary": failure_commitment,
+                    }
+                }
+            });
+            if fail_provenance {
+                return Ok(rejected(
+                    request,
+                    "TASK_PROVENANCE_APPEND_FAILED",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+            let appended = append_event(&transaction, &request.task_id, &event)?;
+            let completed_at = request.to_state == TaskState::Completed;
+            let updated = transaction.execute(
             "UPDATE tasks SET revision = ?2, state = ?3, state_reason_json = ?4, active_step_ids_json = ?5, waiting_on_json = ?6, failure_json = ?7, recovery_json = COALESCE(?8, recovery_json), updated_at = ?9, completed_at = CASE WHEN ?10 THEN ?9 ELSE completed_at END WHERE task_id = ?1 AND revision = ?11 AND state = ?12",
             params![request.task_id, i64::try_from(new_revision).map_err(|_| TaskManagerError::InvalidRecord("Task revision exceeds SQLite range"))?, request.to_state.as_str(), json!({"code":request.reason.code,"message":request.reason.message,"provenance_event_id":appended.event_id}).to_string(), steps, waiting, failure, recovery, resulted_at, completed_at, revision, state],
         )?;
-        if updated != 1 {
-            return Ok(rejected(
-                request,
-                "TASK_REVISION_CONFLICT",
-                observed,
-                &resulted_at,
-            ));
-        }
-        if let Some(plan) = &request.mutation.active_plan {
-            let changed = transaction.execute(
+            if updated != 1 {
+                return Ok(rejected(
+                    request,
+                    "TASK_REVISION_CONFLICT",
+                    observed,
+                    &resulted_at,
+                ));
+            }
+            if let Some(plan) = &request.mutation.active_plan {
+                let changed = transaction.execute(
                 "UPDATE tasks SET active_plan_revision = ?2 WHERE task_id = ?1 AND EXISTS (SELECT 1 FROM plan_revisions WHERE task_id = ?1 AND plan_revision = ?2 AND plan_id = ?3)",
                 params![request.task_id, i64::try_from(plan.revision).map_err(|_| TaskManagerError::InvalidRecord("active plan revision exceeds SQLite range"))?, plan.plan_id],
             )?;
-            if changed != 1 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "active plan mutation does not reference a persisted plan",
-                ));
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "active plan mutation does not reference a persisted plan",
+                    ));
+                }
             }
-        }
-        let result = TransitionResult {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            transition_id: request.transition_id.clone(),
-            task_id: request.task_id.clone(),
-            applied: true,
-            reason_code: "TASK_TRANSITION_APPLIED".to_owned(),
-            message: None,
-            previous_state: Some(observed_state),
-            current_state: Some(request.to_state),
-            previous_revision: Some(observed_revision),
-            current_revision: Some(new_revision),
-            observed_state: Some(request.to_state),
-            observed_revision: Some(new_revision),
-            provenance_event_id: Some(appended.event_id),
-            provenance_event_hash: Some(appended.event_hash),
-            resulted_at: resulted_at.clone(),
-        };
-        transaction.execute(
+            let result = TransitionResult {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                transition_id: request.transition_id.clone(),
+                task_id: request.task_id.clone(),
+                applied: true,
+                reason_code: "TASK_TRANSITION_APPLIED".to_owned(),
+                message: None,
+                previous_state: Some(observed_state),
+                current_state: Some(request.to_state),
+                previous_revision: Some(observed_revision),
+                current_revision: Some(new_revision),
+                observed_state: Some(request.to_state),
+                observed_revision: Some(new_revision),
+                provenance_event_id: Some(appended.event_id),
+                provenance_event_hash: Some(appended.event_hash),
+                resulted_at: resulted_at.clone(),
+            };
+            transaction.execute(
             "INSERT INTO task_transitions (transition_id, task_id, expected_revision, expected_state, to_state, result_revision, result_state, outcome, reason_code, request_json, result_json, provenance_event_id, requested_at, committed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, 'COMMITTED', ?7, ?8, ?9, ?10, ?11, ?11)",
             params![request.transition_id, request.task_id, i64::try_from(request.expected_revision).unwrap_or(i64::MAX), request.expected_state.as_str(), request.to_state.as_str(), i64::try_from(new_revision).unwrap_or(i64::MAX), result.reason_code, request_json, serde_json::to_string(&result)?, result.provenance_event_id, resulted_at],
         )?;
-        if let Some(fresh) = &locked_time {
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
+            if let Some(fresh) = &locked_time {
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+            }
+            transaction.commit()?;
+            locked_time = None;
+            Ok(result)
+        })();
+        if let Some(fresh) = locked_time {
+            fresh.commit(&self.connection)?;
         }
-        transaction.commit()?;
-        Ok(result)
+        outcome
     }
 
     /// Counts committed provenance events for a Task.

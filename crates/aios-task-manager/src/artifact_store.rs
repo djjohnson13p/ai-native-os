@@ -1151,169 +1151,181 @@ impl Read for ArtifactReader {
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
             .and_then(|assessment| assessment.require_trusted_time())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let transaction = self
-            .authority_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        if let Some(identity) = &self.database_identity {
-            verify_database_identity(&transaction, identity).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-            })?;
-        }
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let checked_at = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
-                drop(transaction);
-                fresh
-                    .commit(&self.authority_connection)
-                    .map_err(std::io::Error::other)?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    error,
-                ));
+        let mut locked_time = None;
+        let outcome = (|| -> std::io::Result<usize> {
+            let transaction = self
+                .authority_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?;
+            if let Some(identity) = &self.database_identity {
+                verify_database_identity(&transaction, identity).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?;
             }
-        };
-        let recovery_revision = transaction
-            .query_row(
-                "SELECT revision FROM tasks WHERE task_id=?1 AND state='RECOVERING'",
-                [&self.task_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let fence = validate_reader_fence_in_connection(
-            &transaction,
-            &ReaderFenceContext {
-                lease_owner: &self.lease_owner,
-                lease_epoch: self.lease_epoch,
-                task_id: &self.task_id,
-                authority: &self.authority,
-                artifact_id: &self.artifact_id,
-                reader_admission: self.reader_admission.as_ref(),
-                recovery_replay_revision: self.recovery_replay_revision,
-                export_operation_exemption: self.export_operation_exemption.as_deref(),
-            },
-            &checked_at,
-        );
-        if let Err(error) = fence {
-            drop(transaction);
-            fresh
-                .commit(&self.authority_connection)
-                .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                error,
-            ));
-        }
-        if let Some(revision) = recovery_revision {
-            self.recovery_replay_revision = Some(revision);
-        }
-        let position = self.file.stream_position()?;
-        let mut staged = vec![0_u8; buffer.len().min(COPY_BUFFER_SIZE)];
-        let count = match self.file.read(&mut staged) {
-            Ok(count) => count,
-            Err(error) => {
-                let _ = self.file.seek(SeekFrom::Start(position));
-                return Err(error);
-            }
-        };
-        if count > 0 && !self.reader_admission_delivered {
-            let execution = self.authority.execution.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "missing reader execution authority",
+            locked_time = Some(
+                super::trusted_time::capture_locked(&transaction, &self.clock).map_err(
+                    |error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error),
+                )?,
+            );
+            let fresh = locked_time.as_ref().expect("captured reader time");
+            let checked_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        error,
+                    ));
+                }
+            };
+            let recovery_revision = transaction
+                .query_row(
+                    "SELECT revision FROM tasks WHERE task_id=?1 AND state='RECOVERING'",
+                    [&self.task_id],
+                    |row| row.get::<_, i64>(0),
                 )
-            })?;
-            let admission = self.reader_admission.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "missing reader admission",
-                )
-            })?;
-            let delivery = mark_reader_admission_delivered_in_transaction(
+                .optional()
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?;
+            let fence = validate_reader_fence_in_connection(
                 &transaction,
-                &ReaderDeliveryContext {
+                &ReaderFenceContext {
                     lease_owner: &self.lease_owner,
                     lease_epoch: self.lease_epoch,
                     task_id: &self.task_id,
-                    execution,
+                    authority: &self.authority,
                     artifact_id: &self.artifact_id,
-                    operation_id: &admission.operation_id,
-                    admission: &admission.grant_admission,
-                    clock: &self.clock,
+                    reader_admission: self.reader_admission.as_ref(),
+                    recovery_replay_revision: self.recovery_replay_revision,
+                    export_operation_exemption: self.export_operation_exemption.as_deref(),
                 },
                 &checked_at,
-            )
-            .and_then(|()| reader_delivery_commit_step());
-            if let Err(error) = delivery {
-                self.file.seek(SeekFrom::Start(position))?;
+            );
+            if let Err(error) = fence {
                 drop(transaction);
-                fresh
-                    .commit(&self.authority_connection)
-                    .map_err(std::io::Error::other)?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     error,
                 ));
             }
-        }
-        let delivery_was_pending = count > 0 && !self.reader_admission_delivered;
-        fresh
-            .commit_in(&transaction)
-            .and_then(|assessment| assessment.require_trusted_time())
-            .map_err(std::io::Error::other)?;
-        let commit = transaction
-            .commit()
-            .map_err(TaskManagerError::from)
-            .and_then(|()| {
+            if let Some(revision) = recovery_revision {
+                self.recovery_replay_revision = Some(revision);
+            }
+            reader_post_capture_step().map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+            })?;
+            let position = self.file.stream_position()?;
+            let mut staged = vec![0_u8; buffer.len().min(COPY_BUFFER_SIZE)];
+            let count = match self.file.read(&mut staged) {
+                Ok(count) => count,
+                Err(error) => {
+                    let _ = self.file.seek(SeekFrom::Start(position));
+                    return Err(error);
+                }
+            };
+            if count > 0 && !self.reader_admission_delivered {
+                let execution = self.authority.execution.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "missing reader execution authority",
+                    )
+                })?;
+                let admission = self.reader_admission.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "missing reader admission",
+                    )
+                })?;
+                let delivery = mark_reader_admission_delivered_in_transaction(
+                    &transaction,
+                    &ReaderDeliveryContext {
+                        lease_owner: &self.lease_owner,
+                        lease_epoch: self.lease_epoch,
+                        task_id: &self.task_id,
+                        execution,
+                        artifact_id: &self.artifact_id,
+                        operation_id: &admission.operation_id,
+                        admission: &admission.grant_admission,
+                        clock: &self.clock,
+                    },
+                    &checked_at,
+                )
+                .and_then(|()| reader_delivery_commit_step());
+                if let Err(error) = delivery {
+                    self.file.seek(SeekFrom::Start(position))?;
+                    drop(transaction);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        error,
+                    ));
+                }
+            }
+            let delivery_was_pending = count > 0 && !self.reader_admission_delivered;
+            fresh
+                .commit_in(&transaction)
+                .and_then(|assessment| assessment.require_trusted_time())
+                .map_err(std::io::Error::other)?;
+            let persisted = transaction.commit().map_err(TaskManagerError::from);
+            if persisted.is_ok() {
+                locked_time = None;
+            }
+            let commit = persisted.and_then(|()| {
                 if delivery_was_pending {
                     reader_delivery_commit_result_step()
                 } else {
                     Ok(())
                 }
             });
-        if let Err(error) = commit {
-            let durably_delivered = if delivery_was_pending {
-                let execution = self.authority.execution.as_ref();
-                let admission = self.reader_admission.as_ref();
-                match (execution, admission) {
-                    (Some(execution), Some(admission)) => authenticate_reader_admission(
-                        &self.authority_connection,
-                        &admission.operation_id,
-                        &self.task_id,
-                        execution,
-                        &self.artifact_id,
-                        &admission.grant_admission,
-                        &checked_at,
-                        false,
-                    )
-                    .unwrap_or(false),
-                    _ => false,
+            if let Err(error) = commit {
+                let durably_delivered = if delivery_was_pending {
+                    let execution = self.authority.execution.as_ref();
+                    let admission = self.reader_admission.as_ref();
+                    match (execution, admission) {
+                        (Some(execution), Some(admission)) => authenticate_reader_admission(
+                            &self.authority_connection,
+                            &admission.operation_id,
+                            &self.task_id,
+                            execution,
+                            &self.artifact_id,
+                            &admission.grant_admission,
+                            &checked_at,
+                            false,
+                        )
+                        .unwrap_or(false),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !durably_delivered {
+                    self.file.seek(SeekFrom::Start(position))?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        error,
+                    ));
                 }
-            } else {
-                false
-            };
-            if !durably_delivered {
-                self.file.seek(SeekFrom::Start(position))?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    error,
-                ));
             }
-        }
-        if delivery_was_pending {
-            self.reader_admission_delivered = true;
-            if let (Some(admission), Ok(mut live)) = (
-                self.reader_admission.as_ref(),
-                self.live_reader_admissions.lock(),
-            ) {
-                live.remove(&admission.operation_id);
+            if delivery_was_pending {
+                self.reader_admission_delivered = true;
+                if let (Some(admission), Ok(mut live)) = (
+                    self.reader_admission.as_ref(),
+                    self.live_reader_admissions.lock(),
+                ) {
+                    live.remove(&admission.operation_id);
+                }
             }
+            buffer[..count].copy_from_slice(&staged[..count]);
+            Ok(count)
+        })();
+        if let Some(fresh) = locked_time {
+            fresh
+                .commit(&self.authority_connection)
+                .map_err(std::io::Error::other)?;
         }
-        buffer[..count].copy_from_slice(&staged[..count]);
-        Ok(count)
+        outcome
     }
 }
 
@@ -1371,44 +1383,61 @@ impl ArtifactStagingWriter {
         self.written
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both serialized writer finish phases must preserve captured time on every exit"
+    )]
     pub fn finish(mut self) -> Result<u64> {
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)?
             .require_trusted_time()?;
-        let transaction = self
-            .authority_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-        let checked_at = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
+        let mut first_time = None;
+        let first: Result<_> = (|| {
+            let transaction = self
+                .authority_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            first_time = Some(super::trusted_time::capture_locked(
+                &transaction,
+                &self.clock,
+            )?);
+            let fresh = first_time
+                .as_ref()
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
+            let checked_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            let fence = validate_writer_fence(
+                &transaction,
+                &self.allocation_id,
+                &checked_at,
+                &self.lease_owner,
+                self.lease_epoch,
+                self.grant_admission.as_ref(),
+                &self.writer_session_id,
+                self.writer_generation,
+            );
+            if let Err(error) = fence {
                 drop(transaction);
-                fresh.commit(&self.authority_connection)?;
                 return Err(error);
             }
-        };
-        let fence = validate_writer_fence(
-            &transaction,
-            &self.allocation_id,
-            &checked_at,
-            &self.lease_owner,
-            self.lease_epoch,
-            self.grant_admission.as_ref(),
-            &self.writer_session_id,
-            self.writer_generation,
-        );
-        if let Err(error) = fence {
-            drop(transaction);
+            ensure_writer_unsealed(&self.store, &self.seal_ref)?;
+            let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
+                "Artifact staging writer is already finalized",
+            ))?;
+            file.flush()?;
+            file.sync_all()?;
+            fresh.commit_in(&transaction)?.require_trusted_time()?;
+            transaction.commit()?;
+            first_time = None;
+            Ok(file)
+        })();
+        if let Some(fresh) = first_time {
             fresh.commit(&self.authority_connection)?;
-            return Err(error);
         }
-        ensure_writer_unsealed(&self.store, &self.seal_ref)?;
-        let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
-            "Artifact staging writer is already finalized",
-        ))?;
-        file.flush()?;
-        file.sync_all()?;
-        fresh.commit_in(&transaction)?.require_trusted_time()?;
-        transaction.commit()?;
+        let mut file = first?;
         file.seek(SeekFrom::Start(0))?;
         let (size_bytes, content_hash) = hash_reader(&mut file)?;
         if size_bytes != self.written {
@@ -1420,44 +1449,57 @@ impl ArtifactStagingWriter {
         writer_finish_step()?;
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)?
             .require_trusted_time()?;
-        let transaction = self
-            .authority_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-        let checked_at = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
+        let mut second_time = None;
+        let sealed: Result<()> = (|| {
+            let transaction = self
+                .authority_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            second_time = Some(super::trusted_time::capture_locked(
+                &transaction,
+                &self.clock,
+            )?);
+            let fresh = second_time
+                .as_ref()
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
+            let checked_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            let fence = validate_writer_fence(
+                &transaction,
+                &self.allocation_id,
+                &checked_at,
+                &self.lease_owner,
+                self.lease_epoch,
+                self.grant_admission.as_ref(),
+                &self.writer_session_id,
+                self.writer_generation,
+            );
+            if let Err(error) = fence {
                 drop(transaction);
-                fresh.commit(&self.authority_connection)?;
                 return Err(error);
             }
-        };
-        let fence = validate_writer_fence(
-            &transaction,
-            &self.allocation_id,
-            &checked_at,
-            &self.lease_owner,
-            self.lease_epoch,
-            self.grant_admission.as_ref(),
-            &self.writer_session_id,
-            self.writer_generation,
-        );
-        if let Err(error) = fence {
-            drop(transaction);
+            ensure_writer_unsealed(&self.store, &self.seal_ref)?;
+            let sealed = SealedStaging {
+                version: SEALED_STAGING_VERSION,
+                allocation_id: self.allocation_id.clone(),
+                size_bytes,
+                content_hash,
+            };
+            let bytes = serde_json::to_vec(&sealed)?;
+            write_staging_seal_atomically(&self.store, &self.seal_ref, &bytes)?;
+            fresh.commit_in(&transaction)?.require_trusted_time()?;
+            transaction.commit()?;
+            second_time = None;
+            Ok(())
+        })();
+        if let Some(fresh) = second_time {
             fresh.commit(&self.authority_connection)?;
-            return Err(error);
         }
-        ensure_writer_unsealed(&self.store, &self.seal_ref)?;
-        let sealed = SealedStaging {
-            version: SEALED_STAGING_VERSION,
-            allocation_id: self.allocation_id.clone(),
-            size_bytes,
-            content_hash,
-        };
-        let bytes = serde_json::to_vec(&sealed)?;
-        write_staging_seal_atomically(&self.store, &self.seal_ref, &bytes)?;
-        fresh.commit_in(&transaction)?.require_trusted_time()?;
-        transaction.commit()?;
+        sealed?;
         Ok(self.written)
     }
 }
@@ -1467,135 +1509,153 @@ impl Write for ArtifactStagingWriter {
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
             .and_then(|assessment| assessment.require_trusted_time())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let transaction = self
-            .authority_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)
-            .map_err(std::io::Error::other)?;
-        let checked_at = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
+        let mut locked_time = None;
+        let outcome = (|| -> std::io::Result<usize> {
+            let transaction = self
+                .authority_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(std::io::Error::other)?;
+            locked_time = Some(
+                super::trusted_time::capture_locked(&transaction, &self.clock)
+                    .map_err(std::io::Error::other)?,
+            );
+            let fresh = locked_time.as_ref().expect("captured writer time");
+            let checked_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        error,
+                    ));
+                }
+            };
+            let fence = validate_writer_fence(
+                &transaction,
+                &self.allocation_id,
+                &checked_at,
+                &self.lease_owner,
+                self.lease_epoch,
+                self.grant_admission.as_ref(),
+                &self.writer_session_id,
+                self.writer_generation,
+            );
+            if let Err(error) = fence {
                 drop(transaction);
-                fresh
-                    .commit(&self.authority_connection)
-                    .map_err(std::io::Error::other)?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     error,
                 ));
             }
-        };
-        let fence = validate_writer_fence(
-            &transaction,
-            &self.allocation_id,
-            &checked_at,
-            &self.lease_owner,
-            self.lease_epoch,
-            self.grant_admission.as_ref(),
-            &self.writer_session_id,
-            self.writer_generation,
-        );
-        if let Err(error) = fence {
-            drop(transaction);
-            fresh
-                .commit(&self.authority_connection)
-                .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                error,
-            ));
+            ensure_writer_unsealed(&self.store, &self.seal_ref).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+            })?;
+            let length = u64::try_from(buffer.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
+            })?;
+            if self.written.saturating_add(length) > self.maximum {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "ARTIFACT_SIZE_LIMIT",
+                ));
+            }
+            let written = self
+                .file
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
+                .write(buffer)?;
+            let total = self
+                .written
+                .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
+                .ok_or_else(|| std::io::Error::other("staging byte count overflow"))?;
+            // The file append is the externally observable effect of `Write`. Once it succeeds,
+            // report that exact byte count even if releasing the read-only SQLite fence reports a
+            // late error. Returning `Err` here would invite a conforming caller to append the same
+            // bytes again while leaving our cursor stale.
+            self.written = total;
+            let time_ready = fresh
+                .commit_in(&transaction)
+                .and_then(|assessment| assessment.require_trusted_time())
+                .is_ok();
+            let committed = time_ready && transaction.commit().is_ok();
+            if committed {
+                locked_time = None;
+                let _ = writer_write_commit_result_step();
+            }
+            Ok(written)
+        })();
+        if let Some(fresh) = locked_time {
+            let observation = fresh.commit(&self.authority_connection);
+            if outcome.is_err() {
+                observation.map_err(std::io::Error::other)?;
+            }
         }
-        ensure_writer_unsealed(&self.store, &self.seal_ref)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let length = u64::try_from(buffer.len()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
-        })?;
-        if self.written.saturating_add(length) > self.maximum {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "ARTIFACT_SIZE_LIMIT",
-            ));
-        }
-        let written = self
-            .file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
-            .write(buffer)?;
-        let total = self
-            .written
-            .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
-            .ok_or_else(|| std::io::Error::other("staging byte count overflow"))?;
-        // The file append is the externally observable effect of `Write`. Once it succeeds,
-        // report that exact byte count even if releasing the read-only SQLite fence reports a
-        // late error. Returning `Err` here would invite a conforming caller to append the same
-        // bytes again while leaving our cursor stale.
-        self.written = total;
-        let time_ready = fresh
-            .commit_in(&transaction)
-            .and_then(|assessment| assessment.require_trusted_time())
-            .is_ok();
-        let committed = time_ready && transaction.commit().is_ok();
-        if committed {
-            let _ = writer_write_commit_result_step();
-        }
-        Ok(written)
+        outcome
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
             .and_then(|assessment| assessment.require_trusted_time())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let transaction = self
-            .authority_connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)
-            .map_err(std::io::Error::other)?;
-        let checked_at = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
+        let mut locked_time = None;
+        let outcome = (|| -> std::io::Result<()> {
+            let transaction = self
+                .authority_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(std::io::Error::other)?;
+            locked_time = Some(
+                super::trusted_time::capture_locked(&transaction, &self.clock)
+                    .map_err(std::io::Error::other)?,
+            );
+            let fresh = locked_time.as_ref().expect("captured writer flush time");
+            let checked_at = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        error,
+                    ));
+                }
+            };
+            let fence = validate_writer_fence(
+                &transaction,
+                &self.allocation_id,
+                &checked_at,
+                &self.lease_owner,
+                self.lease_epoch,
+                self.grant_admission.as_ref(),
+                &self.writer_session_id,
+                self.writer_generation,
+            );
+            if let Err(error) = fence {
                 drop(transaction);
-                fresh
-                    .commit(&self.authority_connection)
-                    .map_err(std::io::Error::other)?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     error,
                 ));
             }
-        };
-        let fence = validate_writer_fence(
-            &transaction,
-            &self.allocation_id,
-            &checked_at,
-            &self.lease_owner,
-            self.lease_epoch,
-            self.grant_admission.as_ref(),
-            &self.writer_session_id,
-            self.writer_generation,
-        );
-        if let Err(error) = fence {
-            drop(transaction);
+            ensure_writer_unsealed(&self.store, &self.seal_ref).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+            })?;
+            self.file
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
+                .flush()?;
+            fresh
+                .commit_in(&transaction)
+                .and_then(|assessment| assessment.require_trusted_time())
+                .map_err(std::io::Error::other)?;
+            transaction.commit().map_err(std::io::Error::other)?;
+            locked_time = None;
+            Ok(())
+        })();
+        if let Some(fresh) = locked_time {
             fresh
                 .commit(&self.authority_connection)
                 .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                error,
-            ));
         }
-        ensure_writer_unsealed(&self.store, &self.seal_ref)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        self.file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
-            .flush()?;
-        fresh
-            .commit_in(&transaction)
-            .and_then(|assessment| assessment.require_trusted_time())
-            .map_err(std::io::Error::other)?;
-        transaction.commit().map_err(std::io::Error::other)
+        outcome
     }
 }
 
@@ -2969,115 +3029,133 @@ impl TaskManager {
         }
         let _ = super::trusted_time::protected_now(&self.connection, &self.clock)?;
         let writer_session_id = random_token(&self.connection)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-        let now = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
-                drop(transaction);
-                fresh.commit(&self.connection)?;
-                return Err(error);
-            }
-        };
-        let checked_allocation = validate_writer_authority(
-            &transaction,
-            allocation_id,
-            &now,
-            &self.lease_owner,
-            self.lease_epoch,
-            allocation.writer_grant_admission.as_ref(),
-        );
-        let allocation = match checked_allocation {
-            Ok(allocation) => allocation,
-            Err(error) => {
-                drop(transaction);
-                fresh.commit(&self.connection)?;
-                return Err(error);
-            }
-        };
-        let writer_generation =
-            allocation
-                .writer_generation
-                .checked_add(1)
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "Artifact writer generation exhausted",
-                ))?;
-        let changed = transaction.execute(
-            "UPDATE artifact_output_allocations
+        let mut first_time = None;
+        let mut final_time = None;
+        let outcome = (|| -> Result<u64> {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            first_time = Some(super::trusted_time::capture_locked(
+                &transaction,
+                &self.clock,
+            )?);
+            let fresh = first_time
+                .as_ref()
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
+            let now = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            let checked_allocation = validate_writer_authority(
+                &transaction,
+                allocation_id,
+                &now,
+                &self.lease_owner,
+                self.lease_epoch,
+                allocation.writer_grant_admission.as_ref(),
+            );
+            let allocation = match checked_allocation {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
+                TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
+            )?;
+            let changed = transaction.execute(
+                "UPDATE artifact_output_allocations
              SET writer_session_id=?2,writer_generation=?3,updated_at=?4
              WHERE allocation_id=?1 AND state='WRITING'
                AND writer_generation=?5 AND writer_session_id IS ?6",
-            params![
-                allocation_id,
-                writer_session_id,
-                writer_generation,
-                now,
-                allocation.writer_generation,
-                allocation.writer_session_id
-            ],
-        )?;
-        if changed != 1 {
-            return Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-            ));
-        }
-        let staging_ref =
-            allocation
-                .staging_ref
-                .as_deref()
-                .ok_or(TaskManagerError::InvalidRecord(
+                params![
+                    allocation_id,
+                    writer_session_id,
+                    writer_generation,
+                    now,
+                    allocation.writer_generation,
+                    allocation.writer_session_id
+                ],
+            )?;
+            if changed != 1 {
+                return Err(TaskManagerError::InvalidRecord(
                     "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                ))?;
-        let seal_reference = seal_ref(staging_ref);
-        // Read the fsynced pending evidence first. Once present, it is part of
-        // the authenticated finish protocol and must not be replaced from
-        // subsequently changed staging bytes.
-        let pending_reference = format!("{seal_reference}.pending");
-        let pending = read_staging_seal_evidence(&self.artifact_store_dir, &pending_reference)?;
-        let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
-        let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
-        writer_finish_step()?;
-        let final_fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-        let final_now = match final_fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
+                ));
+            }
+            let staging_ref =
+                allocation
+                    .staging_ref
+                    .as_deref()
+                    .ok_or(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ))?;
+            let seal_reference = seal_ref(staging_ref);
+            // Read the fsynced pending evidence first. Once present, it is part of
+            // the authenticated finish protocol and must not be replaced from
+            // subsequently changed staging bytes.
+            let pending_reference = format!("{seal_reference}.pending");
+            let pending = read_staging_seal_evidence(&self.artifact_store_dir, &pending_reference)?;
+            let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
+            let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
+            writer_finish_step()?;
+            final_time = Some(super::trusted_time::capture_locked(
+                &transaction,
+                &self.clock,
+            )?);
+            let final_fresh = final_time
+                .as_ref()
+                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
+            let final_now = match final_fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            let final_fence = validate_writer_fence(
+                &transaction,
+                allocation_id,
+                &final_now,
+                &self.lease_owner,
+                self.lease_epoch,
+                allocation.writer_grant_admission.as_ref(),
+                &writer_session_id,
+                writer_generation,
+            );
+            if let Err(error) = final_fence {
                 drop(transaction);
-                final_fresh.commit(&self.connection)?;
                 return Err(error);
             }
-        };
-        let final_fence = validate_writer_fence(
-            &transaction,
-            allocation_id,
-            &final_now,
-            &self.lease_owner,
-            self.lease_epoch,
-            allocation.writer_grant_admission.as_ref(),
-            &writer_session_id,
-            writer_generation,
-        );
-        if let Err(error) = final_fence {
-            drop(transaction);
-            final_fresh.commit(&self.connection)?;
-            return Err(error);
+            resolve_staging_seal_evidence(
+                &self.artifact_store_dir,
+                allocation_id,
+                &seal_reference,
+                &pending,
+                &final_seal,
+                size,
+                &hash,
+                true,
+            )?;
+            fresh.commit_in(&transaction)?.require_trusted_time()?;
+            final_fresh
+                .commit_in(&transaction)?
+                .require_trusted_time()?;
+            transaction.commit()?;
+            first_time = None;
+            final_time = None;
+            Ok(size)
+        })();
+        if let Some(fresh) = first_time {
+            fresh.commit(&self.connection)?;
         }
-        resolve_staging_seal_evidence(
-            &self.artifact_store_dir,
-            allocation_id,
-            &seal_reference,
-            &pending,
-            &final_seal,
-            size,
-            &hash,
-            true,
-        )?;
-        final_fresh
-            .commit_in(&transaction)?
-            .require_trusted_time()?;
-        transaction.commit()?;
-        Ok(size)
+        if let Some(fresh) = final_time {
+            fresh.commit(&self.connection)?;
+        }
+        outcome
     }
 
     #[allow(
@@ -3101,264 +3179,272 @@ impl TaskManager {
         let lease_epoch = self.lease_epoch;
         let _ = super::trusted_time::protected_now(&self.connection, &self.clock)?;
         let writer_session_id = random_token(&self.connection)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let fresh = super::trusted_time::capture_locked(&transaction, &self.clock)?;
-        let now = match fresh.require_trusted_time() {
-            Ok(now) => now,
-            Err(error) => {
-                drop(transaction);
-                fresh.commit(&self.connection)?;
-                return Err(error);
-            }
-        };
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
-        let Some(allocation) = load_allocation_row(&transaction, allocation_id)? else {
-            return Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_ALLOCATION_NOT_FOUND",
-            ));
-        };
-        ensure_task_is_not_recovering(&transaction, &allocation.task_id)?;
-        let Some(staging_ref) = allocation.staging_ref.clone() else {
-            return Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_ALLOCATION_NOT_FOUND",
-            ));
-        };
-        if allocation.state == "WRITING" {
-            let validated = validate_writer_authority(
+        let mut locked_time = None;
+        let outcome = (|| -> Result<ArtifactStagingWriter> {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            locked_time = Some(super::trusted_time::capture_locked(
                 &transaction,
-                allocation_id,
-                &now,
-                &lease_owner,
-                lease_epoch,
-                allocation.writer_grant_admission.as_ref(),
-            );
-            if let Err(error) = validated {
-                drop(transaction);
-                fresh.commit(&self.connection)?;
-                return Err(error);
+                &self.clock,
+            )?);
+            let fresh = locked_time
+                .as_ref()
+                .expect("captured writer admission time");
+            let now = match fresh.require_trusted_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
+            assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+            let Some(allocation) = load_allocation_row(&transaction, allocation_id)? else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_NOT_FOUND",
+                ));
+            };
+            ensure_task_is_not_recovering(&transaction, &allocation.task_id)?;
+            let Some(staging_ref) = allocation.staging_ref.clone() else {
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_NOT_FOUND",
+                ));
+            };
+            if allocation.state == "WRITING" {
+                let validated = validate_writer_authority(
+                    &transaction,
+                    allocation_id,
+                    &now,
+                    &lease_owner,
+                    lease_epoch,
+                    allocation.writer_grant_admission.as_ref(),
+                );
+                if let Err(error) = validated {
+                    drop(transaction);
+                    return Err(error);
+                }
+                let seal = seal_ref(&staging_ref);
+                if internal_ref_exists(&self.artifact_store_dir, &seal)?
+                    || internal_ref_exists(&self.artifact_store_dir, &format!("{seal}.pending"))?
+                {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ));
+                }
+                let mut file = self.artifact_store_dir.open_with(
+                    safe_internal_ref(&staging_ref)?,
+                    CapOpenOptions::new().read(true).write(true),
+                )?;
+                let written = file.metadata()?.len();
+                let maximum = allocation
+                    .max_size_bytes
+                    .unwrap_or(IMPORT_LIMIT)
+                    .min(IMPORT_LIMIT);
+                if written > maximum {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
+                }
+                let cursor = file.seek(SeekFrom::End(0))?;
+                if cursor != written || file.metadata()?.len() != written {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ));
+                }
+                let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
+                    TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE artifact_output_allocations
+                 SET writer_session_id=?2,writer_generation=?3,updated_at=?4
+                 WHERE allocation_id=?1 AND state='WRITING'
+                   AND writer_generation=?5 AND writer_session_id IS ?6",
+                    params![
+                        allocation_id,
+                        writer_session_id,
+                        writer_generation,
+                        now,
+                        allocation.writer_generation,
+                        allocation.writer_session_id
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ));
+                }
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+                transaction.commit()?;
+                locked_time = None;
+                return Ok(ArtifactStagingWriter {
+                    file: Some(file),
+                    store: writer_store,
+                    authority_connection,
+                    clock: Arc::clone(&self.clock),
+                    lease_owner,
+                    lease_epoch,
+                    grant_admission: allocation.writer_grant_admission,
+                    allocation_id: allocation_id.to_owned(),
+                    writer_session_id,
+                    writer_generation,
+                    seal_ref: seal,
+                    maximum,
+                    written,
+                    _store_cleanup: self.artifact_store_cleanup.clone(),
+                });
             }
-            let seal = seal_ref(&staging_ref);
-            if internal_ref_exists(&self.artifact_store_dir, &seal)?
-                || internal_ref_exists(&self.artifact_store_dir, &format!("{seal}.pending"))?
-            {
+            if allocation.state != "ALLOCATED" {
                 return Err(TaskManagerError::InvalidRecord(
                     "ARTIFACT_ALLOCATION_STATE_CONFLICT",
                 ));
             }
-            let mut file = self.artifact_store_dir.open_with(
-                safe_internal_ref(&staging_ref)?,
-                CapOpenOptions::new().read(true).write(true),
+            if parse_time(&allocation.expires_at)? <= parse_time(&now)? {
+                transaction.execute(
+                "UPDATE artifact_output_allocations SET state='EXPIRED',updated_at=?2 WHERE allocation_id=?1",
+                params![allocation_id,now],
             )?;
-            let written = file.metadata()?.len();
-            let maximum = allocation
-                .max_size_bytes
-                .unwrap_or(IMPORT_LIMIT)
-                .min(IMPORT_LIMIT);
-            if written > maximum {
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"));
-            }
-            let cursor = file.seek(SeekFrom::End(0))?;
-            if cursor != written || file.metadata()?.len() != written {
+                fresh.commit_in(&transaction)?.require_trusted_time()?;
+                transaction.commit()?;
+                locked_time = None;
                 return Err(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    "ARTIFACT_ALLOCATION_EXPIRED",
                 ));
+            }
+            if let Err(error) =
+                validate_allocation_execution_scope(&transaction, allocation_id, &allocation, &now)
+            {
+                drop(transaction);
+                return Err(error);
             }
             let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
                 TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
             )?;
-            let changed = transaction.execute(
-                "UPDATE artifact_output_allocations
-                 SET writer_session_id=?2,writer_generation=?3,updated_at=?4
-                 WHERE allocation_id=?1 AND state='WRITING'
-                   AND writer_generation=?5 AND writer_session_id IS ?6",
-                params![
-                    allocation_id,
-                    writer_session_id,
-                    writer_generation,
-                    now,
-                    allocation.writer_generation,
-                    allocation.writer_session_id
-                ],
+            let file = self.artifact_store_dir.open_with(
+                safe_internal_ref(&staging_ref)?,
+                CapOpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true),
             )?;
-            if changed != 1 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                ));
-            }
+            let admission = (|| -> Result<Option<GrantAdmission>> {
+                secure_cap_file_permissions(&file)?;
+                file.sync_all()?;
+                sync_cap_directory(&self.artifact_store_dir, "staging")?;
+                writer_staging_durability_step()?;
+                let grant_admission = if let Some(binding_id) = allocation.binding_id.as_deref() {
+                    let execution = capture_execution_authority(
+                        &transaction,
+                        &allocation.task_id,
+                        binding_id,
+                        &now,
+                    )?;
+                    let grant = exact_operation_grant(
+                        &transaction,
+                        &allocation.task_id,
+                        &execution,
+                        "artifact.write",
+                        "output-allocation",
+                        allocation_id,
+                        &now,
+                        None,
+                    )?
+                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                    Some(admit_operation_grant(
+                        &transaction,
+                        &allocation.task_id,
+                        &execution,
+                        "artifact.write",
+                        "output-allocation",
+                        allocation_id,
+                        &now,
+                        &grant.grant_id,
+                    )?)
+                } else {
+                    None
+                };
+                let changed = transaction.execute(
+                    "UPDATE artifact_output_allocations
+                 SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,
+                     writer_session_id=?4,writer_generation=?5,updated_at=?6
+                 WHERE allocation_id=?1 AND state='ALLOCATED' AND writer_generation=?7",
+                    params![
+                        allocation_id,
+                        grant_admission
+                            .as_ref()
+                            .map(|admission| &admission.grant_id),
+                        grant_admission
+                            .as_ref()
+                            .map(|admission| admission.one_shot_consumed),
+                        writer_session_id,
+                        writer_generation,
+                        now,
+                        allocation.writer_generation
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                    ));
+                }
+                Ok(grant_admission)
+            })();
+            let grant_admission = match admission {
+                Ok(admission) => admission,
+                Err(error) => {
+                    drop(file);
+                    let _ = self
+                        .artifact_store_dir
+                        .remove_file(safe_internal_ref(&staging_ref)?);
+                    let _ = sync_cap_directory(&self.artifact_store_dir, "staging");
+                    drop(transaction);
+                    return Err(error);
+                }
+            };
             fresh.commit_in(&transaction)?.require_trusted_time()?;
-            transaction.commit()?;
-            return Ok(ArtifactStagingWriter {
+            let persisted = transaction.commit().map_err(TaskManagerError::from);
+            if persisted.is_ok() {
+                locked_time = None;
+            }
+            let commit_result = persisted.and_then(|()| writer_admission_commit_result_step());
+            if let Err(error) = commit_result {
+                let durable = load_allocation_row(&self.connection, allocation_id)?;
+                let exact = durable.as_ref().is_some_and(|durable| {
+                    durable.state == "WRITING"
+                        && durable.staging_ref.as_deref() == Some(staging_ref.as_str())
+                        && durable.writer_grant_admission == grant_admission
+                        && durable.writer_session_id.as_deref() == Some(writer_session_id.as_str())
+                        && durable.writer_generation == writer_generation
+                });
+                if !exact {
+                    drop(file);
+                    let _ = self
+                        .artifact_store_dir
+                        .remove_file(safe_internal_ref(&staging_ref)?);
+                    return Err(error);
+                }
+            }
+            Ok(ArtifactStagingWriter {
                 file: Some(file),
                 store: writer_store,
                 authority_connection,
                 clock: Arc::clone(&self.clock),
-                lease_owner,
-                lease_epoch,
-                grant_admission: allocation.writer_grant_admission,
+                lease_owner: self.lease_owner.clone(),
+                lease_epoch: self.lease_epoch,
+                grant_admission,
                 allocation_id: allocation_id.to_owned(),
                 writer_session_id,
                 writer_generation,
-                seal_ref: seal,
-                maximum,
-                written,
+                seal_ref: seal_ref(&staging_ref),
+                maximum: allocation
+                    .max_size_bytes
+                    .unwrap_or(IMPORT_LIMIT)
+                    .min(IMPORT_LIMIT),
+                written: 0,
                 _store_cleanup: self.artifact_store_cleanup.clone(),
-            });
-        }
-        if allocation.state != "ALLOCATED" {
-            return Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-            ));
-        }
-        if parse_time(&allocation.expires_at)? <= parse_time(&now)? {
-            transaction.execute(
-                "UPDATE artifact_output_allocations SET state='EXPIRED',updated_at=?2 WHERE allocation_id=?1",
-                params![allocation_id,now],
-            )?;
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            transaction.commit()?;
-            return Err(TaskManagerError::InvalidRecord(
-                "ARTIFACT_ALLOCATION_EXPIRED",
-            ));
-        }
-        if let Err(error) =
-            validate_allocation_execution_scope(&transaction, allocation_id, &allocation, &now)
-        {
-            drop(transaction);
-            fresh.commit(&self.connection)?;
-            return Err(error);
-        }
-        let writer_generation =
-            allocation
-                .writer_generation
-                .checked_add(1)
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "Artifact writer generation exhausted",
-                ))?;
-        let file = self.artifact_store_dir.open_with(
-            safe_internal_ref(&staging_ref)?,
-            CapOpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true),
-        )?;
-        let admission = (|| -> Result<Option<GrantAdmission>> {
-            secure_cap_file_permissions(&file)?;
-            file.sync_all()?;
-            sync_cap_directory(&self.artifact_store_dir, "staging")?;
-            writer_staging_durability_step()?;
-            let grant_admission = if let Some(binding_id) = allocation.binding_id.as_deref() {
-                let execution = capture_execution_authority(
-                    &transaction,
-                    &allocation.task_id,
-                    binding_id,
-                    &now,
-                )?;
-                let grant = exact_operation_grant(
-                    &transaction,
-                    &allocation.task_id,
-                    &execution,
-                    "artifact.write",
-                    "output-allocation",
-                    allocation_id,
-                    &now,
-                    None,
-                )?
-                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-                Some(admit_operation_grant(
-                    &transaction,
-                    &allocation.task_id,
-                    &execution,
-                    "artifact.write",
-                    "output-allocation",
-                    allocation_id,
-                    &now,
-                    &grant.grant_id,
-                )?)
-            } else {
-                None
-            };
-            let changed = transaction.execute(
-                "UPDATE artifact_output_allocations
-                 SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,
-                     writer_session_id=?4,writer_generation=?5,updated_at=?6
-                 WHERE allocation_id=?1 AND state='ALLOCATED' AND writer_generation=?7",
-                params![
-                    allocation_id,
-                    grant_admission
-                        .as_ref()
-                        .map(|admission| &admission.grant_id),
-                    grant_admission
-                        .as_ref()
-                        .map(|admission| admission.one_shot_consumed),
-                    writer_session_id,
-                    writer_generation,
-                    now,
-                    allocation.writer_generation
-                ],
-            )?;
-            if changed != 1 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                ));
-            }
-            Ok(grant_admission)
+            })
         })();
-        let grant_admission = match admission {
-            Ok(admission) => admission,
-            Err(error) => {
-                drop(file);
-                let _ = self
-                    .artifact_store_dir
-                    .remove_file(safe_internal_ref(&staging_ref)?);
-                let _ = sync_cap_directory(&self.artifact_store_dir, "staging");
-                drop(transaction);
-                fresh.commit(&self.connection)?;
-                return Err(error);
-            }
-        };
-        fresh.commit_in(&transaction)?.require_trusted_time()?;
-        let commit_result = transaction
-            .commit()
-            .map_err(TaskManagerError::from)
-            .and_then(|()| writer_admission_commit_result_step());
-        if let Err(error) = commit_result {
-            let durable = load_allocation_row(&self.connection, allocation_id)?;
-            let exact = durable.as_ref().is_some_and(|durable| {
-                durable.state == "WRITING"
-                    && durable.staging_ref.as_deref() == Some(staging_ref.as_str())
-                    && durable.writer_grant_admission == grant_admission
-                    && durable.writer_session_id.as_deref() == Some(writer_session_id.as_str())
-                    && durable.writer_generation == writer_generation
-            });
-            if !exact {
-                drop(file);
-                let _ = self
-                    .artifact_store_dir
-                    .remove_file(safe_internal_ref(&staging_ref)?);
-                return Err(error);
-            }
+        if let Some(fresh) = locked_time {
+            fresh.commit(&self.connection)?;
         }
-        Ok(ArtifactStagingWriter {
-            file: Some(file),
-            store: writer_store,
-            authority_connection,
-            clock: Arc::clone(&self.clock),
-            lease_owner: self.lease_owner.clone(),
-            lease_epoch: self.lease_epoch,
-            grant_admission,
-            allocation_id: allocation_id.to_owned(),
-            writer_session_id,
-            writer_generation,
-            seal_ref: seal_ref(&staging_ref),
-            maximum: allocation
-                .max_size_bytes
-                .unwrap_or(IMPORT_LIMIT)
-                .min(IMPORT_LIMIT),
-            written: 0,
-            _store_cleanup: self.artifact_store_cleanup.clone(),
-        })
+        outcome
     }
 
     /// Publishes provider output only from an allocation bound to an execution attempt.
@@ -4041,6 +4127,10 @@ impl TaskManager {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reader admission keeps the serialized authority check, durable time observation, and response-loss authentication in one transaction"
+    )]
     pub fn open_artifact_reader(
         &mut self,
         scope: &ArtifactReadScope,
@@ -4062,17 +4152,27 @@ impl TaskManager {
                 return Err(error);
             }
         };
-        assert_manager_lease(&transaction, &lease_owner, lease_epoch)?;
+        if let Err(error) = assert_manager_lease(&transaction, &lease_owner, lease_epoch) {
+            drop(transaction);
+            fresh.commit(&self.connection)?;
+            return Err(error);
+        }
+        let Ok(delivered) = self.delivered_reader_admissions.lock() else {
+            drop(transaction);
+            fresh.commit(&self.connection)?;
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact reader admission registry is unavailable",
+            ));
+        };
         let admission = admit_prepared_artifact_reader(
             &transaction,
             scope,
             artifact_id,
             &prepared.handle,
             &admitted_at,
-            &*self.delivered_reader_admissions.lock().map_err(|_| {
-                TaskManagerError::InvalidRecord("Artifact reader admission registry is unavailable")
-            })?,
+            &delivered,
         );
+        drop(delivered);
         let reader_admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
@@ -4081,11 +4181,19 @@ impl TaskManager {
                 return Err(error);
             }
         };
-        fresh.commit_in(&transaction)?.require_trusted_time()?;
-        let commit = transaction
-            .commit()
-            .map_err(TaskManagerError::from)
-            .and_then(|()| reader_admission_commit_result_step());
+        if let Err(error) = fresh
+            .commit_in(&transaction)
+            .and_then(|assessment| assessment.require_trusted_time())
+        {
+            drop(transaction);
+            fresh.commit(&self.connection)?;
+            return Err(error);
+        }
+        if let Err(error) = transaction.commit() {
+            fresh.commit(&self.connection)?;
+            return Err(error.into());
+        }
+        let commit = reader_admission_commit_result_step();
         if let Err(error) = commit {
             if let (Some(execution), Some(admission)) =
                 (&scope.authority.execution, reader_admission.as_ref())
@@ -12825,6 +12933,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static READER_DELIVERY_BEFORE_TRANSACTION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static READER_POST_CAPTURE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static READER_DELIVERY_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static WRITER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -12984,6 +13094,25 @@ fn reader_delivery_before_transaction_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+fn reader_post_capture_step() -> Result<()> {
+    READER_POST_CAPTURE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "reader positioning fault injection shares the production call signature"
+)]
+fn reader_post_capture_step() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -21066,6 +21195,198 @@ mod tests {
             .unwrap();
         assert_eq!(confidence, "TIME_UNCERTAIN");
         assert!(audit >= 3);
+    }
+
+    #[test]
+    fn running_transition_replay_cannot_erase_forward_time_and_resurrect_read_grant() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"replay".as_slice()))
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "time-replay",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let scope = scope_bound_reads(
+            &manager,
+            "T-artifact",
+            &binding_id,
+            std::slice::from_ref(&artifact.artifact_id),
+        )
+        .unwrap();
+        let request = crate::TransitionRequest {
+            schema_version: crate::SCHEMA_VERSION.to_owned(),
+            transition_id: "tr-time-replay".to_owned(),
+            task_id: "T-artifact".to_owned(),
+            expected_revision: 1,
+            expected_state: crate::TaskState::Created,
+            to_state: crate::TaskState::Running,
+            requested_by: Actor {
+                kind: "system-service".to_owned(),
+                id: "service:task-manager".to_owned(),
+            },
+            reason: crate::TransitionReason {
+                code: "STATE_CHANGE_REQUESTED".to_owned(),
+                message: None,
+                related_ids: Vec::new(),
+            },
+            mutation: crate::TaskMutation::default(),
+        };
+        let original = manager.transition(&request).unwrap();
+        assert!(!original.applied);
+        *wall.lock().unwrap() = "2026-09-20T00:00:00Z".to_owned();
+        assert_eq!(manager.transition(&request).unwrap(), original);
+        let before_conflict: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *wall.lock().unwrap() = "2026-09-20T01:00:00Z".to_owned();
+        let mut conflicting = request.clone();
+        conflicting.reason.message = Some("changed request".to_owned());
+        assert_eq!(
+            manager.transition(&conflicting).unwrap().reason_code,
+            "TASK_TRANSITION_ID_REUSE_CONFLICT"
+        );
+        let after_conflict: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(after_conflict > before_conflict);
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))
+        ));
+        let uses: i64 = manager
+            .connection
+            .query_row(
+                "SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-time-replay-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uses, 0);
+    }
+
+    #[test]
+    fn failed_reader_positioning_preserves_captured_forward_time() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"reader".as_slice()))
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "reader-position",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let scope = scope_bound_reads(
+            &manager,
+            "T-artifact",
+            &binding_id,
+            std::slice::from_ref(&artifact.artifact_id),
+        )
+        .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        *wall.lock().unwrap() = "2026-09-19T23:00:00Z".to_owned();
+        READER_POST_CAPTURE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::InvalidRecord(
+                    "test reader positioning failure",
+                ))
+            }));
+        });
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(reader.read(&mut byte).is_err());
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    fn writer_size_rejection_preserves_captured_forward_time() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let mut request = allocation("alloc-time-size");
+        request.max_size_bytes = Some(3);
+        manager.allocate_artifact_output(&request).unwrap();
+        let mut writer = manager
+            .open_artifact_output(&request.allocation_id)
+            .unwrap();
+        *wall.lock().unwrap() = "2026-09-19T22:30:00Z".to_owned();
+        assert_eq!(
+            writer.write_all(b"four").unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(writer.write_all(b"a").is_err());
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    fn resumed_writer_size_rejection_preserves_captured_forward_time() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let mut request = allocation("alloc-time-resume-size");
+        request.max_size_bytes = Some(3);
+        manager.allocate_artifact_output(&request).unwrap();
+        let writer = manager
+            .open_artifact_output(&request.allocation_id)
+            .unwrap();
+        let staging_ref = load_allocation_row(&manager.connection, &request.allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        drop(writer);
+        std::fs::write(manager.artifact_store_root.join(staging_ref), b"four").unwrap();
+        *wall.lock().unwrap() = "2026-09-19T22:30:00Z".to_owned();
+        assert!(matches!(
+            manager.open_artifact_output(&request.allocation_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_SIZE_LIMIT"))
+        ));
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(matches!(
+            manager.open_artifact_output(&request.allocation_id),
+            Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))
+        ));
     }
 
     #[test]
