@@ -2825,7 +2825,7 @@ mod tests {
     #[test]
     fn exact_export_finalization_rechecks_policy_and_approval_freshness() {
         use crate::authority_policy::AuthenticatedApprover;
-        for scenario in ["policy", "approval"] {
+        for scenario in ["policy", "policy-reactivation", "approval"] {
             let (mut manager, approval) = pending_exact_export_fixture();
             match scenario {
                 "policy" => {
@@ -2834,6 +2834,13 @@ mod tests {
                     {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
                     {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
                 ]}).to_string().as_bytes()).unwrap();
+                }
+                "policy-reactivation" => {
+                    manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                        {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                        {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                        {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+                    ]}).to_string().as_bytes()).unwrap();
                 }
                 "approval" => {
                     manager
@@ -3428,8 +3435,29 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks both retained-handle cancellation and unresolved-effect containment through Task transitions"
+    )]
     fn cancelling_exact_export_revokes_issued_grants_but_cannot_hide_unresolved_export() {
-        use crate::artifact_store::{ExactExportTestPhase, install_exact_export_test_hook};
+        use crate::artifact_store::{
+            ArtifactExportWriter, ExactExportTestPhase, install_exact_export_test_hook,
+        };
+        struct CancelledSink(Arc<AtomicUsize>);
+        impl Write for CancelledSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(bytes.len(), Ordering::SeqCst);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl ArtifactExportWriter for CancelledSink {
+            fn finalize(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         let cancel = |revision, state| TransitionRequest {
             schema_version: "0.1".into(),
             transition_id: "transition:exact-cancel".into(),
@@ -3453,15 +3481,74 @@ mod tests {
             .finalize_pending_authority_candidate("candidate:pending-exact")
             .unwrap();
         assert_eq!(finalized.grant_ids.len(), 3);
-        let cancelled = ready
-            .transition(&cancel(3, TaskState::WaitingForAuth))
+        let runnable = ready
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:pending-exact-runnable".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 3,
+                expected_state: TaskState::WaitingForAuth,
+                to_state: TaskState::Runnable,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
             .unwrap();
+        assert!(runnable.applied, "{runnable:?}");
+        let pin = load_current_export_pin(&ready.connection, "candidate:pending-exact")
+            .unwrap()
+            .unwrap();
+        let session = ready
+            .issue_provider_artifact_session("T-candidate", "binding:pending-exact")
+            .unwrap();
+        let scope = ready
+            .scope_artifact_reads(&session, std::slice::from_ref(&pin.source_artifact_id))
+            .unwrap();
+        let cancelled_opens = Arc::new(AtomicUsize::new(0));
+        let cancelled_bytes = Arc::new(AtomicUsize::new(0));
+        let mut retained = ready
+            .issue_exact_bound_artifact_export_destination(
+                &session,
+                &scope,
+                &pin.operation_id,
+                &pin.source_artifact_id,
+                &pin.service_id,
+                &pin.adapter_id,
+                {
+                    let opens = Arc::clone(&cancelled_opens);
+                    let bytes = Arc::clone(&cancelled_bytes);
+                    move || {
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        Ok(CancelledSink(bytes))
+                    }
+                },
+            )
+            .unwrap();
+        let cancelled = ready.transition(&cancel(4, TaskState::Runnable)).unwrap();
         assert!(cancelled.applied, "{cancelled:?}");
+        assert_eq!(
+            ready.get_task("T-candidate").unwrap().unwrap().state,
+            TaskState::Cancelled
+        );
         let revoked: i64 = ready.connection.query_row(
             "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='REVOKED' AND revoked_at IS NOT NULL",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(revoked, 3);
+        assert!(
+            ready
+                .export_artifact(&scope, &pin.source_artifact_id, &mut retained)
+                .is_err()
+        );
+        assert_eq!(cancelled_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(cancelled_bytes.load(Ordering::SeqCst), 0);
 
         let mut fixture = exact_export_fixture();
         let opens = Arc::new(AtomicUsize::new(0));

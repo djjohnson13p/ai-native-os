@@ -19379,6 +19379,34 @@ mod tests {
             "historical class-only operation cannot issue a fresh writer"
         );
         assert_eq!(class_only_opens.load(Ordering::SeqCst), 0);
+        manager
+            .register_trusted_export_service(
+                "service://fixture/legacy",
+                "user-selected-file",
+                "adapter:memory",
+            )
+            .unwrap();
+        assert!(
+            manager
+                .issue_exact_bound_artifact_export_destination(
+                    &session,
+                    &scope,
+                    "export-consumed-replay",
+                    &artifact.artifact_id,
+                    "service://fixture/legacy",
+                    "adapter:memory",
+                    {
+                        let opened = Arc::clone(&class_only_opens);
+                        move || {
+                            opened.fetch_add(1, Ordering::SeqCst);
+                            Ok(Vec::<u8>::new())
+                        }
+                    },
+                )
+                .is_err(),
+            "a historical class-only intent cannot acquire an exact pin after the fact"
+        );
+        assert_eq!(class_only_opens.load(Ordering::SeqCst), 0);
         assert_eq!(
             manager
                 .connection
