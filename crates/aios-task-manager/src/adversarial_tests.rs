@@ -1,5 +1,6 @@
 use super::*;
 
+use std::fs::OpenOptions;
 use std::process::Command;
 
 use rusqlite::Connection;
@@ -13,11 +14,46 @@ const TEST_TIME: &str = "2026-09-19T00:00:00Z";
 const COMPLETION_ARTIFACT_ID: &str =
     "artifact:v1:sha256:52c0b01bbc16da99f646722fd55c1ca9dc2a03f6186637485da30679c38fdabe";
 
+fn verified_provider_admission_from_binding(
+    transaction: &Transaction<'_>,
+    binding_id: &str,
+    binding: &BindingEvidence,
+    checked_at: &str,
+) -> Result<bool> {
+    let Ok(receipt) =
+        aios_registry::BindingReceiptProjection::parse(binding.binding_json.as_bytes())
+    else {
+        return Ok(false);
+    };
+    verified_provider_admission(transaction, binding_id, binding, checked_at, &receipt)
+}
+
+fn conformance_pin_matches(value: &Value, latest_id: &str, required: bool) -> bool {
+    aios_registry::BindingReceiptProjection::parse(value.to_string().as_bytes())
+        .is_ok_and(|receipt| receipt.evidence_pin_matches(latest_id, required))
+}
+
 struct FixedClock;
 
 impl Clock for FixedClock {
     fn now(&self) -> String {
         "2026-09-19T00:00:00Z".to_owned()
+    }
+}
+
+struct LaterClock;
+
+impl Clock for LaterClock {
+    fn now(&self) -> String {
+        "2026-09-19T00:00:02Z".to_owned()
+    }
+}
+
+struct MicroClock;
+
+impl Clock for MicroClock {
+    fn now(&self) -> String {
+        "2026-09-19T00:00:00.000500Z".to_owned()
     }
 }
 
@@ -416,6 +452,2606 @@ fn rust_transition_dtos_serialize_to_machine_schemas_and_spoofed_requests_fail()
     );
     spoofed.reason.code = "model says done".to_owned();
     assert!(manager.transition(&spoofed).is_err());
+}
+
+#[test]
+fn later_failed_conformance_retest_blocks_an_older_pass() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(LaterClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    let raw: String = manager.connection.query_row(
+        "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let mut retest: Value = serde_json::from_str(&raw).unwrap();
+    retest["result_id"] = "evidence-retest-failed".into();
+    retest["result"] = "fail".into();
+    retest["executed_at"] = "2026-09-19T00:00:01Z".into();
+    manager.connection.execute(
+        "INSERT INTO provider_conformance_evidence(evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at) VALUES ('evidence-retest-failed','registration-completion','test.complete@1',?1,'suite:test',?2,'fail',?3,'2026-09-19T00:00:01Z')",
+        params![CONTRACT_HASH, SUITE_HASH, canonical_json(&retest).unwrap()],
+    ).unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-later-failed-retest",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+}
+
+#[test]
+fn future_conformance_pass_never_authorizes_at_check_time() {
+    for (case, future) in [
+        ("nanosecond", "2026-09-19T00:00:00.000000001Z"),
+        ("second", "2026-09-19T00:00:01Z"),
+        ("offset", "2026-09-18T17:00:00.000000001-07:00"),
+    ] {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        prepare_completion_for_admission(&manager);
+        let raw: String = manager.connection.query_row(
+            "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let mut evidence: Value = serde_json::from_str(&raw).unwrap();
+        evidence["executed_at"] = future.into();
+        manager.connection.execute(
+            "UPDATE provider_conformance_evidence SET tested_at=?1,evidence_json=?2 WHERE evidence_id='evidence-completion'",
+            params![future,canonical_json(&evidence).unwrap()],
+        ).unwrap();
+        let result = manager
+            .transition(&request(
+                &format!("tr-future-conformance-{case}"),
+                "T-completion",
+                2,
+                TaskState::Runnable,
+                TaskState::Running,
+            ))
+            .unwrap();
+        assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{case}");
+    }
+}
+
+#[test]
+fn equal_instant_latest_conformance_receipts_fail_closed() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    let raw: String = manager.connection.query_row(
+        "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let mut second: Value = serde_json::from_str(&raw).unwrap();
+    second["result_id"] = "evidence-completion-tie".into();
+    second["executed_at"] = "2026-09-18T17:00:00-07:00".into();
+    manager.connection.execute(
+        "INSERT INTO provider_conformance_evidence(evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
+         VALUES ('evidence-completion-tie','registration-completion','test.complete@1',?1,'suite:test',?2,'pass',?3,'2026-09-18T17:00:00-07:00')",
+        params![CONTRACT_HASH, SUITE_HASH, canonical_json(&second).unwrap()],
+    ).unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-equal-time-conformance",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+}
+
+#[test]
+fn submillisecond_future_retest_does_not_hide_latest_eligible_pass() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(MicroClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    mutate_json_column(
+        &manager,
+        "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+        "UPDATE provider_conformance_evidence SET evidence_json=?1, tested_at='2026-09-19T00:00:00.000400Z' WHERE evidence_id='evidence-completion'",
+        "/executed_at",
+        json!("2026-09-19T00:00:00.000400Z"),
+    );
+    let raw: String = manager.connection.query_row(
+        "SELECT evidence_json FROM provider_conformance_evidence WHERE evidence_id='evidence-completion'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let mut future: Value = serde_json::from_str(&raw).unwrap();
+    future["result_id"] = "evidence-future-failure".into();
+    future["result"] = "fail".into();
+    future["executed_at"] = "2026-09-19T00:00:00.000600Z".into();
+    manager.connection.execute(
+        "INSERT INTO provider_conformance_evidence(evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,status,evidence_json,tested_at)
+         VALUES ('evidence-future-failure','registration-completion','test.complete@1',?1,'suite:test',?2,'fail',?3,'2026-09-19T00:00:00.000600Z')",
+        params![CONTRACT_HASH, SUITE_HASH, canonical_json(&future).unwrap()],
+    ).unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(
+        binding_grants_valid(
+            &transaction,
+            &BindingGrantCheck {
+                task_id: "T-completion",
+                semantic_hash: HASH,
+                node_id: "node-completion",
+                binding_id: "binding-completion",
+                attempt_id: "attempt-completion",
+                grant_refs_json: "[]",
+                checked_at: "2026-09-19T00:00:00.000500Z",
+            }
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn stamped_provider_migration_rejects_legacy_registration_without_admission_receipt() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    manager
+        .connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    manager.connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1',?1)",
+        [TEST_TIME],
+    ).unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-legacy-provider-without-receipt",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    manager.connection.execute(
+        "INSERT INTO provider_manifest_payloads(registration_id,manifest_json) VALUES ('registration-completion','{}')", [],
+    ).unwrap();
+    let second = manager
+        .transition(&request(
+            "tr-legacy-provider-forged-payload",
+            "T-completion",
+            2,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(second.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn verified_provider_receipt_allows_unchanged_claim_on_new_snapshot() {
+    use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+    use aios_registry::{
+        ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
+    };
+
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    manager.initialize_provider_store().unwrap();
+    let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/registry-snapshot.json"
+    ))
+    .unwrap();
+    let types: Vec<TypeContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/type-contracts.json"
+    ))
+    .unwrap();
+    let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/capability-contracts.json"
+    ))
+    .unwrap();
+    let claimed = capabilities
+        .iter_mut()
+        .find(|contract| contract.capability == "artifact.hash")
+        .unwrap();
+    claimed.conformance.suite_hash = Some(SUITE_HASH.into());
+    snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "artifact.hash")
+        .unwrap()
+        .content_hash = aios_registry::capability_contract_hash(claimed)
+        .unwrap()
+        .to_string();
+    let refresh_id = |snapshot: &mut RegistrySnapshot| {
+        let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+            &snapshot.schema_version,
+            &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+            &snapshot
+                .capability_contracts
+                .iter()
+                .map(view)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+    };
+    refresh_id(&mut snapshot);
+    let first = SemanticRegistry::from_records(
+        snapshot.clone(),
+        types.clone(),
+        capabilities.clone(),
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    let unrelated = capabilities
+        .iter_mut()
+        .find(|contract| contract.capability == "table.normalize")
+        .unwrap();
+    unrelated.version = "1.1".into();
+    snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "table.normalize")
+        .unwrap()
+        .version = "1.1".into();
+    snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "table.normalize")
+        .unwrap()
+        .content_hash = aios_registry::capability_contract_hash(unrelated)
+        .unwrap()
+        .to_string();
+    refresh_id(&mut snapshot);
+    let second = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    assert_ne!(first.snapshot_id(), second.snapshot_id());
+    {
+        let mut store = manager.registry_store_writer().unwrap();
+        store.admit_registry(&first).unwrap();
+        store.admit_registry(&second).unwrap();
+    }
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/provider-conformance-cases.json"
+    ))
+    .unwrap();
+    let mut manifest = cases[0]["provider"].clone();
+    manifest["provides"][0]["conformance"]["suite_hash"] = SUITE_HASH.into();
+    let contract_hash = first
+        .capability_contract_hash("artifact.hash", 1)
+        .unwrap()
+        .to_string();
+    manifest["provides"][0]["contract"]["contract_hash"] = contract_hash.clone().into();
+    let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let registration = manager
+        .provider_store_writer()
+        .unwrap()
+        .register(
+            &first,
+            &serde_json::to_vec(&manifest).unwrap(),
+            build,
+            ProviderTrustStatus::Unverified,
+            TEST_TIME,
+        )
+        .unwrap();
+    let mut binding = BindingEvidence {
+        capability: "artifact.hash@1".into(),
+        principal_id: registration.provider_id,
+        program_json: String::new(),
+        registry_snapshot_id: second.snapshot_id().into(),
+        contract_hash: Some(contract_hash),
+        snapshot_manifest_json: String::new(),
+        ir_version: String::new(),
+        provider_version: registration.provider_version,
+        provider_manifest_hash: Some(registration.manifest_hash),
+        provider_build_hash: Some(registration.build_hash),
+        provider_registration_id: Some(registration.registration_id),
+        attempt: 1,
+        policy_decision_refs_json: String::new(),
+        grant_refs_json: String::new(),
+        execution_profile_ref: String::new(),
+        placement_json: String::new(),
+        binding_json: String::new(),
+        created_at: TEST_TIME.into(),
+        conformance_evidence_id: String::new(),
+        conformance_suite_id: Some("suite:artifact-hash".into()),
+        conformance_suite_hash: Some(SUITE_HASH.into()),
+        conformance_status: String::new(),
+        conformance_json: String::new(),
+        conformance_tested_at: None,
+    };
+    binding.conformance_suite_id = manifest["provides"][0]["conformance"]["suite"]
+        .as_str()
+        .map(str::to_owned);
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            !verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME)
+                .unwrap()
+        );
+        transaction.rollback().unwrap();
+    }
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .admit_trust(
+            binding.provider_registration_id.as_deref().unwrap(),
+            "decision:fixture-promotion",
+            ProviderTrustStatus::LocallyTrusted,
+            "review:fixture-owner",
+            TEST_TIME,
+        )
+        .unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(
+        verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap()
+    );
+    binding.registry_snapshot_id = first.snapshot_id().into();
+    assert!(
+        verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap()
+    );
+    let original_receipt: String = transaction
+        .query_row(
+            "SELECT registration_json FROM provider_registrations WHERE registration_id=?1",
+            [binding.provider_registration_id.as_deref().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let original_value: Value = serde_json::from_str(&original_receipt).unwrap();
+    for (pointer, replacement) in [
+        ("/runtime/kind", json!("wasm")),
+        ("/runtime/minimum_isolation", json!("P3")),
+        ("/package/source_kind", json!("registry")),
+        ("/state", json!("registered")),
+        (
+            "/capabilities/0/representations",
+            json!({"artifact":["forged"]}),
+        ),
+    ] {
+        transaction.execute_batch("SAVEPOINT forged_provider_receipt; DROP TRIGGER provider_registration_identity_immutable;").unwrap();
+        let mut forged = original_value.clone();
+        *forged.pointer_mut(pointer).unwrap() = replacement;
+        transaction
+            .execute(
+                "UPDATE provider_registrations SET registration_json=?2 WHERE registration_id=?1",
+                params![
+                    binding.provider_registration_id.as_deref().unwrap(),
+                    canonical_json(&forged).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(
+            !verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME)
+                .unwrap(),
+            "forged receipt field {pointer} must not authorize launch"
+        );
+        transaction
+            .execute_batch("ROLLBACK TO forged_provider_receipt; RELEASE forged_provider_receipt;")
+            .unwrap();
+    }
+    let suite_version = first
+        .capability_contract("artifact.hash", 1)
+        .unwrap()
+        .conformance
+        .suite_version
+        .as_deref()
+        .unwrap();
+    let contract = SnapshotContract {
+        version: first
+            .capability_contract("artifact.hash", 1)
+            .unwrap()
+            .version
+            .clone(),
+        content_hash: binding.contract_hash.clone().unwrap(),
+    };
+    binding.conformance_evidence_id = "cross-snapshot-pass".into();
+    binding.conformance_status = "pass".into();
+    binding.conformance_tested_at = Some(TEST_TIME.into());
+    let mut evidence = json!({
+        "schema_version": "0.1", "result_id": "cross-snapshot-pass",
+        "provider_id": binding.principal_id, "provider_version": binding.provider_version,
+        "provider_build_identity": {"kind": "build_hash", "value": build},
+        "semantic_capability_ref": binding.capability,
+        "semantic_contract_version": contract.version, "semantic_contract_hash": contract.content_hash,
+        "conformance_suite": {"id": binding.conformance_suite_id, "version": suite_version,
+            "hash": SUITE_HASH},
+        "harness": {"id": "fixture-harness", "version": "1"},
+        "result": "pass", "tests_total": 2, "tests_passed": 2, "tests_failed": 0,
+        "executed_at": TEST_TIME, "expires_at": "2026-09-19T00:00:02Z"
+    });
+    binding.conformance_json = canonical_json(&evidence).unwrap();
+    assert!(
+        conformance_evidence_valid(
+            &binding,
+            &contract,
+            "2026-09-19T00:00:01Z",
+            Some(suite_version)
+        )
+        .unwrap()
+    );
+    evidence["tests_total"] = 0.into();
+    evidence["tests_passed"] = 0.into();
+    binding.conformance_json = canonical_json(&evidence).unwrap();
+    assert!(
+        !conformance_evidence_valid(
+            &binding,
+            &contract,
+            "2026-09-19T00:00:01Z",
+            Some(suite_version)
+        )
+        .unwrap()
+    );
+    evidence["tests_total"] = 2.into();
+    evidence["tests_passed"] = 2.into();
+    evidence["conformance_suite"]["version"] = "wrong".into();
+    binding.conformance_json = canonical_json(&evidence).unwrap();
+    assert!(
+        !conformance_evidence_valid(
+            &binding,
+            &contract,
+            "2026-09-19T00:00:01Z",
+            Some(suite_version)
+        )
+        .unwrap()
+    );
+    evidence["conformance_suite"]["version"] = suite_version.into();
+    evidence["expires_at"] = "2026-09-18T23:59:59Z".into();
+    binding.conformance_json = canonical_json(&evidence).unwrap();
+    assert!(
+        !conformance_evidence_valid(
+            &binding,
+            &contract,
+            "2026-09-19T00:00:01Z",
+            Some(suite_version)
+        )
+        .unwrap()
+    );
+    transaction.rollback().unwrap();
+    evidence["expires_at"] = "2026-09-19T00:00:02Z".into();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            binding.provider_registration_id.as_deref().unwrap(),
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(
+            binding.provider_registration_id.as_deref().unwrap(),
+            TEST_TIME,
+        )
+        .unwrap();
+    manager.create_task(&create("T-real-receipt")).unwrap();
+    let trust_source_id: String = manager
+        .connection
+        .query_row(
+            "SELECT admission_id FROM provider_trust_admissions
+             WHERE registration_id=?1 ORDER BY revision DESC LIMIT 1",
+            [binding.provider_registration_id.as_deref().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding_receipt = canonical_json(&json!({
+        "schema_version": "0.1",
+        "binding_id": "binding-real-receipt",
+        "attempt_id": "attempt-real-receipt",
+        "task_id": "T-real-receipt",
+        "semantic_program_hash": HASH,
+        "registry_snapshot_id": second.snapshot_id(),
+        "ir_version": "0.1",
+        "node_id": "node-real",
+        "capability": "artifact.hash@1",
+        "capability_contract_hash": binding.contract_hash,
+        "conformance_evidence_id": "cross-snapshot-pass",
+        "provider_trust_source_id": trust_source_id,
+        "provider": {
+            "id": binding.principal_id,
+            "version": binding.provider_version,
+            "manifest_hash": binding.provider_manifest_hash,
+            "package_or_build_hash": binding.provider_build_hash,
+        },
+        "attempt": 1,
+        "policy_decision_refs": [],
+        "authority": {"grant_refs": []},
+        "execution_profile": {"profile_ref": "profile:test"},
+        "placement": {"locality": "local"},
+        "inputs": {},
+        "outputs": {},
+        "created_at": TEST_TIME,
+    }))
+    .unwrap();
+    binding.binding_json = binding_receipt.clone();
+    manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
+         registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+         provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+         provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+         execution_profile_ref,placement_json,binding_json,created_at)
+         VALUES ('binding-real-receipt','attempt-real-receipt','T-real-receipt',?1,?2,'0.1',
+         'node-real','artifact.hash@1',?3,?4,?5,?6,?7,?8,1,'[]','[]','profile:test',
+         '{\"locality\":\"local\"}',?9,?10)",
+            params![
+                HASH,
+                second.snapshot_id(),
+                binding.contract_hash,
+                binding.provider_registration_id,
+                binding.principal_id,
+                binding.provider_version,
+                binding.provider_manifest_hash,
+                binding.provider_build_hash,
+                binding_receipt,
+                TEST_TIME
+            ],
+        )
+        .unwrap();
+    let first_trust_source: String = manager
+        .connection
+        .query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='binding-real-receipt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(first_trust_source.starts_with("sha256:"));
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap()
+        );
+        let original_receipt = binding.binding_json.clone();
+        binding.binding_json = canonical_json(&json!({
+            "conformance_evidence_id": "cross-snapshot-pass",
+            "provider_trust_source_id": "decision:unrelated",
+        }))
+        .unwrap();
+        assert!(
+            !verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap(),
+            "a binding receipt must identify its durable trust source"
+        );
+        binding.binding_json = original_receipt;
+        transaction.rollback().unwrap();
+    }
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .admit_trust(
+            binding.provider_registration_id.as_deref().unwrap(),
+            "decision:fixture-later-review",
+            ProviderTrustStatus::ProjectReviewed,
+            "review:fixture-owner",
+            "2026-09-19T00:00:01Z",
+        )
+        .unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                TEST_TIME
+            )
+            .unwrap(),
+            "a future trust decision must not invalidate the current binding early"
+        );
+        assert!(
+            !verified_provider_admission_from_binding(
+                &transaction,
+                "binding-real-receipt",
+                &binding,
+                "2026-09-19T00:00:01Z"
+            )
+            .unwrap(),
+            "the old binding expires when the new trust decision becomes effective"
+        );
+        transaction.rollback().unwrap();
+    }
+    let transaction = manager.connection.transaction().unwrap();
+    assert_eq!(
+        latest_conformance_evidence_id(
+            &transaction,
+            &BindingGrantCheck {
+                task_id: "T-real-receipt",
+                semantic_hash: HASH,
+                node_id: "node-real",
+                binding_id: "binding-real-receipt",
+                attempt_id: "attempt-real-receipt",
+                grant_refs_json: "[]",
+                checked_at: "2026-09-19T00:00:01Z",
+            },
+            true
+        )
+        .unwrap()
+        .as_deref(),
+        Some("cross-snapshot-pass")
+    );
+    transaction.rollback().unwrap();
+    let pinned = json!({"conformance_evidence_id":"cross-snapshot-pass"});
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES ('unrelated-legacy-null-time',?1,?2,?3,'suite:unrelated',?4,
+                     'pass','{}',NULL)",
+            params![
+                binding.provider_registration_id.as_deref().unwrap(),
+                binding.capability,
+                binding.contract_hash.as_deref().unwrap(),
+                SUITE_HASH,
+            ],
+        )
+        .unwrap();
+    assert!(conformance_pin_matches(
+        &pinned,
+        "cross-snapshot-pass",
+        true
+    ));
+    assert!(!conformance_pin_matches(
+        &json!({}),
+        "cross-snapshot-pass",
+        true
+    ));
+    let latest = |manager: &mut TaskManager| {
+        let transaction = manager.connection.transaction().unwrap();
+        latest_conformance_evidence_id(
+            &transaction,
+            &BindingGrantCheck {
+                task_id: "T-real-receipt",
+                semantic_hash: HASH,
+                node_id: "node-real",
+                binding_id: "binding-real-receipt",
+                attempt_id: "attempt-real-receipt",
+                grant_refs_json: "[]",
+                checked_at: "2026-09-19T00:00:01Z",
+            },
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(latest(&mut manager), "cross-snapshot-pass");
+    evidence["result_id"] = "renewed-pass".into();
+    evidence["executed_at"] = "2026-09-19T00:00:00.500000Z".into();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            binding.provider_registration_id.as_deref().unwrap(),
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(latest(&mut manager), "renewed-pass");
+    assert!(!conformance_pin_matches(
+        &pinned,
+        &latest(&mut manager),
+        true
+    ));
+    evidence["result_id"] = "later-failure".into();
+    evidence["result"] = "fail".into();
+    evidence["tests_passed"] = 1.into();
+    evidence["tests_failed"] = 1.into();
+    evidence["executed_at"] = "2026-09-19T00:00:00.750000Z".into();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            binding.provider_registration_id.as_deref().unwrap(),
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(latest(&mut manager), "later-failure");
+    assert!(!conformance_pin_matches(
+        &pinned,
+        &latest(&mut manager),
+        true
+    ));
+    binding.registry_snapshot_id = second.snapshot_id().into();
+    for (state, permitted) in [
+        (aios_registry::SnapshotState::Deprecated, true),
+        (aios_registry::SnapshotState::Quarantined, false),
+        (aios_registry::SnapshotState::Revoked, false),
+    ] {
+        manager
+            .registry_store_writer()
+            .unwrap()
+            .set_snapshot_state(first.snapshot_id(), state)
+            .unwrap();
+        let transaction = manager.connection.transaction().unwrap();
+        assert_eq!(
+            verified_provider_receipt_and_compatibility(&transaction, &binding, TEST_TIME).unwrap(),
+            permitted
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn immutable_binding_pins_real_provider_evidence_across_retests() {
+    use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+    use aios_registry::{
+        ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
+    };
+
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager.initialize_provider_store().unwrap();
+    prepare_completion_for_admission(&manager);
+    let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/registry-snapshot.json"
+    ))
+    .unwrap();
+    let types: Vec<TypeContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/type-contracts.json"
+    ))
+    .unwrap();
+    let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/capability-contracts.json"
+    ))
+    .unwrap();
+    let mut completion = capabilities
+        .iter()
+        .find(|contract| contract.capability == "document.compose")
+        .unwrap()
+        .clone();
+    completion.capability = "test.complete".into();
+    completion.inputs.clear();
+    completion.required_effect_classes.clear();
+    completion.allowed_effect_classes = vec![aios_contracts::EffectClass::Pure];
+    completion.required_authority_classes.clear();
+    completion.allowed_authority_classes.clear();
+    completion.conformance.suite_id = "suite:test".into();
+    completion.conformance.suite_hash = Some(SUITE_HASH.into());
+    let contract_hash = aios_registry::capability_contract_hash(&completion)
+        .unwrap()
+        .to_string();
+    snapshot
+        .capability_contracts
+        .push(aios_contracts::ContractRef {
+            id: completion.capability.clone(),
+            version: completion.version.clone(),
+            content_hash: contract_hash.clone(),
+            source: None,
+        });
+    capabilities.push(completion);
+    let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+        id: entry.id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    };
+    snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &snapshot.schema_version,
+        &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+        &snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let registry = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    manager
+        .registry_store_writer()
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/provider-conformance-cases.json"
+    ))
+    .unwrap();
+    let mut manifest = cases[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["capability"] = "test.complete".into();
+    manifest["provides"][0]["contract"]["version"] = "1.0".into();
+    manifest["provides"][0]["contract"]["contract_hash"] = contract_hash.clone().into();
+    manifest["provides"][0]["conformance"]["suite"] = "suite:test".into();
+    manifest["provides"][0]["conformance"]["suite_hash"] = SUITE_HASH.into();
+    manifest["provides"][0]["effect_classes"] = json!(["PURE"]);
+    manifest["provides"][0]["authority"]["actions"] = json!([]);
+    manifest["provides"][0]["authority"]["resource_classes"] = json!([]);
+    let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let registration = manager
+        .provider_store_writer()
+        .unwrap()
+        .register(
+            &registry,
+            &serde_json::to_vec(&manifest).unwrap(),
+            build,
+            ProviderTrustStatus::LocallyTrusted,
+            TEST_TIME,
+        )
+        .unwrap();
+    let evidence = |id: &str, result: &str, at: &str| {
+        json!({
+            "schema_version": "0.1", "result_id": id,
+            "provider_id": registration.provider_id, "provider_version": registration.provider_version,
+            "provider_build_identity": {"kind": "build_hash", "value": build},
+            "semantic_capability_ref": "test.complete@1", "semantic_contract_version": "1.0",
+            "semantic_contract_hash": contract_hash,
+            "conformance_suite": {"id": "suite:test", "version": "0.1", "hash": SUITE_HASH},
+            "harness": {"id": "fixture-harness", "version": "1"},
+            "result": result, "tests_total": 2,
+            "tests_passed": if result == "pass" {2} else {1},
+            "tests_failed": i32::from(result != "pass"),
+            "executed_at": at, "expires_at": "2026-09-20T00:00:00Z"
+        })
+    };
+    let record = |manager: &mut TaskManager, id, result, at| {
+        manager
+            .provider_store_writer()
+            .unwrap()
+            .record_evidence(
+                &registration.registration_id,
+                &serde_json::to_vec(&evidence(id, result, at)).unwrap(),
+            )
+            .unwrap();
+    };
+    record(&mut manager, "E1", "pass", TEST_TIME);
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, TEST_TIME)
+        .unwrap();
+    let mut validation: Value = serde_json::from_str(&manager.connection.query_row(
+        "SELECT result_json FROM validation_results WHERE validation_result_id='validation-completion'",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap()).unwrap();
+    validation["registry_snapshot_id"] = registry.snapshot_id().into();
+    manager.connection.execute("UPDATE validation_results SET registry_snapshot_id=?1,result_json=?2 WHERE validation_result_id='validation-completion'",
+        params![registry.snapshot_id(), canonical_json(&validation).unwrap()]).unwrap();
+    manager.connection.execute("UPDATE semantic_program_revisions SET registry_snapshot_id=?1 WHERE program_id='program-completion'",
+        [registry.snapshot_id()]).unwrap();
+    let base: Value = serde_json::from_str(
+        &manager
+            .connection
+            .query_row(
+                "SELECT binding_json FROM execution_bindings WHERE binding_id='binding-completion'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let insert = |manager: &TaskManager, attempt: i64, pinned: &str| {
+        let binding_id = format!("binding-real-{attempt}");
+        let attempt_id = format!("attempt-real-{attempt}");
+        let allocation_id = format!("allocation-real-{attempt}");
+        let mut receipt = base.clone();
+        receipt["binding_id"] = binding_id.clone().into();
+        receipt["attempt_id"] = attempt_id.clone().into();
+        receipt["attempt"] = attempt.into();
+        receipt["registry_snapshot_id"] = registry.snapshot_id().into();
+        receipt["capability_contract_hash"] = contract_hash.clone().into();
+        receipt["conformance_evidence_id"] = pinned.into();
+        receipt["provider_trust_source_id"] = registration.registration_id.clone().into();
+        let created_at = match pinned {
+            "E2" => "2026-09-19T00:00:00.600Z",
+            "E5-unbounded" => "2026-09-19T00:00:00.980Z",
+            _ => TEST_TIME,
+        };
+        receipt["created_at"] = created_at.into();
+        receipt["provider"]["id"] = registration.provider_id.clone().into();
+        receipt["provider"]["version"] = registration.provider_version.clone().into();
+        receipt["provider"]["manifest_hash"] = registration.manifest_hash.clone().into();
+        receipt["provider"]["package_or_build_hash"] = registration.build_hash.clone().into();
+        receipt["outputs"]["report"]["allocation_ref"] = allocation_id.clone().into();
+        let receipt_json = canonical_json(&receipt).unwrap();
+        // Formatting is not receipt identity; the typed projection is.
+        let receipt_json = if attempt == 14 {
+            format!(" \n{receipt_json}")
+        } else {
+            receipt_json
+        };
+        manager.connection.execute(
+            "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
+             registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+             provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+             provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+             execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES (?1,?2,'T-completion',?3,?4,'0.1','node-completion','test.complete@1',
+             ?5,?6,?7,?8,?9,?10,?11,'[]','[]','profile:test','{\"locality\":\"local\"}',?12,?13)",
+            params![binding_id,attempt_id,HASH,registry.snapshot_id(),contract_hash,
+                registration.registration_id,registration.provider_id,registration.provider_version,
+                 registration.manifest_hash,registration.build_hash,attempt,receipt_json,created_at],
+        ).unwrap();
+        manager.connection.execute(
+            "INSERT INTO artifact_output_allocations(allocation_id,task_id,semantic_program_hash,node_id,
+             binding_id,attempt_id,output_port,expected_semantic_type,sensitivity,retention,state,created_at,expires_at)
+             VALUES (?1,'T-completion',?2,'node-completion',?3,?4,'report','artifact.report@1',
+             'local','task','ALLOCATED',?5,'2026-09-20T00:00:00Z')",
+            params![allocation_id,HASH,binding_id,attempt_id,TEST_TIME],
+        ).unwrap();
+        binding_id
+    };
+    let valid =
+        |manager: &mut TaskManager, binding_id: &str, attempt_id: &str, checked_at: &str| {
+            let transaction = manager.connection.transaction().unwrap();
+            binding_grants_valid(
+                &transaction,
+                &BindingGrantCheck {
+                    task_id: "T-completion",
+                    semantic_hash: HASH,
+                    node_id: "node-completion",
+                    binding_id,
+                    attempt_id,
+                    grant_refs_json: "[]",
+                    checked_at,
+                },
+            )
+            .unwrap()
+        };
+    let first = insert(&manager, 2, "E1");
+    assert!(valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.250Z"
+    ));
+    let first_receipt: Value = serde_json::from_str(
+        &manager
+            .connection
+            .query_row(
+                "SELECT binding_json FROM execution_bindings WHERE binding_id=?1",
+                [&first],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    // A globally stored contract is insufficient when the selected snapshot
+    // never admitted that contract. The failed insert must publish no markers.
+    manager
+        .connection
+        .execute_batch(
+            "SAVEPOINT missing_selected_contract;
+             DROP TRIGGER immutable_registry_snapshot_entries_delete;",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "DELETE FROM registry_snapshot_entries
+             WHERE snapshot_id=?1 AND contract_class='capability'
+             AND semantic_id='test.complete'",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let mut absent_receipt = first_receipt.clone();
+    absent_receipt["binding_id"] = "binding-absent-selected-contract".into();
+    absent_receipt["attempt_id"] = "attempt-absent-selected-contract".into();
+    absent_receipt["attempt"] = 99.into();
+    let missing_contract_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+          attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+          placement_json,binding_json,created_at)
+         SELECT 'binding-absent-selected-contract','attempt-absent-selected-contract',
+                task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                capability,capability_contract_hash,provider_registration_id,provider_id,
+                provider_version,provider_manifest_hash,provider_build_hash,99,
+                policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                placement_json,?1,created_at
+         FROM execution_bindings WHERE binding_id=?2",
+            params![canonical_json(&absent_receipt).unwrap(), first],
+        )
+        .unwrap_err();
+    assert!(
+        missing_contract_error
+            .to_string()
+            .contains("binding conformance evidence was not admitted"),
+        "{missing_contract_error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        let count: i64 = manager.connection.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-absent-selected-contract'"),
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    manager
+        .connection
+        .execute_batch("ROLLBACK TO missing_selected_contract; RELEASE missing_selected_contract")
+        .unwrap();
+    // Even a hash/version row selected under a different semantic ID cannot
+    // authenticate this provider's claim. This catches accidental reliance on
+    // the global contract hash without comparing the claimed capability name.
+    manager
+        .connection
+        .execute_batch(
+            "SAVEPOINT mismatched_selected_name;
+         DROP TRIGGER immutable_semantic_capability_contracts_update;
+         DROP TRIGGER immutable_registry_snapshot_entries_update;",
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE semantic_capability_contracts SET semantic_id='other.name'
+         WHERE content_hash=?1",
+            [&contract_hash],
+        )
+        .unwrap();
+    manager
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_entries SET semantic_id='other.name'
+         WHERE snapshot_id=?1 AND contract_class='capability'
+         AND semantic_id='test.complete'",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let mut wrong_name_receipt = first_receipt.clone();
+    wrong_name_receipt["binding_id"] = "binding-wrong-selected-name".into();
+    wrong_name_receipt["attempt_id"] = "attempt-wrong-selected-name".into();
+    wrong_name_receipt["attempt"] = 100.into();
+    let wrong_name_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+          attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+          placement_json,binding_json,created_at)
+         SELECT 'binding-wrong-selected-name','attempt-wrong-selected-name',
+                task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                capability,capability_contract_hash,provider_registration_id,provider_id,
+                provider_version,provider_manifest_hash,provider_build_hash,100,
+                policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                placement_json,?1,created_at
+         FROM execution_bindings WHERE binding_id=?2",
+            params![canonical_json(&wrong_name_receipt).unwrap(), first],
+        )
+        .unwrap_err();
+    assert!(
+        wrong_name_error
+            .to_string()
+            .contains("binding conformance evidence was not admitted"),
+        "{wrong_name_error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        let count: i64 = manager
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE binding_id='binding-wrong-selected-name'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    manager
+        .connection
+        .execute_batch("ROLLBACK TO mismatched_selected_name; RELEASE mismatched_selected_name")
+        .unwrap();
+    let original_manifest: Value = serde_json::from_str(
+        &manager
+            .connection
+            .query_row(
+                "SELECT manifest_json FROM provider_manifest_payloads WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    for (suffix, attempt, hostile_build) in [
+        (
+            "invalid-schema",
+            101,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        (
+            "duplicate-claim",
+            102,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+    ] {
+        manager
+            .connection
+            .execute_batch("SAVEPOINT invalid_admission_manifest")
+            .unwrap();
+        let mut hostile = original_manifest.clone();
+        if suffix == "invalid-schema" {
+            hostile["forbidden_property"] = json!(true);
+        } else {
+            let mut repeated = hostile["provides"][0].clone();
+            repeated["conformance"]["suite"] = json!("different-suite");
+            hostile["provides"].as_array_mut().unwrap().push(repeated);
+        }
+        let hostile_manifest_json = canonical_json(&hostile).unwrap();
+        let hostile_manifest_hash = provider_identity_digest(
+            b"AIOS-PROVIDER-MANIFEST\0v0.1\0",
+            hostile_manifest_json.as_bytes(),
+        );
+        let hostile_registration_id = provider_identity_digest(
+            b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+            format!(
+                "{}\0{}\0{}\0{hostile_build}",
+                registration.provider_id, registration.provider_version, hostile_manifest_hash
+            )
+            .as_bytes(),
+        );
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}',?7)",
+                params![
+                    hostile_registration_id,
+                    registration.provider_id,
+                    registration.provider_version,
+                    hostile_manifest_hash,
+                    hostile_build,
+                    registry.snapshot_id(),
+                    TEST_TIME
+                ],
+            )
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO provider_manifest_payloads(registration_id,manifest_json) VALUES (?1,?2)",
+            params![hostile_registration_id,hostile_manifest_json],
+        ).unwrap();
+        let hostile_evidence_id = format!("evidence-{suffix}");
+        let mut hostile_evidence = evidence(&hostile_evidence_id, "pass", TEST_TIME);
+        hostile_evidence["provider_build_identity"]["value"] = hostile_build.into();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES (?1,?2,'test.complete@1',?3,'suite:test',?4,'pass',?5,?6)",
+                params![
+                    hostile_evidence_id,
+                    hostile_registration_id,
+                    contract_hash,
+                    SUITE_HASH,
+                    canonical_json(&hostile_evidence).unwrap(),
+                    TEST_TIME
+                ],
+            )
+            .unwrap();
+        manager.connection.execute(
+            "UPDATE provider_registrations SET state='registered',updated_at=?1 WHERE registration_id=?2",
+            params![TEST_TIME,hostile_registration_id],
+        ).unwrap();
+        let binding_id = format!("binding-{suffix}");
+        let attempt_id = format!("attempt-{suffix}");
+        let mut hostile_receipt = first_receipt.clone();
+        hostile_receipt["binding_id"] = binding_id.clone().into();
+        hostile_receipt["attempt_id"] = attempt_id.clone().into();
+        hostile_receipt["attempt"] = attempt.into();
+        hostile_receipt["conformance_evidence_id"] = hostile_evidence_id.into();
+        hostile_receipt["provider_trust_source_id"] = hostile_registration_id.clone().into();
+        hostile_receipt["provider"]["manifest_hash"] = hostile_manifest_hash.clone().into();
+        hostile_receipt["provider"]["package_or_build_hash"] = hostile_build.into();
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+              placement_json,binding_json,created_at)
+             SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                    capability,capability_contract_hash,?3,provider_id,
+                    provider_version,?4,?5,?6,
+                    policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                    placement_json,?7,created_at
+             FROM execution_bindings WHERE binding_id=?8",
+                params![
+                    binding_id,
+                    attempt_id,
+                    hostile_registration_id,
+                    hostile_manifest_hash,
+                    hostile_build,
+                    attempt,
+                    canonical_json(&hostile_receipt).unwrap(),
+                    first
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("binding conformance evidence was not admitted"),
+            "{suffix}: {error}"
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id=?1"),
+                    [&binding_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{suffix}: {table}");
+        }
+        manager
+            .connection
+            .execute_batch(
+                "ROLLBACK TO invalid_admission_manifest; RELEASE invalid_admission_manifest",
+            )
+            .unwrap();
+    }
+    for case in [
+        "valid-control",
+        "offset-equivalent-tie",
+        "wrong-major",
+        "duplicate-expiry",
+        "nul-prefix-expiry",
+        "non-rfc-expiry",
+        "malformed-payload",
+        "non-rfc-tested-at",
+        "result-id",
+        "provider-id",
+        "provider-version",
+        "build-hash",
+        "contract-version",
+        "suite-version",
+        "status",
+        "counts",
+        "executed-at",
+    ] {
+        manager
+            .connection
+            .execute_batch("SAVEPOINT adversarial_evidence_case")
+            .unwrap();
+        let evidence_id = format!("E-{case}");
+        // Each hostile row is uniquely latest at binding creation; an E1 tie
+        // must not mask the parser or projection guard under test.
+        let evidence_time = "2026-09-19T00:00:00.100Z";
+        let binding_time = "2026-09-19T00:00:00.250Z";
+        let mut payload = evidence(&evidence_id, "pass", evidence_time);
+        let capability = if case == "wrong-major" {
+            payload["semantic_capability_ref"] = "test.complete@2".into();
+            "test.complete@2"
+        } else {
+            "test.complete@1"
+        };
+        let tested_at = if case == "non-rfc-tested-at" {
+            payload["executed_at"] = "2026-09-19 00:00:00.100".into();
+            "2026-09-19 00:00:00.100"
+        } else {
+            evidence_time
+        };
+        match case {
+            "result-id" => payload["result_id"] = "E-forged".into(),
+            "provider-id" => payload["provider_id"] = "provider:forged".into(),
+            "provider-version" => payload["provider_version"] = "9.9.9".into(),
+            "build-hash" => payload["provider_build_identity"]["value"] = "build:forged".into(),
+            "contract-version" => payload["semantic_contract_version"] = "2.0".into(),
+            "suite-version" => payload["conformance_suite"]["version"] = "9.9".into(),
+            "status" => payload["result"] = "fail".into(),
+            "counts" => payload["tests_passed"] = 1.into(),
+            "executed-at" => payload["executed_at"] = "2026-09-19T00:00:00.200Z".into(),
+            _ => {}
+        }
+        let mut raw = canonical_json(&payload).unwrap();
+        let expiry = "\"expires_at\":\"2026-09-20T00:00:00Z\"";
+        raw = match case {
+            "duplicate-expiry" => raw.replacen(
+                expiry,
+                "\"expires_at\":\"2026-09-20T00:00:00Z\",\"expires_at\":null",
+                1,
+            ),
+            "nul-prefix-expiry" => raw.replacen(
+                expiry,
+                "\"expires_at\\u0000x\":null,\"expires_at\":\"2026-09-18T00:00:00Z\"",
+                1,
+            ),
+            "non-rfc-expiry" => raw.replacen(expiry, "\"expires_at\":\"2026-09-24 00:00:00\"", 1),
+            "malformed-payload" => "{}".into(),
+            _ => raw,
+        };
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             SELECT ?1,registration_id,?2,contract_hash,suite_id,suite_hash,
+                    status,?3,?4 FROM provider_conformance_evidence WHERE evidence_id='E1'",
+                params![evidence_id, capability, raw, tested_at],
+            )
+            .unwrap();
+        if case == "offset-equivalent-tie" {
+            let offset_time = "2026-09-19T01:00:00.100+01:00";
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO provider_conformance_evidence
+                     (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+                      status,evidence_json,tested_at)
+                     SELECT 'E-offset-tie',registration_id,capability,contract_hash,suite_id,
+                            suite_hash,status,?1,?2
+                     FROM provider_conformance_evidence WHERE evidence_id='E1'",
+                    params![
+                        canonical_json(&evidence("E-offset-tie", "pass", offset_time)).unwrap(),
+                        offset_time
+                    ],
+                )
+                .unwrap();
+        }
+        let mut receipt = first_receipt.clone();
+        receipt["binding_id"] = "binding-real-5".into();
+        receipt["attempt_id"] = "attempt-real-5".into();
+        receipt["attempt"] = 5.into();
+        receipt["capability"] = capability.into();
+        receipt["conformance_evidence_id"] = evidence_id.into();
+        receipt["created_at"] = binding_time.into();
+        let insertion = manager.connection.execute(
+            "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+              policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+              binding_json,created_at)
+             SELECT 'binding-real-5','attempt-real-5',task_id,semantic_program_hash,
+              registry_snapshot_id,ir_version,node_id,?2,capability_contract_hash,
+              provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+              provider_build_hash,5,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,?3,?4
+             FROM execution_bindings WHERE binding_id=?1",
+            params![
+                first,
+                capability,
+                canonical_json(&receipt).unwrap(),
+                binding_time
+            ],
+        );
+        if case == "valid-control" {
+            insertion.unwrap();
+            for table in [
+                "execution_bindings",
+                "execution_binding_admission_markers",
+                "execution_binding_trust_markers",
+                "execution_binding_enablement_markers",
+            ] {
+                let count: i64 = manager
+                    .connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-real-5'"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "valid control did not create {table}");
+            }
+            manager
+                .connection
+                .execute_batch(
+                    "ROLLBACK TO adversarial_evidence_case; RELEASE adversarial_evidence_case",
+                )
+                .unwrap();
+            continue;
+        }
+        let error = insertion.unwrap_err().to_string();
+        assert!(
+            error.contains("binding conformance evidence")
+                || error.contains("binding predates pinned conformance evidence"),
+            "{case}: {error}"
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-real-5'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{case} retained {table}");
+        }
+        manager
+            .connection
+            .execute_batch(
+                "ROLLBACK TO adversarial_evidence_case; RELEASE adversarial_evidence_case",
+            )
+            .unwrap();
+    }
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence
+         (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+          status,evidence_json,tested_at)
+         SELECT 'E-other',registration_id,capability,contract_hash,'suite:other',
+                suite_hash,
+                status,json_set(evidence_json,'$.result_id','E-other',
+                                '$.conformance_suite.id','suite:other'),
+                tested_at
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+            [],
+        )
+        .unwrap();
+    manager.connection.execute(
+        "INSERT INTO provider_conformance_evidence
+         (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+          status,evidence_json,tested_at)
+         SELECT 'E-other-hash',registration_id,capability,contract_hash,suite_id,
+                'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                status,json_set(evidence_json,'$.result_id','E-other-hash',
+                                '$.conformance_suite.hash',
+                                'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'),
+                tested_at
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+        [],
+    ).unwrap();
+    for mismatch in [
+        "id",
+        "version",
+        "manifest",
+        "build",
+        "null-manifest",
+        "null-build",
+        "missing-manifest",
+        "duplicate-provider-id",
+        "duplicate-provider-object",
+        "schema-version",
+        "binding-id",
+        "attempt-id",
+        "task-id",
+        "semantic-program-hash",
+        "registry-snapshot-id",
+        "ir-version",
+        "node-id",
+        "capability",
+        "contract-hash",
+        "attempt",
+        "created-at",
+        "policy-decisions",
+        "grant-refs",
+        "execution-profile",
+        "placement",
+        "inputs",
+        "outputs",
+        "suite-id",
+        "suite-hash",
+    ] {
+        let mut receipt = first_receipt.clone();
+        receipt["binding_id"] = "binding-real-5".into();
+        receipt["attempt_id"] = "attempt-real-5".into();
+        receipt["attempt"] = 5.into();
+        let mut projected_id = registration.provider_id.clone();
+        let mut projected_version = registration.provider_version.clone();
+        let mut projected_manifest = Some(registration.manifest_hash.clone());
+        let mut projected_build = Some(registration.build_hash.clone());
+        match mismatch {
+            "id" => projected_id = "provider:forged".into(),
+            "version" => projected_version = "9.9.9".into(),
+            "manifest" => projected_manifest = Some("manifest:forged".into()),
+            "build" => projected_build = Some("build:forged".into()),
+            "null-manifest" => projected_manifest = None,
+            "null-build" => projected_build = None,
+            "missing-manifest" => {
+                receipt["provider"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("manifest_hash");
+            }
+            "duplicate-provider-id" | "duplicate-provider-object" => {
+                receipt["provider"]["id"] = "provider:forged".into();
+            }
+            "schema-version" => receipt["schema_version"] = "wrong".into(),
+            "binding-id" => receipt["binding_id"] = "binding:wrong".into(),
+            "attempt-id" => receipt["attempt_id"] = "attempt:wrong".into(),
+            "task-id" => receipt["task_id"] = "task:wrong".into(),
+            "semantic-program-hash" => receipt["semantic_program_hash"] = "sha256:wrong".into(),
+            "registry-snapshot-id" => receipt["registry_snapshot_id"] = "snapshot:wrong".into(),
+            "ir-version" => receipt["ir_version"] = "wrong".into(),
+            "node-id" => receipt["node_id"] = "node:wrong".into(),
+            "capability" => receipt["capability"] = "wrong@1".into(),
+            "contract-hash" => receipt["capability_contract_hash"] = "sha256:wrong".into(),
+            "attempt" => receipt["attempt"] = "5".into(),
+            "created-at" => receipt["created_at"] = "2026-09-19T00:00:00.300Z".into(),
+            "policy-decisions" => receipt["policy_decision_refs"] = json!(["wrong"]),
+            "grant-refs" => receipt["authority"]["grant_refs"] = json!(["wrong"]),
+            "execution-profile" => {
+                receipt["execution_profile"]["profile_ref"] = "wrong".into();
+            }
+            "placement" => receipt["placement"] = json!({"locality":"wrong"}),
+            "inputs" => receipt["inputs"] = json!([]),
+            "outputs" => receipt["outputs"] = json!([]),
+            "suite-id" => receipt["conformance_evidence_id"] = "E-other".into(),
+            "suite-hash" => receipt["conformance_evidence_id"] = "E-other-hash".into(),
+            _ => unreachable!(),
+        }
+        let mut binding_json = canonical_json(&receipt).unwrap();
+        if mismatch == "duplicate-provider-id" {
+            binding_json = binding_json.replacen(
+                "\"provider\":{",
+                &format!("\"provider\":{{\"id\":\"{}\",", registration.provider_id),
+                1,
+            );
+        } else if mismatch == "duplicate-provider-object" {
+            binding_json = binding_json.replacen(
+                "\"provider\":",
+                &format!(
+                    "\"provider\":{},\"provider\":",
+                    canonical_json(&first_receipt["provider"]).unwrap()
+                ),
+                1,
+            );
+        }
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+              policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+              binding_json,created_at)
+             SELECT 'binding-real-5','attempt-real-5',task_id,semantic_program_hash,
+              registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+              provider_registration_id,?2,?3,?4,?5,5,policy_decision_refs_json,
+              grant_refs_json,execution_profile_ref,placement_json,?6,created_at
+             FROM execution_bindings WHERE binding_id=?1",
+                params![
+                    first,
+                    projected_id,
+                    projected_version,
+                    projected_manifest,
+                    projected_build,
+                    binding_json
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        let expected_rejection = if matches!(mismatch, "suite-id" | "suite-hash") {
+            error.contains("binding conformance evidence was not admitted")
+        } else if matches!(
+            mismatch,
+            "duplicate-provider-id" | "duplicate-provider-object"
+        ) {
+            // Both guards reject the duplicate; SQLite does not promise trigger order.
+            error.contains("binding provider identity")
+                || error.contains("binding predates provider trust admission")
+        } else {
+            error.contains("binding provider identity")
+        };
+        assert!(expected_rejection, "{mismatch}: {error}");
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-real-5'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{mismatch} retained {table}");
+        }
+    }
+    let identity_retry = insert(&manager, 5, "E1");
+    assert!(valid(
+        &mut manager,
+        &identity_retry,
+        "attempt-real-5",
+        "2026-09-19T00:00:00.250Z"
+    ));
+    // The baseline permits retained evidence without a suite ID. That older
+    // row cannot win latest Stage-1 evidence selection or abort the reader.
+    manager
+        .connection
+        .execute(
+            "INSERT INTO provider_conformance_evidence (
+            evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+            status,evidence_json,tested_at)
+         SELECT 'legacy-null-suite',registration_id,capability,contract_hash,NULL,suite_hash,
+                status,evidence_json,'2026-09-19T00:00:00.200Z'
+         FROM provider_conformance_evidence WHERE evidence_id='E1'",
+            [],
+        )
+        .unwrap();
+    assert!(valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.250Z"
+    ));
+    let null_suite_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-null-suite','attempt-null-suite',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,15,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-null-suite',
+                                      '$.attempt_id','attempt-null-suite','$.attempt',15,
+                                      '$.conformance_evidence_id','legacy-null-suite'),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&first],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        null_suite_error.contains("binding conformance evidence is not latest"),
+        "{null_suite_error}"
+    );
+    manager
+        .connection
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF;")
+        .unwrap();
+    // A result recorded later cannot retroactively authenticate a binding.
+    // The trigger checks row existence at the instant the immutable row is inserted.
+    let premature_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-premature','attempt-premature',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,98,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+            json_set(binding_json,'$.binding_id','binding-premature',
+                                  '$.attempt_id','attempt-premature',
+                                  '$.attempt',98,
+                                  '$.conformance_evidence_id','E2',
+                                  '$.created_at','2026-09-19T00:00:00.600Z'),
+           '2026-09-19T00:00:00.600Z'
+         FROM execution_bindings WHERE binding_id=?1",
+            [&first],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        premature_error.contains("binding conformance evidence is not latest"),
+        "{premature_error}"
+    );
+    assert!(
+        manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO execution_bindings
+         SELECT * FROM execution_bindings WHERE binding_id=?1 AND 1=1",
+                [&first],
+            )
+            .is_err()
+    );
+    assert!(
+        manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-replaced-attempt',attempt_id,task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,99,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,binding_json,created_at
+         FROM execution_bindings WHERE binding_id=?1",
+                [&first],
+            )
+            .is_err()
+    );
+    assert_eq!(manager.connection.query_row(
+        "SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1 AND attempt_id='attempt-real-2'",
+        [&first], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    let reopened_copy = tempdir().unwrap();
+    let copied_path = reopened_copy.path().join("bindings.sqlite3");
+    manager
+        .connection
+        .execute("VACUUM INTO ?1", [copied_path.to_str().unwrap()])
+        .unwrap();
+    let reopened = Connection::open(copied_path).unwrap();
+    assert_eq!(reopened.query_row(
+        "SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1 AND attempt_id='attempt-real-2'",
+        [&first], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    // Emulate a stamped 0013 database written before the insert guard and
+    // admission marker existed. This immutable binding predicts absent E2.
+    manager
+        .connection
+        .execute_batch(
+            "DROP TRIGGER execution_binding_evidence_present_at_insert;
+         DROP TRIGGER execution_binding_evidence_not_future;
+         DROP TRIGGER execution_binding_evidence_unexpired_at_insert;
+         DROP TRIGGER execution_binding_evidence_latest_at_insert;
+         DROP TRIGGER execution_binding_admission_marker_insert;
+         DROP TABLE execution_binding_admission_markers;",
+        )
+        .unwrap();
+    let historical = insert(&manager, 98, "E2");
+    manager
+        .connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    manager.provider_store_writer().unwrap();
+    let old_markers: i64 = manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM execution_binding_admission_markers WHERE binding_id=?1",
+            [&historical],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_markers, 0);
+    for attack in [
+        format!(
+            "INSERT INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{historical}','E2')"
+        ),
+        format!(
+            "INSERT OR REPLACE INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{historical}','E2')"
+        ),
+    ] {
+        assert!(
+            manager.connection.execute_batch(&attack).is_err(),
+            "{attack}"
+        );
+    }
+    record(&mut manager, "E2", "pass", "2026-09-19T00:00:00.500Z");
+    assert!(!valid(
+        &mut manager,
+        &historical,
+        "attempt-real-98",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    assert!(!valid(
+        &mut manager,
+        &first,
+        "attempt-real-2",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .disable(&registration.registration_id, "2026-09-19T00:00:00.200Z")
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    let backdated_enablement = manager.connection.execute(
+        "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-backdated','attempt-backdated',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,4,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+           json_set(binding_json,'$.binding_id','binding-backdated',
+                    '$.attempt_id','attempt-backdated','$.attempt',4,
+                    '$.created_at','2026-09-19T00:00:00.400Z'),
+           '2026-09-19T00:00:00.400Z'
+         FROM execution_bindings WHERE binding_id=?1",
+        [&first],
+    );
+    assert!(
+        backdated_enablement
+            .unwrap_err()
+            .to_string()
+            .contains("binding predates provider enablement"),
+        "a provider enabled at T2 cannot accept a binding claiming T1"
+    );
+    let stale = manager.connection.execute(
+        "INSERT INTO execution_bindings (
+           binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+           ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+           provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+           policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+           binding_json,created_at)
+         SELECT 'binding-real-3','attempt-real-3',task_id,semantic_program_hash,
+           registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+           provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+           provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+           execution_profile_ref,placement_json,
+           json_set(binding_json,'$.binding_id','binding-real-3',
+                    '$.attempt_id','attempt-real-3','$.attempt',3,
+                    '$.created_at','2026-09-19T00:00:00.600Z'),
+           '2026-09-19T00:00:00.600Z'
+         FROM execution_bindings WHERE binding_id=?1",
+        [&first],
+    );
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains("binding conformance evidence is not latest"),
+        "a superseded pass cannot consume a new attempt identity"
+    );
+    let second = insert(&manager, 3, "E2");
+    assert!(valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    // A second disable/enable at exactly the same timestamp still mints a
+    // distinct interval. The prior immutable binding cannot ride the new one.
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .disable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, "2026-09-19T00:00:00.500Z")
+        .unwrap();
+    assert!(!valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    let new_interval = insert(&manager, 4, "E2");
+    assert!(valid(
+        &mut manager,
+        &new_interval,
+        "attempt-real-4",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    // The immutable admission receipt is the trust ceiling. A retained row
+    // whose projection was raised by an older writer cannot authorize launch.
+    assert!(manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).is_err());
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER provider_registration_trust_immutable_update")
+        .unwrap();
+    manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).unwrap();
+    assert!(!valid(
+        &mut manager,
+        &new_interval,
+        "attempt-real-4",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    manager.connection.execute(
+        "UPDATE provider_registrations SET trust_status='locally-trusted' WHERE registration_id=?1",
+        [&registration.registration_id],
+    ).unwrap();
+    manager
+        .connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    assert!(valid(
+        &mut manager,
+        &new_interval,
+        "attempt-real-4",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    for attack in [
+        format!(
+            "UPDATE execution_binding_admission_markers SET conformance_evidence_id='E1' WHERE binding_id='{second}'"
+        ),
+        format!("DELETE FROM execution_binding_admission_markers WHERE binding_id='{second}'"),
+        format!(
+            "INSERT OR REPLACE INTO execution_binding_admission_markers(binding_id,conformance_evidence_id) VALUES ('{second}','E1')"
+        ),
+    ] {
+        assert!(
+            manager.connection.execute_batch(&attack).is_err(),
+            "{attack}"
+        );
+    }
+    manager.connection.execute_batch("VACUUM").unwrap();
+    assert!(valid(
+        &mut manager,
+        &new_interval,
+        "attempt-real-4",
+        "2026-09-19T00:00:00.750Z"
+    ));
+    record(&mut manager, "E3", "fail", "2026-09-19T00:00:00.875Z");
+    assert!(!valid(
+        &mut manager,
+        &second,
+        "attempt-real-3",
+        "2026-09-19T00:00:00.900Z"
+    ));
+    let stored: String = manager
+        .connection
+        .query_row(
+            "SELECT binding_json FROM execution_bindings WHERE binding_id=?1",
+            [&first],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap()["conformance_evidence_id"],
+        "E1"
+    );
+    let mut expiring = evidence("E4-expiring", "pass", "2026-09-19T00:00:00.950Z");
+    expiring["expires_at"] = "2026-09-19T01:00:00.960000001+01:00".into();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&expiring).unwrap(),
+        )
+        .unwrap();
+    let insert_expiry =
+        |manager: &TaskManager, id: &str, attempt: i64, pin: &str, created: &str| {
+            manager.connection.execute(
+                "INSERT INTO execution_bindings (
+             binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+             policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+             binding_json,created_at)
+             SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,?3,
+             policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+             json_set(binding_json,'$.binding_id',?1,'$.attempt_id',?2,'$.attempt',?3,
+                      '$.conformance_evidence_id',?4,'$.created_at',?5),?5
+             FROM execution_bindings WHERE binding_id=?6",
+                params![
+                    id,
+                    format!("attempt-{id}"),
+                    attempt,
+                    pin,
+                    created,
+                    new_interval
+                ],
+            )
+        };
+    for created in [
+        "2026-09-19T00:00:00.960000001Z",
+        "2026-09-19T00:00:00.960000002Z",
+    ] {
+        assert!(
+            insert_expiry(&manager, "binding-expiry", 10, "E4-expiring", created)
+                .unwrap_err()
+                .to_string()
+                .contains("expired at creation")
+        );
+        for table in [
+            "execution_bindings",
+            "execution_binding_admission_markers",
+            "execution_binding_trust_markers",
+            "execution_binding_enablement_markers",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE binding_id='binding-expiry'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained a failed insert");
+        }
+    }
+    insert_expiry(
+        &manager,
+        "binding-expiry",
+        10,
+        "E4-expiring",
+        "2026-09-19T00:00:00.960Z",
+    )
+    .unwrap();
+    let mut unbounded = evidence("E5-unbounded", "pass", "2026-09-19T00:00:00.970Z");
+    unbounded.as_object_mut().unwrap().remove("expires_at");
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&unbounded).unwrap(),
+        )
+        .unwrap();
+    let fresh = insert(&manager, 12, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &fresh,
+        "attempt-real-12",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER execution_binding_evidence_present_at_insert")
+        .unwrap();
+    let owner = manager.lease_owner.clone();
+    upgrade_stamped_registry_guards_fenced(
+        &mut manager.connection,
+        &owner,
+        manager.lease_epoch,
+        TEST_TIME,
+    )
+    .unwrap();
+    assert!(!valid(
+        &mut manager,
+        &fresh,
+        "attempt-real-12",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    assert_eq!(
+        manager
+            .connection
+            .query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "registered"
+    );
+    let after_repair = insert(&manager, 13, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &after_repair,
+        "attempt-real-13",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    let spaced = insert(&manager, 14, "E5-unbounded");
+    assert!(valid(
+        &mut manager,
+        &spaced,
+        "attempt-real-14",
+        "2026-09-19T00:00:00.990Z"
+    ));
+    manager
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_admissions SET state='DEPRECATED'
+         WHERE snapshot_id=?1",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let generation: i64 = manager
+        .connection
+        .query_row(
+            "SELECT MAX(generation) FROM semantic_repair_fences",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(generation, 0);
+    let deprecated_error = manager
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-real-15','attempt-real-15',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,15,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-real-15',
+                                      '$.attempt_id','attempt-real-15','$.attempt',15),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&spaced],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        deprecated_error.contains("binding requires current semantic re-attestation"),
+        "{deprecated_error}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the real file-backed admission, repair, re-attestation, and same-build binding chronology together"
+)]
+fn semantic_repair_allows_fresh_same_build_binding_after_reattest() {
+    use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+    use aios_registry::{
+        ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
+    };
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("same-build-recovery.sqlite3");
+    let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    manager.create_task(&create("T-same-build")).unwrap();
+    manager.initialize_provider_store().unwrap();
+    let mut snapshot: RegistrySnapshot = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/registry-snapshot.json"
+    ))
+    .unwrap();
+    let types: Vec<TypeContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/type-contracts.json"
+    ))
+    .unwrap();
+    let mut capabilities: Vec<CapabilityContract> = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/capability-contracts.json"
+    ))
+    .unwrap();
+    let claimed = capabilities
+        .iter_mut()
+        .find(|contract| contract.capability == "artifact.hash")
+        .unwrap();
+    claimed.conformance.suite_hash = Some(SUITE_HASH.into());
+    let contract_hash = aios_registry::capability_contract_hash(claimed)
+        .unwrap()
+        .to_string();
+    snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "artifact.hash")
+        .unwrap()
+        .content_hash = contract_hash.clone();
+    let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+        id: entry.id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    };
+    snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &snapshot.schema_version,
+        &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+        &snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let mut selected_snapshot = snapshot.clone();
+    selected_snapshot
+        .capability_contracts
+        .retain(|entry| entry.id != "artifact.copy.compat");
+    selected_snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &selected_snapshot.schema_version,
+        &selected_snapshot
+            .type_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+        &selected_snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let selected_registry = SemanticRegistry::from_records(
+        selected_snapshot,
+        types.clone(),
+        capabilities
+            .iter()
+            .filter(|contract| contract.capability != "artifact.copy.compat")
+            .cloned()
+            .collect(),
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    let registry = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    manager
+        .registry_store_writer()
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    manager
+        .registry_store_writer()
+        .unwrap()
+        .admit_registry(&selected_registry)
+        .unwrap();
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/provider-conformance-cases.json"
+    ))
+    .unwrap();
+    let mut manifest = cases[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["contract_hash"] = contract_hash.clone().into();
+    manifest["provides"][0]["conformance"]["suite_hash"] = SUITE_HASH.into();
+    let build = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let registration = manager
+        .provider_store_writer()
+        .unwrap()
+        .register(
+            &registry,
+            &serde_json::to_vec(&manifest).unwrap(),
+            build,
+            ProviderTrustStatus::LocallyTrusted,
+            TEST_TIME,
+        )
+        .unwrap();
+    let evidence = json!({
+        "schema_version":"0.1", "result_id":"E-same-build",
+        "provider_id":registration.provider_id, "provider_version":registration.provider_version,
+        "provider_build_identity":{"kind":"build_hash","value":build},
+        "semantic_capability_ref":"artifact.hash@1", "semantic_contract_version":"1.0",
+        "semantic_contract_hash":contract_hash,
+        "conformance_suite":{"id":manifest["provides"][0]["conformance"]["suite"],
+                             "version":"0.1", "hash":SUITE_HASH},
+        "harness":{"id":"fixture-harness","version":"1"},
+        "result":"pass", "tests_total":1, "tests_passed":1, "tests_failed":0,
+        "executed_at":TEST_TIME, "expires_at":"2026-09-20T00:00:00Z"
+    });
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, TEST_TIME)
+        .unwrap();
+    let insert = |manager: &TaskManager, attempt: i64| {
+        let binding_id = format!("binding-same-build-{attempt}");
+        let attempt_id = format!("attempt-same-build-{attempt}");
+        let receipt = json!({
+            "schema_version":SCHEMA_VERSION, "binding_id":binding_id, "attempt_id":attempt_id,
+            "task_id":"T-same-build", "semantic_program_hash":HASH,
+            "registry_snapshot_id":registry.snapshot_id(), "ir_version":"0.1",
+            "node_id":"node-same-build", "capability":"artifact.hash@1",
+            "capability_contract_hash":contract_hash,
+            "provider":{"id":registration.provider_id,"version":registration.provider_version,
+                        "manifest_hash":registration.manifest_hash,
+                        "package_or_build_hash":registration.build_hash},
+            "provider_trust_source_id":registration.registration_id,
+            "conformance_evidence_id":"E-same-build", "attempt":attempt,
+            "policy_decision_refs":[], "authority":{"grant_refs":[]},
+            "execution_profile":{"profile_ref":"profile:test"},
+            "placement":{"locality":"local"}, "inputs":{}, "outputs":{},
+            "created_at":TEST_TIME
+        });
+        manager.connection.execute(
+            "INSERT INTO execution_bindings(binding_id,attempt_id,task_id,semantic_program_hash,
+             registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+             provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+             provider_build_hash,attempt,policy_decision_refs_json,grant_refs_json,
+             execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES (?1,?2,'T-same-build',?3,?4,'0.1','node-same-build','artifact.hash@1',
+             ?5,?6,?7,?8,?9,?10,?11,'[]','[]','profile:test','{\"locality\":\"local\"}',?12,?13)",
+            params![binding_id, attempt_id, HASH, registry.snapshot_id(), contract_hash,
+                registration.registration_id, registration.provider_id,
+                registration.provider_version, registration.manifest_hash,
+                registration.build_hash, attempt, canonical_json(&receipt).unwrap(), TEST_TIME],
+        ).unwrap();
+        (binding_id, attempt_id)
+    };
+    let accepted = |manager: &mut TaskManager, binding_id: &str, attempt_id: &str| {
+        let binding_json: String = manager
+            .connection
+            .query_row(
+                "SELECT binding_json FROM execution_bindings WHERE binding_id=?1",
+                [binding_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let binding = BindingEvidence {
+            capability: "artifact.hash@1".into(),
+            principal_id: registration.provider_id.clone(),
+            program_json: String::new(),
+            registry_snapshot_id: registry.snapshot_id().into(),
+            contract_hash: Some(contract_hash.clone()),
+            snapshot_manifest_json: String::new(),
+            ir_version: "0.1".into(),
+            provider_version: registration.provider_version.clone(),
+            provider_manifest_hash: Some(registration.manifest_hash.clone()),
+            provider_build_hash: Some(registration.build_hash.clone()),
+            provider_registration_id: Some(registration.registration_id.clone()),
+            attempt: if binding_id.ends_with("-1") { 1 } else { 2 },
+            policy_decision_refs_json: "[]".into(),
+            grant_refs_json: "[]".into(),
+            execution_profile_ref: "profile:test".into(),
+            placement_json: "{\"locality\":\"local\"}".into(),
+            binding_json,
+            created_at: TEST_TIME.into(),
+            conformance_evidence_id: "E-same-build".into(),
+            conformance_suite_id: manifest["provides"][0]["conformance"]["suite"]
+                .as_str()
+                .map(str::to_owned),
+            conformance_suite_hash: Some(SUITE_HASH.into()),
+            conformance_status: "pass".into(),
+            conformance_json: canonical_json(&evidence).unwrap(),
+            conformance_tested_at: Some(TEST_TIME.into()),
+        };
+        let check = BindingGrantCheck {
+            task_id: "T-same-build",
+            semantic_hash: HASH,
+            node_id: "node-same-build",
+            binding_id,
+            attempt_id,
+            grant_refs_json: "[]",
+            checked_at: TEST_TIME,
+        };
+        let transaction = manager.connection.transaction().unwrap();
+        let current_enablement: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM execution_binding_enablement_markers marker
+             JOIN provider_state_epochs epoch ON epoch.registration_id=marker.registration_id
+               AND epoch.revision=marker.revision
+             WHERE marker.binding_id=?1 AND marker.registration_id=?2
+               AND epoch.state='registered'
+               AND epoch.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                                   WHERE registration_id=?2))",
+                params![binding_id, registration.registration_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        current_enablement
+            && binding_receipt_projection(&binding, &check, true).is_some()
+            && verified_provider_admission_from_binding(
+                &transaction,
+                binding_id,
+                &binding,
+                TEST_TIME,
+            )
+            .unwrap()
+    };
+    let (old_binding, old_attempt) = insert(&manager, 1);
+    assert!(accepted(&mut manager, &old_binding, &old_attempt));
+    manager
+        .connection
+        .execute_batch("DROP TRIGGER one_way_registry_snapshot_admissions_update")
+        .unwrap();
+    drop(manager);
+    let mut repaired = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(!accepted(&mut repaired, &old_binding, &old_attempt));
+    repaired
+        .registry_store_writer()
+        .unwrap()
+        .reattest_snapshot(
+            registry.snapshot_id(),
+            "decision:same-build-recovery",
+            "local-authority",
+        )
+        .unwrap();
+    repaired
+        .registry_store_writer()
+        .unwrap()
+        .reattest_snapshot(
+            selected_registry.snapshot_id(),
+            "decision:selected-snapshot-recovery",
+            "local-authority",
+        )
+        .unwrap();
+    assert!(!accepted(&mut repaired, &old_binding, &old_attempt));
+    let candidates = repaired
+        .provider_store_writer()
+        .unwrap()
+        .eligible_candidates(
+            "artifact.hash@1",
+            &contract_hash,
+            registry.snapshot_id(),
+            TEST_TIME,
+        )
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].registration.registration_id,
+        registration.registration_id
+    );
+    let (fresh_binding, fresh_attempt) = insert(&repaired, 2);
+    assert!(accepted(&mut repaired, &fresh_binding, &fresh_attempt));
+    assert_eq!(
+        repaired
+            .connection
+            .query_row(
+                "SELECT package_content_hash FROM provider_registrations WHERE registration_id=?1",
+                [&registration.registration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        build
+    );
+    drop(repaired);
+    let mut stable = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    assert!(!accepted(&mut stable, &old_binding, &old_attempt));
+    assert!(accepted(&mut stable, &fresh_binding, &fresh_attempt));
+    stable
+        .connection
+        .execute(
+            "UPDATE registry_snapshot_admissions SET state='DEPRECATED'
+         WHERE snapshot_id=?1",
+            [registry.snapshot_id()],
+        )
+        .unwrap();
+    let candidates = stable
+        .provider_store_writer()
+        .unwrap()
+        .eligible_candidates(
+            "artifact.hash@1",
+            &contract_hash,
+            selected_registry.snapshot_id(),
+            TEST_TIME,
+        )
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].registration.registration_id,
+        registration.registration_id
+    );
+    let error = stable
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-same-build-3','attempt-same-build-3',task_id,semantic_program_hash,
+                registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-same-build-3',
+                                      '$.attempt_id','attempt-same-build-3','$.attempt',3),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            [&fresh_binding],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("binding requires current semantic re-attestation"),
+        "{error}"
+    );
+    for table in [
+        "execution_bindings",
+        "execution_binding_admission_markers",
+        "execution_binding_trust_markers",
+        "execution_binding_enablement_markers",
+    ] {
+        assert_eq!(
+            stable
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE binding_id='binding-same-build-3'"
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    drop(stable);
+    let stable = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+    stable
+        .connection
+        .execute(
+            "INSERT INTO execution_bindings
+         (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+          ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+          provider_id,provider_version,provider_manifest_hash,provider_build_hash,attempt,
+          policy_decision_refs_json,grant_refs_json,execution_profile_ref,placement_json,
+          binding_json,created_at)
+         SELECT 'binding-same-build-3','attempt-same-build-3',task_id,semantic_program_hash,
+                ?2,ir_version,node_id,capability,capability_contract_hash,
+                provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+                provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+                execution_profile_ref,placement_json,
+                json_set(binding_json,'$.binding_id','binding-same-build-3',
+                                      '$.attempt_id','attempt-same-build-3','$.attempt',3,
+                                      '$.registry_snapshot_id',?2),
+                created_at
+         FROM execution_bindings WHERE binding_id=?1",
+            params![fresh_binding, selected_registry.snapshot_id()],
+        )
+        .unwrap();
+    assert_eq!(
+        stable
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM execution_binding_admission_markers
+         WHERE binding_id='binding-same-build-3'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -6004,18 +8640,26 @@ fn null_certainty_started_and_unknown_operations_block_execution_advancement() {
 
 #[test]
 fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
-    for (name, mutation) in [
+    for (name, mutation, admitted) in [
         (
             "unknown-trust",
             "UPDATE provider_registrations SET trust_status='self-declared' WHERE registration_id='registration-completion'",
+            false,
         ),
         (
             "nonpass-conformance",
             "UPDATE provider_conformance_evidence SET status='fail' WHERE evidence_id='evidence-completion'",
+            false,
+        ),
+        (
+            "organization-approved",
+            "UPDATE provider_registrations SET trust_status='organization-approved' WHERE registration_id='registration-completion'",
+            true,
         ),
     ] {
         let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
         seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+        align_completion_fixture_state(&mut manager, TaskState::Recovering);
         manager.connection.execute_batch(
             "UPDATE tasks SET state='RECOVERING', waiting_on_json='[]' WHERE task_id='T-completion';
              UPDATE step_executions SET state='READY', outcome_certainty='NOT_STARTED' WHERE attempt_id='attempt-completion';
@@ -6034,15 +8678,32 @@ fn provider_admission_rejects_unrecognized_trust_and_nonpassing_conformance() {
                 TaskState::Running,
             ))
             .unwrap();
-        assert!(!result.applied, "{name}");
-        assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+        assert_eq!(result.applied, admitted, "{name}");
+        if !admitted {
+            assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED", "{name}");
+        }
         let step = manager
             .get_step_execution("attempt-completion")
             .unwrap()
             .unwrap();
-        assert_eq!(step.state, StepState::Ready, "{name}");
+        assert_eq!(
+            step.state,
+            if admitted {
+                StepState::Running
+            } else {
+                StepState::Ready
+            },
+            "{name}"
+        );
         let task = manager.get_task("T-completion").unwrap().unwrap();
-        assert_eq!((task.state, task.revision), (TaskState::Recovering, 2));
+        assert_eq!(
+            (task.state, task.revision),
+            if admitted {
+                (TaskState::Running, 3)
+            } else {
+                (TaskState::Recovering, 2)
+            }
+        );
     }
 }
 
@@ -7766,12 +10427,14 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
         PolicyDecisionRefs,
         ExecutionProfile,
         BindingJson(&'static str, Value),
+        BindingJsonDuplicate,
         RegistrationProviderIdentity,
     }
 
     let cases = vec![
         ("policy-decision-refs", Tamper::PolicyDecisionRefs),
         ("execution-profile", Tamper::ExecutionProfile),
+        ("duplicate-binding-key", Tamper::BindingJsonDuplicate),
         (
             "binding-id",
             Tamper::BindingJson("/binding_id", serde_json::json!("binding:forged")),
@@ -7904,6 +10567,26 @@ fn running_admission_rejects_each_forged_binding_identity_without_task_or_step_m
                     )
                     .unwrap();
             }
+            Tamper::BindingJsonDuplicate => {
+                let raw: String = manager
+                    .connection
+                    .query_row(
+                        "SELECT binding_json FROM execution_bindings
+                     WHERE binding_id='binding-completion'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let ambiguous = raw.replacen('{', "{\"attempt\":1,", 1);
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE execution_bindings SET binding_json=?1
+                     WHERE binding_id='binding-completion'",
+                        [ambiguous],
+                    )
+                    .unwrap();
+            }
             Tamper::RegistrationProviderIdentity => {
                 manager
                     .connection
@@ -7965,6 +10648,81 @@ fn prepare_completion_for_admission(manager: &TaskManager) {
              DELETE FROM artifact_publications WHERE publication_id='publication-completion';",
         )
         .unwrap();
+}
+
+#[test]
+fn legacy_provider_registration_cannot_cross_the_active_snapshot() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    prepare_completion_for_admission(&manager);
+    // Exercise the pre-0013 launch profile while keeping the otherwise valid
+    // completion fixture. The second snapshot retains the capability hash but
+    // changes its type catalog, so a registration against it is not authority
+    // for the active program's snapshot.
+    manager
+        .connection
+        .execute(
+            "DELETE FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+            [],
+        )
+        .unwrap();
+    let check = BindingGrantCheck {
+        task_id: "T-completion",
+        semantic_hash: HASH,
+        node_id: "node-completion",
+        binding_id: "binding-completion",
+        attempt_id: "attempt-completion",
+        grant_refs_json: "[]",
+        checked_at: TEST_TIME,
+    };
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(binding_grants_valid(&transaction, &check).unwrap());
+    transaction.commit().unwrap();
+
+    manager.connection.execute_batch(
+        "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+           SELECT 'snapshot-other',
+                  json_set(manifest_json,'$.snapshot_id','snapshot-other',
+                           '$.type_contracts',json('[{\"id\":\"artifact.other\",\"version\":\"1.0\",\"content_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"}]')),
+                  created_at FROM registry_snapshots WHERE snapshot_id='snapshot-completion';
+         UPDATE provider_registrations SET registry_snapshot_id='snapshot-other'
+           WHERE registration_id='registration-completion';",
+    ).unwrap();
+    let transaction = manager.connection.transaction().unwrap();
+    assert!(!binding_grants_valid(&transaction, &check).unwrap());
+    transaction.commit().unwrap();
+
+    let task_before = manager.get_task("T-completion").unwrap().unwrap();
+    let step_before = manager
+        .get_step_execution("attempt-completion")
+        .unwrap()
+        .unwrap();
+    let provenance_before = manager.provenance_count("T-completion").unwrap();
+    let result = manager
+        .transition(&request(
+            "tr-legacy-snapshot-mismatch",
+            "T-completion",
+            task_before.revision,
+            TaskState::Runnable,
+            TaskState::Running,
+        ))
+        .unwrap();
+    assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+    assert_eq!(
+        manager.get_task("T-completion").unwrap().unwrap(),
+        task_before
+    );
+    assert_eq!(
+        manager
+            .get_step_execution("attempt-completion")
+            .unwrap()
+            .unwrap(),
+        step_before
+    );
+    assert_eq!(
+        manager.provenance_count("T-completion").unwrap(),
+        provenance_before
+    );
 }
 
 fn mutate_json_column(

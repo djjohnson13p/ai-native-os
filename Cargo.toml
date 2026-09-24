@@ -23,7 +23,7 @@ fs2 = "0.4.3"
 clap = { version = "4.5.48", features = ["derive"] }
 jsonschema = { version = "=0.37.4", default-features = false }
 proptest = "1.8.0"
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "functions"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_json_canonicalizer = "=0.3.2"

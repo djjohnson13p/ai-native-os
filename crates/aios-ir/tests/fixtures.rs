@@ -8,10 +8,12 @@ use aios_contracts::{
 };
 use aios_ir::{ValidationLimits, ValidationReport, Validator};
 use aios_registry::{
-    HashVerificationMode, RegistryBuildOptions, RegistryLoadOptions, SemanticRegistry,
+    HashVerificationMode, ProviderStore, ProviderTrustStatus, RegistryBuildOptions,
+    RegistryLoadOptions, RegistryStore, SemanticRegistry, SnapshotHashEntry,
 };
 use jsonschema::Resource;
 use proptest::prelude::*;
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -412,6 +414,201 @@ fn downstream_examples_reference_generated_semantic_identities() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn stage1_binding_schema_requires_launch_identities_and_pins() {
+    let specs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../specs");
+    let schema: Value =
+        serde_json::from_slice(&fs::read(specs.join("execution-binding.schema.json")).unwrap())
+            .unwrap();
+    let compiled = jsonschema::validator_for(&schema).unwrap();
+    let binding = fixture_value("execution-binding-import-table.json");
+    assert!(compiled.is_valid(&binding));
+
+    let mut unpinned = binding.clone();
+    unpinned
+        .as_object_mut()
+        .unwrap()
+        .remove("conformance_evidence_id");
+    assert!(!compiled.is_valid(&unpinned));
+
+    let mut empty_pin = binding.clone();
+    empty_pin["conformance_evidence_id"] = "".into();
+    assert!(!compiled.is_valid(&empty_pin));
+
+    for field in ["provider_trust_source_id", "capability_contract_hash"] {
+        let mut missing = binding.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(!compiled.is_valid(&missing), "missing {field}");
+        missing[field] = Value::Null;
+        assert!(!compiled.is_valid(&missing), "null {field}");
+    }
+    for field in ["manifest_hash", "package_or_build_hash"] {
+        let mut missing = binding.clone();
+        missing["provider"].as_object_mut().unwrap().remove(field);
+        assert!(!compiled.is_valid(&missing), "missing provider.{field}");
+        missing["provider"][field] = Value::Null;
+        assert!(!compiled.is_valid(&missing), "null provider.{field}");
+    }
+}
+
+const PROVIDER_TEST_SUITE_HASH: &str =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn provider_test_registry(authored: &SemanticRegistry) -> (SemanticRegistry, String) {
+    let mut snapshot = authored.snapshot().clone();
+    let types = authored.type_contracts().cloned().collect::<Vec<_>>();
+    let mut capabilities = authored.capability_contracts().cloned().collect::<Vec<_>>();
+    let hash_contract = capabilities
+        .iter_mut()
+        .find(|contract| contract.capability == "artifact.hash")
+        .unwrap();
+    hash_contract.conformance.suite_hash = Some(PROVIDER_TEST_SUITE_HASH.into());
+    let hash = aios_registry::capability_contract_hash(hash_contract)
+        .unwrap()
+        .to_string();
+    let hash_entry = snapshot
+        .capability_contracts
+        .iter_mut()
+        .find(|entry| entry.id == "artifact.hash")
+        .unwrap();
+    hash_entry.content_hash.clone_from(&hash);
+    let view = |entry: &aios_contracts::ContractRef| SnapshotHashEntry {
+        id: entry.id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    };
+    snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+        &snapshot.schema_version,
+        &snapshot.type_contracts.iter().map(view).collect::<Vec<_>>(),
+        &snapshot
+            .capability_contracts
+            .iter()
+            .map(view)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .to_string();
+    let registry = SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        RegistryBuildOptions::default(),
+    )
+    .unwrap();
+    assert!(registry.is_strictly_verified());
+    (registry, hash)
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps semantic-hash invariance across provider inventory changes in one fixture"
+)]
+fn provider_inventory_changes_do_not_change_validated_semantic_program_hash() {
+    let authored =
+        SemanticRegistry::load_bundle(fixture_root(), RegistryLoadOptions::default()).unwrap();
+    let (registry, hash) = provider_test_registry(&authored);
+    let program = fixture_value("canonicalization-cases.json")["cases"][1]["left"].clone();
+    let authored_hash = validate(
+        &Validator::new(authored, ValidationLimits::default()),
+        &program,
+    )
+    .output
+    .validation
+    .semantic_hash;
+    let baseline = validate(
+        &Validator::new(registry.clone(), ValidationLimits::default()),
+        &program,
+    );
+    assert!(baseline.output.validation.valid);
+    let expected_hash = baseline.output.validation.semantic_hash.clone();
+    assert_eq!(expected_hash, authored_hash);
+
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+        .unwrap();
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0001_v0_1_trusted_control_plane','UNGENERATED-DRAFT-CHECKSUM','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))
+        .unwrap();
+    connection.execute(
+        "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1','2026-09-19T00:00:00Z')",
+        [],
+    ).unwrap();
+    RegistryStore::initialize_in_memory(&mut connection)
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    let mut providers = ProviderStore::initialize_in_memory(&mut connection).unwrap();
+    let mut manifest = fixture_value("provider-conformance-cases.json")[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["contract_hash"] = hash.into();
+    manifest["provides"][0]["conformance"]["suite_hash"] = PROVIDER_TEST_SUITE_HASH.into();
+    for (id, build) in [
+        (
+            "org.ainative.fixture.artifact-hash-a",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "org.ainative.fixture.artifact-hash-b",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        manifest["id"] = id.into();
+        let registered = providers
+            .register(
+                &registry,
+                &serde_json::to_vec(&manifest).unwrap(),
+                build,
+                ProviderTrustStatus::LocallyTrusted,
+                FIXED_TIME,
+            )
+            .unwrap();
+        let after_registration = validate(
+            &Validator::new(registry.clone(), ValidationLimits::default()),
+            &program,
+        );
+        assert_eq!(
+            after_registration.output.validation.semantic_hash,
+            expected_hash
+        );
+        providers
+            .revoke(&registered.registration_id, FIXED_TIME)
+            .unwrap();
+    }
+    let after_revocation = validate(
+        &Validator::new(registry, ValidationLimits::default()),
+        &program,
+    );
+    assert_eq!(
+        after_revocation.output.validation.semantic_hash,
+        expected_hash
+    );
 }
 
 #[test]

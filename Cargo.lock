@@ -41,6 +41,7 @@ dependencies = [
  "aios-registry",
  "jsonschema",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -80,20 +81,26 @@ version = "0.1.0"
 dependencies = [
  "aios-contracts",
  "cap-std",
+ "fs2",
  "jsonschema",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+ "tempfile",
  "time",
+ "winx",
 ]
 
 [[package]]
 name = "aios-task-manager"
 version = "0.1.0"
 dependencies = [
+ "aios-contracts",
  "aios-ir",
  "aios-provenance",
+ "aios-registry",
  "cap-std",
  "fs2",
  "jsonschema",

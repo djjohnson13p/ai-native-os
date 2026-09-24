@@ -18,6 +18,8 @@ A provider registration references semantic families/exact tested contract evide
 
 Registry Snapshot admission/activation is separate from Provider registration/enablement.
 
+An additive `0014` semantic repair fence separates historical admission projections from prospective executable authority. Repair of a missing `0012` guard advances an append-only generation; a snapshot can be used again only after the owner-bound local writer strictly re-verifies persisted content and records a fresh decision/source receipt for that generation. This does not undo QUARANTINED/REVOKED terminal state, restore old bindings, or rehabilitate an activation scope whose revision history may have been rolled back. A terminal marker remains authoritative even if the admission projection was forged. An append-only activation identity ledger retains deleted and renamed scope identities for repair containment. If activation guards were already absent before this ledger bootstrapped, the store globally quarantines activation because missing identities cannot be reconstructed. When a legacy admission guard was already absent before the terminal ledger existed, old admission history is unprovable and cannot be re-attested. Issue #3 will supply policy-engine integration; Stage 1 records the local writer decision without claiming external policy authentication.
+
 Provider conformance is separate from publisher trust, runtime health, and Task authorization.
 
 The semantic validator never executes/loads provider code.

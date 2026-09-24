@@ -8,12 +8,20 @@ publish = false
 [dependencies]
 aios-contracts.workspace = true
 cap-std.workspace = true
+fs2.workspace = true
 jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 time.workspace = true
+rusqlite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winx.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

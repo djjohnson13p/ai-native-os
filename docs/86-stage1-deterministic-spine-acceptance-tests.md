@@ -270,6 +270,7 @@ Pass criteria:
 Pass criteria:
 
 - after attempt begins, DB/runtime rejects mutation of provider, input/output refs, grants, placement, or attempt identity;
+- new Stage-1 receipts pin exact non-null contract/manifest/build hashes, conformance evidence, and the effective trust source; a disabled provider or future-dated decision cannot retroactively authorize an old binding;
 - retry/substitution creates new binding/attempt.
 
 ### S7.2 No ambient host authority

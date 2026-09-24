@@ -35,11 +35,10 @@ pub use artifact_store::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fs2::FileExt;
+use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +56,8 @@ pub enum TaskManagerError {
     Serialization(serde_json::Error),
     Canonicalization(String),
     Provenance(aios_provenance::Error),
+    Registry(aios_registry::RegistryStoreError),
+    Provider(aios_registry::ProviderStoreError),
     InvalidRecord(&'static str),
 }
 
@@ -70,6 +71,8 @@ impl fmt::Display for TaskManagerError {
                 write!(formatter, "provenance canonicalization failure: {error}")
             }
             Self::Provenance(error) => write!(formatter, "{error}"),
+            Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Provider(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
         }
     }
@@ -98,6 +101,18 @@ impl From<serde_json::Error> for TaskManagerError {
 impl From<aios_provenance::Error> for TaskManagerError {
     fn from(error: aios_provenance::Error) -> Self {
         Self::Provenance(error)
+    }
+}
+
+impl From<aios_registry::RegistryStoreError> for TaskManagerError {
+    fn from(error: aios_registry::RegistryStoreError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+impl From<aios_registry::ProviderStoreError> for TaskManagerError {
+    fn from(error: aios_registry::ProviderStoreError) -> Self {
+        Self::Provider(error)
     }
 }
 
@@ -466,7 +481,8 @@ pub struct TaskManager {
     database_locator: DatabaseLocator,
     artifact_store_root: PathBuf,
     artifact_store_dir: cap_std::fs::Dir,
-    store_lock: Option<StoreLock>,
+    store_lock: Option<Arc<StoreLock>>,
+    store_owner: StoreOwner,
     artifact_store_cleanup: Option<Arc<artifact_store::EphemeralStoreCleanup>>,
     artifact_export_verifiers:
         BTreeMap<String, Arc<dyn artifact_store::ArtifactExportOutcomeVerifier>>,
@@ -487,93 +503,6 @@ impl Clock for SystemClock {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-    }
-}
-
-struct StoreLock {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    database_file: File,
-    _lock_file: File,
-    identity: StoreIdentity,
-}
-
-#[derive(Debug, Clone)]
-struct StoreIdentity {
-    canonical_path: PathBuf,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: u64,
-    #[cfg(windows)]
-    file_index: u64,
-}
-
-impl PartialEq for StoreIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        #[cfg(unix)]
-        {
-            self.device == other.device && self.inode == other.inode
-        }
-        #[cfg(windows)]
-        {
-            self.volume_serial_number == other.volume_serial_number
-                && self.file_index == other.file_index
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            self.canonical_path == other.canonical_path
-        }
-    }
-}
-
-impl Eq for StoreIdentity {}
-
-impl StoreIdentity {
-    fn persistent_key(&self) -> String {
-        #[cfg(unix)]
-        {
-            format!("unix:{}:{}", self.device, self.inode)
-        }
-        #[cfg(windows)]
-        {
-            format!("windows:{}:{}", self.volume_serial_number, self.file_index)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            format!("path:{}", self.canonical_path.display())
-        }
-    }
-}
-
-fn store_identity(path: &Path, file: &File) -> Result<StoreIdentity> {
-    #[cfg(not(windows))]
-    let metadata = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let information = winx::winapi_util::file::information(file)?;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-            volume_serial_number: information.volume_serial_number(),
-            file_index: information.file_index(),
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        Ok(StoreIdentity {
-            canonical_path: path.canonicalize()?,
-        })
     }
 }
 
@@ -598,58 +527,11 @@ impl DatabaseLocator {
 }
 
 fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
-    // Materialize the database before acquiring an identity-bound lock.
-    let database_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    let identity = store_identity(path, &database_file)?;
-    #[cfg(windows)]
-    let lock_path = {
-        // An NTFS alternate data stream belongs to the underlying file, so all
-        // hardlink, symlink, case, and short-name aliases address one stream.
-        // It also avoids interfering with SQLite's locks on the default stream.
-        let mut value = path.as_os_str().to_os_string();
-        value.push(":aios-task-manager-lock");
-        std::path::PathBuf::from(value)
-    };
-    #[cfg(not(windows))]
-    let lock_path = path.to_path_buf();
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    file.try_lock_exclusive()?;
-    Ok(StoreLock {
-        database_file,
-        _lock_file: file,
-        identity,
-    })
+    StoreLock::acquire(path).map_err(Into::into)
 }
 
 fn verify_locked_store_identity(connection: &Connection, lock: &StoreLock) -> Result<()> {
-    let main_filename = connection.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-    if main_filename.is_empty() {
-        return Err(TaskManagerError::InvalidRecord(
-            "SQLite main database has no durable file identity",
-        ));
-    }
-    let main_path = PathBuf::from(main_filename);
-    let main_file = OpenOptions::new().read(true).write(true).open(&main_path)?;
-    if store_identity(&main_path, &main_file)? != lock.identity {
-        return Err(TaskManagerError::InvalidRecord(
-            "SQLite main database identity does not match the locked store",
-        ));
-    }
-    Ok(())
+    lock.verify_connection(connection).map_err(Into::into)
 }
 
 fn open_locked_store<F>(
@@ -661,7 +543,7 @@ fn open_locked_store<F>(
 where
     F: FnOnce(&Path),
 {
-    let lock = acquire_store_lock(path)?;
+    let lock = Arc::new(acquire_store_lock(path)?);
     after_lock(path);
     let connection = Connection::open(path)?;
     verify_locked_store_identity(&connection, &lock)?;
@@ -686,39 +568,6 @@ pub(crate) fn rebind_legacy_windows_artifact_store(path: &Path) -> Result<()> {
     artifact_store::rebind_legacy_windows_root(&lock, &mut connection)
 }
 
-fn claim_manager_lease(connection: &Connection, acquired_at: &str) -> Result<(String, i64)> {
-    connection.execute_batch("BEGIN IMMEDIATE")?;
-    let claimed = (|| -> Result<(String, i64)> {
-        let owner = connection.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
-            row.get::<_, String>(0)
-        })?;
-        connection.execute(
-            "INSERT INTO task_manager_lease(singleton_id, owner_id, fence_epoch, acquired_at)
-             VALUES (1, ?1, 1, ?2)
-             ON CONFLICT(singleton_id) DO UPDATE SET owner_id = excluded.owner_id,
-                 fence_epoch = task_manager_lease.fence_epoch + 1,
-                 acquired_at = excluded.acquired_at",
-            params![owner, acquired_at],
-        )?;
-        let epoch = connection.query_row(
-            "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id = 1 AND owner_id = ?1",
-            [&owner],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok((owner, epoch))
-    })();
-    match claimed {
-        Ok(value) => {
-            connection.execute_batch("COMMIT")?;
-            Ok(value)
-        }
-        Err(error) => {
-            connection.execute_batch("ROLLBACK")?;
-            Err(error)
-        }
-    }
-}
-
 fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) -> Result<()> {
     let current = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_manager_lease WHERE singleton_id = 1 AND owner_id = ?1 AND fence_epoch = ?2)",
@@ -734,6 +583,163 @@ fn assert_manager_lease(transaction: &Transaction<'_>, owner: &str, epoch: i64) 
 }
 
 impl TaskManager {
+    /// Opens a semantic registry writer under this manager's live store lock
+    /// and durable lease. The required optional schema is installed first.
+    ///
+    /// # Errors
+    /// Returns an error if migration, store identity, or the lease fails.
+    pub fn registry_store_writer(&mut self) -> Result<aios_registry::RegistryStore<'_>> {
+        self.initialize_registry_store()?;
+        Ok(aios_registry::RegistryStore::initialize_writer(
+            &mut self.connection,
+            &self.store_owner,
+        )?)
+    }
+
+    /// Opens a provider writer under this manager's live store lock and lease.
+    /// The required optional schemas are installed first.
+    ///
+    /// # Errors
+    /// Returns an error if migration, store identity, or the lease fails.
+    pub fn provider_store_writer(&mut self) -> Result<aios_registry::ProviderStore<'_>> {
+        self.initialize_provider_store()?;
+        Ok(aios_registry::ProviderStore::initialize_writer(
+            &mut self.connection,
+            &self.store_owner,
+        )?)
+    }
+
+    /// Installs or upgrades the optional semantic registry schema while this
+    /// manager owns the identity-bound store lock and current durable lease.
+    ///
+    /// # Errors
+    /// Returns an error if migration preflight, store identity, or the lease fails.
+    pub fn initialize_registry_store(&mut self) -> Result<()> {
+        self.migrate_registry_schema(false)
+    }
+
+    /// Installs or upgrades both registry schemas under the same store fence.
+    ///
+    /// # Errors
+    /// Returns an error if migration preflight, store identity, or the lease fails.
+    pub fn initialize_provider_store(&mut self) -> Result<()> {
+        self.migrate_registry_schema(true)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the fenced optional-schema migration atomic"
+    )]
+    fn migrate_registry_schema(&mut self, provider: bool) -> Result<()> {
+        if let Some(lock) = &self.store_lock {
+            verify_locked_store_identity(&self.connection, lock)?;
+        }
+        preflight_migration_state(&self.connection)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        // CREATE IF NOT EXISTS must never bless unversioned lookalike tables.
+        for (migration, objects, legacy_guards, additive_guards) in [
+            (
+                "0012_semantic_registry_store",
+                "'semantic_type_contracts','semantic_capability_contracts',
+                 'registry_snapshot_admissions','registry_snapshot_entries','registry_activations'",
+                SEMANTIC_LEGACY_GUARDS,
+                SEMANTIC_ADDITIVE_GUARDS,
+            ),
+            (
+                "0013_provider_registry",
+                "'provider_manifest_payloads','provider_health_observations',
+                 'ix_provider_conformance_latest','execution_binding_admission_markers',
+                 'provider_state_epochs','execution_binding_enablement_markers'",
+                PROVIDER_LEGACY_GUARDS,
+                PROVIDER_ADDITIVE_GUARDS,
+            ),
+            (
+                "0014_semantic_repair_fence",
+                "'semantic_repair_fences','semantic_snapshot_reattestations'",
+                &[],
+                SEMANTIC_FENCE_GUARDS,
+            ),
+        ] {
+            let stamped: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id=?1)",
+                [migration],
+                |row| row.get(0),
+            )?;
+            if !stamped {
+                let present: bool = transaction.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ({objects}))"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if present {
+                    return Err(TaskManagerError::InvalidRecord(
+                        "unstamped registry schema objects require operator quarantine",
+                    ));
+                }
+                for guard in legacy_guards.iter().chain(additive_guards) {
+                    let present: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                        [guard],
+                        |row| row.get(0),
+                    )?;
+                    if present {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "unstamped registry schema objects require operator quarantine",
+                        ));
+                    }
+                }
+            }
+        }
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [],
+        )?;
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+        ))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [],
+        )?;
+        if provider {
+            let provider_stamped: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations
+                 WHERE migration_id='0013_provider_registry')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !provider_stamped {
+                // Baseline registrations predate the enabled-interval ledger.
+                // Their current 'registered' state has no provable transition
+                // identity, even when this is the first 0013 installation.
+                transaction.execute(
+                    "UPDATE provider_registrations SET state='disabled',updated_at=?1
+                     WHERE state='registered'",
+                    [self.clock.now()],
+                )?;
+            }
+            transaction.execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                [],
+            )?;
+        }
+        preflight_migration_state(&transaction)?;
+        assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Opens or creates the authoritative local `SQLite` store.
     ///
     /// # Errors
@@ -809,27 +815,29 @@ impl TaskManager {
     fn initialize(
         mut connection: Connection,
         clock: Box<dyn Clock>,
-        store_lock: Option<StoreLock>,
+        store_lock: Option<Arc<StoreLock>>,
         database_locator: DatabaseLocator,
         export_verifiers: Vec<Arc<dyn ArtifactExportOutcomeVerifier>>,
     ) -> Result<Self> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        preflight_migration_state(&connection)?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS task_manager_lease (
-                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-                owner_id TEXT NOT NULL,
-                fence_epoch INTEGER NOT NULL CHECK (fence_epoch >= 1),
-                acquired_at TEXT NOT NULL
-            );",
-        )?;
+        aios_registry::register_strict_json_sqlite(&connection)?;
+        preflight_migration_state_allowing_guard_upgrade(&connection)?;
         let clock: Arc<dyn Clock> = Arc::from(clock);
         let acquired_at = clock.now();
-        let (lease_owner, lease_epoch) = claim_manager_lease(&connection, &acquired_at)?;
+        let store_owner = StoreOwner::claim(&connection, store_lock.clone(), &acquired_at)?;
+        let lease_owner = store_owner.owner().to_owned();
+        let lease_epoch = store_owner.epoch();
+        upgrade_stamped_registry_guards_fenced(
+            &mut connection,
+            &lease_owner,
+            lease_epoch,
+            &acquired_at,
+        )?;
+        preflight_migration_state(&connection)?;
         connection.execute_batch(MIGRATION)?;
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
-            artifact_store::initialize_root(store_lock.as_ref(), &mut connection)?;
+            artifact_store::initialize_root(store_lock.as_deref(), &mut connection)?;
         let artifact_scope_issuer =
             connection.query_row("SELECT lower(hex(randomblob(32)))", [], |row| row.get(0))?;
         let mut artifact_export_verifiers = BTreeMap::new();
@@ -863,6 +871,7 @@ impl TaskManager {
             artifact_store_root,
             artifact_store_dir,
             store_lock,
+            store_owner,
             artifact_store_cleanup,
             artifact_export_verifiers,
             delivered_reader_admissions: Arc::new(Mutex::new(BTreeSet::new())),
@@ -872,6 +881,28 @@ impl TaskManager {
         manager.reconcile_export_operations_startup()?;
         manager.reconcile_artifacts_startup()?;
         manager.recover_startup()?;
+        // Runtime registry writers are admitted only after the complete
+        // Task Manager startup and recovery sequence has succeeded on this
+        // exact connection and lease.
+        manager.connection.execute_batch(
+            "CREATE TEMP TABLE aios_task_manager_startup_ready (
+                nonce TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                fence_epoch INTEGER NOT NULL
+            );",
+        )?;
+        let ready = manager.connection.execute(
+            "INSERT INTO temp.aios_task_manager_startup_ready(nonce,owner_id,fence_epoch)
+             SELECT c.nonce,l.owner_id,l.fence_epoch
+             FROM temp.aios_store_owner_capability c CROSS JOIN task_manager_lease l
+             WHERE l.singleton_id=1 AND l.owner_id=?1 AND l.fence_epoch=?2",
+            params![&manager.lease_owner, manager.lease_epoch],
+        )?;
+        if ready != 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "Task Manager startup lost the current ownership lease",
+            ));
+        }
         Ok(manager)
     }
 
@@ -3402,11 +3433,1004 @@ fn provenance_stream_id(task_id: &str) -> String {
     aios_provenance::stream_id(task_id).expect("validated Task ID forms a provenance stream")
 }
 
+const SEMANTIC_ADDITIVE_GUARDS: &[&str] = &[
+    "one_way_registry_snapshot_admissions_update",
+    "immutable_registry_snapshot_admissions_reinsert",
+    "immutable_admitted_registry_snapshots_reinsert",
+    "immutable_admitted_registry_snapshots_target_update",
+    "immutable_semantic_type_contracts_reinsert",
+    "immutable_semantic_capability_contracts_reinsert",
+    "immutable_registry_snapshot_entries_reinsert",
+    "immutable_admitted_registry_snapshot_entries_insert",
+    "registry_activation_no_duplicate_insert",
+    "registry_activation_revision_monotonic",
+    "registry_activation_no_delete",
+];
+
+const SEMANTIC_LEGACY_GUARDS: &[&str] = &[
+    "immutable_admitted_registry_snapshots_update",
+    "immutable_admitted_registry_snapshots_delete",
+    "immutable_semantic_type_contracts_update",
+    "immutable_semantic_type_contracts_delete",
+    "immutable_semantic_capability_contracts_update",
+    "immutable_semantic_capability_contracts_delete",
+    "immutable_registry_snapshot_entries_update",
+    "immutable_registry_snapshot_entries_delete",
+    "immutable_registry_snapshot_admissions_delete",
+];
+
+const SEMANTIC_FENCE_GUARDS: &[&str] = &[
+    "semantic_repair_fence_no_update",
+    "semantic_repair_fence_no_delete",
+    "semantic_repair_fence_no_duplicate_insert",
+    "semantic_repair_fence_sequence",
+    "semantic_terminal_admission_no_update",
+    "semantic_terminal_admission_no_delete",
+    "semantic_terminal_admission_no_duplicate_insert",
+    "semantic_terminal_admission_insert",
+    "semantic_terminal_admission_transition",
+    "semantic_legacy_unprovable_no_update",
+    "semantic_legacy_unprovable_no_delete",
+    "semantic_legacy_unprovable_no_duplicate_insert",
+    "semantic_invalidated_activation_no_update",
+    "semantic_invalidated_activation_no_delete",
+    "semantic_invalidated_activation_no_duplicate_insert",
+    "semantic_activation_scope_history_no_update",
+    "semantic_activation_scope_history_no_delete",
+    "semantic_activation_scope_history_no_duplicate_insert",
+    "semantic_activation_scope_history_insert",
+    "semantic_activation_scope_history_key_update",
+    "semantic_legacy_activation_quarantine_no_update",
+    "semantic_legacy_activation_quarantine_no_delete",
+    "semantic_legacy_activation_quarantine_no_duplicate_insert",
+    "semantic_snapshot_reattestation_no_update",
+    "semantic_snapshot_reattestation_no_delete",
+    "semantic_snapshot_reattestation_no_duplicate_insert",
+    "semantic_snapshot_reattestation_current_only",
+    "semantic_repair_activation_insert",
+    "semantic_repair_activation_update",
+    "semantic_repair_registration_insert",
+    "semantic_repair_registration_enable",
+    "semantic_repair_binding_insert",
+];
+
+const PROVIDER_ADDITIVE_GUARDS: &[&str] = &[
+    "provider_registration_no_duplicate_insert",
+    "provider_registration_revoked_epoch_insert",
+    "provider_registration_revoked_epoch_update",
+    "provider_manifest_payload_no_duplicate_insert",
+    "provider_evidence_no_duplicate_insert",
+    "execution_binding_no_duplicate_insert",
+    "execution_binding_provider_identity_at_insert",
+    "execution_binding_evidence_present_at_insert",
+    "execution_binding_admission_marker_insert",
+    "execution_binding_marker_no_duplicate_insert",
+    "execution_binding_marker_no_update",
+    "execution_binding_marker_no_delete",
+    "provider_registration_trust_receipt_insert",
+    "provider_registration_trust_immutable_update",
+    "provider_registration_no_initial_enablement",
+    "provider_registration_state_transition_clock",
+    "provider_registration_updated_at_requires_transition",
+    "provider_state_epoch_no_update",
+    "provider_state_epoch_no_delete",
+    "provider_state_epoch_no_duplicate_insert",
+    "provider_state_epoch_event_insert_guard",
+    "provider_state_epoch_initial",
+    "provider_state_epoch_transition",
+    "provider_trust_admission_no_update",
+    "provider_trust_admission_no_delete",
+    "provider_trust_admission_no_duplicate_insert",
+    "provider_trust_admission_receipt_insert",
+    "execution_binding_evidence_pin_required",
+    "execution_binding_evidence_not_future",
+    "execution_binding_evidence_unexpired_at_insert",
+    "execution_binding_enablement_marker_no_update",
+    "execution_binding_enablement_marker_no_delete",
+    "execution_binding_enablement_marker_no_duplicate_insert",
+    "execution_binding_enablement_marker_insert",
+    "execution_binding_evidence_latest_at_insert",
+    "execution_binding_provider_enablement_not_future",
+    "execution_binding_trust_marker_no_update",
+    "execution_binding_trust_marker_no_delete",
+    "execution_binding_trust_marker_no_duplicate_insert",
+    "execution_binding_trust_marker_insert",
+    "execution_binding_trust_not_future",
+    "execution_binding_legacy_trust_quarantine_no_update",
+    "execution_binding_legacy_trust_quarantine_no_delete",
+    "execution_binding_legacy_trust_quarantine_no_duplicate_insert",
+];
+
+// Loss of any of these guards can rewrite the provider state ledger or erase
+// a terminal transition. A stamped store cannot reconstruct that history.
+const PROVIDER_HISTORY_GUARDS: &[&str] = &[
+    "provider_registration_identity_immutable",
+    "provider_registration_no_delete",
+    "provider_registration_no_duplicate_insert",
+    "provider_registration_revocation_terminal",
+    "provider_registration_revoked_epoch_insert",
+    "provider_registration_revoked_epoch_update",
+    "provider_registration_no_initial_enablement",
+    "provider_registration_state_transition_clock",
+    "provider_registration_updated_at_requires_transition",
+    "provider_state_epoch_no_update",
+    "provider_state_epoch_no_delete",
+    "provider_state_epoch_no_duplicate_insert",
+    "provider_state_epoch_event_insert_guard",
+    "provider_state_epoch_initial",
+    "provider_state_epoch_transition",
+];
+
+// These guards authenticate evidence and review decisions used by *future*
+// bindings. Restoring a lost guard cannot distinguish an original row from
+// one replaced or rewritten while the guard was absent. Quarantining only
+// historical bindings would leave that forged authority reusable.
+const PROVIDER_AUTHORITY_HISTORY_GUARDS: &[&str] = &[
+    "provider_evidence_no_duplicate_insert",
+    "provider_registration_trust_receipt_insert",
+    "provider_registration_trust_immutable_update",
+    "provider_trust_admission_no_update",
+    "provider_trust_admission_no_delete",
+    "provider_trust_admission_no_duplicate_insert",
+    "provider_trust_admission_receipt_insert",
+];
+
+const PROVIDER_LEGACY_GUARDS: &[&str] = &[
+    "provider_manifest_payload_immutable_update",
+    "provider_manifest_payload_immutable_delete",
+    "provider_registration_identity_immutable",
+    "provider_registration_no_delete",
+    "provider_registration_revocation_terminal",
+    "provider_evidence_immutable_update",
+    "provider_evidence_immutable_delete",
+];
+
+const PRIOR_PROVIDER_TRUST_GUARDS: &[&str] = &[
+    "execution_binding_trust_marker_insert",
+    "execution_binding_trust_not_future",
+];
+
+const PRIOR_PROVIDER_C5A_GUARDS: &[&str] = &[
+    "provider_registration_state_transition_clock",
+    "provider_state_epoch_event_insert_guard",
+    "provider_state_epoch_transition",
+    "execution_binding_evidence_not_future",
+    "execution_binding_evidence_unexpired_at_insert",
+    "execution_binding_evidence_latest_at_insert",
+    "execution_binding_trust_marker_insert",
+    "execution_binding_trust_not_future",
+    "execution_binding_provider_enablement_not_future",
+];
+
+const PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS: &[&str] = &[
+    "execution_binding_evidence_present_at_insert",
+    "execution_binding_evidence_not_future",
+    "execution_binding_evidence_unexpired_at_insert",
+    "execution_binding_evidence_latest_at_insert",
+];
+
+fn missing_additive_guard(connection: &Connection, guards: &[&str]) -> Result<bool> {
+    for guard in guards {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+            [guard],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn provider_history_provable(connection: &Connection) -> Result<bool> {
+    if !additive_guard_definitions_current(connection, PROVIDER_HISTORY_GUARDS, true, true, true)? {
+        return Ok(false);
+    }
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_state_epochs'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected: String = canonical.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_state_epochs'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(actual.is_some_and(|sql| normalize_schema_sql(&sql) == normalize_schema_sql(&expected)))
+}
+
+fn provider_authority_history_provable(connection: &Connection) -> Result<bool> {
+    let other_guards: Vec<&str> = PROVIDER_AUTHORITY_HISTORY_GUARDS
+        .iter()
+        .copied()
+        .filter(|guard| *guard != "provider_trust_admission_receipt_insert")
+        .collect();
+    if !additive_guard_definitions_current(connection, &other_guards, true, true, true)? {
+        return Ok(false);
+    }
+    if additive_guard_definitions_current(
+        connection,
+        &["provider_trust_admission_receipt_insert"],
+        true,
+        true,
+        true,
+    )? {
+        return Ok(true);
+    }
+    if !legacy_b0b_trust_admission_guard_present(connection)? {
+        return Ok(false);
+    }
+    // The old guard did not authenticate receipt identity or chronology.
+    // An existing immutable decision could have been forged while it ran.
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM provider_trust_admissions)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_b0b_trust_admission_guard_present(connection: &Connection) -> Result<bool> {
+    let actual: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_trust_admission_receipt_insert'",
+        [],
+        |row| row.get(0),
+    ).optional()?;
+    let Some(actual) = actual else {
+        return Ok(false);
+    };
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch("CREATE TABLE provider_trust_admissions(registration_id TEXT)")?;
+    canonical.execute_batch(include_str!(
+        "legacy_b0b7302_provider_trust_admission_guard.sql"
+    ))?;
+    let expected: String = canonical.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_trust_admission_receipt_insert'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(normalize_schema_sql(&actual) == normalize_schema_sql(&expected))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps fenced semantic and provider guard repairs in one atomic transaction"
+)]
+fn upgrade_stamped_registry_guards_fenced(
+    connection: &mut Connection,
+    owner: &str,
+    epoch: i64,
+    upgraded_at: &str,
+) -> Result<()> {
+    let has_migrations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let semantic_stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+        [],
+        |row| row.get(0),
+    )?;
+    let provider_stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+        [],
+        |row| row.get(0),
+    )?;
+    if provider_stamped && !provider_history_provable(connection)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "provider state history requires operator quarantine",
+        ));
+    }
+    if provider_stamped && !provider_authority_history_provable(connection)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "provider evidence or trust history requires operator quarantine",
+        ));
+    }
+    let fence_stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0014_semantic_repair_fence')",
+        [],
+        |row| row.get(0),
+    )?;
+    let upgrade_semantic =
+        semantic_stamped && missing_additive_guard(connection, SEMANTIC_ADDITIVE_GUARDS)?;
+    let legacy_terminal_history_unprovable = semantic_stamped
+        && !fence_stamped
+        && missing_additive_guard(
+            connection,
+            &[
+                "one_way_registry_snapshot_admissions_update",
+                "immutable_registry_snapshot_admissions_reinsert",
+            ],
+        )?;
+    let legacy_activation_history_unprovable = semantic_stamped
+        && !fence_stamped
+        && missing_additive_guard(
+            connection,
+            &[
+                "registry_activation_no_duplicate_insert",
+                "registry_activation_revision_monotonic",
+                "registry_activation_no_delete",
+            ],
+        )?;
+    let upgrade_provider = provider_stamped
+        && (missing_additive_guard(connection, PROVIDER_ADDITIVE_GUARDS)?
+            || !provider_additive_tables_current(connection, true, true)?
+            || legacy_b0b_trust_admission_guard_present(connection)?
+            || legacy_provider_trust_guard_present(connection)?
+            || legacy_c5a_provider_guard_present(connection)?
+            || legacy_2b1_evidence_guard_present(connection)?);
+    if !upgrade_semantic && !upgrade_provider && (fence_stamped || !semantic_stamped) {
+        return Ok(());
+    }
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    assert_manager_lease(&transaction, owner, epoch)?;
+    if semantic_stamped && !fence_stamped {
+        // Only a canonical earlier 0012 store may acquire the new stamp.
+        // A partial 0014 installation is an anti-downgrade failure, not a
+        // generation-zero bootstrap.
+        if !semantic_fence_objects_current(&transaction, false)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "unstamped semantic repair fence requires operator quarantine",
+            ));
+        }
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+        ))?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at)
+             VALUES ('0014_semantic_repair_fence','semantic-repair-fence-v0.1',?1)",
+            [upgraded_at],
+        )?;
+        if legacy_terminal_history_unprovable {
+            // No Stage-1 fact can distinguish a previously terminal row
+            // forged back to ADMITTED before the first fence existed.
+            transaction.execute(
+                "INSERT INTO semantic_legacy_unprovable_admissions(snapshot_id)
+                 SELECT snapshot_id FROM registry_snapshot_admissions",
+                [],
+            )?;
+        }
+        if legacy_activation_history_unprovable {
+            transaction.execute(
+                "INSERT INTO semantic_legacy_activation_quarantine(singleton_id,reason)
+                 VALUES (1,'UNPROVABLE_PRE_0014_HISTORY')",
+                [],
+            )?;
+        }
+    }
+    if upgrade_semantic {
+        // Historical admission transitions are unprovable. Rotate the
+        // append-only fence; old receipts no longer authorize work, while
+        // terminal QUARANTINED/REVOKED projections remain terminal.
+        let current: i64 = transaction.query_row(
+            "SELECT MAX(generation) FROM semantic_repair_fences",
+            [],
+            |row| row.get(0),
+        )?;
+        if current >= i64::MAX - 1 {
+            return Err(TaskManagerError::InvalidRecord(
+                "semantic repair fence generation requires operator quarantine",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO semantic_repair_fences(generation,reason,created_at)
+             VALUES (?1,'GUARD_REPAIR',?2)",
+            params![current + 1, upgraded_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO semantic_invalidated_activation_scopes(scope_kind,scope_id)
+             SELECT h.scope_kind,h.scope_id FROM semantic_activation_scope_history h
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_invalidated_activation_scopes q
+                               WHERE q.scope_kind=h.scope_kind AND q.scope_id=h.scope_id)",
+            [],
+        )?;
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+        ))?;
+    }
+    if upgrade_provider {
+        if legacy_b0b_trust_admission_guard_present(&transaction)? {
+            transaction.execute_batch("DROP TRIGGER provider_trust_admission_receipt_insert")?;
+        }
+        let has_epoch_table: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='provider_state_epochs')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_epoch_table {
+            let exhausted: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_state_epochs
+                 WHERE typeof(revision)<>'integer' OR revision>=?1)",
+                [i64::MAX - 1],
+                |row| row.get(0),
+            )?;
+            if exhausted {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider state epoch revision requires operator quarantine",
+                ));
+            }
+        }
+        let had_enablement_guards = !missing_additive_guard(
+            &transaction,
+            &[
+                "provider_registration_no_initial_enablement",
+                "provider_registration_state_transition_clock",
+                "provider_registration_updated_at_requires_transition",
+                "provider_state_epoch_no_update",
+                "provider_state_epoch_no_delete",
+                "provider_state_epoch_no_duplicate_insert",
+                "provider_state_epoch_event_insert_guard",
+                "provider_state_epoch_initial",
+                "provider_state_epoch_transition",
+                "execution_binding_enablement_marker_no_update",
+                "execution_binding_enablement_marker_no_delete",
+                "execution_binding_enablement_marker_no_duplicate_insert",
+                "execution_binding_enablement_marker_insert",
+            ],
+        )? && transaction.query_row(
+            "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                ('provider_state_epochs','execution_binding_enablement_markers'))=2",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        for name in PRIOR_PROVIDER_TRUST_GUARDS {
+            let actual: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual
+                .as_deref()
+                .map(|sql| legacy_provider_trust_guard_matches(name, sql))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                transaction.execute_batch(match *name {
+                    "execution_binding_trust_marker_insert" => {
+                        "DROP TRIGGER execution_binding_trust_marker_insert"
+                    }
+                    _ => "DROP TRIGGER execution_binding_trust_not_future",
+                })?;
+            }
+        }
+        for name in PRIOR_PROVIDER_C5A_GUARDS {
+            let actual: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual
+                .as_deref()
+                .map(|sql| legacy_c5a_provider_guard_matches(name, sql))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                transaction.execute_batch(&format!("DROP TRIGGER {name}"))?;
+            }
+        }
+        for name in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+            let actual: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual
+                .as_deref()
+                .map(|sql| legacy_2b1_evidence_guard_matches(name, sql))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                transaction.execute_batch(&format!("DROP TRIGGER {name}"))?;
+            }
+        }
+        if !had_enablement_guards {
+            // Older stamped stores cannot prove when an active registration
+            // became enabled. End that interval while still under the lease,
+            // before installing the new clock guard: legacy updated_at may
+            // itself be untrusted or later than the current clock. A partial
+            // upgrade may already have installed that exact guard.
+            transaction.execute_batch(
+                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock;
+                 DROP TRIGGER IF EXISTS provider_state_epoch_transition",
+            )?;
+            transaction.execute(
+                "UPDATE provider_registrations SET state='disabled',updated_at=?1
+                 WHERE state='registered'",
+                [upgraded_at],
+            )?;
+        }
+        if has_epoch_table {
+            // A missing duplicate-insert or initial-epoch guard once allowed
+            // INSERT OR REPLACE to obscure the registration row. The ledger's
+            // terminal revocation still wins over the replacement's state.
+            transaction.execute_batch(
+                "DROP TRIGGER IF EXISTS provider_registration_state_transition_clock;
+                 DROP TRIGGER IF EXISTS provider_state_epoch_transition",
+            )?;
+            transaction.execute(
+                "UPDATE provider_registrations SET state='revoked',updated_at=
+                     CASE WHEN (SELECT e.state FROM provider_state_epochs e
+                                WHERE e.registration_id=provider_registrations.registration_id
+                                ORDER BY e.revision DESC LIMIT 1)='revoked'
+                          THEN (SELECT e.transitioned_at FROM provider_state_epochs e
+                                WHERE e.registration_id=provider_registrations.registration_id
+                                ORDER BY e.revision DESC LIMIT 1)
+                          ELSE ?1 END
+                 WHERE state<>'revoked' AND EXISTS (
+                     SELECT 1 FROM provider_state_epochs e
+                     WHERE e.registration_id=provider_registrations.registration_id
+                       AND e.state='revoked')",
+                [upgraded_at],
+            )?;
+        }
+        transaction.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))?;
+        if has_epoch_table {
+            transaction.execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+                 SELECT r.registration_id,
+                        (SELECT MAX(e.revision)+1 FROM provider_state_epochs e
+                         WHERE e.registration_id=r.registration_id),
+                        'revoked',r.updated_at
+                 FROM provider_registrations r
+                 WHERE r.state='revoked'
+                   AND EXISTS (SELECT 1 FROM provider_state_epochs e
+                               WHERE e.registration_id=r.registration_id AND e.state='revoked')
+                   AND (SELECT e.state FROM provider_state_epochs e
+                        WHERE e.registration_id=r.registration_id
+                        ORDER BY e.revision DESC LIMIT 1)<>'revoked'",
+                [],
+            )?;
+        }
+        if !had_enablement_guards {
+            // A partially installed ledger may have missed the forced
+            // disable transition. Reconcile only that terminal interval;
+            // subsequent enables must mint a fresh revision normally.
+            transaction.execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+                 SELECT r.registration_id,
+                        (SELECT MAX(e.revision)+1 FROM provider_state_epochs e
+                         WHERE e.registration_id=r.registration_id),
+                        'disabled',r.updated_at
+                 FROM provider_registrations r
+                 WHERE r.state='disabled'
+                   AND EXISTS (SELECT 1 FROM provider_state_epochs e
+                               WHERE e.registration_id=r.registration_id)
+                   AND (SELECT e.state FROM provider_state_epochs e
+                        WHERE e.registration_id=r.registration_id
+                        ORDER BY e.revision DESC LIMIT 1) <> 'disabled'",
+                [],
+            )?;
+        }
+        // Any repaired provider guard means historical binding admission was
+        // not fully proven. Preserve immutable markers for audit and deny
+        // their execution, including a store missing only one binding guard.
+        transaction.execute(
+            "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
+                 SELECT m.binding_id FROM execution_binding_trust_markers m
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM execution_binding_legacy_trust_quarantine q
+                     WHERE q.binding_id=m.binding_id
+                 )",
+            [],
+        )?;
+    }
+    if upgrade_semantic && provider_stamped && !upgrade_provider {
+        // Semantic guard loss also invalidates any prior provider bindings.
+        transaction.execute(
+            "INSERT INTO execution_binding_legacy_trust_quarantine(binding_id)
+             SELECT m.binding_id FROM execution_binding_trust_markers m
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM execution_binding_legacy_trust_quarantine q
+                 WHERE q.binding_id=m.binding_id
+             )",
+            [],
+        )?;
+    }
+    preflight_migration_state(&transaction)?;
+    assert_manager_lease(&transaction, owner, epoch)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn additive_guard_definitions_current(
+    connection: &Connection,
+    guards: &[&str],
+    stamped: bool,
+    require_all: bool,
+    provider: bool,
+) -> Result<bool> {
+    let mut found = Vec::with_capacity(guards.len());
+    for guard in guards {
+        found.push(
+            connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [guard],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+        );
+    }
+    if !stamped {
+        return Ok(found.iter().all(Option::is_none));
+    }
+    if require_all && found.iter().any(Option::is_none) {
+        return Ok(false);
+    }
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    if provider {
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+        ))?;
+    }
+    for (guard, actual) in guards.iter().zip(found) {
+        let Some(actual) = actual else { continue };
+        let expected: String = canonical.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [guard],
+            |row| row.get(0),
+        )?;
+        // SQLite preserves the SQL text but old stores may cross a platform's
+        // line-ending convention. Whitespace changes do not alter this DDL.
+        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected)
+            && !(provider && !require_all && legacy_provider_trust_guard_matches(guard, &actual)?)
+            && !(provider && !require_all && legacy_c5a_provider_guard_matches(guard, &actual)?)
+            && !(provider && !require_all && legacy_2b1_evidence_guard_matches(guard, &actual)?)
+            && !(provider
+                && !require_all
+                && *guard == "provider_trust_admission_receipt_insert"
+                && legacy_b0b_trust_admission_guard_present(connection)?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn legacy_provider_trust_guard_definition(name: &str) -> Result<String> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    canonical.execute_batch(
+        "DROP TRIGGER execution_binding_trust_marker_insert;
+         DROP TRIGGER execution_binding_trust_not_future;",
+    )?;
+    canonical.execute_batch(include_str!("legacy_5eb3b71_provider_trust_guards.sql"))?;
+    canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_provider_trust_guard_matches(name: &str, actual: &str) -> Result<bool> {
+    if !PRIOR_PROVIDER_TRUST_GUARDS.contains(&name) {
+        return Ok(false);
+    }
+    Ok(normalize_schema_sql(actual)
+        == normalize_schema_sql(&legacy_provider_trust_guard_definition(name)?))
+}
+
+fn legacy_provider_trust_guard_present(connection: &Connection) -> Result<bool> {
+    for name in PRIOR_PROVIDER_TRUST_GUARDS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(actual) = actual {
+            if legacy_provider_trust_guard_matches(name, &actual)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_c5a_provider_guard_definition(name: &str) -> Result<String> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!("legacy_c5a_provider_registry.sql"))?;
+    canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_c5a_provider_guard_matches(name: &str, actual: &str) -> Result<bool> {
+    if !PRIOR_PROVIDER_C5A_GUARDS.contains(&name) {
+        return Ok(false);
+    }
+    Ok(normalize_schema_sql(actual)
+        == normalize_schema_sql(&legacy_c5a_provider_guard_definition(name)?))
+}
+
+fn legacy_c5a_provider_guard_present(connection: &Connection) -> Result<bool> {
+    for name in PRIOR_PROVIDER_C5A_GUARDS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual
+            .as_deref()
+            .map(|sql| legacy_c5a_provider_guard_matches(name, sql))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_2b1_evidence_guard_definition(name: &str) -> Result<String> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    for guard in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+        canonical.execute_batch(&format!("DROP TRIGGER {guard}"))?;
+    }
+    canonical.execute_batch(include_str!("legacy_2b1f8e2_provider_evidence_guards.sql"))?;
+    canonical
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn legacy_2b1_evidence_guard_matches(name: &str, actual: &str) -> Result<bool> {
+    if !PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS.contains(&name) {
+        return Ok(false);
+    }
+    Ok(normalize_schema_sql(actual)
+        == normalize_schema_sql(&legacy_2b1_evidence_guard_definition(name)?))
+}
+
+fn legacy_2b1_evidence_guard_present(connection: &Connection) -> Result<bool> {
+    for name in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual
+            .as_deref()
+            .map(|sql| legacy_2b1_evidence_guard_matches(name, sql))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn provider_additive_tables_current(
+    connection: &Connection,
+    stamped: bool,
+    require_all: bool,
+) -> Result<bool> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+    ))?;
+    for name in [
+        "provider_manifest_payloads",
+        "provider_health_observations",
+        "execution_binding_admission_markers",
+        "provider_trust_admissions",
+        "execution_binding_trust_markers",
+        "execution_binding_legacy_trust_quarantine",
+        "provider_state_epochs",
+        "execution_binding_enablement_markers",
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !stamped {
+            if actual.is_some() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let Some(actual) = actual else {
+            if require_all {
+                return Ok(false);
+            }
+            continue;
+        };
+        let expected: String = canonical.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn semantic_fence_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0014-semantic-repair-fence.sql"
+    ))?;
+    for (kind, name) in [
+        ("table", "semantic_repair_fences"),
+        ("table", "semantic_snapshot_reattestations"),
+        ("table", "semantic_terminal_admissions"),
+        ("table", "semantic_legacy_unprovable_admissions"),
+        ("table", "semantic_invalidated_activation_scopes"),
+        ("table", "semantic_activation_scope_history"),
+        ("table", "semantic_legacy_activation_quarantine"),
+        ("view", "semantic_current_usable_snapshots"),
+    ]
+    .into_iter()
+    .chain(SEMANTIC_FENCE_GUARDS.iter().map(|name| ("trigger", *name)))
+    {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !stamped {
+            if actual.is_some() {
+                return Ok(false);
+            }
+            continue;
+        }
+        let Some(actual) = actual else {
+            return Ok(false);
+        };
+        let expected: String = canonical.query_row(
+            "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        if normalize_schema_sql(&actual) != normalize_schema_sql(&expected) {
+            return Ok(false);
+        }
+    }
+    if stamped {
+        let invalid: bool = connection.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM semantic_repair_fences WHERE generation=0 AND reason='BOOTSTRAP')
+                 OR EXISTS(SELECT 1 FROM semantic_repair_fences f WHERE typeof(f.generation)<>'integer'
+                           OR (f.generation>0 AND f.reason<>'GUARD_REPAIR')
+                           OR (f.generation>0 AND NOT EXISTS (
+                               SELECT 1 FROM semantic_repair_fences p WHERE p.generation=f.generation-1)))
+                 OR EXISTS(SELECT 1 FROM semantic_snapshot_reattestations r
+                           WHERE r.verification_profile<>'strict-semantic-v0.1'
+                              OR r.decision_id='' OR r.decision_source='')
+                 OR EXISTS(SELECT 1 FROM registry_snapshot_admissions a
+                           WHERE a.state IN ('QUARANTINED','REVOKED')
+                             AND NOT EXISTS(SELECT 1 FROM semantic_terminal_admissions t
+                                            WHERE t.snapshot_id=a.snapshot_id))
+                 OR EXISTS(SELECT 1 FROM registry_activations a
+                           WHERE NOT EXISTS(SELECT 1 FROM semantic_activation_scope_history h
+                                            WHERE h.scope_kind=a.scope_kind AND h.scope_id=a.scope_id))",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn preflight_migration_state_allowing_guard_upgrade(connection: &Connection) -> Result<()> {
+    preflight_migration_state_with_mode(connection, false)?;
+    let has_migrations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let provider_stamped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations
+         WHERE migration_id='0013_provider_registry')",
+        [],
+        |row| row.get(0),
+    )?;
+    if provider_stamped && !provider_authority_history_provable(connection)? {
+        return Err(TaskManagerError::InvalidRecord(
+            "provider evidence or trust history requires operator quarantine",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_migration_state(connection: &Connection) -> Result<()> {
+    preflight_migration_state_with_mode(connection, true)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
 )]
-fn preflight_migration_state(connection: &Connection) -> Result<()> {
+fn preflight_migration_state_with_mode(
+    connection: &Connection,
+    require_additive_guards: bool,
+) -> Result<()> {
     let table_count = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
         [],
@@ -3432,7 +4456,7 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -3495,6 +4519,21 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
         connection,
         "0011_provenance_service_boundary",
         "provenance-service-boundary-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0012_semantic_registry_store",
+        "semantic-registry-store-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0013_provider_registry",
+        "provider-registry-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0014_semantic_repair_fence",
+        "semantic-repair-fence-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -3655,6 +4694,129 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
                 "provenance service-boundary migration is incomplete",
             ));
         }
+        let has_semantic_registry_store = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_semantic_registry_store {
+            require_migration_tables(
+                connection,
+                &[
+                    "semantic_type_contracts",
+                    "semantic_capability_contracts",
+                    "registry_snapshot_admissions",
+                    "registry_snapshot_entries",
+                    "registry_activations",
+                ],
+            )?;
+            if !additive_guard_definitions_current(
+                connection,
+                SEMANTIC_LEGACY_GUARDS,
+                true,
+                true,
+                false,
+            )? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "semantic registry migration is incomplete",
+                ));
+            }
+        }
+        if !additive_guard_definitions_current(
+            connection,
+            SEMANTIC_ADDITIVE_GUARDS,
+            has_semantic_registry_store,
+            require_additive_guards,
+            false,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "semantic registry migration is incomplete",
+            ));
+        }
+        let has_semantic_fence: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations
+             WHERE migration_id='0014_semantic_repair_fence')",
+            [],
+            |row| row.get(0),
+        )?;
+        if (has_semantic_fence && !has_semantic_registry_store)
+            || !semantic_fence_objects_current(connection, has_semantic_fence)?
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "semantic repair fence migration is incomplete",
+            ));
+        }
+        let has_provider_registry = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_provider_registry {
+            if !has_semantic_registry_store {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider registry requires semantic registry migration",
+                ));
+            }
+            if !additive_guard_definitions_current(
+                connection,
+                &[
+                    "execution_bindings_no_update",
+                    "execution_bindings_no_delete",
+                ],
+                true,
+                true,
+                false,
+            )? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider registry migration is incomplete",
+                ));
+            }
+            require_migration_tables(
+                connection,
+                &["provider_health_observations", "provider_manifest_payloads"],
+            )?;
+            if !additive_guard_definitions_current(
+                connection,
+                PROVIDER_LEGACY_GUARDS,
+                true,
+                true,
+                true,
+            )? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider registry migration is incomplete",
+                ));
+            }
+            let index_present: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='ix_provider_conformance_latest')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !index_present {
+                return Err(TaskManagerError::InvalidRecord(
+                    "provider registry migration is incomplete",
+                ));
+            }
+        }
+        if !additive_guard_definitions_current(
+            connection,
+            PROVIDER_ADDITIVE_GUARDS,
+            has_provider_registry,
+            require_additive_guards,
+            true,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "provider registry migration is incomplete",
+            ));
+        }
+        if !provider_additive_tables_current(
+            connection,
+            has_provider_registry,
+            require_additive_guards,
+        )? {
+            return Err(TaskManagerError::InvalidRecord(
+                "provider registry migration is incomplete",
+            ));
+        }
         if has_v11
             && connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM provenance_events WHERE event_id IS NULL)",
@@ -3775,6 +4937,16 @@ fn migrate_task_manager_schema(
         connection,
         "0011_provenance_service_boundary",
         "provenance-service-boundary-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0012_semantic_registry_store",
+        "semantic-registry-store-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0013_provider_registry",
+        "provider-registry-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5921,36 +7093,105 @@ fn snapshot_contract_hash(value: &Value, capability: &str) -> Option<String> {
     snapshot_contract(value, capability).map(|contract| contract.content_hash)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps Stage-1 shared evidence projection beside the retained baseline validation path"
+)]
 fn conformance_evidence_valid(
     binding: &BindingEvidence,
     contract: &SnapshotContract,
     checked_at: &str,
+    admitted_suite_version: Option<&str>,
 ) -> Result<bool> {
-    let Ok(evidence) = serde_json::from_str::<Value>(&binding.conformance_json) else {
+    if let Some(suite_version) = admitted_suite_version {
+        let (Some(build_hash), Some(suite_id), Some(suite_hash), Some(tested_at)) = (
+            binding.provider_build_hash.as_deref(),
+            binding.conformance_suite_id.as_deref(),
+            binding.conformance_suite_hash.as_deref(),
+            binding.conformance_tested_at.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        let expected = aios_registry::EvidenceMatch {
+            evidence_id: &binding.conformance_evidence_id,
+            provider_id: &binding.principal_id,
+            provider_version: &binding.provider_version,
+            build_hash,
+            capability: &binding.capability,
+            contract_version: &contract.version,
+            contract_hash: &contract.content_hash,
+            suite_id,
+            suite_hash,
+            suite_version,
+            status: &binding.conformance_status,
+            tested_at,
+            evaluated_at: &binding.created_at,
+        };
+        let created = OffsetDateTime::parse(&binding.created_at, &Rfc3339).ok();
+        let checked = OffsetDateTime::parse(checked_at, &Rfc3339).ok();
+        return Ok(created
+            .zip(checked)
+            .is_some_and(|(created, checked)| created <= checked)
+            && aios_registry::evidence_matches_binding(
+                binding.conformance_json.as_bytes(),
+                &expected,
+            )
+            && aios_registry::evidence_matches_binding(
+                binding.conformance_json.as_bytes(),
+                &aios_registry::EvidenceMatch {
+                    evaluated_at: checked_at,
+                    ..expected
+                },
+            ));
+    }
+    let Ok(evidence) = aios_registry::parse_strict_value(
+        binding.conformance_json.as_bytes(),
+        aios_registry::StrictJsonLimits::default(),
+    ) else {
         return Ok(false);
     };
     if !provider_conformance_result_validator()?.is_valid(&evidence) {
         return Ok(false);
     }
-    let executed_at_valid = binding
+    let Ok(checked_at_time) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
+        return Ok(false);
+    };
+    let tested_at = binding
         .conformance_tested_at
         .as_deref()
-        .is_some_and(|tested_at| OffsetDateTime::parse(tested_at, &Rfc3339).is_ok());
+        .and_then(|tested_at| OffsetDateTime::parse(tested_at, &Rfc3339).ok());
+    let created_at = OffsetDateTime::parse(&binding.created_at, &Rfc3339).ok();
+    let executed_at_valid = tested_at.is_some_and(|tested_at| {
+        tested_at <= checked_at_time
+            && admitted_suite_version.is_none_or(|_| {
+                created_at.is_some_and(|created| tested_at <= created && created <= checked_at_time)
+            })
+    });
     let not_expired = match evidence.get("expires_at") {
         None | Some(Value::Null) => true,
         Some(Value::String(expires_at)) => {
             let Ok(expires_at) = OffsetDateTime::parse(expires_at, &Rfc3339) else {
                 return Ok(false);
             };
-            let Ok(checked_at) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
-                return Ok(false);
-            };
-            expires_at > checked_at
+            expires_at > checked_at_time
+                && admitted_suite_version
+                    .is_none_or(|_| tested_at.is_some_and(|tested| expires_at > tested))
         }
         Some(_) => false,
     };
+    let admitted_pass_valid = admitted_suite_version.is_none_or(|suite_version| {
+        let total = evidence.get("tests_total").and_then(Value::as_u64);
+        total.is_some_and(|total| total > 0)
+            && evidence.get("tests_passed").and_then(Value::as_u64) == total
+            && evidence.get("tests_failed").and_then(Value::as_u64) == Some(0)
+            && evidence
+                .pointer("/conformance_suite/version")
+                .and_then(Value::as_str)
+                == Some(suite_version)
+    });
     Ok(executed_at_valid
         && not_expired
+        && admitted_pass_valid
         && evidence.get("result_id").and_then(Value::as_str)
             == Some(binding.conformance_evidence_id.as_str())
         && evidence.get("provider_id").and_then(Value::as_str)
@@ -5987,54 +7228,559 @@ fn conformance_evidence_valid(
             == binding.conformance_tested_at.as_deref())
 }
 
-fn binding_json_matches(binding: &BindingEvidence, check: &BindingGrantCheck<'_>) -> Result<bool> {
-    let value: Value = serde_json::from_str(&binding.binding_json)?;
-    if canonical_json(&value)? != binding.binding_json {
+fn latest_conformance_evidence_id(
+    transaction: &Transaction<'_>,
+    check: &BindingGrantCheck<'_>,
+    has_provider_store: bool,
+) -> Result<Option<String>> {
+    let seed: Option<(String, String, Option<String>, String)> = transaction.query_row(
+        "SELECT b.provider_registration_id,b.capability,b.capability_contract_hash,r.registration_json
+         FROM execution_bindings b JOIN provider_registrations r ON r.registration_id=b.provider_registration_id
+         WHERE b.binding_id=?1 AND b.attempt_id=?2 AND b.task_id=?3
+           AND b.semantic_program_hash=?4 AND b.node_id=?5",
+        params![check.binding_id, check.attempt_id, check.task_id, check.semantic_hash, check.node_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let Some((registration_id, capability, contract_hash, receipt_json)) = seed else {
+        return Ok(None);
+    };
+    let Ok(checked_at) = OffsetDateTime::parse(check.checked_at, &Rfc3339) else {
+        return Ok(None);
+    };
+    let claimed_suite = if has_provider_store {
+        let Ok(receipt) = aios_registry::parse_strict_value(
+            receipt_json.as_bytes(),
+            aios_registry::StrictJsonLimits::default(),
+        ) else {
+            return Ok(None);
+        };
+        let Some(claims) = receipt.get("capabilities").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        let matching = claims
+            .iter()
+            .filter_map(|claim| {
+                let id = claim.get("capability")?.as_str()?;
+                let version =
+                    aios_registry::FullVersion::parse(claim.get("version")?.as_str()?).ok()?;
+                if capability != format!("{id}@{}", version.major)
+                    || claim.get("contract_hash")?.as_str() != contract_hash.as_deref()
+                {
+                    return None;
+                }
+                Some((
+                    claim.get("conformance_suite")?.as_str()?.to_owned(),
+                    claim.get("conformance_suite_hash")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Ok(None);
+        }
+        Some(matching[0].clone())
+    } else {
+        None
+    };
+    let mut statement = transaction.prepare(
+        "SELECT evidence_id,tested_at,suite_id,suite_hash FROM provider_conformance_evidence
+         WHERE registration_id=?1 AND capability=?2 AND contract_hash=?3",
+    )?;
+    let mut rows = statement.query(params![registration_id, capability, contract_hash])?;
+    let mut latest: Option<OffsetDateTime> = None;
+    let mut latest_id: Option<String> = None;
+    let mut tied = false;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(suite_id) = row.get::<_, Option<String>>(2)? else {
+            // Baseline evidence may predate required suite identities. It is
+            // retained for audit but cannot participate in Stage-1 selection.
+            continue;
+        };
+        let suite_hash: Option<String> = row.get(3)?;
+        if claimed_suite.as_ref().is_some_and(|(id, hash)| {
+            id != &suite_id || Some(hash.as_str()) != suite_hash.as_deref()
+        }) {
+            continue;
+        }
+        let Some(raw_time) = row.get::<_, Option<String>>(1)? else {
+            return Ok(None);
+        };
+        let Ok(time) = OffsetDateTime::parse(&raw_time, &Rfc3339) else {
+            return Ok(None);
+        };
+        if time > checked_at {
+            continue;
+        }
+        match latest {
+            Some(previous) if time < previous => {}
+            Some(previous) if time == previous => tied = true,
+            _ => {
+                latest = Some(time);
+                latest_id = Some(id);
+                tied = false;
+            }
+        }
+    }
+    Ok((!tied).then_some(latest_id).flatten())
+}
+
+fn embedded_provider_schema(
+    source: &'static str,
+    cache: &'static OnceLock<std::result::Result<jsonschema::Validator, String>>,
+) -> Result<&'static jsonschema::Validator> {
+    cache
+        .get_or_init(|| {
+            let schema: Value = serde_json::from_str(source).map_err(|error| error.to_string())?;
+            jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|_| TaskManagerError::InvalidRecord("embedded provider schema is invalid"))
+}
+
+fn provider_manifest_validator() -> Result<&'static jsonschema::Validator> {
+    static CACHE: OnceLock<std::result::Result<jsonschema::Validator, String>> = OnceLock::new();
+    embedded_provider_schema(
+        include_str!("../../../specs/capability-manifest.schema.json"),
+        &CACHE,
+    )
+}
+
+fn provider_registration_validator() -> Result<&'static jsonschema::Validator> {
+    static CACHE: OnceLock<std::result::Result<jsonschema::Validator, String>> = OnceLock::new();
+    embedded_provider_schema(
+        include_str!("../../../specs/provider-registration.schema.json"),
+        &CACHE,
+    )
+}
+
+fn provider_identity_digest(domain: &[u8], content: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(content);
+    let mut result = String::from("sha256:");
+    for byte in digest.finalize() {
+        write!(&mut result, "{byte:02x}").expect("String writes do not fail");
+    }
+    result
+}
+
+type ProviderAdmissionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "verifies persisted provider identity, immutable receipt, and both semantic snapshots"
+)]
+fn verified_provider_receipt_and_compatibility(
+    transaction: &Transaction<'_>,
+    binding: &BindingEvidence,
+    checked_at: &str,
+) -> Result<bool> {
+    let Some(registration_id) = binding.provider_registration_id.as_deref() else {
+        return Ok(false);
+    };
+    let record: Option<ProviderAdmissionRow> = transaction
+        .query_row(
+            "SELECT r.provider_id,r.provider_version,r.manifest_hash,r.package_content_hash,
+                r.registry_snapshot_id,r.registration_json,r.registered_at,
+                r.trust_status,m.manifest_json
+         FROM provider_registrations r JOIN provider_manifest_payloads m
+           ON m.registration_id=r.registration_id WHERE r.registration_id=?1",
+            [registration_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        provider_id,
+        version,
+        manifest_hash,
+        build_hash,
+        snapshot_id,
+        receipt_json,
+        registered_at,
+        trust_status,
+        manifest_json,
+    )) = record
+    else {
+        return Ok(false);
+    };
+    if provider_id != binding.principal_id
+        || version != binding.provider_version
+        || Some(manifest_hash.as_str()) != binding.provider_manifest_hash.as_deref()
+        || Some(build_hash.as_str()) != binding.provider_build_hash.as_deref()
+        || OffsetDateTime::parse(&registered_at, &Rfc3339).is_err()
+    {
         return Ok(false);
     }
-    let policy_refs: Value = serde_json::from_str(&binding.policy_decision_refs_json)?;
-    let grant_refs: Value = serde_json::from_str(&binding.grant_refs_json)?;
-    let placement: Value = serde_json::from_str(&binding.placement_json)?;
-    Ok(
-        value.get("schema_version").and_then(Value::as_str) == Some(SCHEMA_VERSION)
-            && value.get("binding_id").and_then(Value::as_str) == Some(check.binding_id)
-            && value.get("attempt_id").and_then(Value::as_str) == Some(check.attempt_id)
-            && value.get("task_id").and_then(Value::as_str) == Some(check.task_id)
-            && value.get("semantic_program_hash").and_then(Value::as_str)
-                == Some(check.semantic_hash)
-            && value.get("registry_snapshot_id").and_then(Value::as_str)
-                == Some(binding.registry_snapshot_id.as_str())
-            && value.get("ir_version").and_then(Value::as_str) == Some(binding.ir_version.as_str())
-            && value.get("node_id").and_then(Value::as_str) == Some(check.node_id)
-            && value.get("capability").and_then(Value::as_str) == Some(binding.capability.as_str())
-            && value
-                .get("capability_contract_hash")
-                .and_then(Value::as_str)
-                == binding.contract_hash.as_deref()
-            && value.pointer("/provider/id").and_then(Value::as_str)
-                == Some(binding.principal_id.as_str())
-            && value.pointer("/provider/version").and_then(Value::as_str)
-                == Some(binding.provider_version.as_str())
-            && value
-                .pointer("/provider/manifest_hash")
-                .and_then(Value::as_str)
-                == binding.provider_manifest_hash.as_deref()
-            && value
-                .pointer("/provider/package_or_build_hash")
-                .and_then(Value::as_str)
-                == binding.provider_build_hash.as_deref()
-            && value.get("policy_decision_refs") == Some(&policy_refs)
-            && value.pointer("/authority/grant_refs") == Some(&grant_refs)
-            && value
-                .pointer("/execution_profile/profile_ref")
-                .and_then(Value::as_str)
-                == Some(binding.execution_profile_ref.as_str())
-            && value.get("placement") == Some(&placement)
-            && value.get("attempt").and_then(Value::as_i64) == Some(binding.attempt)
-            && value.get("created_at").and_then(Value::as_str) == Some(binding.created_at.as_str())
-            && value.get("inputs").is_some_and(Value::is_object)
-            && value.get("outputs").is_some_and(Value::is_object),
+    let limits = aios_registry::StrictJsonLimits {
+        max_bytes: 1024 * 1024,
+        max_depth: 32,
+    };
+    let Ok(manifest_value) = aios_registry::parse_strict_value(manifest_json.as_bytes(), limits)
+    else {
+        return Ok(false);
+    };
+    if canonical_json(&manifest_value)? != manifest_json
+        || !provider_manifest_validator()?.is_valid(&manifest_value)
+    {
+        return Ok(false);
+    }
+    let Ok(manifest) =
+        serde_json::from_value::<aios_contracts::CapabilityManifest>(manifest_value.clone())
+    else {
+        return Ok(false);
+    };
+    let expected_manifest_hash =
+        provider_identity_digest(b"AIOS-PROVIDER-MANIFEST\0v0.1\0", manifest_json.as_bytes());
+    let expected_registration_id = provider_identity_digest(
+        b"AIOS-PROVIDER-REGISTRATION\0v0.1\0",
+        format!("{provider_id}\0{version}\0{manifest_hash}\0{build_hash}").as_bytes(),
+    );
+    if manifest.id != provider_id
+        || manifest.version != version
+        || expected_manifest_hash != manifest_hash
+        || expected_registration_id != registration_id
+    {
+        return Ok(false);
+    }
+    let admitted_registration = aios_registry::ProviderRegistration {
+        registration_id: registration_id.to_owned(),
+        provider_id: provider_id.clone(),
+        provider_version: version.clone(),
+        manifest_hash: manifest_hash.clone(),
+        build_hash: build_hash.clone(),
+        snapshot_id: snapshot_id.clone(),
+    };
+    if aios_registry::verify_provider_registration_receipt(
+        &admitted_registration,
+        &manifest,
+        &trust_status,
+        &registered_at,
+        &receipt_json,
     )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    let Ok((effective_trust, _)) = aios_registry::verified_provider_trust_source_at(
+        transaction,
+        &admitted_registration,
+        &manifest,
+        checked_at,
+    ) else {
+        return Ok(false);
+    };
+    if !matches!(
+        effective_trust,
+        aios_registry::ProviderTrustStatus::LocallyTrusted
+            | aios_registry::ProviderTrustStatus::ProjectReviewed
+            | aios_registry::ProviderTrustStatus::OrganizationApproved
+    ) {
+        return Ok(false);
+    }
+    let Ok(receipt) = aios_registry::parse_strict_value(receipt_json.as_bytes(), limits) else {
+        return Ok(false);
+    };
+    if canonical_json(&receipt)? != receipt_json
+        || !provider_registration_validator()?.is_valid(&receipt)
+        || receipt.get("registration_id").and_then(Value::as_str) != Some(registration_id)
+        || receipt.pointer("/provider/id").and_then(Value::as_str) != Some(provider_id.as_str())
+        || receipt.pointer("/provider/version").and_then(Value::as_str) != Some(version.as_str())
+        || receipt
+            .pointer("/provider/manifest_hash")
+            .and_then(Value::as_str)
+            != Some(manifest_hash.as_str())
+        || receipt
+            .pointer("/package/content_hash")
+            .and_then(Value::as_str)
+            != Some(build_hash.as_str())
+        || receipt.get("registry_snapshot_id").and_then(Value::as_str) != Some(snapshot_id.as_str())
+        || receipt.get("registered_at").and_then(Value::as_str) != Some(registered_at.as_str())
+        || receipt.pointer("/trust/status").and_then(Value::as_str) != Some(trust_status.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(receipt_claims) = receipt.get("capabilities").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if receipt_claims.len() != manifest.provides.len() {
+        return Ok(false);
+    }
+    let mut binding_claim_matches = 0;
+    for (claim, recorded) in manifest.provides.iter().zip(receipt_claims) {
+        if recorded.get("capability").and_then(Value::as_str)
+            != Some(claim.contract.capability.as_str())
+            || recorded.get("version").and_then(Value::as_str)
+                != Some(claim.contract.version.as_str())
+            || recorded.get("contract_hash").and_then(Value::as_str)
+                != claim.contract.contract_hash.as_deref()
+            || recorded.get("conformance_suite").and_then(Value::as_str)
+                != Some(claim.conformance.suite.as_str())
+            || recorded
+                .get("conformance_suite_hash")
+                .and_then(Value::as_str)
+                != claim.conformance.suite_hash.as_deref()
+            || recorded.get("conformance_status").and_then(Value::as_str) != Some("declared")
+            || recorded.get("eligible").and_then(Value::as_bool) != Some(false)
+        {
+            return Ok(false);
+        }
+        let Ok(version) = aios_registry::FullVersion::parse(&claim.contract.version) else {
+            return Ok(false);
+        };
+        if binding.capability == format!("{}@{}", claim.contract.capability, version.major)
+            && claim.contract.contract_hash.as_deref() == binding.contract_hash.as_deref()
+            && Some(claim.conformance.suite.as_str()) == binding.conformance_suite_id.as_deref()
+            && claim.conformance.suite_hash.as_deref() == binding.conformance_suite_hash.as_deref()
+        {
+            binding_claim_matches += 1;
+        }
+    }
+    if binding_claim_matches != 1 {
+        return Ok(false);
+    }
+    let origin_state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM semantic_current_usable_snapshots WHERE snapshot_id=?1",
+            [&snapshot_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !matches!(origin_state.as_deref(), Some("ADMITTED" | "DEPRECATED")) {
+        return Ok(false);
+    }
+    let Some(origin_registry) = load_admitted_semantic_registry(transaction, &snapshot_id)? else {
+        return Ok(false);
+    };
+    let Some(selected_registry) =
+        load_admitted_semantic_registry(transaction, &binding.registry_snapshot_id)?
+    else {
+        return Ok(false);
+    };
+    let options = aios_registry::ProviderConformanceOptions::default();
+    let origin_report =
+        aios_registry::validate_provider_manifest(&origin_registry, &manifest, options);
+    let mut selected_manifest = manifest.clone();
+    selected_manifest.provides.retain(|claim| {
+        aios_registry::FullVersion::parse(&claim.contract.version)
+            .ok()
+            .is_some_and(|version| {
+                binding.capability == format!("{}@{}", claim.contract.capability, version.major)
+                    && claim.contract.contract_hash.as_deref() == binding.contract_hash.as_deref()
+                    && Some(claim.conformance.suite.as_str())
+                        == binding.conformance_suite_id.as_deref()
+                    && claim.conformance.suite_hash.as_deref()
+                        == binding.conformance_suite_hash.as_deref()
+            })
+    });
+    let selected_report =
+        aios_registry::validate_provider_manifest(&selected_registry, &selected_manifest, options);
+    Ok(origin_report.valid
+        && !origin_report.bootstrap_contract_hash_bypass_used
+        && selected_report.valid
+        && !selected_report.bootstrap_contract_hash_bypass_used)
+}
+
+/// A binding must retain the exact trust source that existed when its
+/// immutable receipt was inserted. Later provider review requires a new
+/// attempt; it cannot retroactively authorize an older binding.
+fn verified_provider_admission(
+    transaction: &Transaction<'_>,
+    binding_id: &str,
+    binding: &BindingEvidence,
+    checked_at: &str,
+    receipt: &aios_registry::BindingReceiptProjection,
+) -> Result<bool> {
+    let quarantined: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM execution_binding_legacy_trust_quarantine WHERE binding_id=?1)",
+        [binding_id],
+        |row| row.get(0),
+    )?;
+    if quarantined {
+        return Ok(false);
+    }
+    if !verified_provider_receipt_and_compatibility(transaction, binding, checked_at)? {
+        return Ok(false);
+    }
+    let Some(registration_id) = binding.provider_registration_id.as_deref() else {
+        return Ok(false);
+    };
+    let Ok(checked_time) = OffsetDateTime::parse(checked_at, &Rfc3339) else {
+        return Ok(false);
+    };
+    let mut statement = transaction.prepare(
+        "SELECT admission_id,admitted_at FROM provider_trust_admissions
+         WHERE registration_id=?1 ORDER BY revision DESC",
+    )?;
+    let mut rows = statement.query([registration_id])?;
+    let mut expected_source = registration_id.to_owned();
+    while let Some(row) = rows.next()? {
+        let admitted_at: String = row.get(1)?;
+        let Ok(admitted_time) = OffsetDateTime::parse(&admitted_at, &Rfc3339) else {
+            return Ok(false);
+        };
+        if admitted_time <= checked_time {
+            expected_source = row.get(0)?;
+            break;
+        }
+    }
+    let admitted_source: Option<String> = transaction
+        .query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id=?1",
+            [binding_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(admitted_source.as_deref() == Some(expected_source.as_str())
+        && receipt.trust_pin() == Some(expected_source.as_str()))
+}
+
+fn load_admitted_semantic_registry(
+    transaction: &Transaction<'_>,
+    snapshot_id: &str,
+) -> Result<Option<aios_registry::SemanticRegistry>> {
+    let snapshot_json: Option<String> = transaction
+        .query_row(
+            "SELECT manifest_json FROM registry_snapshots WHERE snapshot_id=?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(snapshot_json) = snapshot_json else {
+        return Ok(None);
+    };
+    let Ok(snapshot) = aios_registry::parse_strict_json::<aios_contracts::RegistrySnapshot>(
+        snapshot_json.as_bytes(),
+        aios_registry::StrictJsonLimits::default(),
+    ) else {
+        return Ok(None);
+    };
+    let mut types = Vec::new();
+    let mut capabilities = Vec::new();
+    for (class, sink_type) in [("type", true), ("capability", false)] {
+        let mut statement = transaction.prepare(
+            "SELECT t.contract_json,c.contract_json FROM registry_snapshot_entries e
+             LEFT JOIN semantic_type_contracts t ON e.contract_class='type' AND t.content_hash=e.content_hash
+             LEFT JOIN semantic_capability_contracts c ON e.contract_class='capability' AND c.content_hash=e.content_hash
+             WHERE e.snapshot_id=?1 AND e.contract_class=?2",
+        )?;
+        let mut rows = statement.query(params![snapshot_id, class])?;
+        while let Some(row) = rows.next()? {
+            if sink_type {
+                let Some(json) = row.get::<_, Option<String>>(0)? else {
+                    return Ok(None);
+                };
+                let Ok(contract) = aios_registry::parse_strict_json::<aios_contracts::TypeContract>(
+                    json.as_bytes(),
+                    aios_registry::StrictJsonLimits::default(),
+                ) else {
+                    return Ok(None);
+                };
+                types.push(contract);
+            } else {
+                let Some(json) = row.get::<_, Option<String>>(1)? else {
+                    return Ok(None);
+                };
+                let Ok(contract) = aios_registry::parse_strict_json::<
+                    aios_contracts::CapabilityContract,
+                >(
+                    json.as_bytes(), aios_registry::StrictJsonLimits::default()
+                ) else {
+                    return Ok(None);
+                };
+                capabilities.push(contract);
+            }
+        }
+    }
+    let Ok(registry) = aios_registry::SemanticRegistry::from_records(
+        snapshot,
+        types,
+        capabilities,
+        aios_registry::RegistryBuildOptions::default(),
+    ) else {
+        return Ok(None);
+    };
+    Ok((registry.snapshot_id() == snapshot_id).then_some(registry))
+}
+
+fn admitted_suite_version(
+    transaction: &Transaction<'_>,
+    binding: &BindingEvidence,
+) -> Result<Option<String>> {
+    let Some(registry) =
+        load_admitted_semantic_registry(transaction, &binding.registry_snapshot_id)?
+    else {
+        return Ok(None);
+    };
+    let Some((capability, major)) = binding.capability.rsplit_once('@') else {
+        return Ok(None);
+    };
+    let Ok(major) = major.parse::<u64>() else {
+        return Ok(None);
+    };
+    let Some(contract) = registry.capability_contract(capability, major) else {
+        return Ok(None);
+    };
+    Ok(contract.conformance.suite_version.clone())
+}
+
+fn binding_receipt_projection(
+    binding: &BindingEvidence,
+    check: &BindingGrantCheck<'_>,
+    require_pin: bool,
+) -> Option<aios_registry::BindingReceiptProjection> {
+    let receipt =
+        aios_registry::BindingReceiptProjection::parse(binding.binding_json.as_bytes()).ok()?;
+    let columns = aios_registry::BindingReceiptColumns {
+        binding_id: check.binding_id,
+        attempt_id: check.attempt_id,
+        task_id: check.task_id,
+        semantic_program_hash: check.semantic_hash,
+        registry_snapshot_id: &binding.registry_snapshot_id,
+        ir_version: &binding.ir_version,
+        node_id: check.node_id,
+        capability: &binding.capability,
+        capability_contract_hash: binding.contract_hash.as_deref(),
+        provider_id: &binding.principal_id,
+        provider_version: &binding.provider_version,
+        provider_manifest_hash: binding.provider_manifest_hash.as_deref(),
+        provider_build_hash: binding.provider_build_hash.as_deref(),
+        attempt: binding.attempt,
+        policy_decision_refs_json: &binding.policy_decision_refs_json,
+        grant_refs_json: &binding.grant_refs_json,
+        execution_profile_ref: &binding.execution_profile_ref,
+        placement_json: &binding.placement_json,
+        created_at: &binding.created_at,
+    };
+    ((!require_pin || receipt.conforms_to_stamped_schema())
+        && receipt.matches_columns(&columns)
+        && receipt.evidence_pin_matches(&binding.conformance_evidence_id, require_pin)
+        && (!require_pin || receipt.trust_pin().is_some()))
+    .then_some(receipt)
 }
 
 fn program_node<'a>(program: &'a Value, node_id: &str) -> Option<&'a Value> {
@@ -6124,9 +7870,21 @@ fn binding_grants_valid(
     if grant_ids.len() > 64 || !all_unique(&grant_ids) {
         return Ok(false);
     }
-    let binding = transaction
-        .query_row(
-            "SELECT b.capability, b.provider_id, p.program_json, p.registry_snapshot_id,
+    let has_registry_store: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+        [], |row| row.get(0),
+    )?;
+    let has_provider_store: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0013_provider_registry')",
+        [], |row| row.get(0),
+    )?;
+    let Some(latest_evidence_id) =
+        latest_conformance_evidence_id(transaction, check, has_provider_store)?
+    else {
+        return Ok(false);
+    };
+    let mut binding_query = String::from(
+        "SELECT b.capability, b.provider_id, p.program_json, p.registry_snapshot_id,
                     b.capability_contract_hash, s.manifest_json, b.ir_version,
                     b.provider_version, b.provider_manifest_hash, b.provider_build_hash,
                     b.provider_registration_id, b.attempt, b.policy_decision_refs_json,
@@ -6139,36 +7897,81 @@ fn binding_grants_valid(
              JOIN registry_snapshots s ON s.snapshot_id = p.registry_snapshot_id
              JOIN provider_registrations r ON r.registration_id = b.provider_registration_id
                 AND r.provider_id = b.provider_id AND r.provider_version = b.provider_version
-                AND r.registry_snapshot_id = p.registry_snapshot_id AND r.state = 'registered'
-                AND r.trust_status IN ('locally-trusted', 'project-reviewed', 'organization-approved')
+                AND r.state = 'registered'
                 AND r.manifest_hash = b.provider_manifest_hash
                 AND r.package_content_hash = b.provider_build_hash
-             JOIN provider_conformance_evidence c ON c.registration_id = r.registration_id
-                AND c.capability = b.capability AND c.contract_hash = b.capability_contract_hash
-                AND c.status = 'pass'
+             JOIN provider_conformance_evidence c ON c.evidence_id = ?6
+                AND c.registration_id = r.registration_id AND c.capability = b.capability
+                AND c.contract_hash = b.capability_contract_hash AND c.status = 'pass'
              WHERE b.binding_id = ?1 AND b.attempt_id = ?2 AND b.task_id = ?3
                 AND b.semantic_program_hash = ?4 AND b.node_id = ?5
-                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash
-                AND (SELECT COUNT(*) FROM provider_conformance_evidence c2
-                     WHERE c2.registration_id=r.registration_id
-                       AND c2.capability=b.capability
-                       AND c2.contract_hash=b.capability_contract_hash
-                       AND c2.status='pass')=1",
-            params![check.binding_id, check.attempt_id, check.task_id, check.semantic_hash, check.node_id],
+                AND b.registry_snapshot_id = p.registry_snapshot_id AND b.semantic_program_hash = p.semantic_hash",
+    );
+    if has_registry_store {
+        binding_query.push_str(
+            " AND EXISTS(SELECT 1 FROM semantic_current_usable_snapshots a
+               WHERE a.snapshot_id=p.registry_snapshot_id AND a.state='ADMITTED')",
+        );
+    }
+    if has_provider_store {
+        binding_query.push_str(
+            " AND EXISTS(SELECT 1 FROM execution_binding_admission_markers marker
+               WHERE marker.binding_id=b.binding_id AND marker.conformance_evidence_id=c.evidence_id)
+               AND EXISTS(SELECT 1 FROM execution_binding_enablement_markers marker
+                   JOIN provider_state_epochs epoch
+                     ON epoch.registration_id=marker.registration_id
+                    AND epoch.revision=marker.revision
+                   WHERE marker.binding_id=b.binding_id
+                     AND marker.registration_id=r.registration_id
+                     AND epoch.state='registered'
+                     AND epoch.transitioned_at=r.updated_at
+                     AND epoch.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                                         WHERE registration_id=r.registration_id))",
+        );
+    } else {
+        // Older stores have no append-only trust decisions to verify, so the
+        // immutable registration row remains the complete trust authority.
+        binding_query.push_str(
+            " AND r.registry_snapshot_id=b.registry_snapshot_id
+               AND r.trust_status IN ('locally-trusted','project-reviewed','organization-approved')",
+        );
+    }
+    let binding = transaction
+        .query_row(
+            &binding_query,
+            params![
+                check.binding_id,
+                check.attempt_id,
+                check.task_id,
+                check.semantic_hash,
+                check.node_id,
+                latest_evidence_id
+            ],
             |row| {
                 Ok(BindingEvidence {
-                    capability: row.get(0)?, principal_id: row.get(1)?,
-                    program_json: row.get(2)?, registry_snapshot_id: row.get(3)?,
-                    contract_hash: row.get(4)?, snapshot_manifest_json: row.get(5)?,
-                    ir_version: row.get(6)?, provider_version: row.get(7)?,
-                    provider_manifest_hash: row.get(8)?, provider_build_hash: row.get(9)?,
-                    provider_registration_id: row.get(10)?, attempt: row.get(11)?,
-                    policy_decision_refs_json: row.get(12)?, grant_refs_json: row.get(13)?,
-                    execution_profile_ref: row.get(14)?, placement_json: row.get(15)?,
-                    binding_json: row.get(16)?, created_at: row.get(17)?,
+                    capability: row.get(0)?,
+                    principal_id: row.get(1)?,
+                    program_json: row.get(2)?,
+                    registry_snapshot_id: row.get(3)?,
+                    contract_hash: row.get(4)?,
+                    snapshot_manifest_json: row.get(5)?,
+                    ir_version: row.get(6)?,
+                    provider_version: row.get(7)?,
+                    provider_manifest_hash: row.get(8)?,
+                    provider_build_hash: row.get(9)?,
+                    provider_registration_id: row.get(10)?,
+                    attempt: row.get(11)?,
+                    policy_decision_refs_json: row.get(12)?,
+                    grant_refs_json: row.get(13)?,
+                    execution_profile_ref: row.get(14)?,
+                    placement_json: row.get(15)?,
+                    binding_json: row.get(16)?,
+                    created_at: row.get(17)?,
                     conformance_evidence_id: row.get(18)?,
-                    conformance_suite_id: row.get(19)?, conformance_suite_hash: row.get(20)?,
-                    conformance_status: row.get(21)?, conformance_json: row.get(22)?,
+                    conformance_suite_id: row.get(19)?,
+                    conformance_suite_hash: row.get(20)?,
+                    conformance_status: row.get(21)?,
+                    conformance_json: row.get(22)?,
                     conformance_tested_at: row.get(23)?,
                 })
             },
@@ -6179,7 +7982,20 @@ fn binding_grants_valid(
     };
     if binding.provider_registration_id.is_none()
         || binding.grant_refs_json != check.grant_refs_json
-        || !binding_json_matches(&binding, check)?
+    {
+        return Ok(false);
+    }
+    let Some(receipt) = binding_receipt_projection(&binding, check, has_provider_store) else {
+        return Ok(false);
+    };
+    if has_provider_store
+        && !verified_provider_admission(
+            transaction,
+            check.binding_id,
+            &binding,
+            check.checked_at,
+            &receipt,
+        )?
     {
         return Ok(false);
     }
@@ -6187,8 +8003,21 @@ fn binding_grants_valid(
     let Some(contract) = snapshot_contract(&snapshot, &binding.capability) else {
         return Ok(false);
     };
+    let suite_version = if has_provider_store {
+        let Some(version) = admitted_suite_version(transaction, &binding)? else {
+            return Ok(false);
+        };
+        Some(version)
+    } else {
+        None
+    };
     if Some(contract.content_hash.as_str()) != binding.contract_hash.as_deref()
-        || !conformance_evidence_valid(&binding, &contract, check.checked_at)?
+        || !conformance_evidence_valid(
+            &binding,
+            &contract,
+            check.checked_at,
+            suite_version.as_deref(),
+        )?
     {
         return Ok(false);
     }
@@ -7666,6 +9495,27 @@ mod tests {
         }
     }
 
+    fn remove_fixture_fence_schema(connection: &Connection) {
+        for name in SEMANTIC_FENCE_GUARDS {
+            connection
+                .execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP VIEW semantic_current_usable_snapshots;
+             DROP TABLE semantic_snapshot_reattestations;
+             DROP TABLE semantic_invalidated_activation_scopes;
+             DROP TABLE semantic_activation_scope_history;
+             DROP TABLE semantic_legacy_activation_quarantine;
+             DROP TABLE semantic_legacy_unprovable_admissions;
+             DROP TABLE semantic_terminal_admissions;
+             DROP TABLE semantic_repair_fences;
+             DELETE FROM schema_migrations WHERE migration_id='0014_semantic_repair_fence';",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn provenance_event_id_key_shape_rejects_unique_and_composite_substitutes() {
         let connection = Connection::open_in_memory().unwrap();
@@ -7752,6 +9602,2758 @@ mod tests {
                 "provenance event has no identity"
             ))
         ));
+    }
+
+    #[test]
+    fn stamped_semantic_registry_requires_terminal_state_guard() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+            ))
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0012_semantic_registry_store','semantic-registry-store-v0.1','2026-09-19T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+        for trigger in SEMANTIC_ADDITIVE_GUARDS {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "semantic registry migration is incomplete"
+                ))
+            ));
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn public_registry_initializers_cannot_migrate_without_live_manager_fence() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("registry-public-migration-fence.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut independent = Connection::open(&path).unwrap();
+        assert!(aios_registry::RegistryStore::initialize(&mut independent).is_err());
+        assert!(aios_registry::ProviderStore::initialize(&mut independent).is_err());
+        let migrations: i64 = independent.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrations, 0);
+        drop(independent);
+
+        manager
+            .connection
+            .execute(
+                "UPDATE task_manager_lease SET fence_epoch=fence_epoch+1 WHERE singleton_id=1",
+                [],
+            )
+            .unwrap();
+        assert!(manager.initialize_provider_store().is_err());
+        let migrations: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrations, 0);
+    }
+
+    #[test]
+    fn fenced_registry_migration_rejects_unstamped_lookalike_tables() {
+        let mut manager = test_manager();
+        manager
+            .connection
+            .execute_batch("CREATE TABLE semantic_type_contracts (forged TEXT)")
+            .unwrap();
+        assert!(manager.initialize_registry_store().is_err());
+        let stamped: bool = manager
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0012_semantic_registry_store')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stamped);
+    }
+
+    #[test]
+    fn fenced_registry_migration_rejects_unstamped_triggers_on_baseline_tables() {
+        for (trigger, provider) in [
+            (
+                "CREATE TRIGGER immutable_admitted_registry_snapshots_update BEFORE UPDATE ON registry_snapshots BEGIN SELECT 1; END",
+                false,
+            ),
+            (
+                "CREATE TRIGGER provider_registration_no_delete BEFORE DELETE ON provider_registrations BEGIN SELECT 1; END",
+                true,
+            ),
+        ] {
+            let mut manager = test_manager();
+            manager.connection.execute_batch(trigger).unwrap();
+            assert!(
+                if provider {
+                    manager.initialize_provider_store()
+                } else {
+                    manager.initialize_registry_store()
+                }
+                .is_err()
+            );
+            let stamps: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id IN ('0012_semantic_registry_store','0013_provider_registry')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamps, 0);
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_upgrades_old_stamped_registry_guard() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-stamped-registry.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_registry_store().unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER one_way_registry_snapshot_admissions_update;
+                 DROP TRIGGER immutable_registry_snapshot_admissions_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshots_target_update;
+                 DROP TRIGGER immutable_semantic_type_contracts_reinsert;
+                 DROP TRIGGER immutable_semantic_capability_contracts_reinsert;
+                 DROP TRIGGER immutable_registry_snapshot_entries_reinsert;
+                 DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;",
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        assert!(!missing_additive_guard(&reopened.connection, SEMANTIC_ADDITIVE_GUARDS).unwrap());
+        let after: (String, String) = reopened
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, after);
+    }
+
+    #[test]
+    fn stamped_provider_registry_requires_semantic_registry_stamp() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        manager.connection.execute(
+            "INSERT INTO schema_migrations(migration_id,checksum,applied_at) VALUES ('0013_provider_registry','provider-registry-v0.1','2026-09-19T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provider registry requires semantic registry migration"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stamped_provider_registry_requires_duplicate_insert_guards() {
+        let mut manager = test_manager();
+        manager.initialize_provider_store().unwrap();
+        for trigger in PROVIDER_ADDITIVE_GUARDS {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .unwrap();
+            assert!(matches!(
+                preflight_migration_state(&manager.connection),
+                Err(TaskManagerError::InvalidRecord(
+                    "provider registry migration is incomplete"
+                ))
+            ));
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn stamped_provider_registry_rejects_same_name_malformed_legacy_tables_on_reopen() {
+        for name in ["provider_manifest_payloads", "provider_health_observations"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("malformed-provider.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            let manifest_guards = if name == "provider_manifest_payloads" {
+                [
+                    "provider_manifest_payload_immutable_update",
+                    "provider_manifest_payload_immutable_delete",
+                    "provider_manifest_payload_no_duplicate_insert",
+                ]
+                .iter()
+                .map(|trigger| {
+                    manager
+                        .connection
+                        .query_row(
+                            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                            [trigger],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            manager
+                .connection
+                .execute_batch(&format!("DROP TABLE {name}; CREATE TABLE {name}(x TEXT);"))
+                .unwrap();
+            for guard in manifest_guards {
+                manager
+                    .connection
+                    .execute_batch(&format!("{guard};"))
+                    .unwrap();
+            }
+            if name == "provider_manifest_payloads" {
+                let restored: i64 = manager
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+                     AND name IN ('provider_manifest_payload_immutable_update',
+                                  'provider_manifest_payload_immutable_delete',
+                                  'provider_manifest_payload_no_duplicate_insert')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(restored, 3);
+            }
+            drop(manager);
+
+            assert!(
+                TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err(),
+                "{name}"
+            );
+            let connection = Connection::open(&path).unwrap();
+            let columns: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, format!("CREATE TABLE {name}(x TEXT)"));
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_upgrades_old_stamped_provider_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-stamped-provider.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provider_manifest_payload_no_duplicate_insert;
+                 DROP TRIGGER execution_binding_no_duplicate_insert;
+                 DROP TRIGGER execution_binding_evidence_present_at_insert;
+                 DROP TRIGGER execution_binding_admission_marker_insert;
+                 DROP TABLE execution_binding_admission_markers;",
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        assert!(!missing_additive_guard(&reopened.connection, PROVIDER_ADDITIVE_GUARDS).unwrap());
+        assert!(provider_additive_tables_current(&reopened.connection, true, true).unwrap());
+        let after: (String, String) = reopened
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamp, after);
+    }
+
+    #[test]
+    fn old_trust_insert_guard_upgrades_only_without_prior_decisions() {
+        for poisoned in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("prior-trust-insert.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            manager
+                .connection
+                .execute_batch("DROP TRIGGER provider_trust_admission_receipt_insert")
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "legacy_b0b7302_provider_trust_admission_guard.sql"
+                ))
+                .unwrap();
+            assert!(legacy_b0b_trust_admission_guard_present(&manager.connection).unwrap());
+            if poisoned {
+                manager
+                    .connection
+                    .pragma_update(None, "foreign_keys", "OFF")
+                    .unwrap();
+                manager.connection.execute(
+                    "INSERT INTO provider_trust_admissions
+                     (admission_id,registration_id,decision_id,revision,trust_status,
+                      authority_ref,admitted_at,receipt_json)
+                     VALUES ('forged','missing-registration','review',1,
+                             'locally-trusted','reviewer',?1,
+                             '{\"registration_id\":\"missing-registration\",\"decision_id\":\"review\",\"revision\":1,\"trust_status\":\"locally-trusted\",\"authority_ref\":\"reviewer\",\"admitted_at\":\"2026-09-19T00:00:00Z\"}')",
+                    ["2026-09-19T00:00:00Z"],
+                ).unwrap();
+            }
+            drop(manager);
+            if poisoned {
+                assert!(matches!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                    Err(TaskManagerError::InvalidRecord(
+                        "provider evidence or trust history requires operator quarantine"
+                    ))
+                ));
+                let connection = Connection::open(&path).unwrap();
+                assert!(legacy_b0b_trust_admission_guard_present(&connection).unwrap());
+            } else {
+                let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                assert!(preflight_migration_state(&reopened.connection).is_ok());
+                assert!(!legacy_b0b_trust_admission_guard_present(&reopened.connection).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn lost_evidence_or_trust_history_refuses_fenced_reopen() {
+        for guard in [
+            "provider_evidence_no_duplicate_insert",
+            "provider_trust_admission_no_update",
+            "provider_trust_admission_receipt_insert",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("unprovable-provider-history.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            let old_epoch: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if guard == "provider_evidence_no_duplicate_insert" {
+                manager
+                    .connection
+                    .execute_batch(
+                        "INSERT INTO provider_registrations
+                         (registration_id,provider_id,provider_version,package_content_hash,
+                          state,trust_status,registration_json,registered_at)
+                         VALUES ('forged-provider','provider:forged','1.0.0','build:forged',
+                                 'disabled','locally-trusted',
+                                 '{\"trust\":{\"status\":\"locally-trusted\"}}',
+                                 '2026-09-19T00:00:00Z');
+                         INSERT INTO provider_conformance_evidence
+                         (evidence_id,registration_id,capability,contract_hash,suite_id,
+                          suite_hash,status,evidence_json,tested_at)
+                         VALUES ('forged-evidence','forged-provider','artifact.hash@1',
+                                 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                                 'suite:forged',
+                                 'sha256:2222222222222222222222222222222222222222222222222222',
+                                 'fail','{\"result\":\"fail\"}','2026-09-19T00:00:00Z');",
+                    )
+                    .unwrap();
+            }
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {guard}"))
+                .unwrap();
+            if guard == "provider_evidence_no_duplicate_insert" {
+                manager
+                    .connection
+                    .execute_batch(
+                        "PRAGMA recursive_triggers=OFF;
+                         INSERT OR REPLACE INTO provider_conformance_evidence
+                         (evidence_id,registration_id,capability,contract_hash,suite_id,
+                          suite_hash,status,evidence_json,tested_at)
+                         VALUES ('forged-evidence','forged-provider','artifact.hash@1',
+                                 'sha256:1111111111111111111111111111111111111111111111111111',
+                                 'suite:forged',
+                                 'sha256:2222222222222222222222222222222222222222222222222222',
+                                 'pass','{\"result\":\"pass\"}','2026-09-19T00:00:00Z');",
+                    )
+                    .unwrap();
+                assert_eq!(
+                    manager
+                        .connection
+                        .query_row(
+                            "SELECT status FROM provider_conformance_evidence
+                             WHERE evidence_id='forged-evidence'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                    "pass"
+                );
+            }
+            drop(manager);
+            for _ in 0..2 {
+                assert!(matches!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                    Err(TaskManagerError::InvalidRecord(
+                        "provider evidence or trust history requires operator quarantine"
+                    ))
+                ));
+            }
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                old_epoch,
+                "{guard}"
+            );
+            assert!(
+                missing_additive_guard(&connection, &[guard]).unwrap(),
+                "{guard} was silently reinstalled"
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_reopen_upgrades_complete_prior_evidence_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prior-evidence-guards.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        for guard in PRIOR_PROVIDER_2B1_EVIDENCE_GUARDS {
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {guard}"))
+                .unwrap();
+        }
+        manager
+            .connection
+            .execute_batch(include_str!("legacy_2b1f8e2_provider_evidence_guards.sql"))
+            .unwrap();
+        assert!(legacy_2b1_evidence_guard_present(&manager.connection).unwrap());
+        assert!(matches!(
+            preflight_migration_state(&manager.connection),
+            Err(TaskManagerError::InvalidRecord(
+                "provider registry migration is incomplete"
+            ))
+        ));
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(preflight_migration_state(&reopened.connection).is_ok());
+        assert!(!legacy_2b1_evidence_guard_present(&reopened.connection).unwrap());
+        assert!(
+            additive_guard_definitions_current(
+                &reopened.connection,
+                PROVIDER_ADDITIVE_GUARDS,
+                true,
+                true,
+                true
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn erased_revocation_history_requires_operator_quarantine() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("replaced-revoked-provider.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='terminal-provider';
+             UPDATE provider_registrations SET state='revoked',
+                 updated_at='2026-09-19T00:00:01Z'
+             WHERE registration_id='terminal-provider';
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('unaffected-provider','provider:unaffected','1.0.0','build:unaffected',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             DROP TRIGGER provider_registration_no_duplicate_insert;
+             DROP TRIGGER provider_state_epoch_initial;
+             DROP TRIGGER provider_state_epoch_transition;
+             DROP TRIGGER provider_state_epoch_no_duplicate_insert;
+             DROP TRIGGER provider_state_epoch_event_insert_guard;
+             DROP TRIGGER provider_state_epoch_no_delete;
+             DROP TRIGGER provider_registration_revoked_epoch_insert;
+             DROP TRIGGER provider_registration_revoked_epoch_update;
+             INSERT OR REPLACE INTO provider_state_epochs
+             (registration_id,revision,state,transitioned_at)
+             VALUES ('terminal-provider',2,'disabled','2026-09-19T00:00:01Z');
+             INSERT OR REPLACE INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:02Z'
+             WHERE registration_id='terminal-provider';",
+            )
+            .unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(manager);
+        let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+            Ok(_) => panic!("unprovable legacy provider history reopened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &reopen_error,
+                TaskManagerError::InvalidRecord(
+                    "provider state history requires operator quarantine"
+                        | "provider registry migration is incomplete"
+                )
+            ),
+            "{reopen_error}"
+        );
+        let after = Connection::open(&path).unwrap();
+        assert_eq!(after.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            after
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn retained_revoked_epoch_blocks_replacement_and_state_update() {
+        let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='terminal-provider';
+             UPDATE provider_registrations SET state='revoked',
+                 updated_at='2026-09-19T00:00:01Z'
+             WHERE registration_id='terminal-provider';
+             DROP TRIGGER provider_registration_no_duplicate_insert;",
+            )
+            .unwrap();
+        let replacement = manager
+            .connection
+            .execute(
+                "INSERT OR REPLACE INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at)
+             VALUES ('terminal-provider','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z')",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replacement.contains("provider revocation epoch is terminal"),
+            "{replacement}"
+        );
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER provider_registration_revocation_terminal")
+            .unwrap();
+        let update = manager
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='disabled',
+                updated_at='2026-09-19T00:00:02Z'
+             WHERE registration_id='terminal-provider'",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            update.contains("provider revocation epoch is terminal"),
+            "{update}"
+        );
+        let state: String = manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='terminal-provider'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(state, "revoked");
+        let terminal_epochs: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_state_epochs
+             WHERE registration_id='terminal-provider' AND state='revoked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_epochs, 1);
+    }
+
+    #[test]
+    fn stamped_provider_history_defects_are_not_auto_repaired() {
+        for defect in [
+            "provider_registration_no_duplicate_insert",
+            "provider_registration_revoked_epoch_insert",
+            "provider_state_epoch_no_update",
+            "provider_state_epoch_no_duplicate_insert",
+            "provider_state_epoch_event_insert_guard",
+            "provider_state_epoch_initial",
+            "provider_state_epoch_transition",
+            "provider_state_epochs",
+            "malformed_provider_state_epochs",
+            "malformed_provider_state_epoch_event_insert_guard",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("unprovable-provider-history.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            match defect {
+                "provider_state_epochs" => manager
+                    .connection
+                    .execute_batch("DROP TABLE provider_state_epochs")
+                    .unwrap(),
+                "malformed_provider_state_epochs" => manager
+                    .connection
+                    .execute_batch("ALTER TABLE provider_state_epochs ADD COLUMN forged TEXT")
+                    .unwrap(),
+                "malformed_provider_state_epoch_event_insert_guard" => manager
+                    .connection
+                    .execute_batch(
+                        "DROP TRIGGER provider_state_epoch_event_insert_guard;
+                     CREATE TRIGGER provider_state_epoch_event_insert_guard
+                     BEFORE INSERT ON provider_state_epochs BEGIN SELECT 1; END",
+                    )
+                    .unwrap(),
+                name => manager
+                    .connection
+                    .execute_batch(&format!("DROP TRIGGER {name}"))
+                    .unwrap(),
+            }
+            drop(manager);
+            let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+                Ok(_) => panic!("unprovable provider history reopened: {defect}"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &reopen_error,
+                    TaskManagerError::InvalidRecord(
+                        "provider state history requires operator quarantine"
+                            | "provider registry migration is incomplete"
+                    )
+                ),
+                "{defect}: {reopen_error}"
+            );
+            let retained = Connection::open(&path).unwrap();
+            assert_eq!(
+                retained
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations
+                 WHERE migration_id='0013_provider_registry'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_history_guard_or_ledger_quarantines_before_repair() {
+        for missing in [
+            "provider_state_epoch_transition",
+            "execution_binding_enablement_marker_insert",
+            "provider_state_epochs",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("partial-enable-ledger.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            manager
+                .connection
+                .execute_batch(
+                    "INSERT INTO provider_registrations
+                 (registration_id,provider_id,provider_version,package_content_hash,state,
+                  trust_status,registration_json,registered_at)
+                 VALUES ('epoch-provider','provider:epoch','1.0.0','build:epoch','disabled',
+                         'locally-trusted','{\"trust\":{\"status\":\"locally-trusted\"}}',
+                         '2026-09-19T00:00:00Z');
+                 UPDATE provider_registrations SET state='registered',
+                     updated_at='2026-09-19T00:00:00Z'
+                 WHERE registration_id='epoch-provider';",
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(&format!(
+                    "DROP {} {missing}",
+                    if missing == "provider_state_epochs" {
+                        "TABLE"
+                    } else {
+                        "TRIGGER"
+                    }
+                ))
+                .unwrap();
+            drop(manager);
+            if missing != "execution_binding_enablement_marker_insert" {
+                assert!(
+                    matches!(
+                        TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                        Err(TaskManagerError::InvalidRecord(
+                            "provider state history requires operator quarantine"
+                        ))
+                    ),
+                    "{missing}"
+                );
+                continue;
+            }
+
+            let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert_eq!(reopened.connection.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(), "disabled", "{missing}");
+            assert_eq!(reopened.connection.query_row(
+                "SELECT state FROM provider_state_epochs WHERE registration_id='epoch-provider'
+                 ORDER BY revision DESC LIMIT 1", [], |row| row.get::<_, String>(0),
+            ).unwrap(), "disabled", "{missing}");
+            reopened
+                .connection
+                .execute(
+                    "UPDATE provider_registrations SET state='registered',updated_at=?1
+                 WHERE registration_id='epoch-provider'",
+                    [T0],
+                )
+                .unwrap();
+            let revision: i64 = reopened.connection.query_row(
+                "SELECT MAX(revision) FROM provider_state_epochs WHERE registration_id='epoch-provider'",
+                [], |row| row.get(0),
+            ).unwrap();
+            drop(reopened);
+            let again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert_eq!(again.connection.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(), "registered", "{missing}");
+            assert_eq!(again.connection.query_row(
+                "SELECT MAX(revision) FROM provider_state_epochs WHERE registration_id='epoch-provider'",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(), revision, "{missing}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "tests both exhausted reopen and the reserved terminal transition"
+    )]
+    fn exhausted_epoch_revision_blocks_transition_and_fenced_repair() {
+        for revision in [i64::MAX - 1, i64::MAX] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("exhausted-epoch.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_provider_store().unwrap();
+            manager
+                .connection
+                .execute_batch(
+                    "INSERT INTO provider_registrations
+                 (registration_id,provider_id,provider_version,package_content_hash,
+                  state,trust_status,registration_json,registered_at)
+                 VALUES ('exhausted-provider','provider:exhausted','1.0.0','build:exhausted',
+                         'disabled','locally-trusted',
+                         '{\"trust\":{\"status\":\"locally-trusted\"}}',
+                         '2026-09-19T00:00:00Z');
+                 DROP TRIGGER provider_state_epoch_event_insert_guard;",
+                )
+                .unwrap();
+            manager.connection.execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+                 VALUES ('exhausted-provider',?1,'disabled',?2)",
+                params![revision,T0],
+            ).unwrap();
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            assert!(
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE provider_registrations SET state='registered',updated_at=?1
+                 WHERE registration_id='exhausted-provider'",
+                        [T0],
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("epoch revision exhausted")
+            );
+            assert_eq!(manager.connection.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='exhausted-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(),"disabled");
+            manager
+                .connection
+                .execute_batch("DROP TRIGGER provider_state_epoch_transition")
+                .unwrap();
+            drop(manager);
+            assert!(matches!(
+                TaskManager::open_with_clock(&path, Box::new(FixedClock)),
+                Err(TaskManagerError::InvalidRecord(
+                    "provider state history requires operator quarantine"
+                ))
+            ));
+            let retained = Connection::open(&path).unwrap();
+            assert_eq!(retained.query_row(
+                "SELECT state FROM provider_registrations WHERE registration_id='exhausted-provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(),"disabled");
+            assert_eq!(
+                retained
+                    .query_row(
+                        "SELECT MAX(revision) FROM provider_state_epochs
+                 WHERE registration_id='exhausted-provider'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                revision
+            );
+        }
+        let mut manager = test_manager();
+        manager.initialize_provider_store().unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,
+              state,trust_status,registration_json,registered_at)
+             VALUES ('terminal-epoch','provider:terminal','1.0.0','build:terminal',
+                     'disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='terminal-epoch';
+             DROP TRIGGER provider_state_epoch_event_insert_guard;",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO provider_state_epochs(registration_id,revision,state,transitioned_at)
+             VALUES ('terminal-epoch',?1,'registered',?2)",
+                params![i64::MAX - 2, T0],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(include_str!(
+                "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+            ))
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='disabled',updated_at=?1
+             WHERE registration_id='terminal-epoch'",
+                [T0],
+            )
+            .unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT MAX(revision) FROM provider_state_epochs WHERE registration_id='terminal-epoch'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(),i64::MAX-1);
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE provider_registrations SET state='registered',updated_at=?1
+             WHERE registration_id='terminal-epoch'",
+                    [T0],
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("epoch revision exhausted")
+        );
+    }
+
+    #[test]
+    fn first_provider_migration_disables_unproven_baseline_enablement() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("baseline-provider-epoch.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,package_content_hash,state,
+              trust_status,registration_json,registered_at,updated_at)
+             VALUES ('baseline-provider','provider:baseline','1.0.0','build:baseline',
+                     'registered','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}',
+                     '2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');",
+            )
+            .unwrap();
+        manager.initialize_provider_store().unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='baseline-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "disabled");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT revision,state FROM provider_state_epochs
+             WHERE registration_id='baseline-provider'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (0, "disabled".to_owned())
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE provider_registrations SET state='registered',updated_at=?1
+             WHERE registration_id='baseline-provider'",
+                [T0],
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(reopened.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='baseline-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT revision,state FROM provider_state_epochs
+             WHERE registration_id='baseline-provider' ORDER BY revision DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "registered".to_owned())
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers offset normalization and exact stamped-guard migration in one durable fixture"
+    )]
+    fn large_rfc3339_offsets_survive_provider_guard_upgrade() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("offset-provider-guards.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager.create_task(&create("T-offset-provider")).unwrap();
+        manager.connection.execute_batch(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+             VALUES ('offset-snapshot','{}','2026-09-19T00:00:00Z');
+             INSERT INTO registry_snapshot_admissions(snapshot_id,state)
+             VALUES ('offset-snapshot','ADMITTED');
+             DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
+             INSERT INTO registry_snapshot_entries
+             (snapshot_id,contract_class,semantic_id,major,full_version,content_hash)
+             VALUES ('offset-snapshot','capability','artifact.hash',1,'1.0',
+                     'sha256:1111111111111111111111111111111111111111111111111111111111111111');
+             CREATE TRIGGER immutable_admitted_registry_snapshot_entries_insert
+             BEFORE INSERT ON registry_snapshot_entries
+             WHEN EXISTS (
+                 SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
+             )
+             BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot entry set is immutable'); END;
+             INSERT INTO semantic_capability_contracts
+             (content_hash,semantic_id,full_version,contract_json)
+             VALUES ('sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                     'artifact.hash','1.0',
+                     '{\"conformance\":{\"suite_version\":\"0.1\"}}');
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES ('sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                     'offset-snapshot','disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}',
+                     '2026-09-19T15:00:00+15:00');
+             INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
+             VALUES ('sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b',
+                     '{\"id\":\"provider.offset\",\"provides\":[{\"conformance\":{\"status\":\"declared\",\"suite\":\"offset-suite\",\"suite_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"version\":\"1.0\"},\"effect_classes\":[\"PURE\"],\"execution\":{\"execution_class\":\"deterministic\",\"locality\":[\"local\"],\"minimum_isolation\":\"P2\"}}],\"publisher\":{\"id\":\"fixture\"},\"runtime\":{\"kind\":\"process\"},\"schema_version\":\"0.1\",\"version\":\"1.0.0\"}');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T15:00:00+15:00'
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
+             INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES ('offset-evidence','sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                     'offset-suite','sha256:2222222222222222222222222222222222222222222222222222222222222222','pass',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"offset-evidence\",\"provider_id\":\"provider.offset\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_suite\":{\"id\":\"offset-suite\",\"version\":\"0.1\",\"hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"},\"harness\":{\"id\":\"harness:offset\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00.100Z\",\"expires_at\":\"2026-09-19T00:00:02Z\"}',
+                     '2026-09-19T00:00:00.100Z');
+             INSERT INTO provider_trust_admissions
+             (admission_id,registration_id,decision_id,revision,trust_status,authority_ref,
+              admitted_at,receipt_json)
+             VALUES ('sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986','sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','offset-decision',1,'project-reviewed',
+                     'review:offset','2026-09-19T15:00:00.200+15:00',
+                     '{\"admitted_at\":\"2026-09-19T15:00:00.200+15:00\",\"authority_ref\":\"review:offset\",\"decision_id\":\"offset-decision\",\"registration_id\":\"sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b\",\"revision\":1,\"schema_version\":\"0.1\",\"trust_status\":\"project-reviewed\"}');
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+              placement_json,binding_json,created_at)
+             VALUES ('offset-binding','offset-attempt','T-offset-provider','sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                     'offset-snapshot','0.1','offset-node','artifact.hash@1','sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                     'sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b','provider.offset','1.0.0','sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c','sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                     1,'[]','[]','offset-profile','{\"locality\":\"local\"}',
+                     '{\"schema_version\":\"0.1\",\"binding_id\":\"offset-binding\",\"attempt_id\":\"offset-attempt\",\"task_id\":\"T-offset-provider\",\"semantic_program_hash\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"registry_snapshot_id\":\"offset-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"offset-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"conformance_evidence_id\":\"offset-evidence\",\"provider_trust_source_id\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\",\"provider\":{\"id\":\"provider.offset\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:e3d734314ad3098ce199002e9a9ce433d5b401c52f3ba3a4dbee3194a93c8d6c\",\"package_or_build_hash\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"offset-profile\"},\"placement\":{\"locality\":\"local\"},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T01:00:00.300+01:00\"}',
+                     '2026-09-19T01:00:00.300+01:00');",
+        ).unwrap();
+        let clone_receipt = |binding_id: &str, attempt_id: &str, attempt: i64| {
+            manager
+                .connection
+                .query_row(
+                    "SELECT json_set(binding_json,'$.binding_id',?1,
+                    '$.attempt_id',?2,'$.attempt',?3)
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                    params![binding_id, attempt_id, attempt],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        let insert_clone = |connection: &Connection,
+                            binding_id: &str,
+                            attempt_id: &str,
+                            attempt: i64,
+                            receipt: &str,
+                            policy: &str,
+                            grants: &str,
+                            placement: &str| {
+            let placement = if placement == "{}" {
+                r#"{"locality":"local"}"#
+            } else {
+                placement
+            };
+            connection.execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+                  attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                  placement_json,binding_json,created_at)
+                 SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                        ir_version,node_id,capability,capability_contract_hash,
+                        provider_registration_id,provider_id,provider_version,
+                        provider_manifest_hash,provider_build_hash,?3,
+                        ?5,?6,execution_profile_ref,
+                        ?7,?4,created_at
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                params![
+                    binding_id, attempt_id, attempt, receipt, policy, grants, placement
+                ],
+            )
+        };
+        let receipt = clone_receipt("offset-invalid-unicode", "offset-unicode-attempt", 4);
+        let malformed = receipt.replace("\"outputs\":{}", "\"outputs\":{\"bad\":\"\\ud800\"}");
+        assert_ne!(malformed, receipt);
+        assert!(
+            insert_clone(
+                &manager.connection,
+                "offset-invalid-unicode",
+                "offset-unicode-attempt",
+                4,
+                &malformed,
+                "[]",
+                "[]",
+                "{}"
+            )
+            .is_err()
+        );
+        let raw = Connection::open(&path).unwrap();
+        let raw_receipt = clone_receipt("offset-raw-writer", "offset-raw-attempt", 5);
+        let error = insert_clone(
+            &raw,
+            "offset-raw-writer",
+            "offset-raw-attempt",
+            5,
+            &raw_receipt,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no such function: aios_binding_"), "{error}");
+        let padding = " ".repeat(8 * 1024 * 1024);
+        for (binding_id, attempt_id, attempt, policy, grants, placement) in [
+            (
+                "offset-large-policy",
+                "offset-large-policy-attempt",
+                6,
+                format!("{padding}[]"),
+                "[]".to_owned(),
+                "{}".to_owned(),
+            ),
+            (
+                "offset-large-grants",
+                "offset-large-grants-attempt",
+                7,
+                "[]".to_owned(),
+                format!("{padding}[]"),
+                "{}".to_owned(),
+            ),
+            (
+                "offset-large-placement",
+                "offset-large-placement-attempt",
+                8,
+                "[]".to_owned(),
+                "[]".to_owned(),
+                format!("{padding}{{}}"),
+            ),
+        ] {
+            let receipt = clone_receipt(binding_id, attempt_id, attempt);
+            assert!(
+                insert_clone(
+                    &manager.connection,
+                    binding_id,
+                    attempt_id,
+                    attempt,
+                    &receipt,
+                    &policy,
+                    &grants,
+                    &placement
+                )
+                .is_err(),
+                "{binding_id}"
+            );
+        }
+        let count_binding_and_markers = |id: &str| -> i64 {
+            manager.connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM execution_bindings WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_admission_markers WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_trust_markers WHERE binding_id=?1)
+                      + (SELECT COUNT(*) FROM execution_binding_enablement_markers WHERE binding_id=?1)",
+                [id], |row| row.get(0),
+            ).unwrap()
+        };
+        let binding_id = "offset-non-rfc3339";
+        let attempt_id = "offset-non-rfc3339-attempt";
+        let mut receipt: Value =
+            serde_json::from_str(&clone_receipt(binding_id, attempt_id, 23)).unwrap();
+        let missing_offset = "2026-09-19T00:00:01";
+        receipt["created_at"] = json!(missing_offset);
+        assert!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT julianday(?1) IS NOT NULL",
+                    [missing_offset],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let error = manager
+            .connection
+            .execute(
+                "INSERT INTO execution_bindings
+                 (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+                  ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+                  provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+                  attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                  placement_json,binding_json,created_at)
+                 SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                        ir_version,node_id,capability,capability_contract_hash,
+                        provider_registration_id,provider_id,provider_version,
+                        provider_manifest_hash,provider_build_hash,23,
+                        policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                        placement_json,?3,?4
+                 FROM execution_bindings WHERE binding_id='offset-binding'",
+                params![binding_id, attempt_id, receipt.to_string(), missing_offset],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("binding provider identity does not match registration")
+                || error.contains("binding conformance evidence is not latest"),
+            "{error}"
+        );
+        assert_eq!(count_binding_and_markers(binding_id), 0);
+        let corrected = clone_receipt(binding_id, attempt_id, 23);
+        insert_clone(
+            &manager.connection,
+            binding_id,
+            attempt_id,
+            23,
+            &corrected,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(count_binding_and_markers(binding_id), 4);
+        for id in [
+            "offset-invalid-unicode",
+            "offset-raw-writer",
+            "offset-large-policy",
+            "offset-large-grants",
+            "offset-large-placement",
+        ] {
+            assert_eq!(
+                count_binding_and_markers(id),
+                0,
+                "rejected {id} must leave no binding or markers"
+            );
+        }
+        let overlong = json!((0..65).map(|i| format!("ref:{i}")).collect::<Vec<_>>());
+        for (suffix, attempt, policy, grants) in [
+            ("policy-number", 9, json!([0]), json!([])),
+            ("grant-number", 10, json!([]), json!([0])),
+            ("policy-duplicate", 11, json!(["same", "same"]), json!([])),
+            ("grant-duplicate", 12, json!([]), json!(["same", "same"])),
+            ("policy-overlong", 13, overlong.clone(), json!([])),
+            ("grant-overlong", 14, json!([]), overlong.clone()),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let mut receipt: Value =
+                serde_json::from_str(&clone_receipt(&binding_id, &attempt_id, attempt)).unwrap();
+            receipt["policy_decision_refs"] = policy.clone();
+            receipt["authority"]["grant_refs"] = grants.clone();
+            let error = insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &receipt.to_string(),
+                &policy.to_string(),
+                &grants.to_string(),
+                "{}",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("binding provider identity does not match registration"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(
+                count_binding_and_markers(&binding_id),
+                0,
+                "rejected {suffix} must not consume its immutable identity"
+            );
+        }
+        let corrected = clone_receipt("offset-policy-number", "offset-policy-number-attempt", 9);
+        insert_clone(
+            &manager.connection,
+            "offset-policy-number",
+            "offset-policy-number-attempt",
+            9,
+            &corrected,
+            "[]",
+            "[]",
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(count_binding_and_markers("offset-policy-number"), 4);
+        for (suffix, attempt, old, replacement, valid) in [
+            (
+                "nul-only",
+                15,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\\u0000suffix\":\"0.1\"".to_owned(),
+                false,
+            ),
+            (
+                "nul-before",
+                16,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\\u0000suffix\":\"0.1\",\"schema_version\":\"0.1\"".to_owned(),
+                false,
+            ),
+            (
+                "nul-after",
+                17,
+                "\"schema_version\":\"0.1\"".to_owned(),
+                "\"schema_version\":\"0.1\",\"schema_version\\u0000suffix\":\"0.1\"".to_owned(),
+                false,
+            ),
+            (
+                "evidence-nul-only",
+                18,
+                "\"conformance_evidence_id\":\"offset-evidence\"".to_owned(),
+                "\"conformance_evidence_id\\u0000suffix\":\"offset-evidence\"".to_owned(),
+                false,
+            ),
+            (
+                "trust-nul-only",
+                19,
+                "\"provider_trust_source_id\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\"".to_owned(),
+                "\"provider_trust_source_id\\u0000suffix\":\"sha256:4162116b26d1a831b57a060d6928c2ade7c7140e3ad8245a3e11aaeef1c20986\"".to_owned(),
+                false,
+            ),
+            (
+                "overflow",
+                20,
+                "\"attempt\":20".to_owned(),
+                "\"attempt\":18446744073709551615".to_owned(),
+                false,
+            ),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let receipt = clone_receipt(&binding_id, &attempt_id, attempt);
+            let forged = receipt.replacen(&old, &replacement, 1);
+            assert_ne!(
+                forged, receipt,
+                "fixture mutation {suffix} must be effective"
+            );
+            let result = insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &forged,
+                "[]",
+                "[]",
+                "{}",
+            );
+            if valid {
+                result.unwrap();
+                assert_eq!(count_binding_and_markers(&binding_id), 4, "{suffix}");
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("binding "), "{suffix}: {error}");
+                assert_eq!(count_binding_and_markers(&binding_id), 0, "{suffix}");
+            }
+        }
+        for (suffix, attempt) in [("nul-only", 15), ("overflow", 20)] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let receipt = clone_receipt(&binding_id, &attempt_id, attempt);
+            insert_clone(
+                &manager.connection,
+                &binding_id,
+                &attempt_id,
+                attempt,
+                &receipt,
+                "[]",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+            assert_eq!(count_binding_and_markers(&binding_id), 4);
+        }
+        aios_registry::register_strict_json_sqlite(&raw).unwrap();
+        raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let ignored_sql = "INSERT OR IGNORE INTO execution_bindings
+            (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+             ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+             provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+             attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+             placement_json,binding_json,created_at)
+            SELECT ?1,?2,task_id,semantic_program_hash,registry_snapshot_id,
+                   ir_version,node_id,capability,capability_contract_hash,
+                   provider_registration_id,provider_id,provider_version,
+                   provider_manifest_hash,provider_build_hash,?3,
+                   policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+                   placement_json,?4,created_at
+            FROM execution_bindings WHERE binding_id='offset-binding'";
+        for (suffix, valid_attempt, sql) in [
+            ("ignored-check", 21, ignored_sql.to_owned()),
+            (
+                "replaced-check",
+                22,
+                ignored_sql.replacen("OR IGNORE", "OR REPLACE", 1),
+            ),
+        ] {
+            let binding_id = format!("offset-{suffix}");
+            let attempt_id = format!("offset-{suffix}-attempt");
+            let invalid = clone_receipt(&binding_id, &attempt_id, 0);
+            let error = raw
+                .execute(&sql, params![&binding_id, &attempt_id, 0, &invalid])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("binding provider identity does not match registration"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(count_binding_and_markers(&binding_id), 0, "{suffix}");
+            let corrected = clone_receipt(&binding_id, &attempt_id, valid_attempt);
+            insert_clone(
+                &raw,
+                &binding_id,
+                &attempt_id,
+                valid_attempt,
+                &corrected,
+                "[]",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+            assert_eq!(count_binding_and_markers(&binding_id), 4);
+        }
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+              placement_json,binding_json,created_at)
+             SELECT 'offset-expired','offset-expired-attempt',task_id,semantic_program_hash,
+              registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+              provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+              provider_build_hash,2,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,
+              json_set(binding_json,'$.binding_id','offset-expired',
+                       '$.attempt_id','offset-expired-attempt','$.attempt',2,
+                       '$.created_at','2026-09-19T00:00:02Z'),
+              '2026-09-19T00:00:02Z'
+             FROM execution_bindings WHERE binding_id='offset-binding'",
+                    [],
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("expired at creation")
+        );
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER execution_binding_evidence_unexpired_at_insert")
+            .unwrap();
+        // A partially upgraded store can contain one prior evidence guard
+        // alongside current guards. Reopening must replace the mixed set and
+        // quarantine the already admitted binding and its immutable markers.
+        manager
+            .connection
+            .execute_batch("DROP TRIGGER execution_binding_evidence_present_at_insert")
+            .unwrap();
+        let prior_guards = include_str!("legacy_2b1f8e2_provider_evidence_guards.sql");
+        let first_guard = prior_guards
+            .split_once("END;")
+            .expect("prior guard definition")
+            .0;
+        manager
+            .connection
+            .execute_batch(&format!("{first_guard}END;"))
+            .unwrap();
+        assert!(legacy_2b1_evidence_guard_present(&manager.connection).unwrap());
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0013_provider_registry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert!(!legacy_2b1_evidence_guard_present(&reopened.connection).unwrap());
+        assert_eq!(reopened.connection.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(),"registered");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0013_provider_registry'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            stamp
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_binding_legacy_trust_quarantine
+             WHERE binding_id='offset-binding'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        reopened
+            .connection
+            .execute_batch(
+                "UPDATE provider_registrations SET state='disabled',
+                 updated_at='2026-09-19T00:00:00.400Z'
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T15:00:00.400+15:00'
+             WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b';
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,execution_profile_ref,
+              placement_json,binding_json,created_at)
+             SELECT 'offset-fresh','offset-fresh-attempt',task_id,semantic_program_hash,
+              registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+              provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+              provider_build_hash,3,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,
+              json_set(binding_json,'$.binding_id','offset-fresh',
+                       '$.attempt_id','offset-fresh-attempt','$.attempt',3,
+                       '$.created_at','2026-09-19T00:00:00.500Z'),
+              '2026-09-19T00:00:00.500Z'
+             FROM execution_bindings WHERE binding_id='offset-binding';",
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_binding_enablement_markers m
+             JOIN provider_state_epochs e ON e.registration_id=m.registration_id
+                 AND e.revision=m.revision WHERE m.binding_id='offset-fresh'
+                 AND e.revision=(SELECT MAX(revision) FROM provider_state_epochs
+                                 WHERE registration_id='sha256:afa34cd537c467a13070d3ffaef13b06b7131d12ddd29b7625426730d5b4316b')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers one forged admission and dependent binding across fenced reopen"
+    )]
+    fn semantic_guard_repair_fences_forged_admission_and_existing_binding() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("semantic-guard-repair.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager.create_task(&create("T-semantic-repair")).unwrap();
+        manager.connection.execute_batch(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+             VALUES ('repair-snapshot','{}','2026-09-19T00:00:00Z');
+             INSERT INTO registry_snapshot_admissions(snapshot_id,state)
+             VALUES ('repair-snapshot','ADMITTED');
+             DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
+             INSERT INTO registry_snapshot_entries
+             (snapshot_id,contract_class,semantic_id,major,full_version,content_hash)
+             VALUES ('repair-snapshot','capability','artifact.hash',1,'1.0',
+                     'sha256:3333333333333333333333333333333333333333333333333333333333333333');
+             CREATE TRIGGER immutable_admitted_registry_snapshot_entries_insert
+             BEFORE INSERT ON registry_snapshot_entries
+             WHEN EXISTS (
+                 SELECT 1 FROM registry_snapshot_admissions WHERE snapshot_id IS NEW.snapshot_id
+             )
+             BEGIN SELECT RAISE(ABORT, 'admitted registry snapshot entry set is immutable'); END;
+             INSERT INTO semantic_capability_contracts
+             (content_hash,semantic_id,full_version,contract_json)
+             VALUES ('sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                     'artifact.hash','1.0',
+                     '{\"conformance\":{\"suite_version\":\"0.1\"}}');
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES ('sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                     'repair-snapshot','disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+              INSERT INTO provider_manifest_payloads(registration_id,manifest_json)
+              VALUES ('sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','{\"id\":\"provider.repair\",\"provides\":[{\"conformance\":{\"status\":\"declared\",\"suite\":\"repair-suite\",\"suite_hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"contract\":{\"capability\":\"artifact.hash\",\"contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"version\":\"1.0\"},\"effect_classes\":[\"PURE\"],\"execution\":{\"execution_class\":\"deterministic\",\"locality\":[\"local\"],\"minimum_isolation\":\"P2\"}}],\"publisher\":{\"id\":\"fixture\"},\"runtime\":{\"kind\":\"process\"},\"schema_version\":\"0.1\",\"version\":\"1.0.0\"}');
+             UPDATE provider_registrations SET state='registered',
+                 updated_at='2026-09-19T00:00:00Z'
+             WHERE registration_id='sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74';
+             INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,suite_id,suite_hash,
+              status,evidence_json,tested_at)
+             VALUES ('repair-evidence','sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                     'repair-suite','sha256:4444444444444444444444444444444444444444444444444444444444444444','pass',
+                     '{\"schema_version\":\"0.1\",\"result_id\":\"repair-evidence\",\"provider_id\":\"provider.repair\",\"provider_version\":\"1.0.0\",\"provider_build_identity\":{\"kind\":\"build_hash\",\"value\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"semantic_capability_ref\":\"artifact.hash@1\",\"semantic_contract_version\":\"1.0\",\"semantic_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_suite\":{\"id\":\"repair-suite\",\"version\":\"0.1\",\"hash\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\"},\"harness\":{\"id\":\"harness:repair\",\"version\":\"0.1\"},\"result\":\"pass\",\"tests_total\":1,\"tests_passed\":1,\"tests_failed\":0,\"executed_at\":\"2026-09-19T00:00:00Z\",\"expires_at\":\"2026-09-20T00:00:00Z\"}',
+                     '2026-09-19T00:00:00Z');
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES ('repair-binding','repair-attempt','T-semantic-repair','sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     'repair-snapshot','0.1','repair-node','artifact.hash@1','sha256:3333333333333333333333333333333333333333333333333333333333333333',
+                     'sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74','provider.repair','1.0.0','sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777','sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                     1,'[]','[]','repair-profile','{\"locality\":\"local\"}',
+                      '{\"schema_version\":\"0.1\",\"binding_id\":\"repair-binding\",\"attempt_id\":\"repair-attempt\",\"task_id\":\"T-semantic-repair\",\"semantic_program_hash\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"registry_snapshot_id\":\"repair-snapshot\",\"ir_version\":\"0.1\",\"node_id\":\"repair-node\",\"capability\":\"artifact.hash@1\",\"capability_contract_hash\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"conformance_evidence_id\":\"repair-evidence\",\"provider_trust_source_id\":\"sha256:a09b3d1eec3f8d97709b8253a4f3e380e70b8cd23af341b4d0bf2e8b91bd7a74\",\"provider\":{\"id\":\"provider.repair\",\"version\":\"1.0.0\",\"manifest_hash\":\"sha256:6024c42cbfc4fce1192605eaf452bc37f61e2e03a44fdc8047f864ea4f925777\",\"package_or_build_hash\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"attempt\":1,\"policy_decision_refs\":[],\"authority\":{\"grant_refs\":[]},\"execution_profile\":{\"profile_ref\":\"repair-profile\"},\"placement\":{\"locality\":\"local\"},\"inputs\":{},\"outputs\":{},\"created_at\":\"2026-09-19T00:00:00Z\"}',
+                     '2026-09-19T00:00:00Z');",
+        ).unwrap();
+        let stamp: (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0012_semantic_registry_store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(manager.connection.query_row(
+            "SELECT COUNT(*) FROM execution_binding_trust_markers WHERE binding_id='repair-binding'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(),1);
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER one_way_registry_snapshot_admissions_update;
+             UPDATE registry_snapshot_admissions SET state='QUARANTINED'
+             WHERE snapshot_id='repair-snapshot';
+             UPDATE registry_snapshot_admissions SET state='ADMITTED'
+             WHERE snapshot_id='repair-snapshot';",
+            )
+            .unwrap();
+        drop(manager);
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(reopened.connection.query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id='repair-snapshot'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(),"ADMITTED");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT MAX(generation) FROM semantic_repair_fences",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(reopened.connection.query_row(
+            "SELECT COUNT(*) FROM semantic_current_usable_snapshots WHERE snapshot_id='repair-snapshot'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(),0);
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_binding_legacy_trust_quarantine
+             WHERE binding_id='repair-binding'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0012_semantic_registry_store'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            stamp
+        );
+        drop(reopened);
+        let again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(again.connection.query_row(
+            "SELECT state FROM registry_snapshot_admissions WHERE snapshot_id='repair-snapshot'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(),"ADMITTED");
+        assert_eq!(
+            again
+                .connection
+                .query_row(
+                    "SELECT MAX(generation) FROM semantic_repair_fences",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checks clean legacy bootstrap and distinct partial-stamp fence defects together"
+    )]
+    fn intact_0012_bootstraps_zero_fence_and_partial_0014_fails_closed() {
+        for mutation in [
+            "clean-legacy",
+            "unstamped-partial",
+            "stamped-missing",
+            "stamped-noop",
+            "stamped-history-missing",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("semantic-fence-migration.sqlite3");
+            let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            manager.initialize_registry_store().unwrap();
+            let mut expected_default = None;
+            if mutation == "clean-legacy" {
+                use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+                use aios_registry::{RegistryBuildOptions, SemanticRegistry};
+
+                let registry = SemanticRegistry::from_records(
+                    serde_json::from_str::<RegistrySnapshot>(include_str!(
+                        "../../../examples/aios-ir/registry-snapshot.json"
+                    ))
+                    .unwrap(),
+                    serde_json::from_str::<Vec<TypeContract>>(include_str!(
+                        "../../../examples/aios-ir/type-contracts.json"
+                    ))
+                    .unwrap(),
+                    serde_json::from_str::<Vec<CapabilityContract>>(include_str!(
+                        "../../../examples/aios-ir/capability-contracts.json"
+                    ))
+                    .unwrap(),
+                    RegistryBuildOptions::default(),
+                )
+                .unwrap();
+                let mut store = manager.registry_store_writer().unwrap();
+                store.admit_registry(&registry).unwrap();
+                let first = store
+                    .activate_default("device", "legacy", None, registry.snapshot_id())
+                    .unwrap();
+                let second = store
+                    .activate_default(
+                        "device",
+                        "legacy",
+                        Some(first.revision),
+                        registry.snapshot_id(),
+                    )
+                    .unwrap();
+                assert_eq!(second.revision, 2);
+                expected_default = Some((registry.snapshot_id().to_owned(), second.revision));
+            }
+            match mutation {
+                "clean-legacy" | "unstamped-partial" => {
+                    remove_fixture_fence_schema(&manager.connection);
+                    if mutation == "unstamped-partial" {
+                        manager.connection.execute_batch(
+                            "CREATE TABLE semantic_repair_fences(generation INTEGER PRIMARY KEY)",
+                        ).unwrap();
+                    }
+                }
+                "stamped-missing" => {
+                    manager
+                        .connection
+                        .execute_batch("DROP TRIGGER semantic_terminal_admission_transition")
+                        .unwrap();
+                }
+                "stamped-noop" => {
+                    manager.connection.execute_batch(
+                        "DROP TRIGGER semantic_terminal_admission_transition;
+                         CREATE TRIGGER semantic_terminal_admission_transition
+                         AFTER UPDATE OF state ON registry_snapshot_admissions BEGIN SELECT 1; END;",
+                    ).unwrap();
+                }
+                "stamped-history-missing" => {
+                    manager
+                        .connection
+                        .execute_batch("DROP TRIGGER semantic_activation_scope_history_no_delete")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(manager);
+            if mutation == "clean-legacy" {
+                let mut reopened =
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+                let default = reopened
+                    .registry_store_writer()
+                    .unwrap()
+                    .default_snapshot("device", "legacy")
+                    .unwrap()
+                    .unwrap();
+                let (snapshot_id, revision) = expected_default.unwrap();
+                assert_eq!(default.snapshot_id, snapshot_id);
+                assert_eq!(default.revision, revision);
+                assert_eq!(
+                    reopened
+                        .connection
+                        .query_row(
+                            "SELECT MAX(generation) FROM semantic_repair_fences",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    reopened
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM semantic_activation_scope_history
+                     WHERE scope_kind='device' AND scope_id='legacy'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    reopened
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM semantic_invalidated_activation_scopes",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    reopened
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM semantic_legacy_activation_quarantine",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    reopened
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM semantic_legacy_unprovable_admissions",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+            } else {
+                assert!(
+                    TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err(),
+                    "{mutation}"
+                );
+                let raw = Connection::open(&path).unwrap();
+                let stamped: i64 = raw.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0014_semantic_repair_fence'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    stamped,
+                    i64::from(mutation != "unstamped-partial"),
+                    "{mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::drop_non_drop,
+        reason = "exercises strict re-attestation, ownership, repeated repairs, terminal history and legacy ambiguity in one file-backed chronology"
+    )]
+    fn semantic_repair_requires_explicit_strict_reattestation_and_rotates_again() {
+        use aios_contracts::{CapabilityContract, RegistrySnapshot, TypeContract};
+        use aios_registry::{RegistryBuildOptions, SemanticRegistry};
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("semantic-reattest.sqlite3");
+        let registry = SemanticRegistry::from_records(
+            serde_json::from_str::<RegistrySnapshot>(include_str!(
+                "../../../examples/aios-ir/registry-snapshot.json"
+            ))
+            .unwrap(),
+            serde_json::from_str::<Vec<TypeContract>>(include_str!(
+                "../../../examples/aios-ir/type-contracts.json"
+            ))
+            .unwrap(),
+            serde_json::from_str::<Vec<CapabilityContract>>(include_str!(
+                "../../../examples/aios-ir/capability-contracts.json"
+            ))
+            .unwrap(),
+            RegistryBuildOptions::default(),
+        )
+        .unwrap();
+        let snapshot_id = registry.snapshot_id().to_owned();
+        let mut fresh_snapshot = registry.snapshot().clone();
+        let fresh_types = registry.type_contracts().cloned().collect::<Vec<_>>();
+        let mut fresh_capabilities = registry.capability_contracts().cloned().collect::<Vec<_>>();
+        let changed = fresh_capabilities
+            .iter_mut()
+            .find(|contract| contract.capability == "artifact.hash")
+            .unwrap();
+        changed.version = "1.1".to_owned();
+        let changed_hash = aios_registry::capability_contract_hash(changed)
+            .unwrap()
+            .to_string();
+        let changed_ref = fresh_snapshot
+            .capability_contracts
+            .iter_mut()
+            .find(|entry| entry.id == "artifact.hash")
+            .unwrap();
+        changed_ref.version = "1.1".to_owned();
+        changed_ref.content_hash = changed_hash;
+        let as_hash = |entry: &aios_contracts::ContractRef| aios_registry::SnapshotHashEntry {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+        };
+        fresh_snapshot.snapshot_id = aios_registry::registry_snapshot_id(
+            &fresh_snapshot.schema_version,
+            &fresh_snapshot
+                .type_contracts
+                .iter()
+                .map(as_hash)
+                .collect::<Vec<_>>(),
+            &fresh_snapshot
+                .capability_contracts
+                .iter()
+                .map(as_hash)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_string();
+        let fresh_registry = SemanticRegistry::from_records(
+            fresh_snapshot,
+            fresh_types,
+            fresh_capabilities,
+            RegistryBuildOptions::default(),
+        )
+        .unwrap();
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut store = manager.registry_store_writer().unwrap();
+        store.admit_registry(&registry).unwrap();
+        store
+            .activate_default("device", "local", None, &snapshot_id)
+            .unwrap();
+        store
+            .activate_default("device", "deleted", None, &snapshot_id)
+            .unwrap();
+        store
+            .activate_default("device", "renamed", None, &snapshot_id)
+            .unwrap();
+        for revision in 1..7 {
+            store
+                .activate_default("device", "local", Some(revision), &snapshot_id)
+                .unwrap();
+        }
+        drop(store);
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER one_way_registry_snapshot_admissions_update;
+             DROP TRIGGER registry_activation_revision_monotonic;
+             DROP TRIGGER registry_activation_no_delete;
+             UPDATE registry_activations SET revision=1
+             WHERE scope_kind='device' AND scope_id='local';
+             DELETE FROM registry_activations
+             WHERE scope_kind='device' AND scope_id='deleted';
+             UPDATE registry_activations SET scope_id='renamed-new',revision=2
+             WHERE scope_kind='device' AND scope_id='renamed'",
+            )
+            .unwrap();
+        drop(manager);
+
+        let mut reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut store = reopened.registry_store_writer().unwrap();
+        assert!(store.default_snapshot("device", "local").unwrap().is_none());
+        assert!(
+            store
+                .reattest_snapshot(&snapshot_id, "", "local-authority")
+                .is_err()
+        );
+        let side = Connection::open(&path).unwrap();
+        side.execute_batch(
+            "UPDATE task_manager_lease SET owner_id='stale-owner',fence_epoch=fence_epoch+1
+             WHERE singleton_id=1",
+        )
+        .unwrap();
+        assert!(
+            store
+                .reattest_snapshot(&snapshot_id, "decision:stale", "local-authority")
+                .is_err()
+        );
+        assert_eq!(
+            side.query_row(
+                "SELECT COUNT(*) FROM semantic_snapshot_reattestations
+             WHERE snapshot_id=?1 AND generation=1",
+                [&snapshot_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        drop(store);
+        drop(reopened);
+        let mut reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut store = reopened.registry_store_writer().unwrap();
+        store
+            .reattest_snapshot(&snapshot_id, "decision:repair:1", "local-authority")
+            .unwrap();
+        let fresh_id = store.admit_registry(&fresh_registry).unwrap();
+        store
+            .activate_default("device", "fresh-import", None, &fresh_id)
+            .unwrap();
+        store
+            .reattest_snapshot(&snapshot_id, "decision:repair:1", "local-authority")
+            .unwrap();
+        assert!(
+            store
+                .reattest_snapshot(&snapshot_id, "decision:changed", "local-authority")
+                .is_err()
+        );
+        assert!(store.default_snapshot("device", "local").unwrap().is_none());
+        assert!(
+            store
+                .activate_default("device", "local", Some(1), &snapshot_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .activate_default("device", "deleted", None, &snapshot_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .activate_default("device", "renamed", None, &snapshot_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .activate_default("device", "renamed-new", Some(2), &snapshot_id)
+                .is_err()
+        );
+        store
+            .activate_default("device", "fresh", None, &snapshot_id)
+            .unwrap();
+        assert!(store.default_snapshot("device", "fresh").unwrap().is_some());
+        drop(store);
+        reopened
+            .connection
+            .execute_batch("DROP TRIGGER immutable_registry_snapshot_entries_reinsert")
+            .unwrap();
+        drop(reopened);
+
+        let mut again = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            again
+                .connection
+                .query_row(
+                    "SELECT MAX(generation) FROM semantic_repair_fences",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let mut store = again.registry_store_writer().unwrap();
+        assert!(store.default_snapshot("device", "fresh").unwrap().is_none());
+        store
+            .reattest_snapshot(&snapshot_id, "decision:repair:2", "local-authority")
+            .unwrap();
+        store
+            .activate_default("device", "fresh-2", None, &snapshot_id)
+            .unwrap();
+        assert!(
+            store
+                .default_snapshot("device", "fresh-2")
+                .unwrap()
+                .is_some()
+        );
+        store
+            .set_snapshot_state(&snapshot_id, aios_registry::SnapshotState::Quarantined)
+            .unwrap();
+        assert!(
+            store
+                .reattest_snapshot(&snapshot_id, "decision:repair:3", "local-authority")
+                .is_err()
+        );
+        assert!(
+            store
+                .default_snapshot("device", "fresh-2")
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        assert_eq!(
+            again
+                .connection
+                .query_row(
+                    "SELECT terminal_state FROM semantic_terminal_admissions WHERE snapshot_id=?1",
+                    [&snapshot_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "QUARANTINED"
+        );
+        again
+            .connection
+            .execute_batch("DROP TRIGGER one_way_registry_snapshot_admissions_update")
+            .unwrap();
+        again
+            .connection
+            .execute(
+                "UPDATE registry_snapshot_admissions SET state='ADMITTED' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        drop(again);
+        let mut terminal_reopen =
+            TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let mut store = terminal_reopen.registry_store_writer().unwrap();
+        assert!(
+            store
+                .reattest_snapshot(&snapshot_id, "decision:forged", "local-authority")
+                .is_err()
+        );
+        assert!(
+            store
+                .default_snapshot("device", "fresh-2")
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        // An old 0012 database with no 0014 terminal ledger cannot prove
+        // whether a formerly terminal admission was forged back to ADMITTED.
+        let legacy_path = directory.path().join("legacy-ambiguous.sqlite3");
+        let mut legacy = TaskManager::open_with_clock(&legacy_path, Box::new(FixedClock)).unwrap();
+        let mut writer = legacy.registry_store_writer().unwrap();
+        writer.admit_registry(&registry).unwrap();
+        writer
+            .set_snapshot_state(&snapshot_id, aios_registry::SnapshotState::Quarantined)
+            .unwrap();
+        drop(writer);
+        remove_fixture_fence_schema(&legacy.connection);
+        legacy
+            .connection
+            .execute_batch("DROP TRIGGER one_way_registry_snapshot_admissions_update")
+            .unwrap();
+        legacy
+            .connection
+            .execute(
+                "UPDATE registry_snapshot_admissions SET state='ADMITTED' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        drop(legacy);
+        let mut legacy_reopen =
+            TaskManager::open_with_clock(&legacy_path, Box::new(FixedClock)).unwrap();
+        assert_eq!(legacy_reopen.connection.query_row(
+            "SELECT COUNT(*) FROM semantic_legacy_unprovable_admissions WHERE snapshot_id=?1",
+            [&snapshot_id], |row| row.get::<_, i64>(0),
+        ).unwrap(),1);
+        assert!(
+            legacy_reopen
+                .registry_store_writer()
+                .unwrap()
+                .reattest_snapshot(&snapshot_id, "decision:legacy", "local-authority")
+                .is_err()
+        );
+
+        // If an activation identity disappeared before the first 0014
+        // bootstrap, no local ledger can enumerate it. Even a strictly
+        // re-attested snapshot cannot issue a new activation in that store.
+        let lost_scope_path = directory.path().join("legacy-lost-activation.sqlite3");
+        let mut lost =
+            TaskManager::open_with_clock(&lost_scope_path, Box::new(FixedClock)).unwrap();
+        let mut writer = lost.registry_store_writer().unwrap();
+        writer.admit_registry(&registry).unwrap();
+        writer
+            .activate_default("device", "lost", None, &snapshot_id)
+            .unwrap();
+        drop(writer);
+        remove_fixture_fence_schema(&lost.connection);
+        lost.connection
+            .execute_batch(
+                "DROP TRIGGER registry_activation_no_delete;
+             DELETE FROM registry_activations WHERE scope_kind='device' AND scope_id='lost'",
+            )
+            .unwrap();
+        drop(lost);
+        let mut recovered =
+            TaskManager::open_with_clock(&lost_scope_path, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            recovered
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM semantic_legacy_activation_quarantine",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let mut writer = recovered.registry_store_writer().unwrap();
+        writer
+            .reattest_snapshot(&snapshot_id, "decision:lost-scope", "local-authority")
+            .unwrap();
+        assert!(
+            writer
+                .activate_default("device", "lost", None, &snapshot_id)
+                .is_err()
+        );
+        assert!(
+            writer
+                .activate_default("device", "new", None, &snapshot_id)
+                .is_err()
+        );
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises the full file-backed historical schema upgrade and audit preservation"
+    )]
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "each flag selects an independent historical fixture defect"
+    )]
+    fn assert_file_backed_reopen_quarantines_legacy_bindings(
+        missing_prior_guards: bool,
+        existing_quarantine_table: bool,
+        future_legacy_clock: bool,
+        partial_binding_guard_only: bool,
+        partial_clock_guard: bool,
+    ) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("old-trust-guard.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        manager.create_task(&create("T-old-trust-guard")).unwrap();
+        let stamp: (String, String) = manager.connection.query_row(
+            "SELECT checksum,applied_at FROM schema_migrations WHERE migration_id='0013_provider_registry'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_trust_marker_insert;
+             DROP TRIGGER execution_binding_trust_not_future;",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(include_str!("legacy_5eb3b71_provider_trust_guards.sql"))
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER provider_registration_state_transition_clock;
+             DROP TRIGGER provider_registration_updated_at_requires_transition;
+             DROP TRIGGER execution_binding_provider_enablement_not_future;
+              DROP TRIGGER execution_binding_evidence_latest_at_insert;
+              DROP TRIGGER execution_binding_evidence_present_at_insert;
+              DROP TRIGGER execution_binding_provider_identity_at_insert;",
+            )
+            .unwrap();
+        if !existing_quarantine_table {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER execution_binding_legacy_trust_quarantine_no_update;
+                     DROP TRIGGER execution_binding_legacy_trust_quarantine_no_delete;
+                     DROP TRIGGER execution_binding_legacy_trust_quarantine_no_duplicate_insert;
+                     DROP TABLE execution_binding_legacy_trust_quarantine;",
+                )
+                .unwrap();
+        }
+        manager.connection.execute_batch(
+            "INSERT INTO registry_snapshots(snapshot_id,manifest_json,created_at)
+             VALUES ('legacy-snapshot','{}','2026-09-19T00:00:00Z');
+              INSERT INTO registry_snapshot_admissions(snapshot_id,state)
+              VALUES ('legacy-snapshot','ADMITTED');
+             INSERT INTO provider_registrations
+             (registration_id,provider_id,provider_version,manifest_hash,package_content_hash,
+              registry_snapshot_id,state,trust_status,registration_json,registered_at)
+             VALUES ('legacy-provider','legacy-provider','1.0.0','legacy-manifest','legacy-build',
+                     'legacy-snapshot','disabled','locally-trusted',
+                     '{\"trust\":{\"status\":\"locally-trusted\"}}','2026-09-19T00:00:00Z');
+             UPDATE provider_registrations
+             SET state='registered',updated_at='2026-09-18T00:00:00Z'
+             WHERE registration_id='legacy-provider';
+             INSERT INTO provider_conformance_evidence
+             (evidence_id,registration_id,capability,contract_hash,status,evidence_json,tested_at)
+             VALUES ('legacy-evidence','legacy-provider','artifact.hash@1','legacy-contract',
+                     'pass','{}','2026-09-19T00:00:00Z');
+             INSERT INTO execution_bindings
+             (binding_id,attempt_id,task_id,semantic_program_hash,registry_snapshot_id,
+              ir_version,node_id,capability,capability_contract_hash,provider_registration_id,
+              provider_id,provider_version,provider_manifest_hash,provider_build_hash,
+              attempt,policy_decision_refs_json,grant_refs_json,
+              execution_profile_ref,placement_json,binding_json,created_at)
+             VALUES ('legacy-binding','legacy-attempt','T-old-trust-guard','legacy-program',
+                     'legacy-snapshot','0.1','legacy-node','artifact.hash@1','legacy-contract',
+                     'legacy-provider','legacy-provider','1.0.0','legacy-manifest','legacy-build',
+                     1,'[]','[]','legacy-profile','{}',
+                     '{\"conformance_evidence_id\":\"legacy-evidence\",\"provider_trust_source_id\":\"legacy-provider\",\"provider\":{\"id\":\"legacy-provider\",\"version\":\"1.0.0\",\"manifest_hash\":\"legacy-manifest\",\"package_or_build_hash\":\"legacy-build\"}}',
+                     '2026-09-19T00:00:00Z');",
+        ).unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
+        let old_marker: String = manager.connection.query_row(
+            "SELECT trust_source_id FROM execution_binding_trust_markers WHERE binding_id='legacy-binding'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(old_marker, "legacy-provider");
+        if future_legacy_clock {
+            manager
+                .connection
+                .execute(
+                    "UPDATE provider_registrations SET updated_at='2026-09-20T00:00:00Z'
+                 WHERE registration_id='legacy-provider'",
+                    [],
+                )
+                .unwrap();
+        }
+        if missing_prior_guards {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER execution_binding_trust_marker_insert;
+                     DROP TRIGGER execution_binding_trust_not_future;",
+                )
+                .unwrap();
+        }
+        if partial_binding_guard_only || partial_clock_guard {
+            manager
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS execution_binding_trust_marker_insert;
+                 DROP TRIGGER IF EXISTS execution_binding_trust_not_future;",
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(include_str!(
+                    "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                ))
+                .unwrap();
+            manager
+                .connection
+                .execute_batch(if partial_binding_guard_only {
+                    "DROP TRIGGER execution_binding_provider_enablement_not_future;"
+                } else {
+                    "DROP TRIGGER provider_registration_updated_at_requires_transition;"
+                })
+                .unwrap();
+        }
+        drop(manager);
+
+        if partial_binding_guard_only {
+            let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+            assert!(preflight_migration_state(&reopened.connection).is_ok());
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM execution_binding_legacy_trust_quarantine
+                 WHERE binding_id='legacy-binding'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT state FROM provider_registrations
+                 WHERE registration_id='legacy-provider'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "registered"
+            );
+            return;
+        }
+        let reopen_error = match TaskManager::open_with_clock(&path, Box::new(FixedClock)) {
+            Ok(_) => panic!("unprovable legacy provider history reopened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &reopen_error,
+                TaskManagerError::InvalidRecord(
+                    "provider state history requires operator quarantine"
+                        | "provider registry migration is incomplete"
+                )
+            ),
+            "{reopen_error}"
+        );
+        let retained = Connection::open(&path).unwrap();
+        assert_eq!(
+            retained
+                .query_row(
+                    "SELECT checksum,applied_at FROM schema_migrations
+             WHERE migration_id='0013_provider_registry'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            stamp
+        );
+        let preserved_marker: String = retained
+            .query_row(
+                "SELECT trust_source_id FROM execution_binding_trust_markers
+             WHERE binding_id='legacy-binding'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_marker, old_marker);
+        assert_eq!(retained.query_row(
+            "SELECT state FROM provider_registrations WHERE registration_id='legacy-provider'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "registered");
+    }
+
+    #[test]
+    fn file_backed_reopen_replaces_only_exact_5eb3b71_trust_guards() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, false, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_old_markers_with_both_guards_missing() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(true, false, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_old_markers_with_existing_table() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, false, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_quarantines_only_missing_binding_guard() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, false, true, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_disables_future_dated_legacy_enablement() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, true, false, false);
+    }
+
+    #[test]
+    fn file_backed_reopen_disables_future_legacy_row_with_partial_clock_guard() {
+        assert_file_backed_reopen_quarantines_legacy_bindings(false, true, true, false, true);
+    }
+
+    #[test]
+    fn same_name_trust_guard_noop_rejects_reopen_before_lease_claim() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("forged-trust-guard.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        let old_epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER execution_binding_trust_marker_insert;
+             CREATE TRIGGER execution_binding_trust_marker_insert
+             BEFORE INSERT ON execution_bindings BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        let forged: String = manager.connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='execution_binding_trust_marker_insert'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(manager);
+
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let epoch: i64 = connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let still_forged: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='execution_binding_trust_marker_insert'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(epoch, old_epoch);
+        assert_eq!(still_forged, forged);
+    }
+
+    #[test]
+    fn stamped_guard_names_do_not_authenticate_noop_definitions() {
+        let mut manager = test_manager();
+        manager.initialize_provider_store().unwrap();
+        for (name, table) in [
+            (
+                "immutable_admitted_registry_snapshot_entries_insert",
+                "registry_snapshot_entries",
+            ),
+            (
+                "immutable_registry_snapshot_entries_update",
+                "registry_snapshot_entries",
+            ),
+            (
+                "provider_evidence_no_duplicate_insert",
+                "provider_conformance_evidence",
+            ),
+            (
+                "provider_evidence_immutable_update",
+                "provider_conformance_evidence",
+            ),
+            (
+                "execution_binding_marker_no_duplicate_insert",
+                "execution_binding_admission_markers",
+            ),
+            ("execution_bindings_no_update", "execution_bindings"),
+        ] {
+            manager.connection.execute_batch(&format!(
+                "DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE INSERT ON {table} BEGIN SELECT 1; END;"
+            )).unwrap();
+            assert!(
+                preflight_migration_state_allowing_guard_upgrade(&manager.connection).is_err(),
+                "{name}"
+            );
+            assert!(
+                preflight_migration_state(&manager.connection).is_err(),
+                "{name}"
+            );
+            manager
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {name}"))
+                .unwrap();
+            if name == "execution_bindings_no_update" {
+                manager
+                    .connection
+                    .execute_batch(include_str!("../../../specs/persistence-v0.1.sql"))
+                    .unwrap();
+            } else if name == "immutable_admitted_registry_snapshot_entries_insert"
+                || name == "immutable_registry_snapshot_entries_update"
+            {
+                manager
+                    .connection
+                    .execute_batch(include_str!(
+                        "../../../specs/persistence-v0.1-0012-semantic-registry.sql"
+                    ))
+                    .unwrap();
+            } else {
+                manager
+                    .connection
+                    .execute_batch(include_str!(
+                        "../../../specs/persistence-v0.1-0013-provider-registry.sql"
+                    ))
+                    .unwrap();
+            }
+        }
+        assert!(preflight_migration_state(&manager.connection).is_ok());
+    }
+
+    #[test]
+    fn unstamped_binding_marker_objects_are_not_silently_adopted() {
+        let manager = test_manager();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TABLE execution_binding_admission_markers (
+                binding_id TEXT PRIMARY KEY, conformance_evidence_id TEXT NOT NULL
+            );",
+            )
+            .unwrap();
+        assert!(preflight_migration_state_allowing_guard_upgrade(&manager.connection).is_err());
+        manager
+            .connection
+            .execute_batch("DROP TABLE execution_binding_admission_markers")
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER execution_binding_admission_marker_insert
+             BEFORE INSERT ON execution_bindings BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(preflight_migration_state_allowing_guard_upgrade(&manager.connection).is_err());
+    }
+
+    #[test]
+    fn failed_open_does_not_upgrade_guards_before_claiming_lease() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("untrusted-old-guards.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        let old_epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
+             DROP TRIGGER provider_evidence_no_duplicate_insert;
+             CREATE TRIGGER provider_evidence_no_duplicate_insert
+             BEFORE INSERT ON provider_conformance_evidence BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        drop(manager);
+
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let connection = Connection::open(&path).unwrap();
+        let new_epoch: i64 = connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_epoch, old_epoch);
+        assert!(missing_additive_guard(&connection, SEMANTIC_ADDITIVE_GUARDS).unwrap());
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='provider_evidence_no_duplicate_insert'",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert!(sql.contains("SELECT 1"));
+    }
+
+    #[test]
+    fn fenced_guard_upgrade_installs_both_migrations_after_lease_claim() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("atomic-old-guards.sqlite3");
+        let mut manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        manager.initialize_provider_store().unwrap();
+        let old_epoch: i64 = manager
+            .connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "DROP TRIGGER immutable_admitted_registry_snapshot_entries_insert;
+             DROP TRIGGER execution_binding_evidence_present_at_insert;",
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        drop(reopened);
+        let connection = Connection::open(&path).unwrap();
+        let new_epoch: i64 = connection
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_epoch, old_epoch + 1);
+        assert!(!missing_additive_guard(&connection, SEMANTIC_ADDITIVE_GUARDS).unwrap());
+        assert!(!missing_additive_guard(&connection, PROVIDER_ADDITIVE_GUARDS).unwrap());
     }
 
     #[test]

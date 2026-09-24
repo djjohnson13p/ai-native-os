@@ -129,7 +129,6 @@ No current AIOS contract is `STABLE`.
 | --- | --- |
 | `capability-manifest.schema.json` | provider implementation declaration using canonical effect vocabulary |
 | `provider-registration.schema.json` | provider package/trust/conformance registration state |
-| `provider-conformance-evidence.schema.json` | evidence tied to exact provider/contract/package identity |
 | `provider-conformance-result.schema.json` | provider-vs-contract conformance result |
 | `execution-binding.schema.json` | immutable attempt-specific semantic-node → provider/resources/grants/placement receipt |
 | `execution-profile.schema.json` | sandbox/process/container/VM isolation profile |
