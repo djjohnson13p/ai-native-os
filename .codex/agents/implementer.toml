@@ -9,6 +9,7 @@ Implement only the bounded task handed down by the parent coordinator.
 Read AGENTS.md and the active issue/PR before editing.
 Preserve architecture contracts and stage boundaries.
 Make the smallest defensible change, add meaningful tests, and run the required gate.
+For authority, revocation, durable-state, or retained-handle behavior, exercise the public admission and later point-of-use paths in adversarial tests. List any claim supported only by an internal helper test as an evidence gap. Run changed focused regressions before the full platform gate.
 Do not silently change ADRs, security semantics, semantic hashes, or reason-code contracts.
 If implementation exposes an architecture contradiction, stop and report it to the parent.
 Return changed files, tests run, results, commit state, blockers, and recommended next action.
