@@ -446,15 +446,6 @@ fn replay_existing(
         || row.7 != request.capability_contract_hash
         || row.8 != request.provider_registration_id
         || row.12 != i64::from(request.attempt_number)
-        || row.13
-            != i64::try_from(
-                request
-                    .resources
-                    .iter()
-                    .filter(|r| !matches!(r.handle, CandidateResourceHandle::ExternalExport { .. }))
-                    .count(),
-            )
-            .map_err(|_| reject())?
         || row.14 != "PENDING"
     {
         return Err(reject());
@@ -474,6 +465,30 @@ fn replay_existing(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let stored_export = load_current_export_pin(connection, request.candidate_id)?;
+    // A replay cannot widen the sealed semantic request. Diagnose this at the
+    // same reservation fence, before the generic resource-count/replay checks.
+    if request.resources.iter().any(|claim| {
+        !stored.iter().any(|(action, selector, ..)| {
+            action == &claim.action && selector == &claim.semantic_selector
+        }) && !stored_export.as_ref().is_some_and(|pin| {
+            claim.action == "data.egress" && claim.semantic_selector == pin.selector
+        })
+    }) {
+        return Err(semantic_request_mismatch());
+    }
+    if row.13
+        != i64::try_from(
+            request
+                .resources
+                .iter()
+                .filter(|r| !matches!(r.handle, CandidateResourceHandle::ExternalExport { .. }))
+                .count(),
+        )
+        .map_err(|_| reject())?
+    {
+        return Err(reject());
+    }
     let mut requested = Vec::with_capacity(request.resources.len());
     let mut requested_export = None;
     for choice in request.resources {
@@ -531,7 +546,6 @@ fn replay_existing(
     if stored != requested {
         return Err(reject());
     }
-    let stored_export = load_current_export_pin(connection, request.candidate_id)?;
     match (requested_export, stored_export) {
         (None, None) => {}
         (Some((action, selector, service, source, operation, purpose, ceiling)), Some(pin))
@@ -1865,11 +1879,11 @@ mod tests {
     }
 
     fn coherent_planning_fixture(path: &Path) -> (TaskManager, String, String, String) {
-        fixture_at_mode(Some(path), true, false)
+        fixture_at_mode(Some(path), true, false, None)
     }
 
     fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
-        fixture_at_mode(path, false, false)
+        fixture_at_mode(path, false, false, None)
     }
 
     #[allow(
@@ -1880,6 +1894,7 @@ mod tests {
         path: Option<&Path>,
         coherent_planning: bool,
         export: bool,
+        provider_id: Option<&str>,
     ) -> (TaskManager, String, String, String) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
@@ -1981,6 +1996,9 @@ mod tests {
         ))
         .unwrap();
         let mut manifest = cases[0]["provider"].clone();
+        if let Some(provider_id) = provider_id {
+            manifest["id"] = json!(provider_id);
+        }
         manifest["provides"][0]["contract"]["capability"] = json!("artifact.copy");
         manifest["provides"][0]["contract"]["contract_hash"] = json!(contract_hash);
         manifest["provides"][0]["conformance"]["suite"] = json!("conformance://artifact.copy/1");
@@ -2140,6 +2158,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "loads fixture facts and proves the full authority boundary has no side effects"
+    )]
     fn fixture_undeclared_network_claim_is_typed_denial_before_any_authority() {
         let cases: Vec<Value> = serde_json::from_str(include_str!(
             "../../../examples/authority/authority-cases.json"
@@ -2156,12 +2178,23 @@ mod tests {
             .as_str()
             .unwrap();
         let runtime_claim = case["facts"]["runtime_request"].as_str().unwrap();
+        let principal = case["facts"]["principal"].as_str().unwrap();
         let (semantic_action, semantic_selector) = semantic_claim.split_once(' ').unwrap();
         let (runtime_action, runtime_service) = runtime_claim.split_once(' ').unwrap();
         assert_eq!(runtime_action, "network.connect");
         assert!(runtime_service.starts_with("service://"));
 
-        let (mut manager, hash, snapshot, registration) = fixture();
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, false, false, Some(principal));
+        let registered_principal: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM provider_registrations WHERE registration_id=?1",
+                [&registration],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered_principal, principal);
         let program_json: String = manager.connection.query_row(
             "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-candidate' AND semantic_hash=?1",
             [&hash], |row| row.get(0),
@@ -2241,6 +2274,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn undeclared_network_claim_on_existing_candidate_is_typed_denial() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        let mut choices = choices();
+        manager
+            .reserve_authority_candidate(&replay_network_request(
+                &hash,
+                &snapshot,
+                &contract,
+                &registration,
+                &choices,
+            ))
+            .unwrap();
+        let counts = |manager: &TaskManager| {
+            [
+                "authority_candidate_reservations",
+                "authority_candidate_resources",
+                "policy_decisions",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before = counts(&manager);
+        choices.push(CandidateResourceChoice {
+            action: "network.connect".into(),
+            semantic_selector: "service://unrequested".into(),
+            handle: CandidateResourceHandle::NetworkService {
+                service_id: "service://unrequested".into(),
+            },
+        });
+        let error = manager
+            .reserve_authority_candidate(&replay_network_request(
+                &hash,
+                &snapshot,
+                &contract,
+                &registration,
+                &choices,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.authority_denial(),
+            Some(AuthorityDenial {
+                stage: AuthorityDenialStage::CandidateReservation,
+                reason: AuthorityDenialReason::SemanticRequestMismatch,
+            })
+        );
+        assert_eq!(counts(&manager), before);
+    }
+
+    fn replay_network_request<'a>(
+        hash: &'a str,
+        snapshot: &'a str,
+        contract: &'a str,
+        registration: &'a str,
+        resources: &'a [CandidateResourceChoice],
+    ) -> ReserveAuthorityCandidate<'a> {
+        ReserveAuthorityCandidate {
+            candidate_id: "candidate:replay-network",
+            binding_id: "binding:replay-network",
+            attempt_id: "attempt:replay-network",
+            task_id: "T-candidate",
+            semantic_program_hash: hash,
+            registry_snapshot_id: snapshot,
+            node_id: "copy",
+            capability_contract_hash: contract,
+            provider_registration_id: registration,
+            attempt_number: 1,
+            resources,
+        }
+    }
+
     fn choices_with_source(artifact_id: &str) -> Vec<CandidateResourceChoice> {
         choices_with_source_and_output(artifact_id, "allocation:copy")
     }
@@ -2291,7 +2405,7 @@ mod tests {
                 self.flush()
             }
         }
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true, None);
         let bytes = b"private fixture export";
         let imported = manager
             .import_artifact(
@@ -2721,7 +2835,8 @@ mod tests {
         use crate::authority_policy::AuthenticatedApprover;
         let directory = tempdir().unwrap();
         let path = directory.path().join("exact-export.sqlite3");
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(Some(&path), true, true);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(Some(&path), true, true, None);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -2886,7 +3001,7 @@ mod tests {
     )]
     fn pending_exact_export_fixture() -> (TaskManager, String) {
         use crate::authority_policy::AuthenticatedApprover;
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true, None);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -3050,7 +3165,8 @@ mod tests {
     fn retained_exact_export_denies_changed_service_approval_policy_or_read_grant() {
         use crate::authority_policy::AuthenticatedApprover;
         for scenario in ["service", "approval", "policy", "read-grant"] {
-            let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+            let (mut manager, hash, snapshot, registration) =
+                fixture_at_mode(None, true, true, None);
             let imported = manager
                 .import_artifact(
                     &ImportArtifactRequest {
@@ -5876,7 +5992,7 @@ mod tests {
         reason = "proves coordinator grant admission, active use, and durable expiry under one frozen wall fixture"
     )]
     fn run_frozen_wall_coordinator_grant(expire_before_running: bool) {
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, false);
+        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, false, None);
         let contract = contract_hash(&manager, &snapshot);
         manager
             .reserve_authority_candidate(&ReserveAuthorityCandidate {
