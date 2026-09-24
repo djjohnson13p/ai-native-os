@@ -6,6 +6,52 @@ use std::process::Command;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
+#[test]
+fn authority_issuance_fence_rejects_missing_or_replaced_guard() {
+    for replacement in [
+        "DROP TRIGGER authority_issuance_receipt_exact_insert;",
+        "DROP TRIGGER authority_issuance_receipt_exact_insert;
+         CREATE TRIGGER authority_issuance_receipt_exact_insert
+         BEFORE INSERT ON authority_issuance_receipts BEGIN SELECT 1; END;",
+    ] {
+        let manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+        manager.connection.execute_batch(replacement).unwrap();
+        assert!(preflight_migration_state(&manager.connection).is_err());
+    }
+}
+
+#[test]
+fn authority_issuance_migration_preserves_but_does_not_admit_legacy_grant() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
+    manager.connection.execute_batch(
+        "INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at)
+         VALUES ('legacy-policy','task','T-completion','builtin','sha256:fixture','fixture','1','{}','2026-09-19T00:00:00Z');
+         INSERT INTO authority_requests(request_id,task_id,semantic_program_hash,registry_snapshot_id,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,action,resolved_resource_kind,resolved_resource_id,semantic_selector,request_json,requested_at)
+         VALUES ('legacy-request','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','snapshot-completion','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','artifact.read','artifact','artifact:fixture','input:fixture','{}','2026-09-19T00:00:00Z');
+         INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,reason_codes_json,decision_json,decided_at)
+         VALUES ('legacy-decision','legacy-request','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','provider','provider:test','artifact.read','artifact','artifact:fixture','ALLOW','legacy-policy','[]','{}','2026-09-19T00:00:00Z');
+         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at)
+         VALUES ('legacy-grant','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','legacy-decision','legacy-policy','[{\"action\":\"artifact.read\",\"resource_kind\":\"artifact\",\"resource_id\":\"artifact:fixture\",\"semantic_selector\":\"input:fixture\"}]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
+         DROP TABLE authority_issuance_receipts;
+         DELETE FROM schema_migrations WHERE migration_id='0015_authority_issuance_fence';",
+    ).unwrap();
+    migrate_task_manager_schema(
+        &manager.connection,
+        &manager.lease_owner,
+        manager.lease_epoch,
+    )
+    .unwrap();
+    let (token_id, receipt_count): (Option<String>, i64) = manager.connection.query_row(
+        "SELECT g.token_id,(SELECT COUNT(*) FROM authority_issuance_receipts WHERE grant_id=g.grant_id)
+         FROM authority_grants g WHERE g.grant_id='legacy-grant'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(token_id, None);
+    assert_eq!(receipt_count, 0);
+    assert!(preflight_migration_state(&manager.connection).is_ok());
+}
+
 const HASH: &str = "sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50";
 const CONTRACT_HASH: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -3178,7 +3224,7 @@ fn unstamped_pre_reconciliation_store_is_quarantined_without_mutation() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        10
+        11
     );
 }
 
@@ -6734,6 +6780,25 @@ fn binding_grants_exactly_cover_current_authority_requests() {
         &["decision-cover-1", "decision-cover-2"],
         &["grant-cover-1", "grant-cover-2"],
     );
+    manager.connection.execute(
+        "UPDATE authority_grants SET token_id='fixture:manual-sql' WHERE grant_id='grant-cover-1'",
+        [],
+    ).unwrap();
+    {
+        let transaction = manager.connection.transaction().unwrap();
+        assert!(
+            !binding_grants_valid(
+                &transaction,
+                &check(
+                    "[\"grant-cover-1\",\"grant-cover-2\"]",
+                    "binding-completion"
+                )
+            )
+            .unwrap()
+        );
+    }
+    admit_fixture_grant(&manager.connection, "grant-cover-1").unwrap();
+    admit_fixture_grant(&manager.connection, "grant-cover-2").unwrap();
     let transaction = manager.connection.transaction().unwrap();
     assert!(!binding_grants_valid(&transaction, &check("[]", "binding-completion")).unwrap());
     assert!(
@@ -6842,6 +6907,7 @@ fn approval_backed_grants_revalidate_status_expiry_decision_and_identity() {
          INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES ('grant-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','policy-decision-approved','policy-approved','approval-approved','[{"action":"action.approved","resource_kind":"artifact","resource_id":"artifact:approved","semantic_selector":"resource:approved"}]','ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"#,
     ).unwrap();
     set_completion_binding_refs(&manager, &["policy-decision-approved"], &["grant-approved"]);
+    admit_fixture_grant(&manager.connection, "grant-approved").unwrap();
     let check = |transaction: &Transaction<'_>| {
         binding_grants_valid(
             transaction,

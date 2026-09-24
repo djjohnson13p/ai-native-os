@@ -7389,6 +7389,13 @@ fn binding_runtime_authority_valid(
                         r.request_id,r.capability,r.action,r.resolved_resource_kind,
                         r.resolved_resource_id,r.semantic_selector,g.state,g.max_uses,g.uses_consumed
                  FROM authority_grants g
+                 JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+                    AND i.token_id=g.token_id AND i.task_id=g.task_id
+                    AND i.execution_binding_id=g.execution_binding_id
+                    AND i.attempt_id=g.attempt_id
+                    AND i.policy_decision_id=g.policy_decision_id
+                    AND i.issued_at=g.issued_at
+                    AND i.issuance_profile='coordinator-issued-v0.1'
                  JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
                     AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
                     AND d.node_id=g.node_id AND d.policy_snapshot_id=g.policy_snapshot_id
@@ -7657,6 +7664,13 @@ fn exact_operation_grant(
                         r.request_id,r.capability,r.action,r.resolved_resource_kind,
                         r.resolved_resource_id,r.semantic_selector,g.state,g.max_uses,g.uses_consumed
                  FROM authority_grants g
+                 JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+                    AND i.token_id=g.token_id AND i.task_id=g.task_id
+                    AND i.execution_binding_id=g.execution_binding_id
+                    AND i.attempt_id=g.attempt_id
+                    AND i.policy_decision_id=g.policy_decision_id
+                    AND i.issued_at=g.issued_at
+                    AND i.issuance_profile='coordinator-issued-v0.1'
                  JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
                     AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
                     AND d.node_id=g.node_id AND d.policy_snapshot_id=g.policy_snapshot_id
@@ -13489,11 +13503,16 @@ mod tests {
         }
     }
 
-    fn install_one_shot_binding(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "builds the full synthetic binding and grant rows for authority fixture tests"
+    )]
+    fn install_one_shot_binding_with_issuance(
         manager: &TaskManager,
         fixture: &str,
         input_artifact_ids: &[String],
         operations: &[(&str, &str, &str)],
+        issue_receipts: bool,
     ) -> (String, String) {
         let program_hash = allocation("unused").semantic_program_hash;
         let registry_id = format!("registry-{fixture}");
@@ -13593,8 +13612,56 @@ mod tests {
                     params![grant_ids[index], program_hash, binding_id, attempt_id, decision_ids[index], policy_id, grants.to_string()],
                 )
                 .unwrap();
+            if issue_receipts {
+                crate::admit_fixture_grant(&manager.connection, &grant_ids[index]).unwrap();
+            }
         }
         (binding_id, attempt_id)
+    }
+
+    fn install_one_shot_binding(
+        manager: &TaskManager,
+        fixture: &str,
+        input_artifact_ids: &[String],
+        operations: &[(&str, &str, &str)],
+    ) -> (String, String) {
+        install_one_shot_binding_with_issuance(
+            manager,
+            fixture,
+            input_artifact_ids,
+            operations,
+            true,
+        )
+    }
+
+    #[test]
+    fn sql_seeded_grant_without_issuance_cannot_read_artifact() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"legacy authority fixture".as_slice()),
+            )
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding_with_issuance(
+            &manager,
+            "unissued-read",
+            &[artifact.artifact_id.clone()],
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+            false,
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET token_id='fixture:manual-sql' WHERE grant_id='grant-unissued-read-0'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            scope_bound_reads(&manager, "T-artifact", &binding_id, &[artifact.artifact_id]),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
     }
 
     #[allow(
@@ -21721,6 +21788,8 @@ mod tests {
             artifact.artifact_id,
             artifact.artifact_id,
         )).unwrap();
+        crate::admit_fixture_grant(&manager.connection, "grant-read").unwrap();
+        crate::admit_fixture_grant(&manager.connection, "grant-write").unwrap();
         let revoked_scope = scope_bound_reads(
             &manager,
             "T-artifact",
@@ -23625,6 +23694,8 @@ mod tests {
                  INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,grants_json,scope,state,issued_at,expires_at) VALUES ('grant-stale-unopened','T-artifact','{program_hash}','compose_report','document.compose','provider','provider:test','binding-old','attempt-old','decision-stale-unopened','policy-artifact','[{{\"action\":\"artifact.write\",\"resource_kind\":\"output-allocation\",\"resource_id\":\"alloc-stale-unopened\",\"semantic_selector\":\"task.output\"}}]','TASK','ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"
             ))
             .unwrap();
+        crate::admit_fixture_grant(&manager.connection, "grant-stale").unwrap();
+        crate::admit_fixture_grant(&manager.connection, "grant-stale-unopened").unwrap();
         let mut request = allocation("alloc-stale");
         request.binding_id = Some("binding-old".to_owned());
         request.attempt_id = Some("attempt-old".to_owned());

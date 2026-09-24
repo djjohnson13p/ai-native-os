@@ -55,6 +55,8 @@ Detailed semantics are in `docs/77-v0.1-authority-coordinator-policy-approval-an
 
 This ADR is a core enforcement boundary. Any implementation shortcut that allows a provider/model to act under broader logged-in user credentials violates I1/I2/I10/I14/I33/I35.
 
+The Stage-1 `0015_authority_issuance_fence` migration preserves preexisting grants as historical records but denies their use without a matching issuance receipt. It does not infer missing token or Execution Binding facts, and it does not treat a SQL row alone as proof of coordinator issuance. A later private Authority Coordinator writer must own receipt creation; the additive fence does not claim resistance to arbitrary privileged database modification.
+
 ## Related
 
 - ADR 0006

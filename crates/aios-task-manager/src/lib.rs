@@ -4423,6 +4423,50 @@ fn preflight_migration_state(connection: &Connection) -> Result<()> {
     preflight_migration_state_with_mode(connection, true)
 }
 
+fn authority_fence_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
+    const OBJECTS: [&str; 4] = [
+        "authority_issuance_receipts",
+        "authority_issuance_receipt_exact_insert",
+        "authority_issuance_receipt_no_update",
+        "authority_issuance_receipt_no_delete",
+    ];
+    let canonical = if stamped {
+        let canonical = Connection::open_in_memory()?;
+        canonical.execute_batch(MIGRATION)?;
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))?;
+        Some(canonical)
+    } else {
+        None
+    };
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expected = canonical
+            .as_ref()
+            .map(|canonical| {
+                canonical.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
@@ -4456,7 +4500,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4535,6 +4579,11 @@ fn preflight_migration_state_with_mode(
         "0014_semantic_repair_fence",
         "semantic-repair-fence-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0015_authority_issuance_fence",
+        "authority-issuance-fence-v0.1",
+    )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4592,6 +4641,16 @@ fn preflight_migration_state_with_mode(
                     "skills",
                 ],
             )?;
+        }
+        let has_authority_fence: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0015_authority_issuance_fence')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !authority_fence_objects_current(connection, has_authority_fence)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority issuance fence requires operator quarantine",
+            ));
         }
         let has_v3 = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0003_task_manager_recovery_fencing_privacy')",
@@ -4947,6 +5006,11 @@ fn migrate_task_manager_schema(
         connection,
         "0013_provider_registry",
         "provider-registry-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0015_authority_issuance_fence",
+        "authority-issuance-fence-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5319,6 +5383,13 @@ fn migrate_task_manager_schema(
         }
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0011_provenance_service_boundary', 'provenance-service-boundary-v0.1', '2026-09-21T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0015-authority-issuance-fence.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0015_authority_issuance_fence', 'authority-issuance-fence-v0.1', '2026-09-23T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -8114,7 +8185,7 @@ fn binding_grants_valid(
     for grant_id in grant_ids {
         let grant = transaction
             .query_row(
-                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id, g.scope, d.decision_id, g.delegable, g.max_delegation_depth FROM authority_grants g JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
+                "SELECT g.expires_at, g.capability, g.principal_kind, g.principal_id, g.policy_snapshot_id, g.grants_json, r.request_id, d.task_id, d.semantic_program_hash, d.node_id, d.principal_kind, d.principal_id, d.action, d.resolved_resource_kind, d.resolved_resource_id, d.decision, d.policy_snapshot_id, g.approval_id, d.approval_request_id, g.scope, d.decision_id, g.delegable, g.max_delegation_depth FROM authority_grants g JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id AND i.token_id=g.token_id AND i.task_id=g.task_id AND i.execution_binding_id=g.execution_binding_id AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1' JOIN policy_decisions d ON d.decision_id = g.policy_decision_id JOIN authority_requests r ON r.request_id = d.authority_request_id WHERE g.grant_id = ?1 AND g.task_id = ?2 AND g.semantic_program_hash = ?3 AND g.node_id = ?4 AND g.execution_binding_id = ?5 AND g.attempt_id = ?6 AND g.state = 'ACTIVE' AND g.scope IN ('ONE_SHOT', 'TASK', 'TIME_LIMITED') AND (g.max_uses IS NULL OR g.uses_consumed < g.max_uses)",
                 params![grant_id, check.task_id, check.semantic_hash, check.node_id, check.binding_id, check.attempt_id],
                 |row| {
                     Ok((
@@ -12938,6 +13009,28 @@ mod tests {
             .unwrap();
         assert_eq!(rollback.reason_code, "TASK_TRANSITION_GUARD_FAILED");
     }
+}
+
+#[cfg(test)]
+pub(crate) fn admit_fixture_grant(connection: &Connection, grant_id: &str) -> Result<()> {
+    // Unit tests exercise downstream admission with synthetic trusted issuance.
+    // This helper is absent from production builds; production issuance belongs
+    // to the future private Authority Coordinator writer.
+    let token_id = format!("fixture-token:{grant_id}");
+    connection.execute(
+        "UPDATE authority_grants SET token_id=?2 WHERE grant_id=?1",
+        params![grant_id, token_id],
+    )?;
+    connection.execute(
+        "INSERT INTO authority_issuance_receipts(
+            grant_id,token_id,task_id,execution_binding_id,attempt_id,
+            policy_decision_id,issued_at,issuance_profile)
+         SELECT grant_id,token_id,task_id,execution_binding_id,attempt_id,
+                policy_decision_id,issued_at,'coordinator-issued-v0.1'
+         FROM authority_grants WHERE grant_id=?1",
+        [grant_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

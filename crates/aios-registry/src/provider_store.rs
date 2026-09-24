@@ -1472,6 +1472,10 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
         ),
         (MIGRATION_ID, MIGRATION_CHECKSUM),
         ("0014_semantic_repair_fence", "semantic-repair-fence-v0.1"),
+        (
+            "0015_authority_issuance_fence",
+            "authority-issuance-fence-v0.1",
+        ),
     ];
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;

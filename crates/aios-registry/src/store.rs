@@ -97,6 +97,10 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
         (MIGRATION_ID, MIGRATION_CHECKSUM),
         ("0013_provider_registry", "provider-registry-v0.1"),
         ("0014_semantic_repair_fence", "semantic-repair-fence-v0.1"),
+        (
+            "0015_authority_issuance_fence",
+            "authority-issuance-fence-v0.1",
+        ),
     ];
     let mut stamped = false;
     let mut baseline = false;
