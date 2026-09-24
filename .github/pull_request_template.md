@@ -47,6 +47,25 @@ Details:
 # exact commands + results
 ```
 
+## Review evidence for trusted-boundary changes
+
+<!-- For authority, persistence, revocation, retained handles, and recovery changes. Use N/A otherwise. Review the complete executable path before requesting external review. -->
+
+- Public admission entry point and later point-of-use entry point:
+- Durable state transitions and supported restart/migration states:
+- Adversarial public-path tests and their observable denial/effect:
+- Windows and Linux/WSL focused results before the full exact-head gate:
+- Remaining unproven behavior (if any):
+
+## Review-loop cost and decision
+
+<!-- Update after each substantive review. Count distinct pushed heads, not comments or routine polling. After two successive heads expose different failures in one trust boundary, record the design challenge and scope decision before another patch. -->
+
+- Head-changing review cycles so far:
+- Findings: introduced / previously latent / uncertain:
+- Full exact-head gates run so far:
+- Boundary design or PR-scope decision, if the two-head escalation triggered:
+
 ## AIOS IR / validator-specific checks (if applicable)
 
 - [ ] Positive fixtures pass
