@@ -6401,6 +6401,26 @@ impl TaskManager {
     pub(crate) fn reconcile_artifacts_startup(&mut self) -> Result<ArtifactReconciliationReport> {
         let reconciled_at = self.clock.now();
         let mut findings = Vec::new();
+        // Publication can leave a pending blob, a promoted final blob, and
+        // staging/seal evidence across several separately marked filesystem
+        // calls. Until its entry-time marker is resolved, startup must not
+        // promote, delete, classify, or terminalize any of that evidence.
+        // Defer the whole Artifact reconciliation pass: blob filenames alone
+        // cannot identify which incomplete primitive the prior owner reached.
+        let unresolved_publication: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM trusted_time_effect_preparations p
+                 JOIN trusted_time_effect_pending x ON x.marker_id=p.marker_id
+                 WHERE p.subject_kind='ARTIFACT_PUBLICATION')",
+            [],
+            |row| row.get(0),
+        )?;
+        if unresolved_publication {
+            return Ok(ArtifactReconciliationReport {
+                reconciled_at,
+                findings,
+            });
+        }
         for content_hash in reconcile_pending_blob_placements(&self.artifact_store_dir)? {
             findings.push(ArtifactReconciliationFinding {
                 kind: ArtifactReconciliationKind::BlobCorrupt,
@@ -25310,6 +25330,82 @@ mod tests {
         );
         assert!(!manager.artifact_store_root.join(&final_ref).exists());
         assert!(manager.reconcile_artifacts_startup().is_ok());
+    }
+
+    #[test]
+    fn unresolved_publication_marker_preserves_blob_and_staging_on_reopen() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        manager
+            .allocate_artifact_output(&allocation("alloc-pending-publication-marker"))
+            .unwrap();
+        let staging_ref: String = manager
+            .connection
+            .query_row(
+                "SELECT staging_ref FROM artifact_output_allocations WHERE allocation_id='alloc-pending-publication-marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .artifact_store_dir
+            .write(&staging_ref, b"unresolved staging")
+            .unwrap();
+        let bytes = b"unresolved publication bytes";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = tagged_digest(hasher);
+        let digest = hash.strip_prefix("sha256:").unwrap();
+        let pending_ref = format!("blobs/pending/{digest}-unresolved");
+        let final_ref = format!("blobs/sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        manager
+            .artifact_store_dir
+            .write(&pending_ref, bytes)
+            .unwrap();
+        #[cfg(unix)]
+        for reference in [&staging_ref, &pending_ref] {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(
+                manager.artifact_store_root.join(reference),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let _unresolved = crate::trusted_time::prepare_external_effect(
+            &manager.connection,
+            &manager.clock,
+            &manager.lease_owner,
+            manager.lease_epoch,
+            "T-artifact",
+            crate::trusted_time::ExternalEffectKind::Publication,
+            "pub-unresolved-marker",
+        )
+        .unwrap();
+        drop(manager);
+
+        let reopened = TaskManager::open_with_clock(&database, Box::new(FixedClock)).unwrap();
+        assert_eq!(
+            reopened.artifact_store_dir.read(&pending_ref).unwrap(),
+            bytes
+        );
+        assert!(!reopened.artifact_store_root.join(final_ref).exists());
+        assert_eq!(
+            reopened.artifact_store_dir.read(&staging_ref).unwrap(),
+            b"unresolved staging"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state FROM artifact_output_allocations WHERE allocation_id='alloc-pending-publication-marker'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ALLOCATED"
+        );
     }
 
     #[test]
