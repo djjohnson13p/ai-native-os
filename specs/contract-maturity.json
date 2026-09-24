@@ -63,11 +63,11 @@
       "maturity": "SPIKE_READY",
       "workstream": "Deterministic policy, approval, scoped runtime grant lifecycle",
       "issue": 3,
-      "artifacts": ["specs/authority-evaluation-request.schema.json", "specs/policy-decision.schema.json", "specs/policy-snapshot.schema.json", "specs/approval-request.schema.json", "specs/approval-decision.schema.json", "specs/authority-grant-record.schema.json", "specs/capability-token.schema.json", "specs/authority-reason-codes.json", "docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md"],
-      "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039"],
+      "artifacts": ["specs/authority-candidate-reservation.schema.json", "specs/authority-evaluation-request.schema.json", "specs/policy-decision.schema.json", "specs/policy-snapshot.schema.json", "specs/approval-request.schema.json", "specs/approval-decision.schema.json", "specs/authority-grant-record.schema.json", "specs/capability-token.schema.json", "specs/authority-reason-codes.json", "docs/77-v0.1-authority-coordinator-policy-approval-and-grant-lifecycle.md"],
+      "controlling_adrs": ["ADR-0006", "ADR-0010", "ADR-0039", "ADR-0044"],
       "fixture_paths": ["examples/authority/", "examples/reference-task/policy-local-read.json"],
       "blocking_questions": [],
-      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency."
+      "notes": "Policy backend is replaceable; Cedar remains a proposed reference backend rather than semantic dependency. Migration 0016 adds a non-executable pre-policy candidate reservation, preserving immutable binding creation after grant issuance. Multi-output task.output resolution is pending an explicit broker contract."
     },
     {
       "id": "credential-broker-v0.1",

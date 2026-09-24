@@ -13,6 +13,7 @@
 )]
 
 mod artifact_store;
+mod authority_candidate;
 
 pub use aios_provenance::{
     CheckpointExpectation as ProvenanceCheckpointExpectation,
@@ -4467,6 +4468,63 @@ fn authority_fence_objects_current(connection: &Connection, stamped: bool) -> Re
     Ok(true)
 }
 
+fn authority_candidate_objects_current(connection: &Connection, stamped: bool) -> Result<bool> {
+    const OBJECTS: [&str; 23] = [
+        "authority_candidate_reservations",
+        "authority_candidate_resources",
+        "ux_authority_candidate_output_identity",
+        "authority_candidate_status",
+        "authority_candidate_reservation_no_duplicate_insert",
+        "authority_candidate_resource_no_duplicate_insert",
+        "authority_candidate_status_no_duplicate_insert",
+        "authority_candidate_reservation_exact_insert",
+        "authority_candidate_binding_insert_guard",
+        "authority_candidate_step_insert_guard",
+        "authority_candidate_step_identity_update_guard",
+        "authority_candidate_step_no_delete",
+        "authority_candidate_allocation_insert_guard",
+        "authority_candidate_allocation_identity_update_guard",
+        "authority_candidate_allocation_no_delete",
+        "authority_candidate_resource_exact_insert",
+        "authority_candidate_status_exact_insert",
+        "authority_candidate_status_cas_update",
+        "authority_candidate_reservation_no_update",
+        "authority_candidate_reservation_no_delete",
+        "authority_candidate_resource_no_update",
+        "authority_candidate_resource_no_delete",
+        "authority_candidate_status_no_delete",
+    ];
+    let canonical = if stamped {
+        let canonical = Connection::open_in_memory()?;
+        canonical.execute_batch(MIGRATION)?;
+        canonical.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0016-authority-candidate-reservations.sql"
+        ))?;
+        Some(canonical)
+    } else {
+        None
+    };
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','index','trigger')",
+                [name], |row| row.get(0),
+            ).optional()?;
+        let expected = canonical.as_ref().map(|canonical| {
+            canonical.query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','index','trigger')",
+                [name], |row| row.get::<_,String>(0),
+            )
+        }).transpose()?;
+        if actual.map(|sql| normalize_schema_sql(&sql))
+            != expected.map(|sql| normalize_schema_sql(&sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
@@ -4500,7 +4558,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4584,6 +4642,11 @@ fn preflight_migration_state_with_mode(
         "0015_authority_issuance_fence",
         "authority-issuance-fence-v0.1",
     )?;
+    verify_migration_checksum(
+        connection,
+        "0016_authority_candidate_reservations",
+        "authority-candidate-reservations-v0.1",
+    )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4650,6 +4713,15 @@ fn preflight_migration_state_with_mode(
         if !authority_fence_objects_current(connection, has_authority_fence)? {
             return Err(TaskManagerError::InvalidRecord(
                 "authority issuance fence requires operator quarantine",
+            ));
+        }
+        let has_candidate_reservations: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0016_authority_candidate_reservations')",
+            [], |row| row.get(0),
+        )?;
+        if !authority_candidate_objects_current(connection, has_candidate_reservations)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "authority candidate reservation schema requires operator quarantine",
             ));
         }
         let has_v3 = connection.query_row(
@@ -5011,6 +5083,11 @@ fn migrate_task_manager_schema(
         connection,
         "0015_authority_issuance_fence",
         "authority-issuance-fence-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0016_authority_candidate_reservations",
+        "authority-candidate-reservations-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -5390,6 +5467,13 @@ fn migrate_task_manager_schema(
         ))?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0015_authority_issuance_fence', 'authority-issuance-fence-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0016-authority-candidate-reservations.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0016_authority_candidate_reservations', 'authority-candidate-reservations-v0.1', '2026-09-23T00:00:00Z')",
             [],
         )?;
         Ok(())

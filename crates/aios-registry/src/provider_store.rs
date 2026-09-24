@@ -1476,6 +1476,10 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
             "0015_authority_issuance_fence",
             "authority-issuance-fence-v0.1",
         ),
+        (
+            "0016_authority_candidate_reservations",
+            "authority-candidate-reservations-v0.1",
+        ),
     ];
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;

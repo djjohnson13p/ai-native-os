@@ -101,6 +101,10 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
             "0015_authority_issuance_fence",
             "authority-issuance-fence-v0.1",
         ),
+        (
+            "0016_authority_candidate_reservations",
+            "authority-candidate-reservations-v0.1",
+        ),
     ];
     let mut stamped = false;
     let mut baseline = false;
