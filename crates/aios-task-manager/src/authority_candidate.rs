@@ -484,8 +484,12 @@ fn replay_existing(
                 purpose,
                 max_size_bytes,
             } => {
+                if choice.action != "data.egress" {
+                    return Err(reject());
+                }
                 if requested_export
                     .replace((
+                        choice.action.as_str(),
                         choice.semantic_selector.as_str(),
                         service_id.as_str(),
                         source_artifact_id.as_str(),
@@ -517,8 +521,9 @@ fn replay_existing(
     let stored_export = load_current_export_pin(connection, request.candidate_id)?;
     match (requested_export, stored_export) {
         (None, None) => {}
-        (Some((selector, service, source, operation, purpose, ceiling)), Some(pin))
-            if pin.selector == selector
+        (Some((action, selector, service, source, operation, purpose, ceiling)), Some(pin))
+            if action == "data.egress"
+                && pin.selector == selector
                 && pin.service_id == service
                 && pin.source_artifact_id == source
                 && pin.operation_id == operation
@@ -2285,6 +2290,33 @@ mod tests {
         {
             *service_id = "service://fixture/b".into();
         }
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &substituted,
+                    ..request
+                })
+                .is_ok()
+        );
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &substituted,
+                    ..request
+                })
+                .is_ok()
+        );
+        let mut changed_action = substituted.clone();
+        changed_action[2].action = "artifact.read".into();
+        assert!(
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    resources: &changed_action,
+                    ..request
+                })
+                .is_err(),
+            "a changed export action must not replay a pending candidate"
+        );
         assert!(
             manager
                 .reserve_authority_candidate(&ReserveAuthorityCandidate {
