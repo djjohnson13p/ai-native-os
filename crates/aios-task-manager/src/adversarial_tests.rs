@@ -6899,12 +6899,9 @@ fn binding_grants_exactly_cover_current_authority_requests() {
     );
 }
 
-#[test]
-fn approval_backed_grants_revalidate_status_expiry_decision_and_identity() {
-    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
-    seed_completion_fixture(&mut manager, HASH, &["artifact-output"], "COMMITTED");
-    manager.connection.execute_batch(
-        r#"UPDATE semantic_program_revisions SET program_json='{"nodes":[{"id":"node-completion","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"report":"artifact.report@1"},"authority_requests":[{"action":"action.approved","resource":"resource:approved"}]}]}' WHERE task_id='T-completion';
+fn seed_approval_backed_grant(manager: &mut TaskManager, pending: bool) {
+    seed_completion_fixture(manager, HASH, &["artifact-output"], "COMMITTED");
+    let fixture_sql = r#"UPDATE semantic_program_revisions SET program_json='{"nodes":[{"id":"node-completion","operation":{"kind":"invoke","capability":"test.complete@1"},"outputs":{"report":"artifact.report@1"},"authority_requests":[{"action":"action.approved","resource":"resource:approved"}]}]}' WHERE task_id='T-completion';
          DROP TRIGGER execution_bindings_no_update;
          UPDATE execution_bindings SET grant_refs_json='["grant-approved"]' WHERE binding_id='binding-completion';
          INSERT INTO policy_snapshots(snapshot_id,scope_kind,scope_id,policy_language,policy_set_hash,engine_id,engine_version,snapshot_json,created_at) VALUES ('policy-approved','task','T-completion','fixture','sha256:policy','engine:test','0.1','{}','2026-09-19T00:00:00Z');
@@ -6913,10 +6910,135 @@ fn approval_backed_grants_revalidate_status_expiry_decision_and_identity() {
          INSERT INTO approval_requests(approval_id,authority_request_id,task_id,semantic_program_hash,node_id,action,status,request_json,created_at,expires_at) VALUES ('approval-other','authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','action.approved','APPROVED','{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');
          INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at) VALUES ('approval-decision','approval-approved','T-completion','APPROVE','user','user:approver','ONE_SHOT','2026-09-20T00:00:00Z','{}','2026-09-19T00:00:00Z');
          INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,semantic_program_hash,node_id,principal_kind,principal_id,action,resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,approval_request_id,reason_codes_json,decision_json,decided_at) VALUES ('policy-decision-approved','authority-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','provider','provider:test','action.approved','artifact','artifact:approved','ALLOW','policy-approved','approval-approved','[]','{}','2026-09-19T00:00:00Z');
-         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES ('grant-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','policy-decision-approved','policy-approved','approval-approved','[{"action":"action.approved","resource_kind":"artifact","resource_id":"artifact:approved","semantic_selector":"resource:approved"}]','ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"#,
-    ).unwrap();
-    set_completion_binding_refs(&manager, &["policy-decision-approved"], &["grant-approved"]);
+         INSERT INTO authority_grants(grant_id,task_id,semantic_program_hash,node_id,capability,principal_kind,principal_id,execution_binding_id,attempt_id,policy_decision_id,policy_snapshot_id,approval_id,grants_json,scope,max_uses,uses_consumed,state,issued_at,expires_at) VALUES ('grant-approved','T-completion','sha256:a26d727d3b1a003e872352a31689f73fbfad0e5f24dbb566f28b97f368272c50','node-completion','test.complete@1','provider','provider:test','binding-completion','attempt-completion','policy-decision-approved','policy-approved','approval-approved','[{"action":"action.approved","resource_kind":"artifact","resource_id":"artifact:approved","semantic_selector":"resource:approved"}]','ONE_SHOT',1,0,'ACTIVE','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z');"#;
+    let sql = if pending {
+        fixture_sql
+            .replacen(
+                "'action.approved','APPROVED'",
+                "'action.approved','PENDING'",
+                1,
+            )
+            .lines()
+            .filter(|line| !line.contains("INSERT INTO approval_decisions("))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        fixture_sql.to_owned()
+    };
+    manager.connection.execute_batch(&sql).unwrap();
+    set_completion_binding_refs(manager, &["policy-decision-approved"], &["grant-approved"]);
     admit_fixture_grant(&manager.connection, "grant-approved").unwrap();
+}
+
+#[test]
+fn bound_approval_withdrawal_fences_an_otherwise_valid_active_grant() {
+    use crate::authority_policy::AuthenticatedApprover;
+
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_approval_backed_grant(&mut manager, true);
+    // The 0017 binding trigger requires a pending request and an exact
+    // REQUIRE_APPROVAL evaluation before the approval can be decided.
+    manager
+        .connection
+        .execute_batch(
+            r"
+        INSERT INTO authority_candidate_reservations(
+            candidate_id,binding_id,attempt_id,task_id,semantic_program_hash,
+            registry_snapshot_id,ir_version,node_id,capability,capability_contract_hash,
+            provider_registration_id,provider_id,provider_version,provider_manifest_hash,
+            provider_build_hash,conformance_evidence_id,provider_trust_source_id,
+            execution_profile_ref,isolation_class,placement_locality,attempt_number,
+            resource_count,created_at)
+        SELECT 'candidate:withdrawal','binding:withdrawal','attempt:withdrawal',
+            task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+            capability,capability_contract_hash,provider_registration_id,provider_id,
+            provider_version,provider_manifest_hash,provider_build_hash,
+            'evidence-completion','fixture:trust',execution_profile_ref,'P1','local',2,1,
+            created_at FROM execution_bindings WHERE binding_id='binding-completion';
+        INSERT INTO authority_candidate_resources(candidate_id,action,semantic_selector,
+            resource_kind,resource_id,output_port,expected_semantic_type)
+        VALUES ('candidate:withdrawal','action.approved','resource:approved',
+            'artifact','artifact:approved',NULL,'artifact.report@1');
+        INSERT INTO authority_candidate_status(candidate_id,revision,state,updated_at)
+        VALUES ('candidate:withdrawal',1,'PENDING','2026-09-19T00:00:00Z');
+        INSERT INTO authority_policy_payloads(content_hash,policy_json,created_at)
+        VALUES ('fixture:withdrawal-policy','{}','2026-09-19T00:00:00Z');
+        INSERT INTO authority_policy_activations(revision,content_hash,activated_at)
+        VALUES (1,'fixture:withdrawal-policy','2026-09-19T00:00:00Z');
+        INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,
+            semantic_program_hash,node_id,principal_kind,principal_id,action,
+            resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,
+            approval_request_id,reason_codes_json,decision_json,decided_at)
+        SELECT 'decision:requiring',authority_request_id,task_id,semantic_program_hash,
+            node_id,principal_kind,principal_id,action,resolved_resource_kind,
+            resolved_resource_id,'REQUIRE_APPROVAL',policy_snapshot_id,
+            'approval-approved','[]','{}','2026-09-19T00:00:00Z'
+        FROM policy_decisions WHERE decision_id='policy-decision-approved';
+        INSERT INTO authority_evaluation_fingerprints(decision_id,candidate_id,
+            fingerprint,activation_revision,evaluated_at)
+        VALUES ('decision:requiring','candidate:withdrawal','fixture:fingerprint',1,
+            '2026-09-19T00:00:00Z');
+        INSERT INTO authority_approval_bindings(approval_id,candidate_id,fingerprint,
+            activation_revision,requiring_decision_id)
+        VALUES ('approval-approved','candidate:withdrawal','fixture:fingerprint',1,
+            'decision:requiring');
+        INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,
+            decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at)
+        VALUES ('approval-decision','approval-approved','T-completion','APPROVE',
+            'user','user:adversarial','ONE_SHOT','2026-09-20T00:00:00Z','{}',
+            '2026-09-19T00:00:00Z');
+        UPDATE approval_requests SET status='APPROVED'
+        WHERE approval_id='approval-approved' AND status='PENDING';
+    ",
+        )
+        .unwrap();
+    let valid = |manager: &mut TaskManager| {
+        let transaction = manager.connection.transaction().unwrap();
+        binding_grants_valid(
+            &transaction,
+            &BindingGrantCheck {
+                task_id: "T-completion",
+                semantic_hash: HASH,
+                node_id: "node-completion",
+                binding_id: "binding-completion",
+                attempt_id: "attempt-completion",
+                grant_refs_json: "[\"grant-approved\"]",
+                checked_at: TEST_TIME,
+            },
+        )
+        .unwrap()
+    };
+    assert!(valid(&mut manager));
+    manager
+        .revoke_candidate_approval(
+            "approval-approved",
+            &AuthenticatedApprover {
+                principal_id: "user:adversarial",
+            },
+        )
+        .unwrap();
+    let (status, decision, grant_state): (String, String, String) = manager
+        .connection
+        .query_row(
+            "SELECT a.status,d.decision,g.state FROM approval_requests a
+         JOIN approval_decisions d USING(approval_id)
+         JOIN authority_grants g ON g.approval_id=a.approval_id
+         WHERE a.approval_id='approval-approved'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (status.as_str(), decision.as_str(), grant_state.as_str()),
+        ("APPROVED", "APPROVE", "ACTIVE")
+    );
+    assert!(!valid(&mut manager));
+}
+
+#[test]
+fn approval_backed_grants_revalidate_status_expiry_decision_and_identity() {
+    let mut manager = TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap();
+    seed_approval_backed_grant(&mut manager, false);
     let check = |transaction: &Transaction<'_>| {
         binding_grants_valid(
             transaction,

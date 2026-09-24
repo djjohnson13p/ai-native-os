@@ -8231,6 +8231,23 @@ fn output_allocations_ready(
     Ok(actual == expected_ports)
 }
 
+pub(crate) fn approval_not_withdrawn(
+    connection: &Connection,
+    approval_id: Option<&str>,
+) -> Result<bool> {
+    let Some(approval_id) = approval_id else {
+        return Ok(true);
+    };
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM authority_approval_bindings
+         WHERE approval_id=?1 AND revoked_at IS NOT NULL)",
+            [approval_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the exact semantic-request, policy-decision, and runtime-grant intersection auditable"
@@ -8511,6 +8528,9 @@ fn binding_grants_valid(
         let Some(grant) = grant else {
             return Ok(false);
         };
+        if !approval_not_withdrawn(transaction, grant.17.as_deref())? {
+            return Ok(false);
+        }
         let Some(request) = durable_by_id.get(&grant.6) else {
             return Ok(false);
         };

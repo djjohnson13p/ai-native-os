@@ -8328,6 +8328,9 @@ fn binding_runtime_authority_valid(
         let Some(grant) = grant else {
             return Ok(false);
         };
+        if !super::approval_not_withdrawn(connection, grant.1.as_deref())? {
+            return Ok(false);
+        }
         let consumed_one_shot = consumed_one_shot_grant(&grant.11, &grant.25, grant.26, grant.27);
         let exhausted_finite = exhausted_finite_grant(&grant.11, &grant.25, grant.26, grant.27);
         let structurally_exhausted = consumed_one_shot || exhausted_finite;
@@ -8605,6 +8608,9 @@ fn exact_operation_grant(
         let Some(row) = row else {
             continue;
         };
+        if !super::approval_not_withdrawn(connection, row.approval_id.as_deref())? {
+            continue;
+        }
         let lifecycle_valid = match admitted {
             Some(admission) if admission.one_shot_consumed => {
                 consumed_one_shot_grant(&row.scope, &row.state, row.max_uses, row.uses_consumed)
@@ -16034,6 +16040,274 @@ mod tests {
             operations,
             true,
         )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps the complete approval binding and retained-reader chronology visible in one regression"
+    )]
+    fn withdrawn_bound_approval_fences_artifact_reader_without_mutating_grant() {
+        use crate::authority_policy::AuthenticatedApprover;
+
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"approval-backed input".as_slice()),
+            )
+            .unwrap();
+        let fixture = "withdrawn-approval-read";
+        let (binding_id, _) = install_one_shot_binding_with_issuance(
+            &manager,
+            fixture,
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+            false,
+        );
+        let approval_id = "approval-withdrawn-artifact-read";
+        let request_id = format!("request-{fixture}-0");
+        let decision_id = format!("decision-{fixture}-0");
+        let grant_id = format!("grant-{fixture}-0");
+        let program_hash = allocation("unused").semantic_program_hash;
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET scope='TASK',max_uses=NULL WHERE grant_id=?1",
+                [&grant_id],
+            )
+            .unwrap();
+        crate::admit_fixture_grant(&manager.connection, &grant_id).unwrap();
+
+        // A bound 0017 approval requires a pending request and its exact
+        // REQUIRE_APPROVAL evaluation before the APPROVE decision is recorded.
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_registrations(registration_id,provider_id,provider_version,
+                manifest_hash,package_content_hash,registry_snapshot_id,state,trust_status,
+                registration_json,registered_at)
+             VALUES ('registration:withdrawn-read','provider:sequential','1',
+                'manifest:withdrawn-read','package:withdrawn-read',
+                'registry-withdrawn-approval-read','registered','trusted','{}',
+                '2026-09-19T00:00:00Z');
+             INSERT INTO provider_conformance_evidence(evidence_id,registration_id,capability,
+                contract_hash,status,evidence_json,tested_at)
+             VALUES ('evidence:withdrawn-read','registration:withdrawn-read','document.compose',
+                'contract:withdrawn-read','passed','{}','2026-09-19T00:00:00Z');
+             INSERT INTO authority_policy_payloads(content_hash,policy_json,created_at)
+             VALUES ('policy:withdrawn-read','{}','2026-09-19T00:00:00Z');
+             INSERT INTO authority_policy_activations(revision,content_hash,activated_at)
+             VALUES (1,'policy:withdrawn-read','2026-09-19T00:00:00Z');",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO authority_candidate_reservations(candidate_id,binding_id,attempt_id,
+                task_id,semantic_program_hash,registry_snapshot_id,ir_version,node_id,
+                capability,capability_contract_hash,provider_registration_id,provider_id,
+                provider_version,provider_manifest_hash,provider_build_hash,
+                conformance_evidence_id,provider_trust_source_id,execution_profile_ref,
+                isolation_class,placement_locality,attempt_number,resource_count,created_at)
+             VALUES ('candidate:withdrawn-read','binding:candidate-withdrawn-read',
+                'attempt:candidate-withdrawn-read','T-artifact',?1,
+                'registry-withdrawn-approval-read','0.1','compose_report','document.compose',
+                'contract:withdrawn-read','registration:withdrawn-read','provider:sequential',
+                '1','manifest:withdrawn-read','build:withdrawn-read',
+                'evidence:withdrawn-read','trust:withdrawn-read','profile:test','P1','local',2,
+                1,'2026-09-19T00:00:00Z')",
+                [&program_hash],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO authority_candidate_resources(candidate_id,action,semantic_selector,
+                resource_kind,resource_id,output_port,expected_semantic_type)
+             VALUES ('candidate:withdrawn-read','artifact.read','fixture','artifact',?1,
+                NULL,'artifact.table@1')",
+                [&artifact.artifact_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO authority_candidate_status(candidate_id,revision,state,updated_at)
+             VALUES ('candidate:withdrawn-read',1,'PENDING','2026-09-19T00:00:00Z');",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO approval_requests(approval_id,authority_request_id,task_id,
+                semantic_program_hash,node_id,action,status,request_json,created_at,expires_at)
+             VALUES (?1,?2,'T-artifact',?3,'compose_report','artifact.read','PENDING',
+                '{}','2026-09-19T00:00:00Z','2026-09-20T00:00:00Z')",
+                params![approval_id, request_id, program_hash],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO policy_decisions(decision_id,authority_request_id,task_id,
+                semantic_program_hash,node_id,principal_kind,principal_id,action,
+                resolved_resource_kind,resolved_resource_id,decision,policy_snapshot_id,
+                approval_request_id,reason_codes_json,decision_json,decided_at)
+             VALUES ('decision:requiring-withdrawn-read',?1,'T-artifact',?2,
+                'compose_report','provider','provider:sequential','artifact.read',
+                'artifact',?3,'REQUIRE_APPROVAL','policy-withdrawn-approval-read',?4,
+                '[]','{}','2026-09-19T00:00:00Z')",
+                params![request_id, program_hash, artifact.artifact_id, approval_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "INSERT INTO authority_evaluation_fingerprints(decision_id,candidate_id,
+                fingerprint,activation_revision,evaluated_at)
+             VALUES ('decision:requiring-withdrawn-read','candidate:withdrawn-read',
+                'fingerprint:withdrawn-read',1,'2026-09-19T00:00:00Z');",
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO authority_approval_bindings(approval_id,candidate_id,fingerprint,
+                activation_revision,requiring_decision_id)
+             VALUES (?1,'candidate:withdrawn-read','fingerprint:withdrawn-read',1,
+                'decision:requiring-withdrawn-read')",
+                [approval_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "INSERT INTO approval_decisions(decision_id,approval_id,task_id,decision,
+                decided_by_kind,decided_by_id,scope,approved_until,decision_json,decided_at)
+             VALUES ('approval-decision:withdrawn-read',?1,'T-artifact','APPROVE',
+                'user','user:test','TASK','2026-09-20T00:00:00Z','{}',
+                '2026-09-19T00:00:00Z')",
+                [approval_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE approval_requests SET status='APPROVED' WHERE approval_id=?1",
+                [approval_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_decisions SET approval_request_id=?2 WHERE decision_id=?1",
+                params![decision_id, approval_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET approval_id=?2 WHERE grant_id=?1",
+                params![grant_id, approval_id],
+            )
+            .unwrap();
+
+        let scope = scope_bound_reads(
+            &manager,
+            "T-artifact",
+            &binding_id,
+            std::slice::from_ref(&artifact.artifact_id),
+        )
+        .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        let mut first_byte = [0_u8; 1];
+        assert_eq!(reader.read(&mut first_byte).unwrap(), 1);
+        assert_eq!(first_byte[0], b'a');
+        assert_eq!(reader.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let grant_before: (String, i64, Option<String>) = manager
+            .connection
+            .query_row(
+                "SELECT state,uses_consumed,revoked_at FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(grant_before, ("ACTIVE".to_owned(), 0, None));
+        // The retained scope is still usable immediately before withdrawal.
+        assert_eq!(reader.read(&mut first_byte).unwrap(), 1);
+        let fresh_scope = scope_bound_reads(
+            &manager,
+            "T-artifact",
+            &binding_id,
+            std::slice::from_ref(&artifact.artifact_id),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .open_artifact_reader(&fresh_scope, &artifact.artifact_id)
+                .is_ok()
+        );
+
+        manager
+            .revoke_candidate_approval(
+                approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+            )
+            .unwrap();
+        let (status, decision, grant_state, revoked_at): (String, String, String, Option<String>) =
+            manager
+                .connection
+                .query_row(
+                    "SELECT a.status,d.decision,g.state,b.revoked_at
+                 FROM approval_requests a JOIN approval_decisions d USING(approval_id)
+                 JOIN authority_grants g ON g.approval_id=a.approval_id
+                 JOIN authority_approval_bindings b USING(approval_id)
+                 WHERE a.approval_id=?1",
+                    [approval_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), decision.as_str(), grant_state.as_str()),
+            ("APPROVED", "APPROVE", "ACTIVE")
+        );
+        assert!(revoked_at.is_some());
+        let grant_after: (String, i64, Option<String>) = manager
+            .connection
+            .query_row(
+                "SELECT state,uses_consumed,revoked_at FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(grant_after, grant_before);
+        assert!(matches!(
+            scope_bound_reads(
+                &manager,
+                "T-artifact",
+                &binding_id,
+                std::slice::from_ref(&artifact.artifact_id)
+            ),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert!(matches!(
+            manager.open_artifact_reader(&scope, &artifact.artifact_id),
+            Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
+        ));
+        assert_eq!(
+            reader.read(&mut first_byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            reader.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

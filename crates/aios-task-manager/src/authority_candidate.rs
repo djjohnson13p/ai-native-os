@@ -1323,6 +1323,7 @@ mod tests {
                 params![provider_id, approved.decisions[1].decision_id],
             )
             .unwrap();
+        assert!(crate::approval_not_withdrawn(&manager.connection, Some(approval)).unwrap());
         manager
             .revoke_candidate_approval(
                 approval,
@@ -1331,6 +1332,20 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(!crate::approval_not_withdrawn(&manager.connection, Some(approval)).unwrap());
+        let (status, decision): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.status,d.decision FROM approval_requests a
+                 JOIN approval_decisions d USING(approval_id) WHERE a.approval_id=?1",
+                [approval],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), decision.as_str()),
+            ("APPROVED", "APPROVE")
+        );
         assert!(
             manager
                 .evaluate_pending_authority_candidate("candidate:policy")
