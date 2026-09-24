@@ -13535,6 +13535,31 @@ mod tests {
         }
     }
 
+    struct SecondSampleAdvanceClock {
+        wall: Arc<Mutex<String>>,
+        advance_after_samples: Arc<Mutex<Option<(u8, String)>>>,
+    }
+
+    impl Clock for SecondSampleAdvanceClock {
+        fn now(&self) -> String {
+            self.wall.lock().unwrap().clone()
+        }
+
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            let mut armed = self.advance_after_samples.lock().unwrap();
+            if let Some((remaining, forward)) = armed.as_mut() {
+                if *remaining == 1 {
+                    *self.wall.lock().unwrap() = forward.clone();
+                    *armed = None;
+                } else {
+                    *remaining -= 1;
+                }
+            }
+            drop(armed);
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
+
     fn deferred<W: ArtifactExportWriter + 'static>(
         writer: W,
     ) -> impl FnOnce() -> std::io::Result<W> {
@@ -13812,6 +13837,35 @@ mod tests {
             temp.path().join("task-manager.sqlite"),
             Box::new(MutableClock {
                 now: Arc::clone(now),
+            }),
+        )
+        .unwrap();
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-artifact".to_owned(),
+                principal: Actor {
+                    kind: "user".to_owned(),
+                    id: "user:test".to_owned(),
+                },
+                workspace_id: None,
+                original_intent: "exercise Artifact storage".to_owned(),
+                normalized_intent: None,
+                active_step_ids: Vec::new(),
+            })
+            .unwrap();
+        manager
+    }
+
+    fn manager_with_second_sample_clock(
+        temp: &TempDir,
+        wall: &Arc<Mutex<String>>,
+        advance_after_samples: &Arc<Mutex<Option<(u8, String)>>>,
+    ) -> TaskManager {
+        let mut manager = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(SecondSampleAdvanceClock {
+                wall: Arc::clone(wall),
+                advance_after_samples: Arc::clone(advance_after_samples),
             }),
         )
         .unwrap();
@@ -21328,6 +21382,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    fn real_reader_file_failure_preserves_only_the_locked_forward_sample() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let advance = Arc::new(Mutex::new(None));
+        let mut manager = manager_with_second_sample_clock(&temp, &wall, &advance);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"reader".as_slice()))
+            .unwrap();
+        let (binding_id, _) = install_one_shot_binding(
+            &manager,
+            "reader-real-file",
+            std::slice::from_ref(&artifact.artifact_id),
+            &[("artifact.read", "artifact", &artifact.artifact_id)],
+        );
+        let scope = scope_bound_reads(
+            &manager,
+            "T-artifact",
+            &binding_id,
+            std::slice::from_ref(&artifact.artifact_id),
+        )
+        .unwrap();
+        let mut reader = manager
+            .open_artifact_reader(&scope, &artifact.artifact_id)
+            .unwrap();
+        reader.file = File::create(temp.path().join("write-only-reader")).unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(reader.file.stream_position().is_err() || reader.file.read(&mut byte).is_err());
+        let before: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *advance.lock().unwrap() = Some((2, "2026-09-19T23:00:00Z".to_owned()));
+        assert!(reader.read(&mut byte).is_err());
+        let after: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(after > before);
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    fn sealed_writer_denial_preserves_only_the_locked_forward_sample() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let advance = Arc::new(Mutex::new(None));
+        let mut manager = manager_with_second_sample_clock(&temp, &wall, &advance);
+        let request = allocation("alloc-time-sealed");
+        manager.allocate_artifact_output(&request).unwrap();
+        let writer = manager
+            .open_artifact_output(&request.allocation_id)
+            .unwrap();
+        let staging_ref = load_allocation_row(&manager.connection, &request.allocation_id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        std::fs::write(
+            manager.artifact_store_root.join(seal_ref(&staging_ref)),
+            b"already sealed",
+        )
+        .unwrap();
+        let before: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *advance.lock().unwrap() = Some((2, "2026-09-19T22:30:00Z".to_owned()));
+        assert!(matches!(
+            writer.finish(),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_ALLOCATION_STATE_CONFLICT"
+            ))
+        ));
+        let after: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(after > before);
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(matches!(
+            manager.open_artifact_output(&request.allocation_id),
+            Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))
+        ));
     }
 
     #[test]

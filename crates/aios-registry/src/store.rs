@@ -110,6 +110,7 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
             "authority-policy-evaluation-v0.1",
         ),
         ("0018_trusted_time", "trusted-time-v0.1"),
+        ("0019_inflight_time", "inflight-time-v0.1"),
     ];
     let mut stamped = false;
     let mut baseline = false;

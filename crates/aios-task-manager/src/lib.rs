@@ -857,7 +857,7 @@ impl TaskManager {
         migrate_task_manager_schema(&connection, &lease_owner, lease_epoch)?;
         // Assess before any recovery path can make a protected expiry decision.
         // An uncertain sample is durable but does not prevent ordinary inspection/recovery.
-        trusted_time::assess(&connection, &clock)?;
+        trusted_time::startup_assess(&connection, &clock)?;
         let (artifact_store_root, artifact_store_dir, artifact_store_cleanup) =
             artifact_store::initialize_root(store_lock.as_deref(), &mut connection)?;
         let artifact_scope_issuer =
@@ -4620,7 +4620,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -4715,6 +4715,7 @@ fn preflight_migration_state_with_mode(
         "authority-policy-evaluation-v0.1",
     )?;
     verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
+    verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
         [],
@@ -4809,6 +4810,16 @@ fn preflight_migration_state_with_mode(
         if !trusted_time::objects_current(connection, has_trusted_time)? {
             return Err(TaskManagerError::InvalidRecord(
                 "trusted time schema requires operator quarantine",
+            ));
+        }
+        let has_inflight_time: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0019_inflight_time')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !trusted_time::inflight_objects_current(connection, has_inflight_time)? {
+            return Err(TaskManagerError::InvalidRecord(
+                "in-flight time marker schema requires operator quarantine",
             ));
         }
         let has_v3 = connection.query_row(
@@ -5182,6 +5193,7 @@ fn migrate_task_manager_schema(
         "authority-policy-evaluation-v0.1",
     )?;
     verify_migration_checksum(connection, "0018_trusted_time", "trusted-time-v0.1")?;
+    verify_migration_checksum(connection, "0019_inflight_time", "inflight-time-v0.1")?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
         statement.query([])?.next()?.is_some()
@@ -5579,6 +5591,11 @@ fn migrate_task_manager_schema(
         connection.execute_batch(trusted_time::MIGRATION)?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0018_trusted_time', 'trusted-time-v0.1', '2026-09-23T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(trusted_time::INFLIGHT_MIGRATION)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0019_inflight_time', 'inflight-time-v0.1', '2026-09-24T00:00:00Z')",
             [],
         )?;
         Ok(())
