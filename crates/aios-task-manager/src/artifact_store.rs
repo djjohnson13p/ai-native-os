@@ -1356,12 +1356,14 @@ pub struct ArtifactStagingWriter {
     lease_owner: String,
     lease_epoch: i64,
     grant_admission: Option<GrantAdmission>,
+    task_id: String,
     allocation_id: String,
     writer_session_id: String,
     writer_generation: i64,
     seal_ref: String,
     maximum: u64,
     written: u64,
+    poisoned: bool,
     _store_cleanup: Option<Arc<EphemeralStoreCleanup>>,
 }
 
@@ -1388,6 +1390,11 @@ impl ArtifactStagingWriter {
         reason = "both serialized writer finish phases must preserve captured time on every exit"
     )]
     pub fn finish(mut self) -> Result<u64> {
+        if self.poisoned {
+            return Err(TaskManagerError::InvalidRecord(
+                "Artifact staging writer outcome is uncertain",
+            ));
+        }
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)?
             .require_trusted_time()?;
         let mut first_time = None;
@@ -1506,94 +1513,110 @@ impl ArtifactStagingWriter {
 
 impl Write for ArtifactStagingWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
+        if self.poisoned {
+            return Err(std::io::Error::other("staging write outcome is uncertain"));
+        }
+        if self.file.is_none() {
+            return Err(std::io::Error::other("staging writer is finalized"));
+        }
+        // Even a locally rejected write must retain a newly observed forward
+        // clock sample, so rollback cannot revive this writer's authority.
+        super::trusted_time::assess(&self.authority_connection, &self.clock)
             .and_then(|assessment| assessment.require_trusted_time())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let mut locked_time = None;
+        let length = u64::try_from(buffer.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
+        })?;
+        if self.written.saturating_add(length) > self.maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "ARTIFACT_SIZE_LIMIT",
+            ));
+        }
+        let permit = super::trusted_time::prepare_external_effect(
+            &self.authority_connection,
+            &self.clock,
+            &self.lease_owner,
+            self.lease_epoch,
+            &self.task_id,
+            super::trusted_time::ExternalEffectKind::StagingWrite,
+            &self.allocation_id,
+        )
+        .map_err(std::io::Error::other)?;
         let outcome = (|| -> std::io::Result<usize> {
+            writer_write_before_entry_step()?;
             let transaction = self
                 .authority_connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(std::io::Error::other)?;
-            locked_time = Some(
-                super::trusted_time::capture_locked(&transaction, &self.clock)
-                    .map_err(std::io::Error::other)?,
-            );
-            let fresh = locked_time.as_ref().expect("captured writer time");
-            let checked_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        error,
-                    ));
+            let entry =
+                super::trusted_time::capture_external_entry(&transaction, &self.clock, &permit)
+                    .map_err(std::io::Error::other)?;
+            let pre_call = entry.require_trusted_time().and_then(|now| {
+                validate_writer_fence(
+                    &transaction,
+                    &self.allocation_id,
+                    &now,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    self.grant_admission.as_ref(),
+                    &self.writer_session_id,
+                    self.writer_generation,
+                )?;
+                let exact_task: bool = transaction.query_row(
+                    "SELECT task_id=?2 FROM artifact_output_allocations WHERE allocation_id=?1",
+                    params![self.allocation_id, self.task_id],
+                    |row| row.get(0),
+                )?;
+                if !exact_task {
+                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
                 }
-            };
-            let fence = validate_writer_fence(
-                &transaction,
-                &self.allocation_id,
-                &checked_at,
-                &self.lease_owner,
-                self.lease_epoch,
-                self.grant_admission.as_ref(),
-                &self.writer_session_id,
-                self.writer_generation,
-            );
-            if let Err(error) = fence {
-                drop(transaction);
+                ensure_writer_unsealed(&self.store, &self.seal_ref)?;
+                Ok(())
+            });
+            if let Err(error) = pre_call {
+                super::trusted_time::resolve_external_no_effect_in(&permit, entry)
+                    .map_err(std::io::Error::other)?;
+                transaction.commit().map_err(std::io::Error::other)?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     error,
                 ));
             }
-            ensure_writer_unsealed(&self.store, &self.seal_ref).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-            })?;
-            let length = u64::try_from(buffer.len()).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "write is too large")
-            })?;
-            if self.written.saturating_add(length) > self.maximum {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::FileTooLarge,
-                    "ARTIFACT_SIZE_LIMIT",
-                ));
+            // A File::write may append some bytes even when it returns Err. Every
+            // invoked result is therefore effectful for the marker protocol.
+            let write_result =
+                writer_write_primitive(self.file.as_mut().expect("checked staging file"), buffer);
+            if let Ok(written) = write_result.as_ref() {
+                self.written += u64::try_from(*written).expect("write count fits buffer length");
             }
-            let written = self
-                .file
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
-                .write(buffer)?;
-            let total = self
-                .written
-                .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
-                .ok_or_else(|| std::io::Error::other("staging byte count overflow"))?;
-            // The file append is the externally observable effect of `Write`. Once it succeeds,
-            // report that exact byte count even if releasing the read-only SQLite fence reports a
-            // late error. Returning `Err` here would invite a conforming caller to append the same
-            // bytes again while leaving our cursor stale.
-            self.written = total;
-            let time_ready = fresh
-                .commit_in(&transaction)
-                .and_then(|assessment| assessment.require_trusted_time())
-                .is_ok();
-            let committed = time_ready && transaction.commit().is_ok();
-            if committed {
-                locked_time = None;
+            if write_result.is_err() {
+                self.poisoned = true;
+            }
+            let resolved = writer_write_resolution_step()
+                .and_then(|()| super::trusted_time::resolve_external_entry_in(&permit, entry))
+                .and_then(|_| transaction.commit().map_err(TaskManagerError::from));
+            if resolved.is_err() {
+                self.poisoned = true;
+            } else {
+                // A lost commit acknowledgement cannot turn an already appended
+                // byte count into a retryable write failure.
                 let _ = writer_write_commit_result_step();
             }
-            Ok(written)
+            write_result
         })();
-        if let Some(fresh) = locked_time {
-            let observation = fresh.commit(&self.authority_connection);
-            if outcome.is_err() {
-                observation.map_err(std::io::Error::other)?;
-            }
+        if outcome.is_err() {
+            // The durable marker remains pending if entry or resolution failed.
+            // A failed pre-call resolution is also unsafe to retry on this handle.
+            self.poisoned = true;
         }
         outcome
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other("staging write outcome is uncertain"));
+        }
         let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
             .and_then(|assessment| assessment.require_trusted_time())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
@@ -3282,12 +3305,14 @@ impl TaskManager {
                     lease_owner,
                     lease_epoch,
                     grant_admission: allocation.writer_grant_admission,
+                    task_id: allocation.task_id,
                     allocation_id: allocation_id.to_owned(),
                     writer_session_id,
                     writer_generation,
                     seal_ref: seal,
                     maximum,
                     written,
+                    poisoned: false,
                     _store_cleanup: self.artifact_store_cleanup.clone(),
                 });
             }
@@ -3429,6 +3454,7 @@ impl TaskManager {
                 lease_owner: self.lease_owner.clone(),
                 lease_epoch: self.lease_epoch,
                 grant_admission,
+                task_id: allocation.task_id,
                 allocation_id: allocation_id.to_owned(),
                 writer_session_id,
                 writer_generation,
@@ -3438,6 +3464,7 @@ impl TaskManager {
                     .unwrap_or(IMPORT_LIMIT)
                     .min(IMPORT_LIMIT),
                 written: 0,
+                poisoned: false,
                 _store_cleanup: self.artifact_store_cleanup.clone(),
             })
         })();
@@ -6423,6 +6450,18 @@ impl TaskManager {
                 artifact_ids: Vec::new(),
             });
         }
+        // A pending 0019 marker identifies the whole allocation, including
+        // replacement writer sessions. Until time resolution, preserve its
+        // staging bytes, both seal files, allocation state, and association.
+        let pending_staging_allocations = {
+            let mut statement = self.connection.prepare(
+                "SELECT p.subject_id FROM trusted_time_effect_preparations p
+                 JOIN trusted_time_effect_pending x ON x.marker_id=p.marker_id
+                 WHERE p.subject_kind IN ('ARTIFACT_STAGING_WRITE','ARTIFACT_STAGING_SEAL')",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
         let staged = {
             let mut statement = self.connection.prepare(
                 "SELECT a.allocation_id,a.staging_ref,a.state,a.expires_at,t.state,a.task_id,
@@ -6450,6 +6489,9 @@ impl TaskManager {
         for (allocation_id, staging_ref, state, expires_at, task_state, task_id, publication_id) in
             &mut staged
         {
+            if pending_staging_allocations.contains(allocation_id) {
+                continue;
+            }
             let expired = parse_time(expires_at)? <= parse_time(&reconciled_at)?;
             let terminal_task = matches!(
                 task_state.as_str(),
@@ -6628,11 +6670,12 @@ impl TaskManager {
         }
         let staged_by_ref = staged
             .into_iter()
-            .filter(|(_, _, state, _, _, _, _)| {
-                !matches!(
-                    state.as_str(),
-                    "ALLOCATED" | "FAILED" | "ABORTED" | "EXPIRED" | "PUBLISHED"
-                )
+            .filter(|(allocation_id, _, state, _, _, _, _)| {
+                pending_staging_allocations.contains(allocation_id)
+                    || !matches!(
+                        state.as_str(),
+                        "ALLOCATED" | "FAILED" | "ABORTED" | "EXPIRED" | "PUBLISHED"
+                    )
             })
             .map(|(allocation_id, staging_ref, _, _, _, _, _)| (staging_ref, allocation_id))
             .collect::<std::collections::BTreeMap<_, _>>();
@@ -12912,6 +12955,10 @@ fn reader_setup_step() -> Result<()> {
 type ExportCompletionTestHook = Box<dyn FnOnce() -> Result<()>>;
 
 #[cfg(test)]
+type WriterWritePrimitiveTestHook =
+    Box<dyn FnOnce(&mut cap_std::fs::File, &[u8]) -> std::io::Result<usize>>;
+
+#[cfg(test)]
 thread_local! {
     static IMPORT_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
@@ -12926,6 +12973,12 @@ thread_local! {
     static WRITER_FINISH_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static WRITER_WRITE_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static WRITER_WRITE_BEFORE_ENTRY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static WRITER_WRITE_RESOLUTION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static WRITER_WRITE_PRIMITIVE_TEST_HOOK: std::cell::RefCell<Option<WriterWritePrimitiveTestHook>> =
         const { std::cell::RefCell::new(None) };
     static READER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
@@ -13054,6 +13107,58 @@ fn writer_write_commit_result_step() -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+fn writer_write_before_entry_step() -> std::io::Result<()> {
+    WRITER_WRITE_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook().map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test preparation-to-entry injection shares the staging write boundary"
+)]
+fn writer_write_before_entry_step() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn writer_write_resolution_step() -> Result<()> {
+    WRITER_WRITE_RESOLUTION_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test resolution failure injection shares the staging write boundary"
+)]
+fn writer_write_resolution_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn writer_write_primitive(file: &mut cap_std::fs::File, buffer: &[u8]) -> std::io::Result<usize> {
+    if let Some(hook) = WRITER_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook(file, buffer)
+    } else {
+        file.write(buffer)
+    }
+}
+
+#[cfg(not(test))]
+fn writer_write_primitive(file: &mut cap_std::fs::File, buffer: &[u8]) -> std::io::Result<usize> {
+    file.write(buffer)
 }
 
 #[cfg(test)]
@@ -21412,6 +21517,7 @@ mod tests {
         reader.file = File::create(temp.path().join("write-only-reader")).unwrap();
         let mut byte = [0_u8; 1];
         assert!(reader.file.stream_position().is_err() || reader.file.read(&mut byte).is_err());
+        byte = [0xa5];
         let before: i64 = manager
             .connection
             .query_row(
@@ -21422,6 +21528,7 @@ mod tests {
             .unwrap();
         *advance.lock().unwrap() = Some((2, "2026-09-19T23:00:00Z".to_owned()));
         assert!(reader.read(&mut byte).is_err());
+        assert_eq!(byte, [0xa5]);
         let after: i64 = manager
             .connection
             .query_row(
@@ -24597,6 +24704,11 @@ mod tests {
         assert_eq!(resumed.bytes_written(), 3);
         assert!(first.write_all(b"stale").is_err());
         assert!(first.finish().is_err());
+        let no_effect: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='NO_EFFECT'",
+            [allocation_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(no_effect, 1);
 
         resumed.write_all(b"BBB").unwrap();
         assert_eq!(resumed.finish().unwrap(), 6);
@@ -26277,6 +26389,13 @@ mod tests {
         });
         assert_eq!(writer.write(b"first").unwrap(), 5);
         assert_eq!(writer.bytes_written(), 5);
+        let (invoked, pending): (i64, i64) = manager.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1)",
+            [allocation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((invoked, pending), (1, 0));
         drop(writer);
 
         let mut resumed = open_bound(&mut manager, allocation_id);
@@ -26294,6 +26413,331 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"first-second");
+    }
+
+    #[test]
+    fn staging_write_partial_success_reports_exact_bytes_and_resolves_invocation() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-partial-write";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        WRITER_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|file, bytes| file.write(&bytes[..2])));
+        });
+        assert_eq!(writer.write(b"hello").unwrap(), 2);
+        assert_eq!(writer.bytes_written(), 2);
+        assert_eq!(writer.write(b"llo").unwrap(), 3);
+        assert_eq!(writer.finish().unwrap(), 5);
+        let invoked: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(invoked, 2);
+    }
+
+    #[test]
+    fn staging_write_partial_error_preserves_error_and_poisons_handle() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-partial-error";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        WRITER_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|file, bytes| {
+                file.write_all(&bytes[..2])?;
+                Err(std::io::Error::other("injected partial write error"))
+            }));
+        });
+        assert!(
+            writer
+                .write(b"hello")
+                .unwrap_err()
+                .to_string()
+                .contains("injected partial write error")
+        );
+        assert!(writer.write(b"retry").is_err());
+        assert!(writer.flush().is_err());
+        assert!(writer.finish().is_err());
+        let resumed = manager.open_artifact_output(id).unwrap();
+        assert_eq!(resumed.bytes_written(), 2);
+        let invoked: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(invoked, 1);
+    }
+
+    #[test]
+    fn staging_write_expiry_after_preparation_resolves_no_effect() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-expired-at-entry";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        WRITER_WRITE_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                rusqlite::Connection::open(database)?.execute(
+                    "UPDATE artifact_output_allocations SET expires_at='2026-09-19T21:00:00Z' WHERE allocation_id=?1",
+                    [id],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(writer.write(b"denied").is_err());
+        let no_effect: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='NO_EFFECT'",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(no_effect, 1);
+        assert_eq!(writer.bytes_written(), 0);
+    }
+
+    #[test]
+    fn staging_write_revocation_after_preparation_resolves_no_effect() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-revoked-at-entry";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "revoked-at-entry",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, id);
+        let grant_id: String = manager
+            .connection
+            .query_row(
+                "SELECT writer_grant_id FROM artifact_output_allocations WHERE allocation_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        WRITER_WRITE_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                rusqlite::Connection::open(database)?.execute(
+                    "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z' WHERE grant_id=?1",
+                    [grant_id],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(writer.write(b"denied").is_err());
+        assert_eq!(writer.bytes_written(), 0);
+        let (no_effect, pending): (i64, i64) = manager.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='NO_EFFECT'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1)",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((no_effect, pending), (1, 0));
+    }
+
+    #[test]
+    fn staging_write_clock_rollback_at_entry_never_invokes_file_write() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let id = "alloc-rollback-at-entry";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        let wall_at_entry = Arc::clone(&wall);
+        WRITER_WRITE_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *wall_at_entry.lock().unwrap() = "2026-09-19T21:00:00Z".to_owned();
+                Ok(())
+            }));
+        });
+        WRITER_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| panic!("file write was invoked")));
+        });
+        assert!(writer.write(b"denied").is_err());
+        assert_eq!(writer.bytes_written(), 0);
+        WRITER_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            assert!(hook.borrow().is_some());
+            hook.borrow_mut().take();
+        });
+        let (no_effect, pending): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1
+                       AND r.resolution_kind='NO_EFFECT'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_pending x
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1)",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((no_effect, pending), (1, 0));
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the paired write and seal restart cases must assert the same allocation-wide quarantine invariants"
+    )]
+    fn pending_staging_marker_quarantines_allocation_and_every_seal_on_restart() {
+        for kind in ["write", "seal"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let id = format!("alloc-pending-{kind}");
+            manager.allocate_artifact_output(&allocation(&id)).unwrap();
+            let mut writer = manager.open_artifact_output(&id).unwrap();
+            if kind == "write" {
+                WRITER_WRITE_RESOLUTION_TEST_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        Err(TaskManagerError::Io(std::io::Error::other(
+                            "injected resolution failure",
+                        )))
+                    }));
+                });
+                assert_eq!(writer.write(b"protected bytes").unwrap(), 15);
+                assert_eq!(writer.bytes_written(), 15);
+                assert!(writer.write(b"retry").is_err());
+                assert!(writer.flush().is_err());
+            } else {
+                writer.write_all(b"protected bytes").unwrap();
+                crate::trusted_time::prepare_external_effect(
+                    &manager.connection,
+                    &manager.clock,
+                    &manager.lease_owner,
+                    manager.lease_epoch,
+                    "T-artifact",
+                    crate::trusted_time::ExternalEffectKind::StagingSeal,
+                    &id,
+                )
+                .unwrap();
+            }
+            drop(writer);
+            let staging_ref = load_allocation_row(&manager.connection, &id)
+                .unwrap()
+                .unwrap()
+                .staging_ref
+                .unwrap();
+            let staging_path = manager.artifact_store_root.join(&staging_ref);
+            let final_seal = manager.artifact_store_root.join(seal_ref(&staging_ref));
+            let pending_seal = manager
+                .artifact_store_root
+                .join(format!("{}.pending", seal_ref(&staging_ref)));
+            std::fs::write(&final_seal, b"incomplete final seal").unwrap();
+            std::fs::write(&pending_seal, b"incomplete pending seal").unwrap();
+            for reference in [
+                seal_ref(&staging_ref),
+                format!("{}.pending", seal_ref(&staging_ref)),
+            ] {
+                let file = manager
+                    .artifact_store_dir
+                    .open(safe_internal_ref(&reference).unwrap())
+                    .unwrap();
+                secure_cap_file_permissions(&file).unwrap();
+            }
+            if kind == "write" {
+                manager.connection.execute(
+                    "UPDATE artifact_output_allocations SET expires_at='2026-09-19T21:00:00Z' WHERE allocation_id=?1",
+                    [&id],
+                ).unwrap();
+                // A replacement session cannot erase an allocation-wide
+                // unresolved write, even if it has a newer generation.
+                manager
+                    .connection
+                    .execute(
+                        "UPDATE artifact_output_allocations
+                     SET writer_generation=writer_generation+1,
+                         writer_session_id='replacement-session'
+                     WHERE allocation_id=?1",
+                        [&id],
+                    )
+                    .unwrap();
+            } else {
+                manager.connection.execute(
+                    "UPDATE artifact_output_allocations SET state='EXPIRED' WHERE allocation_id=?1",
+                    [&id],
+                ).unwrap();
+            }
+            let subject_kind = if kind == "write" {
+                "ARTIFACT_STAGING_WRITE"
+            } else {
+                "ARTIFACT_STAGING_SEAL"
+            };
+            let pending_before: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_pending x
+                 JOIN trusted_time_effect_preparations p USING(marker_id)
+                 WHERE p.subject_kind=?1 AND p.subject_id=?2",
+                    params![subject_kind, id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending_before, 1);
+            drop(manager);
+
+            let mut reopened = TaskManager::open_with_clock(
+                temp.path().join("task-manager.sqlite"),
+                Box::new(FixedClock),
+            )
+            .unwrap();
+            let allocation = load_allocation_row(&reopened.connection, &id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                allocation.state,
+                if kind == "write" {
+                    "WRITING"
+                } else {
+                    "EXPIRED"
+                }
+            );
+            assert_eq!(
+                allocation.staging_ref.as_deref(),
+                Some(staging_ref.as_str())
+            );
+            if kind == "write" {
+                assert_eq!(
+                    allocation.writer_session_id.as_deref(),
+                    Some("replacement-session")
+                );
+                assert_eq!(allocation.writer_generation, 2);
+                assert!(reopened.open_artifact_output(&id).is_err());
+            }
+            let pending_after: i64 = reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_pending x
+                 JOIN trusted_time_effect_preparations p USING(marker_id)
+                 WHERE p.subject_kind=?1 AND p.subject_id=?2",
+                    params![subject_kind, id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending_after, 1);
+            assert_eq!(std::fs::read(staging_path).unwrap(), b"protected bytes");
+            assert_eq!(std::fs::read(final_seal).unwrap(), b"incomplete final seal");
+            assert_eq!(
+                std::fs::read(pending_seal).unwrap(),
+                b"incomplete pending seal"
+            );
+            assert!(
+                crate::trusted_time::protected_now(&reopened.connection, &reopened.clock).is_err()
+            );
+        }
     }
 
     #[test]
@@ -26615,11 +27059,13 @@ mod tests {
                 )))
             }));
         });
-        let mut probe = [0_u8; 1];
+        let mut probe = [0xa5_u8; 3];
         assert_eq!(
             reader.read(&mut probe).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        assert_eq!(probe, [0xa5; 3]);
+        assert_eq!(reader.file.stream_position().unwrap(), 0);
         assert_eq!(
             reopened
                 .connection
@@ -28199,6 +28645,20 @@ mod tests {
     ) -> Result<()> {
         let connection = Connection::open(database)?;
         match scenario {
+            "revocation" => {
+                connection.execute(
+                    "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z'
+                     WHERE grant_id='grant-delivery-revocation-0'",
+                    [],
+                )?;
+            }
+            "expiry" => {
+                connection.execute(
+                    "UPDATE authority_grants SET expires_at='2026-09-19T22:00:00Z'
+                     WHERE grant_id='grant-delivery-expiry-0'",
+                    [],
+                )?;
+            }
             "recovery" => {
                 connection.execute(
                     "UPDATE tasks SET state='RECOVERING' WHERE task_id='T-artifact'",
@@ -28257,8 +28717,10 @@ mod tests {
     }
 
     #[test]
-    fn reader_delivery_transaction_rechecks_recovery_and_manager_lease() {
+    fn reader_delivery_transaction_rechecks_current_authority_before_bytes_escape() {
         for scenario in [
+            "revocation",
+            "expiry",
             "recovery",
             "lease",
             "supersession",
@@ -28304,7 +28766,15 @@ mod tests {
                 }));
             });
 
-            let mut byte = [0_u8; 1];
+            let before_revision: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT revision FROM trusted_time_state WHERE singleton_id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut byte = [0xa5_u8; 1];
             if scenario == "recovery" {
                 assert_eq!(reader.read(&mut byte).unwrap(), 1);
                 assert_eq!(
@@ -28324,6 +28794,17 @@ mod tests {
                     reader.read(&mut byte).unwrap_err().kind(),
                     std::io::ErrorKind::PermissionDenied
                 );
+                assert_eq!(byte, [0xa5]);
+                assert_eq!(reader.file.stream_position().unwrap(), 0);
+                let after_revision: i64 = manager
+                    .connection
+                    .query_row(
+                        "SELECT revision FROM trusted_time_state WHERE singleton_id=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(after_revision > before_revision);
                 assert_eq!(
                     manager
                         .connection
