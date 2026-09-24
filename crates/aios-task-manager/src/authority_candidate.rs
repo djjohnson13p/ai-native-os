@@ -4063,6 +4063,16 @@ mod tests {
         run_coherent_candidate_reader_and_publication(DeadlineScenario::PolicyBeforePublication);
     }
 
+    #[test]
+    fn task_cancellation_revokes_outstanding_coordinator_grants() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::CancelBeforeRunning);
+    }
+
+    #[test]
+    fn task_cancellation_cannot_hide_an_unfinished_artifact_operation() {
+        run_coherent_candidate_reader_and_publication(DeadlineScenario::CancelWithOpenReader);
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DeadlineScenario {
         Never,
@@ -4071,6 +4081,8 @@ mod tests {
         ReaderPreflightRegression,
         PolicyBeforeWrite,
         PolicyBeforePublication,
+        CancelBeforeRunning,
+        CancelWithOpenReader,
     }
 
     #[allow(
@@ -4128,6 +4140,48 @@ mod tests {
         manager
             .finalize_pending_authority_candidate("candidate:reader")
             .unwrap();
+        if scenario == DeadlineScenario::CancelBeforeRunning {
+            let result = manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:reader-cancelled".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 2,
+                    expected_state: TaskState::Planning,
+                    to_state: TaskState::Cancelled,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "TASK_CANCELLED".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation::default(),
+                })
+                .unwrap();
+            assert!(result.applied, "{result:?}");
+            let active: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='ACTIVE'",
+                [], |row| row.get(0),
+            ).unwrap();
+            let revoked: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='REVOKED' AND revoked_at IS NOT NULL AND revocation_reason_code='AUTH_GRANT_REVOKED'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(active, 0);
+            assert_eq!(revoked, 2);
+            let retained = manager
+                .issue_provider_artifact_session("T-candidate", "binding:reader")
+                .unwrap();
+            assert!(
+                manager
+                    .scope_artifact_reads(&retained, std::slice::from_ref(&imported.artifact_id))
+                    .is_err()
+            );
+            return;
+        }
         for (transition_id, expected_revision, from, to) in [
             (
                 "transition:reader-runnable",
@@ -4207,6 +4261,40 @@ mod tests {
         let mut reader = manager
             .open_artifact_reader(&scope, &imported.artifact_id)
             .unwrap();
+        if scenario == DeadlineScenario::CancelWithOpenReader {
+            let result = manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:open-reader-cancel".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 4,
+                    expected_state: TaskState::Running,
+                    to_state: TaskState::Cancelled,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into(),
+                    },
+                    reason: TransitionReason {
+                        code: "TASK_CANCELLED".into(),
+                        message: None,
+                        related_ids: vec![],
+                    },
+                    mutation: TaskMutation::default(),
+                })
+                .unwrap();
+            assert!(!result.applied);
+            assert_eq!(result.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+            assert_eq!(
+                manager.get_task("T-candidate").unwrap().unwrap().state,
+                TaskState::Running
+            );
+            let revoked: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM authority_grants WHERE task_id='T-candidate' AND state='REVOKED'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(revoked, 0);
+            return;
+        }
         if scenario == DeadlineScenario::ReaderPreflightRegression {
             regression_phase.store(1, Ordering::SeqCst);
             let mut denied = [0xa5_u8; 1];
@@ -4276,7 +4364,9 @@ mod tests {
         match scenario {
             DeadlineScenario::Never
             | DeadlineScenario::ReaderPreflightRegression
-            | DeadlineScenario::PolicyBeforeWrite => {}
+            | DeadlineScenario::PolicyBeforeWrite
+            | DeadlineScenario::CancelBeforeRunning
+            | DeadlineScenario::CancelWithOpenReader => {}
             DeadlineScenario::PolicyBeforePublication => {
                 manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
                     {"effect":"DENY","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},

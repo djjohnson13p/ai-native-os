@@ -2821,6 +2821,14 @@ impl TaskManager {
                     &resulted_at,
                 ));
             }
+            if request.to_state == TaskState::Cancelled {
+                transaction.execute(
+                    "UPDATE authority_grants SET state='REVOKED', revoked_at=?2,
+                     revocation_reason_code='AUTH_GRANT_REVOKED'
+                     WHERE task_id=?1 AND state='ACTIVE'",
+                    params![request.task_id, resulted_at],
+                )?;
+            }
             if let Some(plan) = &request.mutation.active_plan {
                 let changed = transaction.execute(
                 "UPDATE tasks SET active_plan_revision = ?2 WHERE task_id = ?1 AND EXISTS (SELECT 1 FROM plan_revisions WHERE task_id = ?1 AND plan_revision = ?2 AND plan_id = ?3)",
@@ -9627,6 +9635,32 @@ fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Resul
         && live_credential_uses == 0)
 }
 
+// Cancellation retires active grants in the same transaction as the Task
+// transition. It still cannot conceal a live attempt or uncertain effect.
+fn cancellation_execution_is_contained(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+) -> Result<bool> {
+    let live_attempts: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM step_executions WHERE task_id=?1 AND
+         (state IN ('STARTING','RUNNING','UNKNOWN') OR
+          outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'))",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let live_effects: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM operations WHERE task_id=?1 AND
+         (state IN ('PREPARED','STARTED','UNKNOWN') OR
+          outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'))",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(live_attempts == 0
+        && live_effects == 0
+        && unresolved_provider_invocation_ids(transaction, task_id)?.is_empty()
+        && unresolved_credential_use_ids(transaction, task_id)?.is_empty())
+}
+
 fn active_execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Result<bool> {
     let active_attempts = transaction.query_row(
         "SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND state IN ('STARTING', 'RUNNING', 'UNKNOWN')",
@@ -10530,11 +10564,15 @@ fn guard_failure(
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
         }
+        TaskState::Cancelled
+            if !cancellation_execution_is_contained(transaction, &request.task_id)? =>
+        {
+            Some("TASK_TRANSITION_GUARD_FAILED")
+        }
         TaskState::Planning
         | TaskState::WaitingForInput
         | TaskState::WaitingForAuth
         | TaskState::Paused
-        | TaskState::Cancelled
             if !execution_is_contained(transaction, &request.task_id)? =>
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
