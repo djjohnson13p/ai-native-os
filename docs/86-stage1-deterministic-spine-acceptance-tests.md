@@ -244,6 +244,12 @@ Pass criteria:
 
 - `network.connect` grant alone is insufficient for `data.egress`;
 - `data.egress` is bound to exact destination/resource/policy/approval facts.
+- an export writer with a test destructor that writes to its destination is
+  retired under a distinct admitted marker before success/provenance commit;
+  a later destination drop or replay cannot write again;
+- revocation or expiry before destructor entry prevents that write and leaves
+  the prior effect `OUTCOME_UNKNOWN`; an unused or rejected destination cannot
+  execute an effectful factory-capture destructor.
 
 ## Gate S6 — Credential mediation
 

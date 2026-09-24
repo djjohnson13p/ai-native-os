@@ -25,6 +25,13 @@ Side-effecting operations require deterministic task-scoped grants that bind at 
 
 Plans are proposals. The policy engine is the authority source. The execution layer verifies effective authority independently of planner/model output.
 
+For trusted in-process adapters, the protected operation includes effects at
+resource retirement, including a destructor that can write or close an external
+destination. The core must admit and finish those effects before it records
+success. If current authority cannot admit retirement, it suppresses the
+destructor and records uncertainty instead of letting ordinary object lifetime
+run the effect later. Arbitrary third-party adapters require isolation.
+
 Persistent user preferences are represented as policy rules from which new task-scoped grants are derived; they are not immortal reusable agent tokens.
 
 Delegation, if supported, may only narrow authority.

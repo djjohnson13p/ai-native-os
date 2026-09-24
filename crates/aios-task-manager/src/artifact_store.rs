@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -917,9 +918,73 @@ pub trait ArtifactExportWriter: Write {
     fn finalize(&mut self) -> std::io::Result<()>;
 }
 
+type ExportWriterFactory<W> = Box<dyn FnOnce() -> std::io::Result<W>>;
+
 impl ArtifactExportWriter for Vec<u8> {
     fn finalize(&mut self) -> std::io::Result<()> {
         self.flush()
+    }
+}
+
+/// A value supplied by an external destination may perform effects in `Drop`.
+/// Ordinary error paths and destruction of an unused destination must therefore
+/// leave it inert. `dispose` is called only inside an admitted external callback.
+struct EffectOwned<T> {
+    value: Option<T>,
+}
+
+impl<T> EffectOwned<T> {
+    fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+
+    fn into_inner(mut self) -> T {
+        self.value.take().expect("effect-owned value was consumed")
+    }
+
+    fn dispose(mut self) {
+        drop(self.value.take());
+    }
+}
+
+impl<T> Drop for EffectOwned<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            std::mem::forget(value);
+        }
+    }
+}
+
+impl<T> Deref for EffectOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("effect-owned value was consumed")
+    }
+}
+
+impl<T> DerefMut for EffectOwned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("effect-owned value was consumed")
+    }
+}
+
+/// Catch a trusted adapter panic before its payload can leave the authority
+/// fence. Panic payloads are arbitrary owned values and may themselves perform
+/// external effects in `Drop`, just like writers and callback errors.
+fn catch_effectful_callback<T>(callback: impl FnOnce() -> T) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let _suppressed_payload = EffectOwned::new(payload);
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+            ))
+        }
     }
 }
 
@@ -962,8 +1027,8 @@ fn deny_export_callback_reentry(active: &AtomicBool) -> std::io::Result<()> {
 /// The destination class and exact egress admission are sealed into this handle, so callers of
 /// [`TaskManager::export_artifact`] cannot substitute an arbitrary writer or destination label.
 pub struct ArtifactExportDestination<W: ArtifactExportWriter> {
-    writer_factory: Option<Box<dyn FnOnce() -> std::io::Result<W>>>,
-    writer: Option<W>,
+    writer_factory: Option<EffectOwned<ExportWriterFactory<W>>>,
+    writer: Option<EffectOwned<W>>,
     external_effect_possible: bool,
     operation_id: String,
     intent_json: String,
@@ -4360,6 +4425,7 @@ impl TaskManager {
         W: ArtifactExportWriter,
         F: FnOnce() -> std::io::Result<W> + 'static,
     {
+        let writer_factory = EffectOwned::new(Box::new(writer_factory) as ExportWriterFactory<W>);
         self.validate_provider_artifact_session(session)?;
         validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
         validate_id(
@@ -4441,7 +4507,7 @@ impl TaskManager {
                 ));
             }
             return Ok(ArtifactExportDestination {
-                writer_factory: Some(Box::new(writer_factory)),
+                writer_factory: Some(writer_factory),
                 writer: None,
                 external_effect_possible: false,
                 operation_id: operation_id.to_owned(),
@@ -4490,7 +4556,7 @@ impl TaskManager {
             grant_id: Some(grant.grant_id.clone()),
         })?;
         Ok(ArtifactExportDestination {
-            writer_factory: Some(Box::new(writer_factory)),
+            writer_factory: Some(writer_factory),
             writer: None,
             external_effect_possible: false,
             operation_id: operation_id.to_owned(),
@@ -4624,6 +4690,7 @@ impl TaskManager {
         W: ArtifactExportWriter,
         F: FnOnce() -> std::io::Result<W> + 'static,
     {
+        let writer_factory = EffectOwned::new(Box::new(writer_factory) as ExportWriterFactory<W>);
         validate_id(operation_id, 256, "invalid Artifact export operation ID")?;
         validate_id(
             destination_class,
@@ -4692,7 +4759,7 @@ impl TaskManager {
                 ));
             }
             return Ok(ArtifactExportDestination {
-                writer_factory: Some(Box::new(writer_factory)),
+                writer_factory: Some(writer_factory),
                 writer: None,
                 external_effect_possible: false,
                 operation_id: operation_id.to_owned(),
@@ -4731,7 +4798,7 @@ impl TaskManager {
             grant_id: None,
         })?;
         Ok(ArtifactExportDestination {
-            writer_factory: Some(Box::new(writer_factory)),
+            writer_factory: Some(writer_factory),
             writer: None,
             external_effect_possible: false,
             operation_id: operation_id.to_owned(),
@@ -4968,13 +5035,11 @@ impl TaskManager {
         )?;
         export_after_arm_step()?;
         destination.consumed = true;
-        let writer_factory =
-            destination
-                .writer_factory
-                .take()
-                .ok_or(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
-                ))?;
+        if destination.writer_factory.is_none() {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
         // Opening or constructing an external destination may itself create,
         // truncate, or otherwise affect it, even when the callback returns an
         // error before yielding a writer. Failures before that callback are
@@ -4989,7 +5054,7 @@ impl TaskManager {
             &destination.operation_id,
         )?;
         let mut callback_invoked = false;
-        let construction = (|| -> Result<W> {
+        let construction = (|| -> Result<EffectOwned<W>> {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -5067,11 +5132,25 @@ impl TaskManager {
                     return Err(error);
                 }
             };
+            let Some(writer_factory) = destination.writer_factory.take() else {
+                super::trusted_time::resolve_external_no_effect_in(&construction_permit, entry)?;
+                transaction.commit()?;
+                return Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+                ));
+            };
             callback_invoked = true;
-            let writer = writer_factory();
+            let writer = catch_effectful_callback(|| writer_factory.into_inner()())?
+                .map(EffectOwned::new)
+                .map_err(EffectOwned::new);
             super::trusted_time::resolve_external_entry_in(&construction_permit, entry)?;
             transaction.commit()?;
-            Ok(writer?)
+            match writer {
+                Ok(writer) => Ok(writer),
+                Err(_error) => Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+                )),
+            }
         })();
         destination.external_effect_possible = callback_invoked;
         destination.writer = if let Ok(writer) = construction {
@@ -5115,7 +5194,7 @@ impl TaskManager {
         };
         let (exported, exported_hash) = match copy_export_bounded(
             &mut reader,
-            destination
+            &mut **destination
                 .writer
                 .as_mut()
                 .ok_or(TaskManagerError::InvalidRecord(
@@ -5180,30 +5259,104 @@ impl TaskManager {
             .ok_or(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
             ))?;
-        export_pre_finalize_step()?;
-        let finalize_permit = super::trusted_time::prepare_external_effect(
-            &self.connection,
-            &self.clock,
-            &self.lease_owner,
-            self.lease_epoch,
-            &destination.task_id,
-            super::trusted_time::ExternalEffectKind::ExportFinalize,
-            &destination.operation_id,
-        )?;
-        let finalize = (|| -> Result<()> {
+        let finalize = export_pre_finalize_step()
+            .and_then(|()| {
+                super::trusted_time::prepare_external_effect(
+                    &self.connection,
+                    &self.clock,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    &destination.task_id,
+                    super::trusted_time::ExternalEffectKind::ExportFinalize,
+                    &destination.operation_id,
+                )
+            })
+            .and_then(|finalize_permit| {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let entry = super::trusted_time::capture_external_entry(
+                    &transaction,
+                    &self.clock,
+                    &finalize_permit,
+                )?;
+                let pre_call = entry.require_trusted_time().and_then(|finalize_at| {
+                    assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
+                    validate_export_destination_fence(
+                        &transaction,
+                        &finalize_at,
+                        &destination.task_id,
+                        &destination.authority,
+                        &destination.destination_class,
+                        destination.grant_admission.as_ref(),
+                    )
+                });
+                let _callback_guard = match pre_call.and_then(|()| {
+                    ExportCallbackGuard::enter(&self.artifact_export_callback_active)
+                }) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        super::trusted_time::resolve_external_no_effect_in(
+                            &finalize_permit,
+                            entry,
+                        )?;
+                        transaction.commit()?;
+                        return Err(error);
+                    }
+                };
+                // Destination finalization may itself make bytes externally
+                // visible. Keep the same serialized authority fence held across
+                // that irreversible callback; a concurrent revocation or recovery
+                // transition cannot commit until finalization is complete.
+                let result =
+                    catch_effectful_callback(|| writer.finalize())?.map_err(EffectOwned::new);
+                super::trusted_time::resolve_external_entry_in(&finalize_permit, entry)?;
+                transaction.commit()?;
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(_error) => Err(TaskManagerError::InvalidRecord(
+                        "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+                    )),
+                }
+            });
+        if finalize.is_err() {
+            self.finish_unknown_export_operation(
+                &destination.operation_id,
+                &destination.intent_json,
+                &destination.task_id,
+            )?;
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+            ));
+        }
+        // Destruction of W is another externally effectful callback. A fresh
+        // marker and a current authority sample are required even after a
+        // successful finalize. The capsule suppresses Drop on every denial.
+        let dispose_permit = export_pre_dispose_step().and_then(|()| {
+            super::trusted_time::prepare_external_effect(
+                &self.connection,
+                &self.clock,
+                &self.lease_owner,
+                self.lease_epoch,
+                &destination.task_id,
+                super::trusted_time::ExternalEffectKind::ExportFinalize,
+                &destination.operation_id,
+            )
+        });
+        let disposal = dispose_permit.and_then(|dispose_permit| {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let entry = super::trusted_time::capture_external_entry(
                 &transaction,
                 &self.clock,
-                &finalize_permit,
+                &dispose_permit,
             )?;
-            let pre_call = entry.require_trusted_time().and_then(|finalize_at| {
+            let pre_call = entry.require_trusted_time().and_then(|dispose_at| {
                 assert_manager_lease(&transaction, &self.lease_owner, self.lease_epoch)?;
                 validate_export_destination_fence(
                     &transaction,
-                    &finalize_at,
+                    &dispose_at,
                     &destination.task_id,
                     &destination.authority,
                     &destination.destination_class,
@@ -5215,21 +5368,24 @@ impl TaskManager {
             {
                 Ok(guard) => guard,
                 Err(error) => {
-                    super::trusted_time::resolve_external_no_effect_in(&finalize_permit, entry)?;
+                    super::trusted_time::resolve_external_no_effect_in(&dispose_permit, entry)?;
                     transaction.commit()?;
                     return Err(error);
                 }
             };
-            // Destination finalization may itself make bytes externally
-            // visible. Keep the same serialized authority fence held across
-            // that irreversible callback; a concurrent revocation or recovery
-            // transition cannot commit until finalization is complete.
-            let result = writer.finalize();
-            super::trusted_time::resolve_external_entry_in(&finalize_permit, entry)?;
+            let writer = destination
+                .writer
+                .take()
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+                ))?;
+            catch_effectful_callback(|| writer.dispose())?;
+            export_post_dispose_step()?;
+            super::trusted_time::resolve_external_entry_in(&dispose_permit, entry)?;
             transaction.commit()?;
-            Ok(result?)
-        })();
-        if finalize.is_err() {
+            Ok(())
+        });
+        if disposal.is_err() {
             self.finish_unknown_export_operation(
                 &destination.operation_id,
                 &destination.intent_json,
@@ -12027,10 +12183,16 @@ where
         }
     };
     // The callback can change the destination even when it returns Err.
-    let result = callback();
+    let result = catch_effectful_callback(callback)
+        .map_err(map)?
+        .map_err(EffectOwned::new);
     super::trusted_time::resolve_external_entry_in(&permit, entry).map_err(map)?;
     transaction.commit().map_err(|error| map(error.into()))?;
-    result.map_err(|error| map(error.into()))
+    result.map_err(|_error| {
+        map(TaskManagerError::InvalidRecord(
+            "ARTIFACT_EXPORT_OUTCOME_UNKNOWN",
+        ))
+    })
 }
 
 #[allow(
@@ -14185,6 +14347,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static EXPORT_PRE_FINALIZE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
+    static EXPORT_PRE_DISPOSE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static EXPORT_POST_DISPOSE_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
     static EXPORT_COMPLETION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_COMPLETION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
@@ -14781,6 +14947,26 @@ fn export_pre_finalize_step() -> Result<()> {
 }
 
 #[cfg(test)]
+fn export_pre_dispose_step() -> Result<()> {
+    EXPORT_PRE_DISPOSE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn export_post_dispose_step() -> Result<()> {
+    EXPORT_POST_DISPOSE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn publication_replay_hash_step() -> Result<()> {
     PUBLICATION_REPLAY_HASH_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -14861,6 +15047,24 @@ fn export_completion_commit_result_step() -> Result<()> {
     reason = "test authority race injection shares the production pre-finalize boundary"
 )]
 fn export_pre_finalize_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test authority race injection shares the production pre-disposal boundary"
+)]
+fn export_pre_dispose_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test fault injection shares the production post-disposal resolution boundary"
+)]
+fn export_post_dispose_step() -> Result<()> {
     Ok(())
 }
 
@@ -14985,6 +15189,199 @@ mod tests {
         writer: W,
     ) -> impl FnOnce() -> std::io::Result<W> {
         move || Ok(writer)
+    }
+
+    struct CapturedExportWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedExportWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for CapturedExportWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EffectfulDropWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        drops: Arc<AtomicUsize>,
+        guarded_drops: Arc<AtomicUsize>,
+        callback_active: Arc<AtomicBool>,
+        database: PathBuf,
+        operation_id: String,
+        state_at_drop: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Write for EffectfulDropWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for EffectfulDropWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for EffectfulDropWriter {
+        fn drop(&mut self) {
+            let state = Connection::open(&self.database)
+                .and_then(|connection| {
+                    connection.query_row(
+                        "SELECT state FROM operations WHERE operation_id=?1",
+                        [&self.operation_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                })
+                .expect("effectful destructor must observe the export operation");
+            *self.state_at_drop.lock().unwrap() = Some(state);
+            self.bytes.lock().unwrap().push(b'!');
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            if self.callback_active.load(Ordering::SeqCst) {
+                self.guarded_drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct EffectfulDropSignal(Arc<AtomicUsize>);
+
+    impl Drop for EffectfulDropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for EffectfulDropSignal {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("effectful error payload")
+        }
+    }
+
+    impl std::fmt::Debug for EffectfulDropSignal {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("EffectfulDropSignal")
+        }
+    }
+
+    impl std::error::Error for EffectfulDropSignal {}
+
+    struct EffectfulIoErrorWriter {
+        phase: &'static str,
+        bytes: Arc<Mutex<Vec<u8>>>,
+        error_drops: Arc<AtomicUsize>,
+    }
+
+    impl EffectfulIoErrorWriter {
+        fn error(&self) -> std::io::Error {
+            std::io::Error::other(EffectfulDropSignal(Arc::clone(&self.error_drops)))
+        }
+    }
+
+    impl Write for EffectfulIoErrorWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.phase == "write" {
+                return Err(self.error());
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.phase == "flush" {
+                Err(self.error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ArtifactExportWriter for EffectfulIoErrorWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            if self.phase == "finalize" {
+                Err(self.error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct PanickingDropWriter {
+        drops: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl Write for PanickingDropWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for PanickingDropWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for PanickingDropWriter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(EffectfulDropSignal(Arc::clone(&self.payload_drops)));
+        }
+    }
+
+    struct PanickingCallbackWriter {
+        phase: &'static str,
+        payload_drops: Arc<AtomicUsize>,
+        writer_drops: Arc<AtomicUsize>,
+    }
+
+    impl Write for PanickingCallbackWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.phase == "write" {
+                std::panic::panic_any(EffectfulDropSignal(Arc::clone(&self.payload_drops)));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.phase == "flush" {
+                std::panic::panic_any(EffectfulDropSignal(Arc::clone(&self.payload_drops)));
+            }
+            Ok(())
+        }
+    }
+
+    impl ArtifactExportWriter for PanickingCallbackWriter {
+        fn finalize(&mut self) -> std::io::Result<()> {
+            if self.phase == "finalize" {
+                std::panic::panic_any(EffectfulDropSignal(Arc::clone(&self.payload_drops)));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for PanickingCallbackWriter {
+        fn drop(&mut self) {
+            self.writer_drops.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[derive(Default)]
@@ -15141,6 +15538,12 @@ mod tests {
         fn finalize(&mut self) -> std::io::Result<()> {
             self.probe();
             Ok(())
+        }
+    }
+
+    impl Drop for ReenteringExportWriter {
+        fn drop(&mut self) {
+            self.probe();
         }
     }
 
@@ -16308,7 +16711,8 @@ mod tests {
                 .unwrap(),
             8
         );
-        assert!(export_two.writer.is_some());
+        // A successful export retires its writer before recording success.
+        assert!(export_two.writer.is_none());
         assert_eq!(
             manager
                 .get_artifact(&first.artifact_id)
@@ -16521,6 +16925,7 @@ mod tests {
             ),
             Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))
         ));
+        let captured = Arc::new(Mutex::new(Vec::new()));
         let mut destination = manager
             .issue_bound_artifact_export_destination(
                 &session,
@@ -16529,7 +16934,7 @@ mod tests {
                 &artifact.artifact_id,
                 "user-selected-file",
                 1_024,
-                deferred(Vec::new()),
+                deferred(CapturedExportWriter(Arc::clone(&captured))),
             )
             .unwrap();
         assert_eq!(
@@ -16538,20 +16943,16 @@ mod tests {
                 .unwrap(),
             14
         );
-        assert_eq!(
-            destination.writer.as_deref(),
-            Some(b"exported bytes".as_slice())
-        );
+        assert!(destination.writer.is_none());
+        assert_eq!(*captured.lock().unwrap(), b"exported bytes");
         assert_eq!(
             manager
                 .export_artifact(&scope, &artifact.artifact_id, &mut destination)
                 .unwrap(),
             14
         );
-        assert_eq!(
-            destination.writer.as_deref(),
-            Some(b"exported bytes".as_slice())
-        );
+        assert!(destination.writer.is_none());
+        assert_eq!(*captured.lock().unwrap(), b"exported bytes");
         assert_eq!(
             manager
                 .connection
@@ -16605,6 +17006,750 @@ mod tests {
     }
 
     #[test]
+    fn successful_export_disposes_effectful_writer_under_fresh_guarded_marker() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"dispose me".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded_drops = Arc::new(AtomicUsize::new(0));
+        let state_at_drop = Arc::new(Mutex::new(None));
+        let writer = EffectfulDropWriter {
+            bytes: Arc::clone(&bytes),
+            drops: Arc::clone(&drops),
+            guarded_drops: Arc::clone(&guarded_drops),
+            callback_active: Arc::clone(&manager.artifact_export_callback_active),
+            database,
+            operation_id: "export-effectful-dispose-success".to_owned(),
+            state_at_drop: Arc::clone(&state_at_drop),
+        };
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-effectful-dispose-success",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(writer),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .export_artifact(&scope, &artifact.artifact_id, &mut destination)
+                .unwrap(),
+            10
+        );
+        assert_eq!(*bytes.lock().unwrap(), b"dispose me!");
+        assert!(destination.writer.is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(guarded_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(state_at_drop.lock().unwrap().as_deref(), Some("STARTED"));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(DISTINCT p.marker_id) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-effectful-dispose-success'
+                       AND r.resolution_kind='EFFECT_INVOKED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "finalization and disposal have separate durable markers"
+        );
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "asserts disposal denial, durable marker state, replay, and inert destructor together"
+    )]
+    fn revoked_disposal_keeps_effectful_writer_inert_and_export_unknown() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"dispose denied".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guarded_drops = Arc::new(AtomicUsize::new(0));
+        let state_at_drop = Arc::new(Mutex::new(None));
+        let writer = EffectfulDropWriter {
+            bytes: Arc::clone(&bytes),
+            drops: Arc::clone(&drops),
+            guarded_drops: Arc::clone(&guarded_drops),
+            callback_active: Arc::clone(&manager.artifact_export_callback_active),
+            database: database.clone(),
+            operation_id: "export-effectful-dispose-denied".to_owned(),
+            state_at_drop: Arc::clone(&state_at_drop),
+        };
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-effectful-dispose-denied",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(writer),
+            )
+            .unwrap();
+        EXPORT_PRE_DISPOSE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET principal_id='user:revoked-before-dispose' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(*bytes.lock().unwrap(), b"dispose denied");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(guarded_drops.load(Ordering::SeqCst), 0);
+        assert!(state_at_drop.lock().unwrap().is_none());
+        assert!(destination.writer.is_some());
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-effectful-dispose-denied'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        let (invoked, denied): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-effectful-dispose-denied'
+                       AND r.resolution_kind='EFFECT_INVOKED'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-effectful-dispose-denied'
+                       AND r.resolution_kind='NO_EFFECT')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((invoked, denied), (1, 1));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events
+                     WHERE event_id=?1",
+                    [event_id(
+                        "artifact-exported",
+                        "export-effectful-dispose-denied"
+                    )],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn construction_marker_failure_does_not_drop_returned_writer() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"marker fails".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let state_at_drop = Arc::new(Mutex::new(None));
+        let writer = EffectfulDropWriter {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            drops: Arc::clone(&drops),
+            guarded_drops: Arc::new(AtomicUsize::new(0)),
+            callback_active: Arc::clone(&manager.artifact_export_callback_active),
+            database: temp.path().join("task-manager.sqlite"),
+            operation_id: "export-construction-marker-fails".to_owned(),
+            state_at_drop: Arc::clone(&state_at_drop),
+        };
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-construction-marker-fails",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(writer),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_export_construction_resolution
+                 BEFORE INSERT ON trusted_time_effect_resolutions
+                 WHEN EXISTS (
+                   SELECT 1 FROM trusted_time_effect_preparations
+                   WHERE marker_id=NEW.marker_id
+                     AND subject_kind='ARTIFACT_EXPORT_CONSTRUCTION'
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'injected construction marker failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(state_at_drop.lock().unwrap().is_none());
+        assert!(destination.writer.is_none());
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn disposal_resolution_failure_keeps_external_effect_unknown() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"post dispose".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let state_at_drop = Arc::new(Mutex::new(None));
+        let writer = EffectfulDropWriter {
+            bytes: Arc::clone(&bytes),
+            drops: Arc::clone(&drops),
+            guarded_drops: Arc::new(AtomicUsize::new(0)),
+            callback_active: Arc::clone(&manager.artifact_export_callback_active),
+            database: temp.path().join("task-manager.sqlite"),
+            operation_id: "export-disposal-resolution-fails".to_owned(),
+            state_at_drop: Arc::clone(&state_at_drop),
+        };
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-disposal-resolution-fails",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(writer),
+            )
+            .unwrap();
+        EXPORT_POST_DISPOSE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::InvalidRecord(
+                    "injected disposal resolution failure",
+                ))
+            }));
+        });
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(*bytes.lock().unwrap(), b"post dispose!");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(state_at_drop.lock().unwrap().as_deref(), Some("STARTED"));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-disposal-resolution-fails'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        let (prepared, resolved): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM trusted_time_effect_preparations
+                     WHERE subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND subject_id='export-disposal-resolution-fails'),
+                    (SELECT COUNT(*) FROM trusted_time_effect_resolutions r
+                     JOIN trusted_time_effect_preparations p USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-disposal-resolution-fails')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((prepared, resolved), (2, 1));
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [event_id(
+                        "artifact-exported",
+                        "export-disposal-resolution-fails"
+                    )],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panicking_destination_destructor_cannot_record_export_success() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"panic drop".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-panicking-destructor",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(PanickingDropWriter {
+                    drops: Arc::clone(&drops),
+                    payload_drops: Arc::clone(&payload_drops),
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        assert!(destination.writer.is_none());
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state FROM operations WHERE operation_id='export-panicking-destructor'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_preparations p
+                     LEFT JOIN trusted_time_effect_resolutions r USING(marker_id)
+                     WHERE p.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                       AND p.subject_id='export-panicking-destructor'
+                       AND r.marker_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE event_id=?1",
+                    [event_id("artifact-exported", "export-panicking-destructor")],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn callback_panic_payloads_never_drop_outside_export_fence() {
+        for (phase, marker_kind) in [
+            ("construction", "ARTIFACT_EXPORT_CONSTRUCTION"),
+            ("write", "ARTIFACT_EXPORT_COPY"),
+            ("flush", "ARTIFACT_EXPORT_COPY"),
+            ("finalize", "ARTIFACT_EXPORT_FINALIZE"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let artifact = manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"panic payload".as_slice()),
+                )
+                .unwrap();
+            let scope = manager
+                .scope_owned_artifact_reads(
+                    "T-artifact",
+                    std::slice::from_ref(&artifact.artifact_id),
+                )
+                .unwrap();
+            let payload_drops = Arc::new(AtomicUsize::new(0));
+            let writer_drops = Arc::new(AtomicUsize::new(0));
+            let operation_id = format!("export-panic-payload-{phase}");
+            let payload_for_factory = Arc::clone(&payload_drops);
+            let writer_drops_for_factory = Arc::clone(&writer_drops);
+            let mut destination = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    move || -> std::io::Result<PanickingCallbackWriter> {
+                        if phase == "construction" {
+                            std::panic::panic_any(EffectfulDropSignal(payload_for_factory));
+                        }
+                        Ok(PanickingCallbackWriter {
+                            phase,
+                            payload_drops: payload_for_factory,
+                            writer_drops: writer_drops_for_factory,
+                        })
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ));
+            assert_eq!(payload_drops.load(Ordering::SeqCst), 0, "{phase}");
+            assert_eq!(writer_drops.load(Ordering::SeqCst), 0, "{phase}");
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT state || ':' || outcome_certainty FROM operations
+                         WHERE operation_id=?1",
+                        [&operation_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "UNKNOWN:OUTCOME_UNKNOWN",
+                "{phase}"
+            );
+            assert_eq!(
+                manager
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM trusted_time_effect_preparations p
+                         LEFT JOIN trusted_time_effect_resolutions r USING(marker_id)
+                         WHERE p.subject_kind=?1 AND p.subject_id=?2
+                           AND r.marker_id IS NULL",
+                        params![marker_kind, operation_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{phase}"
+            );
+            drop(destination);
+            assert_eq!(payload_drops.load(Ordering::SeqCst), 0, "{phase}");
+            assert_eq!(writer_drops.load(Ordering::SeqCst), 0, "{phase}");
+        }
+    }
+
+    #[test]
+    fn denied_issuer_does_not_drop_effectful_factory_capture() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"denied".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let signal = EffectfulDropSignal(Arc::clone(&drops));
+        assert!(
+            manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    "",
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    move || {
+                        drop(signal);
+                        Ok(Vec::new())
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unused_issued_destination_does_not_drop_effectful_factory_capture() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"unused".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signal = EffectfulDropSignal(Arc::clone(&drops));
+        let factory_calls = Arc::clone(&calls);
+        let destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-unused-destination",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    factory_calls.fetch_add(1, Ordering::SeqCst);
+                    drop(signal);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        drop(destination);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operations WHERE operation_id='export-unused-destination'
+                     AND state='SUCCEEDED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_time_effect_preparations
+                     WHERE subject_id='export-unused-destination'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn denied_construction_entry_does_not_drop_factory_capture() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"denied".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let signal = EffectfulDropSignal(Arc::clone(&drops));
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-denied-construction-capture",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || {
+                    drop(signal);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        EXPORT_AFTER_ARM_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(database)?.execute(
+                    "UPDATE tasks SET principal_id='user:revoked-before-construction' WHERE task_id='T-artifact'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+            ))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn constructor_error_payload_is_not_dropped_after_callback_fence() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(&import_request(), &mut Cursor::new(b"error".as_slice()))
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let error_drops = Arc::clone(&drops);
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-effectful-constructor-error",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                move || -> std::io::Result<Vec<u8>> {
+                    Err(std::io::Error::other(EffectfulDropSignal(error_drops)))
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn write_flush_and_finalize_error_payloads_are_not_dropped_after_fence() {
+        for phase in ["write", "flush", "finalize"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let artifact = manager
+                .import_artifact(
+                    &import_request(),
+                    &mut Cursor::new(b"error body".as_slice()),
+                )
+                .unwrap();
+            let scope = manager
+                .scope_owned_artifact_reads(
+                    "T-artifact",
+                    std::slice::from_ref(&artifact.artifact_id),
+                )
+                .unwrap();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let operation_id = format!("export-effectful-{phase}-error");
+            let mut destination = manager
+                .issue_owned_artifact_export_destination(
+                    &scope,
+                    &operation_id,
+                    &artifact.artifact_id,
+                    "user-selected-file",
+                    1_024,
+                    deferred(EffectfulIoErrorWriter {
+                        phase,
+                        bytes: Arc::clone(&bytes),
+                        error_drops: Arc::clone(&drops),
+                    }),
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+                Err(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+                ))
+            ));
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "{phase}");
+            assert_eq!(
+                *bytes.lock().unwrap(),
+                if phase == "write" {
+                    b"".as_slice()
+                } else {
+                    b"error body".as_slice()
+                },
+                "{phase}"
+            );
+            drop(destination);
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "{phase}");
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "covers exact replay, changed-intent conflict, and fresh-operation retransmission fencing together"
@@ -16637,10 +17782,7 @@ mod tests {
                 .unwrap(),
             13
         );
-        assert_eq!(
-            original.writer.as_deref(),
-            Some(b"exported once".as_slice())
-        );
+        assert!(original.writer.is_none());
         manager
             .connection
             .execute(
@@ -17643,7 +18785,7 @@ mod tests {
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
-        assert_eq!(destination.writer.as_deref(), Some(b"exported".as_slice()));
+        assert!(destination.writer.is_none());
         assert_eq!(
             manager
                 .connection
@@ -17774,7 +18916,10 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(factory_opens.load(Ordering::SeqCst), 1);
-        assert_eq!(destination.writer.as_deref(), Some([].as_slice()));
+        assert_eq!(
+            destination.writer.as_ref().map(|writer| writer.as_slice()),
+            Some([].as_slice())
+        );
         assert_eq!(
             manager
                 .connection
@@ -17985,7 +19130,7 @@ mod tests {
             7
         );
         let denied = denied.lock().unwrap();
-        assert_eq!(denied.len(), 4);
+        assert_eq!(denied.len(), 5);
         assert!(
             denied
                 .iter()
@@ -20541,6 +21686,142 @@ mod tests {
     }
 
     #[test]
+    fn post_copy_pre_finalize_failure_is_durable_unknown_without_destructor() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"copied first".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let copied = Arc::new(Mutex::new(Vec::new()));
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-pre-finalize-error",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(CapturedExportWriter(Arc::clone(&copied))),
+            )
+            .unwrap();
+        EXPORT_PRE_FINALIZE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::InvalidRecord(
+                    "injected pre-finalize failure",
+                ))
+            }));
+        });
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(*copied.lock().unwrap(), b"copied first");
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-pre-finalize-error'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM recovery_unknown_operations
+                     WHERE operation_id='operation:export-pre-finalize-error'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+    }
+
+    #[test]
+    fn post_copy_finalize_permit_failure_is_unknown_and_keeps_writer_inert() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let artifact = manager
+            .import_artifact(
+                &import_request(),
+                &mut Cursor::new(b"permit fails".as_slice()),
+            )
+            .unwrap();
+        let scope = manager
+            .scope_owned_artifact_reads("T-artifact", std::slice::from_ref(&artifact.artifact_id))
+            .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut destination = manager
+            .issue_owned_artifact_export_destination(
+                &scope,
+                "export-finalize-permit-fails",
+                &artifact.artifact_id,
+                "user-selected-file",
+                1_024,
+                deferred(EffectfulDropWriter {
+                    bytes: Arc::clone(&bytes),
+                    drops: Arc::clone(&drops),
+                    guarded_drops: Arc::new(AtomicUsize::new(0)),
+                    callback_active: Arc::clone(&manager.artifact_export_callback_active),
+                    database: temp.path().join("task-manager.sqlite"),
+                    operation_id: "export-finalize-permit-fails".to_owned(),
+                    state_at_drop: Arc::new(Mutex::new(None)),
+                }),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_export_finalize_preparation
+                 BEFORE INSERT ON trusted_time_effect_preparations
+                 WHEN NEW.subject_kind='ARTIFACT_EXPORT_FINALIZE'
+                 BEGIN SELECT RAISE(ABORT,'injected finalize permit failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
+        assert_eq!(*bytes.lock().unwrap(), b"permit fails");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .connection
+                .query_row(
+                    "SELECT state || ':' || outcome_certainty FROM operations
+                     WHERE operation_id='export-finalize-permit-fails'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "UNKNOWN:OUTCOME_UNKNOWN"
+        );
+        drop(destination);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn destination_construction_holds_serialized_authority_fence_across_external_effect() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("task-manager.sqlite");
@@ -20930,14 +22211,14 @@ mod tests {
             }))
             .is_err()
         );
-        assert_eq!(destination.writer.as_deref(), Some(b"escaped".as_slice()));
+        assert!(destination.writer.is_none());
         assert!(matches!(
             manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
             Err(TaskManagerError::InvalidRecord(
                 "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
             ))
         ));
-        assert_eq!(destination.writer.as_deref(), Some(b"escaped".as_slice()));
+        assert!(destination.writer.is_none());
         manager
             .connection
             .execute_batch(
@@ -23150,6 +24431,7 @@ mod tests {
             reader.read_to_end(&mut read).unwrap();
             assert_eq!(read, bytes, "owner read failed in {state}");
 
+            let captured = Arc::new(Mutex::new(Vec::new()));
             let mut exported = manager
                 .issue_owned_artifact_export_destination(
                     &scope,
@@ -23157,15 +24439,16 @@ mod tests {
                     &artifact.artifact_id,
                     "user-selected-file",
                     1_024,
-                    deferred(Vec::new()),
+                    deferred(CapturedExportWriter(Arc::clone(&captured))),
                 )
                 .unwrap();
             manager
                 .export_artifact(&scope, &artifact.artifact_id, &mut exported)
                 .unwrap();
+            assert!(exported.writer.is_none(), "owner export failed in {state}");
             assert_eq!(
-                exported.writer.as_deref(),
-                Some(bytes.as_slice()),
+                *captured.lock().unwrap(),
+                bytes,
                 "owner export failed in {state}"
             );
             assert_eq!(
@@ -31462,7 +32745,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_started_export_immediately_fences_unrelated_artifact_work_after_unwind() {
+    fn armed_export_callback_panic_becomes_unknown_and_fences_unrelated_artifact_work() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
         let artifact = manager
@@ -31490,10 +32773,12 @@ mod tests {
             )
             .unwrap();
 
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = manager.export_artifact(&scope, &artifact.artifact_id, &mut destination);
-        }));
-        assert!(unwind.is_err());
+        assert!(matches!(
+            manager.export_artifact(&scope, &artifact.artifact_id, &mut destination),
+            Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OUTCOME_UNKNOWN"
+            ))
+        ));
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             manager
@@ -31505,7 +32790,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "STARTED:effect-boundary-armed"
+            "UNKNOWN:effect-boundary-armed"
         );
         assert!(matches!(
             manager.import_artifact(

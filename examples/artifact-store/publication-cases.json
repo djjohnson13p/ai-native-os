@@ -188,6 +188,24 @@
         "content_hash_unchanged": true,
         "exports_are_separate_side_effects": true
       }
+    },
+    {
+      "name": "export-writer-destructor-before-success",
+      "setup": "trusted destination writer has a destructor that appends a visible test byte",
+      "expected": {
+        "destructor_runs_under_distinct_admitted_marker": true,
+        "destructor_precedes_success_receipt": true,
+        "later_destination_drop_writes_again": false
+      }
+    },
+    {
+      "name": "export-destructor-denied-after-revocation",
+      "mutation": "revoke exact egress grant after finalize but before destructor entry, then drop the destination",
+      "expected": {
+        "unadmitted_destructor_runs": false,
+        "export_outcome": "OUTCOME_UNKNOWN",
+        "later_destination_drop_writes": false
+      }
     }
   ]
 }
