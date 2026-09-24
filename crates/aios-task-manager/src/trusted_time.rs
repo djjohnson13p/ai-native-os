@@ -721,9 +721,23 @@ pub(crate) fn with_protected_immediate<T>(
     };
     match operation(&transaction, &now) {
         Ok(value) => {
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            transaction.commit()?;
-            Ok(value)
+            if let Err(error) = fresh
+                .commit_in(&transaction)
+                .and_then(|observation| observation.require_trusted_time().map(|_| ()))
+            {
+                drop(transaction);
+                fresh.commit(connection)?;
+                return Err(error);
+            }
+            match transaction.commit() {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    // Preserve the sampled expiry floor even if SQLite did not
+                    // durably acknowledge the protected transaction.
+                    fresh.commit(connection)?;
+                    Err(error.into())
+                }
+            }
         }
         Err(error) => {
             drop(transaction);
@@ -1190,6 +1204,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(effects, 0);
+    }
+
+    #[test]
+    fn failed_time_observation_preserves_exact_locked_forward_sample() {
+        let clock = MutableClock::new("2026-09-19T21:00:00Z");
+        let manager = TaskManager::open_in_memory_with_clock(Box::new(clock.clone())).unwrap();
+        manager
+            .connection
+            .execute_batch(
+                "CREATE TABLE protected_time_effect(id INTEGER PRIMARY KEY);
+                 CREATE TEMP TRIGGER refuse_tentative_effect_time
+                 BEFORE INSERT ON trusted_time_observations
+                 WHEN EXISTS(SELECT 1 FROM protected_time_effect)
+                 BEGIN SELECT RAISE(ABORT,'tentative effect time audit refused'); END",
+            )
+            .unwrap();
+        let advancing_clock = clock.clone();
+        BEFORE_PROTECTED_LOCK_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                advancing_clock.set(Some("2026-09-19T22:00:00Z"));
+            }));
+        });
+        let result =
+            with_protected_immediate(&manager.connection, &manager.clock, |transaction, _| {
+                transaction.execute("INSERT INTO protected_time_effect(id) VALUES (1)", [])?;
+                Ok(())
+            });
+        assert!(result.is_err());
+        let effects: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM protected_time_effect", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(effects, 0);
+        let high: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            i128::from(high),
+            super::OffsetDateTime::parse("2026-09-19T22:00:00Z", &super::Rfc3339)
+                .unwrap()
+                .unix_timestamp_nanos()
+        );
+        clock.set(Some("2026-09-19T21:00:00Z"));
+        assert!(matches!(
+            protected_now(&manager.connection, &manager.clock),
+            Err(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))
+        ));
     }
 
     #[test]

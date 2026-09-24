@@ -3342,26 +3342,15 @@ impl TaskManager {
             let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
                 TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
             )?;
-            let file = self.artifact_store_dir.open_with(
-                safe_internal_ref(&staging_ref)?,
-                CapOpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true),
-            )?;
-            let admission = (|| -> Result<Option<GrantAdmission>> {
-                secure_cap_file_permissions(&file)?;
-                file.sync_all()?;
-                sync_cap_directory(&self.artifact_store_dir, "staging")?;
-                writer_staging_durability_step()?;
-                let grant_admission = if let Some(binding_id) = allocation.binding_id.as_deref() {
-                    let execution = capture_execution_authority(
-                        &transaction,
-                        &allocation.task_id,
-                        binding_id,
-                        &now,
-                    )?;
-                    let grant = exact_operation_grant(
+            let grant = if let Some(binding_id) = allocation.binding_id.as_deref() {
+                let execution = capture_execution_authority(
+                    &transaction,
+                    &allocation.task_id,
+                    binding_id,
+                    &now,
+                )?;
+                Some(
+                    exact_operation_grant(
                         &transaction,
                         &allocation.task_id,
                         &execution,
@@ -3371,81 +3360,126 @@ impl TaskManager {
                         &now,
                         None,
                     )?
-                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-                    Some(admit_operation_grant(
-                        &transaction,
-                        &allocation.task_id,
-                        &execution,
-                        "artifact.write",
-                        "output-allocation",
-                        allocation_id,
-                        &now,
-                        &grant.grant_id,
-                    )?)
-                } else {
-                    None
-                };
-                let changed = transaction.execute(
-                    "UPDATE artifact_output_allocations
+                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?,
+                )
+            } else {
+                None
+            };
+            let pin = StagingOpenPin {
+                allocation_id: allocation_id.to_owned(),
+                allocation: allocation.clone(),
+                grant,
+                lease_owner: lease_owner.clone(),
+                lease_epoch,
+            };
+            fresh.commit_in(&transaction)?.require_trusted_time()?;
+            transaction.commit()?;
+            locked_time = None;
+            // Each filesystem call gets its own durable preparation and exact
+            // locked entry. An error leaves ALLOCATED residue for recovery.
+            let staging_path = safe_internal_ref(&staging_ref)?;
+            let mut create_options = CapOpenOptions::new();
+            create_options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                // A crash after create_new can precede the separately fenced
+                // permission mutation; the new inode must already be private.
+                create_options.mode(0o600);
+            }
+            let file =
+                staging_open_primitive(&self.connection, &self.clock, &pin, "create_new", || {
+                    self.artifact_store_dir
+                        .open_with(&staging_path, &create_options)
+                        .map_err(Into::into)
+                })?;
+            staging_open_primitive(&self.connection, &self.clock, &pin, "permissions", || {
+                secure_cap_file_permissions(&file)
+            })?;
+            staging_open_primitive(&self.connection, &self.clock, &pin, "file_sync", || {
+                file.sync_all().map_err(Into::into)
+            })?;
+            staging_open_primitive(&self.connection, &self.clock, &pin, "dir_sync", || {
+                sync_cap_directory(&self.artifact_store_dir, "staging")
+            })?;
+            writer_staging_durability_step()?;
+            let admission = super::trusted_time::with_protected_immediate(
+                &self.connection,
+                &self.clock,
+                |transaction, admitted_at| {
+                    validate_staging_open_pin(transaction, &pin, admitted_at)?;
+                    let grant_admission = if let (Some(binding_id), Some(grant)) =
+                        (pin.allocation.binding_id.as_deref(), pin.grant.as_ref())
+                    {
+                        let execution = capture_execution_authority(
+                            transaction,
+                            &pin.allocation.task_id,
+                            binding_id,
+                            admitted_at,
+                        )?;
+                        Some(admit_operation_grant(
+                            transaction,
+                            &pin.allocation.task_id,
+                            &execution,
+                            "artifact.write",
+                            "output-allocation",
+                            allocation_id,
+                            admitted_at,
+                            &grant.grant_id,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let changed = transaction.execute(
+                        "UPDATE artifact_output_allocations
                  SET state='WRITING',writer_grant_id=?2,writer_grant_one_shot_consumed=?3,
                      writer_session_id=?4,writer_generation=?5,updated_at=?6
                  WHERE allocation_id=?1 AND state='ALLOCATED' AND writer_generation=?7",
-                    params![
-                        allocation_id,
-                        grant_admission
-                            .as_ref()
-                            .map(|admission| &admission.grant_id),
-                        grant_admission
-                            .as_ref()
-                            .map(|admission| admission.one_shot_consumed),
-                        writer_session_id,
-                        writer_generation,
-                        now,
-                        allocation.writer_generation
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(TaskManagerError::InvalidRecord(
-                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                    ));
-                }
-                Ok(grant_admission)
-            })();
-            let grant_admission = match admission {
-                Ok(admission) => admission,
-                Err(error) => {
-                    drop(file);
-                    let _ = self
-                        .artifact_store_dir
-                        .remove_file(safe_internal_ref(&staging_ref)?);
-                    let _ = sync_cap_directory(&self.artifact_store_dir, "staging");
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            let persisted = transaction.commit().map_err(TaskManagerError::from);
-            if persisted.is_ok() {
-                locked_time = None;
-            }
-            let commit_result = persisted.and_then(|()| writer_admission_commit_result_step());
+                        params![
+                            allocation_id,
+                            grant_admission
+                                .as_ref()
+                                .map(|admission| &admission.grant_id),
+                            grant_admission
+                                .as_ref()
+                                .map(|admission| admission.one_shot_consumed),
+                            writer_session_id,
+                            writer_generation,
+                            admitted_at,
+                            allocation.writer_generation
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                        ));
+                    }
+                    Ok(grant_admission)
+                },
+            );
+            let commit_result = admission.and_then(|_| writer_admission_commit_result_step());
             if let Err(error) = commit_result {
                 let durable = load_allocation_row(&self.connection, allocation_id)?;
                 let exact = durable.as_ref().is_some_and(|durable| {
                     durable.state == "WRITING"
                         && durable.staging_ref.as_deref() == Some(staging_ref.as_str())
-                        && durable.writer_grant_admission == grant_admission
+                        && durable.writer_grant_admission
+                            == pin.grant.as_ref().map(|grant| GrantAdmission {
+                                grant_id: grant.grant_id.clone(),
+                                one_shot_consumed: grant.scope == "ONE_SHOT",
+                            })
                         && durable.writer_session_id.as_deref() == Some(writer_session_id.as_str())
                         && durable.writer_generation == writer_generation
                 });
                 if !exact {
-                    drop(file);
-                    let _ = self
-                        .artifact_store_dir
-                        .remove_file(safe_internal_ref(&staging_ref)?);
                     return Err(error);
                 }
             }
+            let grant_admission = load_allocation_row(&self.connection, allocation_id)?
+                .ok_or(TaskManagerError::InvalidRecord(
+                    "ARTIFACT_ALLOCATION_NOT_FOUND",
+                ))?
+                .writer_grant_admission;
             Ok(ArtifactStagingWriter {
                 file: Some(file),
                 store: writer_store,
@@ -7380,7 +7414,7 @@ impl TaskManager {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AllocationRow {
     task_id: String,
     semantic_program_hash: String,
@@ -7398,6 +7432,91 @@ struct AllocationRow {
     writer_generation: i64,
     staging_ref: Option<String>,
     expires_at: String,
+}
+
+// Private construction has no writer admission. Keep the entire allocation and
+// the exact still-unconsumed grant pinned across each independently marked call.
+struct StagingOpenPin {
+    allocation_id: String,
+    allocation: AllocationRow,
+    grant: Option<ExactOperationGrant>,
+    lease_owner: String,
+    lease_epoch: i64,
+}
+
+fn validate_staging_open_pin(
+    connection: &Transaction<'_>,
+    pin: &StagingOpenPin,
+    now: &str,
+) -> Result<()> {
+    assert_manager_lease(connection, &pin.lease_owner, pin.lease_epoch)?;
+    let current = load_allocation_row(connection, &pin.allocation_id)?.ok_or(
+        TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_NOT_FOUND"),
+    )?;
+    if current != pin.allocation
+        || current.state != "ALLOCATED"
+        || parse_time(&current.expires_at)? <= parse_time(now)?
+    {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    ensure_task_is_not_recovering(connection, &current.task_id)?;
+    ensure_no_unknown_artifact_export(connection, &current.task_id)?;
+    validate_allocation_execution_scope(connection, &pin.allocation_id, &current, now)?;
+    if let Some(binding_id) = current.binding_id.as_deref() {
+        let execution = capture_execution_authority(connection, &current.task_id, binding_id, now)?;
+        let grant = exact_operation_grant(
+            connection,
+            &current.task_id,
+            &execution,
+            "artifact.write",
+            "output-allocation",
+            &pin.allocation_id,
+            now,
+            None,
+        )?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if pin.grant.as_ref() != Some(&grant) {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+    } else if pin.grant.is_some() {
+        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+    }
+    Ok(())
+}
+
+fn staging_open_primitive<T>(
+    connection: &Connection,
+    clock: &Arc<dyn Clock>,
+    pin: &StagingOpenPin,
+    step: &'static str,
+    primitive: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let permit = super::trusted_time::prepare_external_effect(
+        connection,
+        clock,
+        &pin.lease_owner,
+        pin.lease_epoch,
+        &pin.allocation.task_id,
+        super::trusted_time::ExternalEffectKind::StagingWrite,
+        &pin.allocation_id,
+    )?;
+    staging_open_before_entry_step(step)?;
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    let entry = super::trusted_time::capture_external_entry(&transaction, clock, &permit)?;
+    let pre_call = entry
+        .require_trusted_time()
+        .and_then(|now| validate_staging_open_pin(&transaction, pin, &now));
+    if let Err(error) = pre_call {
+        super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+        transaction.commit()?;
+        return Err(error);
+    }
+    // Once invoked, even Err may have changed metadata or left private bytes.
+    let result = staging_open_invocation_step(step).and_then(|()| primitive());
+    staging_open_resolution_step(step)?;
+    super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+    transaction.commit()?;
+    result
 }
 
 fn load_allocation_row(
@@ -8028,7 +8147,7 @@ fn binding_runtime_authority_valid(
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExactOperationGrant {
     grant_id: String,
     scope: String,
@@ -12959,6 +13078,9 @@ type WriterWritePrimitiveTestHook =
     Box<dyn FnOnce(&mut cap_std::fs::File, &[u8]) -> std::io::Result<usize>>;
 
 #[cfg(test)]
+type StagingOpenTestHook = Box<dyn FnMut(&'static str) -> Result<()>>;
+
+#[cfg(test)]
 thread_local! {
     static IMPORT_COMMIT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
@@ -12993,6 +13115,12 @@ thread_local! {
     static WRITER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static WRITER_STAGING_DURABILITY_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK: std::cell::RefCell<Option<StagingOpenTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_OPEN_INVOCATION_TEST_HOOK: std::cell::RefCell<Option<StagingOpenTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_OPEN_RESOLUTION_TEST_HOOK: std::cell::RefCell<Option<StagingOpenTestHook>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
@@ -13241,6 +13369,36 @@ fn writer_staging_durability_step() -> Result<()> {
 }
 
 #[cfg(test)]
+fn staging_open_before_entry_step(step: &'static str) -> Result<()> {
+    STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn staging_open_invocation_step(step: &'static str) -> Result<()> {
+    STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn staging_open_resolution_step(step: &'static str) -> Result<()> {
+    STAGING_OPEN_RESOLUTION_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn export_admission_commit_result_step() -> Result<()> {
     EXPORT_ADMISSION_COMMIT_RESULT_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -13403,6 +13561,33 @@ fn writer_admission_commit_result_step() -> Result<()> {
     reason = "test failure injection shares the durable staging admission boundary"
 )]
 fn writer_staging_durability_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test hook shares staging construction boundary"
+)]
+fn staging_open_before_entry_step(_step: &'static str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test hook shares staging construction boundary"
+)]
+fn staging_open_invocation_step(_step: &'static str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test hook shares staging construction boundary"
+)]
+fn staging_open_resolution_step(_step: &'static str) -> Result<()> {
     Ok(())
 }
 
@@ -14818,7 +15003,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_admission_database_error_removes_staging_and_preserves_retry() {
+    fn writer_admission_database_error_preserves_private_residue_until_reconciliation() {
         let temp = TempDir::new().unwrap();
         let mut manager = manager(&temp);
         let allocation_id = "alloc-admission-cleanup";
@@ -14854,7 +15039,7 @@ mod tests {
             manager.open_bound_artifact_output(&session, allocation_id),
             Err(TaskManagerError::Storage(_))
         ));
-        assert!(!staging_path.exists());
+        assert!(staging_path.exists());
         assert_eq!(
             manager
                 .connection
@@ -14881,6 +15066,13 @@ mod tests {
             .connection
             .execute_batch("DROP TRIGGER reject_writer_admission;")
             .unwrap();
+        assert!(
+            manager
+                .open_bound_artifact_output(&session, allocation_id)
+                .is_err()
+        );
+        manager.reconcile_artifacts_startup().unwrap();
+        assert!(!staging_path.exists());
         let mut writer = open_bound(&mut manager, allocation_id);
         writer.write_all(b"retry succeeded").unwrap();
         writer.finish().unwrap();
@@ -26100,6 +26292,17 @@ mod tests {
             0
         );
         assert!(
+            resolve_internal_ref(&manager.artifact_store_root, &staging_ref)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            manager
+                .open_bound_artifact_output(&session, allocation_id)
+                .is_err()
+        );
+        manager.reconcile_artifacts_startup().unwrap();
+        assert!(
             !resolve_internal_ref(&manager.artifact_store_root, &staging_ref)
                 .unwrap()
                 .exists()
@@ -26109,6 +26312,496 @@ mod tests {
                 .open_bound_artifact_output(&session, allocation_id)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn staging_open_each_invoked_failure_preserves_unconsumed_allocation() {
+        for step in ["create_new", "permissions", "file_sync", "dir_sync"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let id = format!("alloc-open-fail-{step}");
+            let (binding_id, attempt_id) = install_one_shot_binding(
+                &manager,
+                step,
+                &[],
+                &[("artifact.write", "output-allocation", &id)],
+            );
+            let mut request = allocation(&id);
+            request.binding_id = Some(binding_id);
+            request.attempt_id = Some(attempt_id);
+            allocate_bound(&mut manager, &request);
+            let staging_ref = load_allocation_row(&manager.connection, &id)
+                .unwrap()
+                .unwrap()
+                .staging_ref
+                .unwrap();
+            let staging_path = manager.artifact_store_root.join(&staging_ref);
+            let injected_path = staging_path.clone();
+            STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |called| {
+                    if called == step {
+                        if step == "create_new" {
+                            std::fs::write(&injected_path, b"partial private construction")?;
+                        }
+                        Err(TaskManagerError::Io(std::io::Error::other(
+                            "injected primitive failure",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }));
+            });
+            assert!(manager.open_artifact_output(&id).is_err());
+            STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            let (state, uses, invoked, pending): (String, i64, i64, i64) = manager.connection.query_row(
+                "SELECT a.state,g.uses_consumed,
+                 (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id)
+                  WHERE p.subject_id=a.allocation_id AND r.resolution_kind='EFFECT_INVOKED'),
+                 (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id)
+                  WHERE p.subject_id=a.allocation_id)
+                 FROM artifact_output_allocations a JOIN authority_grants g ON g.task_id=a.task_id
+                 WHERE a.allocation_id=?1 AND g.grant_id=?2",
+                params![id, format!("grant-{step}-0")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(state, "ALLOCATED");
+            assert_eq!(uses, 0);
+            assert!(invoked >= 1);
+            assert_eq!(pending, 0);
+            assert!(staging_path.exists());
+            assert!(manager.open_artifact_output(&id).is_err());
+            manager.reconcile_artifacts_startup().unwrap();
+            assert!(!staging_path.exists());
+        }
+    }
+
+    #[test]
+    fn staging_open_unresolved_primitive_quarantines_allocated_residue_on_reopen() {
+        for step in ["create_new", "permissions", "file_sync", "dir_sync"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let id = format!("alloc-open-pending-{step}");
+            manager.allocate_artifact_output(&allocation(&id)).unwrap();
+            let staging_ref = load_allocation_row(&manager.connection, &id)
+                .unwrap()
+                .unwrap()
+                .staging_ref
+                .unwrap();
+            let staging_path = manager.artifact_store_root.join(&staging_ref);
+            STAGING_OPEN_RESOLUTION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |called| {
+                    if called == step {
+                        Err(TaskManagerError::Io(std::io::Error::other(
+                            "injected resolution failure",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }));
+            });
+            assert!(manager.open_artifact_output(&id).is_err());
+            STAGING_OPEN_RESOLUTION_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            assert!(staging_path.exists());
+            let seal_path = manager.artifact_store_root.join(seal_ref(&staging_ref));
+            std::fs::write(&seal_path, b"unresolved seal residue").unwrap();
+            let seal = manager
+                .artifact_store_dir
+                .open(safe_internal_ref(&seal_ref(&staging_ref)).unwrap())
+                .unwrap();
+            secure_cap_file_permissions(&seal).unwrap();
+            let pending: i64 = manager.connection.query_row(
+                "SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id)
+                 WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1",
+                [&id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(pending, 1);
+            drop(manager);
+            let mut reopened = TaskManager::open_with_clock(
+                temp.path().join("task-manager.sqlite"),
+                Box::new(FixedClock),
+            )
+            .unwrap();
+            assert_eq!(
+                load_allocation_row(&reopened.connection, &id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "ALLOCATED"
+            );
+            assert!(staging_path.exists());
+            assert_eq!(
+                std::fs::read(&seal_path).unwrap(),
+                b"unresolved seal residue"
+            );
+            assert!(reopened.open_artifact_output(&id).is_err());
+        }
+    }
+
+    #[test]
+    fn staging_open_rechecks_current_grant_before_every_primitive() {
+        for step in ["create_new", "permissions", "file_sync", "dir_sync"] {
+            let temp = TempDir::new().unwrap();
+            let mut manager = manager(&temp);
+            let id = format!("alloc-open-revoked-{step}");
+            let (binding_id, attempt_id) = install_one_shot_binding(
+                &manager,
+                &format!("open-revoked-{step}"),
+                &[],
+                &[("artifact.write", "output-allocation", &id)],
+            );
+            let mut request = allocation(&id);
+            request.binding_id = Some(binding_id);
+            request.attempt_id = Some(attempt_id);
+            allocate_bound(&mut manager, &request);
+            let database = temp.path().join("task-manager.sqlite");
+            let grant_id = format!("grant-open-revoked-{step}-0");
+            let target_invocations = Arc::new(AtomicUsize::new(0));
+            let invoked = Arc::clone(&target_invocations);
+            STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |called| {
+                    if called == step {
+                        invoked.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                }));
+            });
+            STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |called| {
+                    if called == step {
+                        Connection::open(&database)?.execute(
+                            "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z' WHERE grant_id=?1",
+                            [&grant_id],
+                        )?;
+                    }
+                    Ok(())
+                }));
+            });
+            assert!(manager.open_artifact_output(&id).is_err());
+            STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            assert_eq!(target_invocations.load(Ordering::SeqCst), 0);
+            let (uses, no_effect, pending): (i64, i64, i64) = manager.connection.query_row(
+                "SELECT g.uses_consumed,
+                 (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id)
+                  WHERE p.subject_id=?1 AND r.resolution_kind='NO_EFFECT'),
+                 (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id)
+                  WHERE p.subject_id=?1)
+                 FROM authority_grants g WHERE g.grant_id=?2",
+                params![id, format!("grant-open-revoked-{step}-0")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!((uses, no_effect, pending), (0, 1, 0));
+            assert_eq!(
+                load_allocation_row(&manager.connection, &id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "ALLOCATED"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_open_final_admission_rechecks_pinned_grant() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-open-final-revoked";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "open-final-revoked",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let staging_ref = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        WRITER_STAGING_DURABILITY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(&database)?.execute(
+                    "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z'
+                     WHERE grant_id='grant-open-final-revoked-0'",
+                    [],
+                )?;
+                Ok(())
+            }));
+        });
+        assert!(manager.open_artifact_output(id).is_err());
+        assert!(manager.artifact_store_root.join(staging_ref).exists());
+        assert_eq!(
+            load_allocation_row(&manager.connection, id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "ALLOCATED"
+        );
+        let uses: i64 = manager.connection.query_row(
+            "SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-open-final-revoked-0'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(uses, 0);
+    }
+
+    #[test]
+    fn staging_open_does_not_substitute_newly_eligible_grant() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-open-no-grant-switch";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "open-no-grant-switch",
+            &[],
+            &[
+                ("artifact.write", "output-allocation", id),
+                ("artifact.write", "output-allocation", "another-allocation"),
+            ],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let execution = capture_execution_authority(
+            &manager.connection,
+            "T-artifact",
+            request.binding_id.as_deref().unwrap(),
+            "2026-09-19T22:00:00Z",
+        )
+        .unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&invoked);
+        STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |called| {
+                if called == "permissions" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }));
+        });
+        STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |called| {
+                if called == "permissions" {
+                    let other = Connection::open(&database)?;
+                    other.execute_batch(
+                        "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z'
+                         WHERE grant_id='grant-open-no-grant-switch-0';
+                         UPDATE authority_requests SET resolved_resource_id='alloc-open-no-grant-switch'
+                         WHERE request_id='request-open-no-grant-switch-1';
+                         UPDATE policy_decisions SET resolved_resource_id='alloc-open-no-grant-switch'
+                         WHERE decision_id='decision-open-no-grant-switch-1';
+                         UPDATE authority_grants SET grants_json='[{\"action\":\"artifact.write\",\"resource_kind\":\"output-allocation\",\"resource_id\":\"alloc-open-no-grant-switch\",\"semantic_selector\":\"fixture\"}]'
+                         WHERE grant_id='grant-open-no-grant-switch-1';",
+                    )?;
+                }
+                Ok(())
+            }));
+        });
+        assert!(manager.open_artifact_output(id).is_err());
+        STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        let eligible = exact_operation_grant(
+            &manager.connection,
+            "T-artifact",
+            &execution,
+            "artifact.write",
+            "output-allocation",
+            id,
+            "2026-09-19T22:00:00Z",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(eligible.grant_id, "grant-open-no-grant-switch-1");
+        let (uses, no_effect): (i64, i64) = manager.connection.query_row(
+            "SELECT (SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-open-no-grant-switch-1'),
+             (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id)
+              WHERE p.subject_id='alloc-open-no-grant-switch' AND r.resolution_kind='NO_EFFECT')",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((uses, no_effect), (0, 1));
+    }
+
+    #[test]
+    fn staging_open_expired_grant_prevents_file_sync_entry() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let mut manager = manager_with_mutable_clock(&temp, &wall);
+        let id = "alloc-open-grant-expiry";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "open-grant-expiry",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        manager
+            .connection
+            .execute(
+                "UPDATE authority_grants SET expires_at='2026-09-19T22:30:00Z'
+             WHERE grant_id='grant-open-grant-expiry-0'",
+                [],
+            )
+            .unwrap();
+        let at_entry = Arc::clone(&wall);
+        STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |called| {
+                if called == "file_sync" {
+                    *at_entry.lock().unwrap() = "2026-09-19T23:00:00Z".to_owned();
+                }
+                Ok(())
+            }));
+        });
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&invoked);
+        STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |called| {
+                if called == "file_sync" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }));
+        });
+        assert!(manager.open_artifact_output(id).is_err());
+        STAGING_OPEN_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        STAGING_OPEN_INVOCATION_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        let (uses, no_effect): (i64, i64) = manager.connection.query_row(
+            "SELECT (SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-open-grant-expiry-0'),
+             (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id)
+              WHERE p.subject_id='alloc-open-grant-expiry' AND r.resolution_kind='NO_EFFECT')",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((uses, no_effect), (0, 1));
+    }
+
+    #[test]
+    fn staging_open_final_denial_retains_exact_locked_forward_time() {
+        let temp = TempDir::new().unwrap();
+        let wall = Arc::new(Mutex::new("2026-09-19T22:00:00Z".to_owned()));
+        let advance = Arc::new(Mutex::new(None));
+        let mut manager = manager_with_second_sample_clock(&temp, &wall, &advance);
+        let id = "alloc-open-final-clock";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let armed = Arc::clone(&advance);
+        WRITER_STAGING_DURABILITY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                Connection::open(&database)?.execute(
+                    "UPDATE artifact_output_allocations SET writer_generation=writer_generation+1
+                     WHERE allocation_id='alloc-open-final-clock'",
+                    [],
+                )?;
+                *armed.lock().unwrap() = Some((2, "2026-09-19T23:00:00Z".to_owned()));
+                Ok(())
+            }));
+        });
+        assert!(manager.open_artifact_output(id).is_err());
+        let high: i64 = manager
+            .connection
+            .query_row(
+                "SELECT high_water_unix_nanos FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            high,
+            i64::try_from(
+                parse_time("2026-09-19T23:00:00Z")
+                    .unwrap()
+                    .unix_timestamp_nanos()
+            )
+            .unwrap()
+        );
+        *wall.lock().unwrap() = "2026-09-19T22:00:00Z".to_owned();
+        assert!(crate::trusted_time::protected_now(&manager.connection, &manager.clock).is_err());
+        let confidence: String = manager
+            .connection
+            .query_row(
+                "SELECT confidence FROM trusted_time_state WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "TIME_UNCERTAIN");
+    }
+
+    #[test]
+    fn staging_open_lost_admission_ack_returns_exact_one_shot_writer() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-open-lost-ack";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "open-lost-ack",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        WRITER_ADMISSION_COMMIT_RESULT_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(TaskManagerError::Io(std::io::Error::other(
+                    "lost writer admission acknowledgement",
+                )))
+            }));
+        });
+        let mut writer = open_bound(&mut manager, id);
+        let durable = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.state, "WRITING");
+        assert_eq!(
+            durable.writer_session_id.as_deref(),
+            Some(writer.writer_session_id.as_str())
+        );
+        assert_eq!(durable.writer_generation, writer.writer_generation);
+        assert_eq!(
+            durable
+                .writer_grant_admission
+                .as_ref()
+                .map(|x| x.grant_id.as_str()),
+            Some("grant-open-lost-ack-0")
+        );
+        let uses: i64 = manager
+            .connection
+            .query_row(
+                "SELECT uses_consumed FROM authority_grants WHERE grant_id='grant-open-lost-ack-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uses, 1);
+        writer.write_all(b"durable admission").unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]
@@ -26395,7 +27088,8 @@ mod tests {
             [allocation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
-        assert_eq!((invoked, pending), (1, 0));
+        // Four private staging setup primitives precede the single write.
+        assert_eq!((invoked, pending), (5, 0));
         drop(writer);
 
         let mut resumed = open_bound(&mut manager, allocation_id);
@@ -26433,7 +27127,8 @@ mod tests {
             "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
             [id], |row| row.get(0),
         ).unwrap();
-        assert_eq!(invoked, 2);
+        // Four setup primitives and two file writes were invoked.
+        assert_eq!(invoked, 6);
     }
 
     #[test]
@@ -26465,7 +27160,8 @@ mod tests {
             "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_WRITE' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
             [id], |row| row.get(0),
         ).unwrap();
-        assert_eq!(invoked, 1);
+        // Four setup primitives and the partial-error write were invoked.
+        assert_eq!(invoked, 5);
     }
 
     #[test]
