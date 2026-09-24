@@ -1376,6 +1376,88 @@ struct SealedStaging {
     content_hash: String,
 }
 
+/// One invocation of a live staging-seal filesystem primitive.  In particular,
+/// a failed primitive is still an invoked effect: it may have changed the file.
+struct LiveStagingSeal<'a> {
+    connection: &'a mut Connection,
+    clock: &'a Arc<dyn Clock>,
+    lease_owner: &'a str,
+    lease_epoch: i64,
+    grant_admission: Option<&'a GrantAdmission>,
+    task_id: &'a str,
+    allocation_id: &'a str,
+    writer_session_id: &'a str,
+    writer_generation: i64,
+}
+
+impl LiveStagingSeal<'_> {
+    fn invoke<T>(&mut self, primitive: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.invoke_checked(|| Ok(()), primitive)
+    }
+
+    fn invoke_unsealed<T>(
+        &mut self,
+        store: &Dir,
+        seal_reference: &str,
+        primitive: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.invoke_checked(|| ensure_writer_unsealed(store, seal_reference), primitive)
+    }
+
+    fn invoke_checked<T>(
+        &mut self,
+        precheck: impl FnOnce() -> Result<()>,
+        primitive: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let permit = super::trusted_time::prepare_external_effect(
+            self.connection,
+            self.clock,
+            self.lease_owner,
+            self.lease_epoch,
+            self.task_id,
+            super::trusted_time::ExternalEffectKind::StagingSeal,
+            self.allocation_id,
+        )?;
+        staging_seal_before_entry_step()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let entry = super::trusted_time::capture_external_entry(&transaction, self.clock, &permit)?;
+        let pre_call = entry.require_trusted_time().and_then(|now| {
+            validate_writer_fence(
+                &transaction,
+                self.allocation_id,
+                &now,
+                self.lease_owner,
+                self.lease_epoch,
+                self.grant_admission,
+                self.writer_session_id,
+                self.writer_generation,
+            )?;
+            let exact_task: bool = transaction.query_row(
+                "SELECT task_id=?2 FROM artifact_output_allocations WHERE allocation_id=?1",
+                params![self.allocation_id, self.task_id],
+                |row| row.get(0),
+            )?;
+            if !exact_task {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            precheck()?;
+            Ok(())
+        });
+        if let Err(error) = pre_call {
+            super::trusted_time::resolve_external_no_effect_in(&permit, entry)?;
+            transaction.commit()?;
+            return Err(error);
+        }
+        let outcome = primitive();
+        staging_seal_resolution_step()?;
+        super::trusted_time::resolve_external_entry_in(&permit, entry)?;
+        transaction.commit()?;
+        outcome
+    }
+}
+
 impl ArtifactStagingWriter {
     pub fn allocation_id(&self) -> &str {
         &self.allocation_id
@@ -1395,56 +1477,22 @@ impl ArtifactStagingWriter {
                 "Artifact staging writer outcome is uncertain",
             ));
         }
-        let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)?
-            .require_trusted_time()?;
-        let mut first_time = None;
-        let first: Result<_> = (|| {
-            let transaction = self
-                .authority_connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            first_time = Some(super::trusted_time::capture_locked(
-                &transaction,
-                &self.clock,
-            )?);
-            let fresh = first_time
-                .as_ref()
-                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
-            let checked_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            let fence = validate_writer_fence(
-                &transaction,
-                &self.allocation_id,
-                &checked_at,
-                &self.lease_owner,
-                self.lease_epoch,
-                self.grant_admission.as_ref(),
-                &self.writer_session_id,
-                self.writer_generation,
-            );
-            if let Err(error) = fence {
-                drop(transaction);
-                return Err(error);
-            }
-            ensure_writer_unsealed(&self.store, &self.seal_ref)?;
-            let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
-                "Artifact staging writer is already finalized",
-            ))?;
-            file.flush()?;
-            file.sync_all()?;
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            transaction.commit()?;
-            first_time = None;
-            Ok(file)
-        })();
-        if let Some(fresh) = first_time {
-            fresh.commit(&self.authority_connection)?;
-        }
-        let mut file = first?;
+        let mut file = self.file.take().ok_or(TaskManagerError::InvalidRecord(
+            "Artifact staging writer is already finalized",
+        ))?;
+        let mut seal = LiveStagingSeal {
+            connection: &mut self.authority_connection,
+            clock: &self.clock,
+            lease_owner: &self.lease_owner,
+            lease_epoch: self.lease_epoch,
+            grant_admission: self.grant_admission.as_ref(),
+            task_id: &self.task_id,
+            allocation_id: &self.allocation_id,
+            writer_session_id: &self.writer_session_id,
+            writer_generation: self.writer_generation,
+        };
+        seal.invoke_unsealed(&self.store, &self.seal_ref, || Ok(file.flush()?))?;
+        seal.invoke_unsealed(&self.store, &self.seal_ref, || Ok(file.sync_all()?))?;
         file.seek(SeekFrom::Start(0))?;
         let (size_bytes, content_hash) = hash_reader(&mut file)?;
         if size_bytes != self.written {
@@ -1454,59 +1502,14 @@ impl ArtifactStagingWriter {
         }
         drop(file);
         writer_finish_step()?;
-        let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)?
-            .require_trusted_time()?;
-        let mut second_time = None;
-        let sealed: Result<()> = (|| {
-            let transaction = self
-                .authority_connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            second_time = Some(super::trusted_time::capture_locked(
-                &transaction,
-                &self.clock,
-            )?);
-            let fresh = second_time
-                .as_ref()
-                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
-            let checked_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            let fence = validate_writer_fence(
-                &transaction,
-                &self.allocation_id,
-                &checked_at,
-                &self.lease_owner,
-                self.lease_epoch,
-                self.grant_admission.as_ref(),
-                &self.writer_session_id,
-                self.writer_generation,
-            );
-            if let Err(error) = fence {
-                drop(transaction);
-                return Err(error);
-            }
-            ensure_writer_unsealed(&self.store, &self.seal_ref)?;
-            let sealed = SealedStaging {
-                version: SEALED_STAGING_VERSION,
-                allocation_id: self.allocation_id.clone(),
-                size_bytes,
-                content_hash,
-            };
-            let bytes = serde_json::to_vec(&sealed)?;
-            write_staging_seal_atomically(&self.store, &self.seal_ref, &bytes)?;
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            transaction.commit()?;
-            second_time = None;
-            Ok(())
-        })();
-        if let Some(fresh) = second_time {
-            fresh.commit(&self.authority_connection)?;
-        }
-        sealed?;
+        let sealed = SealedStaging {
+            version: SEALED_STAGING_VERSION,
+            allocation_id: self.allocation_id.clone(),
+            size_bytes,
+            content_hash,
+        };
+        let bytes = serde_json::to_vec(&sealed)?;
+        write_staging_seal_live(&mut seal, &self.store, &self.seal_ref, &bytes)?;
         Ok(self.written)
     }
 }
@@ -1617,68 +1620,27 @@ impl Write for ArtifactStagingWriter {
         if self.poisoned {
             return Err(std::io::Error::other("staging write outcome is uncertain"));
         }
-        let _ = super::trusted_time::assess(&self.authority_connection, &self.clock)
-            .and_then(|assessment| assessment.require_trusted_time())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
-        let mut locked_time = None;
-        let outcome = (|| -> std::io::Result<()> {
-            let transaction = self
-                .authority_connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(std::io::Error::other)?;
-            locked_time = Some(
-                super::trusted_time::capture_locked(&transaction, &self.clock)
-                    .map_err(std::io::Error::other)?,
-            );
-            let fresh = locked_time.as_ref().expect("captured writer flush time");
-            let checked_at = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        error,
-                    ));
-                }
+        let outcome = (|| -> Result<()> {
+            let file = self.file.as_mut().ok_or(TaskManagerError::InvalidRecord(
+                "staging writer is finalized",
+            ))?;
+            let mut seal = LiveStagingSeal {
+                connection: &mut self.authority_connection,
+                clock: &self.clock,
+                lease_owner: &self.lease_owner,
+                lease_epoch: self.lease_epoch,
+                grant_admission: self.grant_admission.as_ref(),
+                task_id: &self.task_id,
+                allocation_id: &self.allocation_id,
+                writer_session_id: &self.writer_session_id,
+                writer_generation: self.writer_generation,
             };
-            let fence = validate_writer_fence(
-                &transaction,
-                &self.allocation_id,
-                &checked_at,
-                &self.lease_owner,
-                self.lease_epoch,
-                self.grant_admission.as_ref(),
-                &self.writer_session_id,
-                self.writer_generation,
-            );
-            if let Err(error) = fence {
-                drop(transaction);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    error,
-                ));
-            }
-            ensure_writer_unsealed(&self.store, &self.seal_ref).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-            })?;
-            self.file
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("staging writer is finalized"))?
-                .flush()?;
-            fresh
-                .commit_in(&transaction)
-                .and_then(|assessment| assessment.require_trusted_time())
-                .map_err(std::io::Error::other)?;
-            transaction.commit().map_err(std::io::Error::other)?;
-            locked_time = None;
-            Ok(())
+            seal.invoke_unsealed(&self.store, &self.seal_ref, || Ok(file.flush()?))
         })();
-        if let Some(fresh) = locked_time {
-            fresh
-                .commit(&self.authority_connection)
-                .map_err(std::io::Error::other)?;
+        if outcome.is_err() {
+            self.poisoned = true;
         }
-        outcome
+        outcome.map_err(std::io::Error::other)
     }
 }
 
@@ -3052,133 +3014,100 @@ impl TaskManager {
         }
         let _ = super::trusted_time::protected_now(&self.connection, &self.clock)?;
         let writer_session_id = random_token(&self.connection)?;
-        let mut first_time = None;
-        let mut final_time = None;
-        let outcome = (|| -> Result<u64> {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            first_time = Some(super::trusted_time::capture_locked(
-                &transaction,
+        // Commit the generation switch before touching filesystem evidence. A
+        // failed later primitive must never leave the retained writer active.
+        let (writer_generation, grant_admission, staging_ref) =
+            super::trusted_time::with_protected_immediate(
+                &self.connection,
                 &self.clock,
-            )?);
-            let fresh = first_time
-                .as_ref()
-                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
-            let now = match fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            let checked_allocation = validate_writer_authority(
-                &transaction,
-                allocation_id,
-                &now,
-                &self.lease_owner,
-                self.lease_epoch,
-                allocation.writer_grant_admission.as_ref(),
-            );
-            let allocation = match checked_allocation {
-                Ok(allocation) => allocation,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            let writer_generation = allocation.writer_generation.checked_add(1).ok_or(
-                TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
-            )?;
-            let changed = transaction.execute(
-                "UPDATE artifact_output_allocations
+                |transaction, now| {
+                    let checked = validate_writer_authority(
+                        transaction,
+                        allocation_id,
+                        now,
+                        &self.lease_owner,
+                        self.lease_epoch,
+                        allocation.writer_grant_admission.as_ref(),
+                    )?;
+                    let writer_generation = checked.writer_generation.checked_add(1).ok_or(
+                        TaskManagerError::InvalidRecord("Artifact writer generation exhausted"),
+                    )?;
+                    let changed = transaction.execute(
+                        "UPDATE artifact_output_allocations
              SET writer_session_id=?2,writer_generation=?3,updated_at=?4
              WHERE allocation_id=?1 AND state='WRITING'
                AND writer_generation=?5 AND writer_session_id IS ?6",
-                params![
-                    allocation_id,
-                    writer_session_id,
-                    writer_generation,
-                    now,
-                    allocation.writer_generation,
-                    allocation.writer_session_id
-                ],
+                        params![
+                            allocation_id,
+                            writer_session_id,
+                            writer_generation,
+                            now,
+                            checked.writer_generation,
+                            checked.writer_session_id
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(TaskManagerError::InvalidRecord(
+                            "ARTIFACT_ALLOCATION_STATE_CONFLICT",
+                        ));
+                    }
+                    let staging_ref = checked.staging_ref.ok_or(
+                        TaskManagerError::InvalidRecord("ARTIFACT_ALLOCATION_STATE_CONFLICT"),
+                    )?;
+                    Ok((
+                        writer_generation,
+                        checked.writer_grant_admission,
+                        staging_ref,
+                    ))
+                },
             )?;
-            if changed != 1 {
-                return Err(TaskManagerError::InvalidRecord(
-                    "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                ));
-            }
-            let staging_ref =
-                allocation
-                    .staging_ref
-                    .as_deref()
-                    .ok_or(TaskManagerError::InvalidRecord(
-                        "ARTIFACT_ALLOCATION_STATE_CONFLICT",
-                    ))?;
-            let seal_reference = seal_ref(staging_ref);
-            // Read the fsynced pending evidence first. Once present, it is part of
-            // the authenticated finish protocol and must not be replaced from
-            // subsequently changed staging bytes.
-            let pending_reference = format!("{seal_reference}.pending");
-            let pending = read_staging_seal_evidence(&self.artifact_store_dir, &pending_reference)?;
-            let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
-            let (size, hash) = hash_internal_file(&self.artifact_store_dir, staging_ref)?;
-            writer_finish_step()?;
-            final_time = Some(super::trusted_time::capture_locked(
-                &transaction,
-                &self.clock,
-            )?);
-            let final_fresh = final_time
-                .as_ref()
-                .ok_or(TaskManagerError::InvalidRecord("TIME_UNCERTAIN"))?;
-            let final_now = match final_fresh.require_trusted_time() {
-                Ok(now) => now,
-                Err(error) => {
-                    drop(transaction);
-                    return Err(error);
-                }
-            };
-            let final_fence = validate_writer_fence(
-                &transaction,
-                allocation_id,
-                &final_now,
-                &self.lease_owner,
-                self.lease_epoch,
-                allocation.writer_grant_admission.as_ref(),
-                &writer_session_id,
-                writer_generation,
-            );
-            if let Err(error) = final_fence {
-                drop(transaction);
-                return Err(error);
-            }
-            resolve_staging_seal_evidence(
-                &self.artifact_store_dir,
-                allocation_id,
-                &seal_reference,
-                &pending,
-                &final_seal,
-                size,
-                &hash,
-                true,
-            )?;
-            fresh.commit_in(&transaction)?.require_trusted_time()?;
-            final_fresh
-                .commit_in(&transaction)?
-                .require_trusted_time()?;
-            transaction.commit()?;
-            first_time = None;
-            final_time = None;
-            Ok(size)
-        })();
-        if let Some(fresh) = first_time {
-            fresh.commit(&self.connection)?;
+        let seal_reference = seal_ref(&staging_ref);
+        // Read the fsynced pending evidence first. Once present, it is part of
+        // the authenticated finish protocol and must not be replaced from
+        // subsequently changed staging bytes.
+        let pending_reference = format!("{seal_reference}.pending");
+        let pending = read_staging_seal_evidence(&self.artifact_store_dir, &pending_reference)?;
+        let final_seal = read_staging_seal_evidence(&self.artifact_store_dir, &seal_reference)?;
+        let (size, hash) = hash_internal_file(&self.artifact_store_dir, &staging_ref)?;
+        writer_finish_step()?;
+        let mut seal = LiveStagingSeal {
+            connection: &mut self.connection,
+            clock: &self.clock,
+            lease_owner: &self.lease_owner,
+            lease_epoch: self.lease_epoch,
+            grant_admission: grant_admission.as_ref(),
+            task_id: &allocation.task_id,
+            allocation_id,
+            writer_session_id: &writer_session_id,
+            writer_generation,
+        };
+        if !matches!(pending, StagingSealEvidence::Complete(_))
+            && !matches!(final_seal, StagingSealEvidence::Complete(_))
+        {
+            // A reconstructed seal must attest bytes made durable under this
+            // exact retry generation, including when both seal names are absent.
+            seal.invoke(|| {
+                durability_step("sync-staging-retry-file")?;
+                self.artifact_store_dir
+                    .open_with(
+                        safe_internal_ref(&staging_ref)?,
+                        CapOpenOptions::new().read(true).write(true),
+                    )?
+                    .sync_all()?;
+                Ok(())
+            })?;
         }
-        if let Some(fresh) = final_time {
-            fresh.commit(&self.connection)?;
-        }
-        outcome
+        resolve_staging_seal_evidence_live(
+            &mut seal,
+            &self.artifact_store_dir,
+            allocation_id,
+            &seal_reference,
+            &pending,
+            &final_seal,
+            size,
+            &hash,
+        )?;
+        Ok(size)
     }
 
     #[allow(
@@ -12630,10 +12559,14 @@ fn resolve_staging_seal_evidence(
 
 fn write_staging_seal_atomically(store: &Dir, seal_reference: &str, bytes: &[u8]) -> Result<()> {
     let temporary = format!("{seal_reference}.pending");
-    let mut seal = store.open_with(
-        safe_internal_ref(&temporary)?,
-        CapOpenOptions::new().write(true).create_new(true),
-    )?;
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut seal = store.open_with(safe_internal_ref(&temporary)?, &options)?;
     secure_cap_file_permissions(&seal)?;
     seal.write_all(bytes)?;
     seal.flush()?;
@@ -12646,6 +12579,141 @@ fn write_staging_seal_atomically(store: &Dir, seal_reference: &str, bytes: &[u8]
         safe_internal_ref(seal_reference)?,
     )?;
     sync_completed_staging_seal_directory(store)
+}
+
+fn write_staging_seal_live(
+    authority: &mut LiveStagingSeal<'_>,
+    store: &Dir,
+    seal_reference: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let temporary = format!("{seal_reference}.pending");
+    let mut seal = authority.invoke_unsealed(store, seal_reference, || {
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        Ok(store.open_with(safe_internal_ref(&temporary)?, &options)?)
+    })?;
+    authority.invoke(|| secure_cap_file_permissions(&seal))?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written =
+            authority.invoke(|| Ok(staging_seal_write_primitive(&mut seal, &bytes[offset..])?))?;
+        if written == 0 {
+            return Err(TaskManagerError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "staging seal write returned zero bytes",
+            )));
+        }
+        offset += written;
+    }
+    authority.invoke(|| Ok(seal.flush()?))?;
+    authority.invoke(|| Ok(seal.sync_all()?))?;
+    authority.invoke(|| {
+        durability_step("sync-staging-seal")?;
+        sync_cap_directory(store, "staging")
+    })?;
+    authority.invoke(|| {
+        store.rename(
+            safe_internal_ref(&temporary)?,
+            store,
+            safe_internal_ref(seal_reference)?,
+        )?;
+        Ok(())
+    })?;
+    authority.invoke(|| sync_completed_staging_seal_directory(store))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the live resolver authenticates pending and final evidence before each marked primitive"
+)]
+fn resolve_staging_seal_evidence_live(
+    authority: &mut LiveStagingSeal<'_>,
+    store: &Dir,
+    allocation_id: &str,
+    seal_reference: &str,
+    pending: &StagingSealEvidence,
+    final_seal: &StagingSealEvidence,
+    size_bytes: u64,
+    content_hash: &str,
+) -> Result<()> {
+    let pending_reference = format!("{seal_reference}.pending");
+    if let StagingSealEvidence::Complete(sealed) = pending {
+        validate_staging_seal(sealed, allocation_id, size_bytes, content_hash)?;
+    }
+    if let StagingSealEvidence::Complete(sealed) = final_seal {
+        validate_staging_seal(sealed, allocation_id, size_bytes, content_hash)?;
+    }
+    if matches!(pending, StagingSealEvidence::Complete(_)) {
+        match final_seal {
+            StagingSealEvidence::Complete(_) => {
+                authority.invoke(|| {
+                    store.remove_file(safe_internal_ref(&pending_reference)?)?;
+                    Ok(())
+                })?;
+                return authority.invoke(|| sync_completed_staging_seal_directory(store));
+            }
+            StagingSealEvidence::Truncated => {
+                authority.invoke(|| {
+                    store.remove_file(safe_internal_ref(seal_reference)?)?;
+                    Ok(())
+                })?;
+                authority.invoke(|| sync_cap_directory(store, "staging"))?;
+            }
+            StagingSealEvidence::Absent => {}
+        }
+        authority.invoke(|| {
+            store.rename(
+                safe_internal_ref(&pending_reference)?,
+                store,
+                safe_internal_ref(seal_reference)?,
+            )?;
+            Ok(())
+        })?;
+        return authority.invoke(|| sync_completed_staging_seal_directory(store));
+    }
+    if matches!(final_seal, StagingSealEvidence::Complete(_)) {
+        if matches!(pending, StagingSealEvidence::Truncated) {
+            authority.invoke(|| {
+                store.remove_file(safe_internal_ref(&pending_reference)?)?;
+                Ok(())
+            })?;
+        }
+        return authority.invoke(|| sync_completed_staging_seal_directory(store));
+    }
+    for (reference, evidence) in [
+        (pending_reference.as_str(), pending),
+        (seal_reference, final_seal),
+    ] {
+        if matches!(evidence, StagingSealEvidence::Truncated) {
+            authority.invoke(|| {
+                store.remove_file(safe_internal_ref(reference)?)?;
+                Ok(())
+            })?;
+        }
+    }
+    if matches!(pending, StagingSealEvidence::Truncated)
+        || matches!(final_seal, StagingSealEvidence::Truncated)
+    {
+        authority.invoke(|| sync_cap_directory(store, "staging"))?;
+    }
+    let sealed = SealedStaging {
+        version: SEALED_STAGING_VERSION,
+        allocation_id: allocation_id.to_owned(),
+        size_bytes,
+        content_hash: content_hash.to_owned(),
+    };
+    write_staging_seal_live(
+        authority,
+        store,
+        seal_reference,
+        &serde_json::to_vec(&sealed)?,
+    )
 }
 
 fn sync_completed_staging_seal_directory(store: &Dir) -> Result<()> {
@@ -13078,6 +13146,9 @@ type WriterWritePrimitiveTestHook =
     Box<dyn FnOnce(&mut cap_std::fs::File, &[u8]) -> std::io::Result<usize>>;
 
 #[cfg(test)]
+type StagingSealTestHook = Box<dyn FnMut() -> Result<()>>;
+
+#[cfg(test)]
 type StagingOpenTestHook = Box<dyn FnMut(&'static str) -> Result<()>>;
 
 #[cfg(test)]
@@ -13101,6 +13172,12 @@ thread_local! {
     static WRITER_WRITE_RESOLUTION_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
     static WRITER_WRITE_PRIMITIVE_TEST_HOOK: std::cell::RefCell<Option<WriterWritePrimitiveTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_SEAL_BEFORE_ENTRY_TEST_HOOK: std::cell::RefCell<Option<StagingSealTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_SEAL_RESOLUTION_TEST_HOOK: std::cell::RefCell<Option<StagingSealTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static STAGING_SEAL_WRITE_PRIMITIVE_TEST_HOOK: std::cell::RefCell<Option<WriterWritePrimitiveTestHook>> =
         const { std::cell::RefCell::new(None) };
     static READER_ADMISSION_COMMIT_RESULT_TEST_HOOK: std::cell::RefCell<Option<ExportCompletionTestHook>> =
         const { std::cell::RefCell::new(None) };
@@ -13287,6 +13364,65 @@ fn writer_write_primitive(file: &mut cap_std::fs::File, buffer: &[u8]) -> std::i
 #[cfg(not(test))]
 fn writer_write_primitive(file: &mut cap_std::fs::File, buffer: &[u8]) -> std::io::Result<usize> {
     file.write(buffer)
+}
+
+#[cfg(test)]
+fn staging_seal_before_entry_step() -> Result<()> {
+    STAGING_SEAL_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().as_mut() {
+            callback()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test entry failure injection shares this signature"
+)]
+fn staging_seal_before_entry_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn staging_seal_resolution_step() -> Result<()> {
+    STAGING_SEAL_RESOLUTION_TEST_HOOK.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().as_mut() {
+            callback()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test resolution failure injection shares this signature"
+)]
+fn staging_seal_resolution_step() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn staging_seal_write_primitive(
+    file: &mut cap_std::fs::File,
+    bytes: &[u8],
+) -> std::io::Result<usize> {
+    if let Some(hook) = STAGING_SEAL_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| hook.borrow_mut().take())
+    {
+        hook(file, bytes)
+    } else {
+        file.write(bytes)
+    }
+}
+
+#[cfg(not(test))]
+fn staging_seal_write_primitive(
+    file: &mut cap_std::fs::File,
+    bytes: &[u8],
+) -> std::io::Result<usize> {
+    file.write(bytes)
 }
 
 #[cfg(test)]
@@ -23626,6 +23762,271 @@ mod tests {
                 .join(seal_ref(&staging_ref))
                 .exists()
         );
+    }
+
+    #[test]
+    fn retry_syncs_staging_file_under_committed_generation_before_reconstruction() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-retry-file-sync";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "retry-file-sync",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut retained = open_bound(&mut manager, id);
+        retained.write_all(b"durable reconstruction").unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        DURABILITY_TEST_CONTROL.with(|control| {
+            *control.borrow_mut() = Some((Vec::new(), Some("sync-staging-retry-file".to_owned())));
+        });
+        assert!(matches!(
+            manager.retry_bound_artifact_output_finish(&session, id),
+            Err(TaskManagerError::Io(_))
+        ));
+        DURABILITY_TEST_CONTROL.with(|control| {
+            let operations = control.borrow_mut().take().unwrap().0;
+            assert_eq!(operations, ["sync-staging-retry-file"]);
+        });
+        let allocation = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocation.writer_generation, 2);
+        let staging_ref = allocation.staging_ref.unwrap();
+        assert!(
+            !manager
+                .artifact_store_root
+                .join(seal_ref(&staging_ref))
+                .exists()
+        );
+        assert!(retained.write(b"denied").is_err());
+        let invoked: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(invoked, 1);
+    }
+
+    #[test]
+    fn staging_seal_rechecks_revocation_between_finish_primitives() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-seal-later-revocation";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "seal-later-revocation",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id);
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, id);
+        writer.write_all(b"sealed later").unwrap();
+        let grant_id: String = manager
+            .connection
+            .query_row(
+                "SELECT writer_grant_id FROM artifact_output_allocations WHERE allocation_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let database = temp.path().join("task-manager.sqlite");
+        let mut entries = 0;
+        STAGING_SEAL_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                entries += 1;
+                if entries == 2 {
+                    rusqlite::Connection::open(&database)?.execute(
+                        "UPDATE authority_grants SET state='REVOKED',revoked_at='2026-09-19T22:00:00Z' WHERE grant_id=?1",
+                        [&grant_id],
+                    )?;
+                }
+                Ok(())
+            }));
+        });
+        assert!(writer.finish().is_err());
+        STAGING_SEAL_BEFORE_ENTRY_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        let (invoked, no_effect, pending): (i64, i64, i64) = manager.connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'),
+                (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1 AND r.resolution_kind='NO_EFFECT'),
+                (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1)",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((invoked, no_effect, pending), (1, 1, 0));
+    }
+
+    #[test]
+    fn partial_seal_write_is_invoked_and_retry_reconstructs_only_after_resolution() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-partial-seal-write";
+        let (binding_id, attempt_id) = install_one_shot_binding(
+            &manager,
+            "partial-seal-write",
+            &[],
+            &[("artifact.write", "output-allocation", id)],
+        );
+        let mut request = allocation(id);
+        request.binding_id = Some(binding_id.clone());
+        request.attempt_id = Some(attempt_id);
+        allocate_bound(&mut manager, &request);
+        let mut writer = open_bound(&mut manager, id);
+        writer.write_all(b"partial seal body").unwrap();
+        STAGING_SEAL_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|file, bytes| {
+                file.write_all(&bytes[..7])?;
+                Err(std::io::Error::other("injected partial seal write"))
+            }));
+        });
+        assert!(matches!(writer.finish(), Err(TaskManagerError::Io(_))));
+        let staging_ref = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let pending = manager
+            .artifact_store_root
+            .join(format!("{}.pending", seal_ref(&staging_ref)));
+        assert_eq!(std::fs::read(&pending).unwrap().len(), 7);
+        let (invoked, pending_markers): (i64, i64) = manager.connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM trusted_time_effect_resolutions r JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1 AND r.resolution_kind='EFFECT_INVOKED'),
+                (SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1)",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((invoked, pending_markers), (5, 0));
+        let session = manager
+            .issue_provider_artifact_session("T-artifact", &binding_id)
+            .unwrap();
+        assert_eq!(
+            manager
+                .retry_bound_artifact_output_finish(&session, id)
+                .unwrap(),
+            17
+        );
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn unresolved_partial_seal_write_quarantines_pending_bytes_across_reopen() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-unresolved-partial-seal";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        writer.write_all(b"unresolved body").unwrap();
+        STAGING_SEAL_WRITE_PRIMITIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|file, bytes| {
+                file.write_all(&bytes[..7])?;
+                Err(std::io::Error::other("partial seal"))
+            }));
+        });
+        let mut resolutions = 0;
+        STAGING_SEAL_RESOLUTION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                resolutions += 1;
+                if resolutions == 5 {
+                    Err(TaskManagerError::Io(std::io::Error::other(
+                        "lost seal resolution",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }));
+        });
+        assert!(writer.finish().is_err());
+        STAGING_SEAL_RESOLUTION_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        let staging_ref = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let pending = manager
+            .artifact_store_root
+            .join(format!("{}.pending", seal_ref(&staging_ref)));
+        assert_eq!(std::fs::read(&pending).unwrap().len(), 7);
+        let final_seal = manager.artifact_store_root.join(seal_ref(&staging_ref));
+        assert!(!final_seal.exists());
+        drop(manager);
+        let mut reopened = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        assert!(reopened.open_artifact_output(id).is_err());
+        assert_eq!(std::fs::read(&pending).unwrap().len(), 7);
+        assert!(!final_seal.exists());
+        let unresolved: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn unresolved_rename_resolution_preserves_final_seal_across_reopen() {
+        let temp = TempDir::new().unwrap();
+        let mut manager = manager(&temp);
+        let id = "alloc-unresolved-seal-rename";
+        manager.allocate_artifact_output(&allocation(id)).unwrap();
+        let mut writer = manager.open_artifact_output(id).unwrap();
+        writer.write_all(b"renamed before response loss").unwrap();
+        let mut resolutions = 0;
+        STAGING_SEAL_RESOLUTION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                resolutions += 1;
+                if resolutions == 9 {
+                    Err(TaskManagerError::Io(std::io::Error::other(
+                        "lost rename resolution",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }));
+        });
+        assert!(writer.finish().is_err());
+        STAGING_SEAL_RESOLUTION_TEST_HOOK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        let staging_ref = load_allocation_row(&manager.connection, id)
+            .unwrap()
+            .unwrap()
+            .staging_ref
+            .unwrap();
+        let final_seal = manager.artifact_store_root.join(seal_ref(&staging_ref));
+        let pending = manager
+            .artifact_store_root
+            .join(format!("{}.pending", seal_ref(&staging_ref)));
+        let bytes = std::fs::read(&final_seal).unwrap();
+        assert!(!pending.exists());
+        drop(manager);
+        let mut reopened = TaskManager::open_with_clock(
+            temp.path().join("task-manager.sqlite"),
+            Box::new(FixedClock),
+        )
+        .unwrap();
+        assert!(reopened.open_artifact_output(id).is_err());
+        assert_eq!(std::fs::read(&final_seal).unwrap(), bytes);
+        assert!(!pending.exists());
+        let unresolved: i64 = reopened.connection.query_row(
+            "SELECT COUNT(*) FROM trusted_time_effect_pending x JOIN trusted_time_effect_preparations p USING(marker_id) WHERE p.subject_kind='ARTIFACT_STAGING_SEAL' AND p.subject_id=?1",
+            [id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(unresolved, 1);
     }
 
     #[test]
