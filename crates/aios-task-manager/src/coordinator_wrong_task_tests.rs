@@ -17,14 +17,6 @@ const SUITE_HASH: &str = "sha256:33333333333333333333333333333333333333333333333
 const BUILD_HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SOURCE: &[u8] = b"exact private export bytes\n";
 
-struct UnusedAdapter;
-
-impl TrustedExportAdapter for UnusedAdapter {
-    fn open(&self) -> io::Result<Box<dyn ArtifactExportWriter>> {
-        panic!("a denied read claim must never open the export destination")
-    }
-}
-
 fn admitted_registry() -> (SemanticRegistry, String) {
     let mut snapshot: aios_contracts::RegistrySnapshot = serde_json::from_str(include_str!(
         "../../../examples/aios-ir/registry-snapshot.json"
@@ -257,7 +249,6 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
             "service://fixture/exact",
             "fixture_remote",
             "adapter:exact",
-            Arc::new(UnusedAdapter),
         )
         .unwrap();
     coordinator
@@ -303,7 +294,7 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::Running
+            TaskState::Runnable
         );
     }
     let session_b = coordinator
