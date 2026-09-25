@@ -5,9 +5,9 @@
 //! identities, adapters, or destination factories.
 
 use super::{
-    Actor, ArtifactExportWriter, CreateTask, ImportArtifactRequest, Result, TaskManager,
-    TaskManagerError, TaskMutation, TaskState, TransitionReason, TransitionRequest, WaitingKind,
-    WaitingOn,
+    Actor, ArtifactExportWriter, ArtifactReader, CreateTask, ImportArtifactRequest,
+    ProviderArtifactSession, Result, TaskManager, TaskManagerError, TaskMutation, TaskState,
+    TransitionReason, TransitionRequest, WaitingKind, WaitingOn,
     artifact_store::ExactExportReplayIdentity,
     authority_candidate::{
         CandidateResourceChoice, CandidateResourceHandle, ReserveAuthorityCandidate,
@@ -121,6 +121,15 @@ pub struct LocalExportProposal {
     pub max_size_bytes: u64,
 }
 
+/// Fresh identities for an unused attempt retired by trusted startup recovery.
+pub struct RestartedLocalExportAttempt {
+    pub candidate_id: String,
+    pub binding_id: String,
+    pub attempt_id: String,
+    pub output_allocation_id: String,
+    pub operation_id: String,
+}
+
 /// Opaque export prepared by the trusted coordinator.
 #[derive(Clone)]
 #[allow(
@@ -140,6 +149,13 @@ pub struct PreparedLocalExport {
     purpose: String,
     max_size_bytes: u64,
     approval_ids: Vec<String>,
+}
+
+/// Opaque session issued only after the trusted binding claim is admitted.
+#[derive(Debug)]
+pub struct AdmittedLocalArtifactRead {
+    session: ProviderArtifactSession,
+    source_artifact_id: String,
 }
 
 impl PreparedLocalExport {
@@ -673,6 +689,232 @@ impl TrustedLocalCoordinator {
         Ok(LocalExportExecution {
             prepared: prepared.clone(),
         })
+    }
+
+    /// Prepares a fresh attempt after startup retired an unused prior binding.
+    /// The historical reference is authenticated against the finalized receipt;
+    /// it carries no authority into the new clock session.
+    ///
+    /// # Errors
+    /// Returns an error if the old receipt was not safely retired or current
+    /// provider, resource, policy, and candidate admission fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps historical replay authentication and fresh candidate admission together"
+    )]
+    pub fn prepare_restarted_local_export(
+        &mut self,
+        previous: &CompletedLocalExportReference,
+        next: &RestartedLocalExportAttempt,
+    ) -> Result<PreparedLocalExport> {
+        let old = self
+            .manager
+            .finalize_pending_authority_candidate(&previous.candidate_id)?;
+        if old.binding_id != previous.binding_id {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let pin = load_current_export_pin(&self.manager.connection, &previous.candidate_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if pin.service_id != previous.service_id
+            || pin.operation_id != previous.operation_id
+            || pin.source_artifact_id != previous.source_artifact_id
+            || pin.selector != previous.destination_selector
+            || pin.purpose != previous.purpose
+            || pin.max_size_bytes != previous.max_size_bytes
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let (task_id, snapshot, node, contract, registration, attempt_number, output_port): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+        ) = self
+            .manager
+            .connection
+            .query_row(
+                "SELECT c.task_id,c.registry_snapshot_id,c.node_id,c.capability_contract_hash,
+                    c.provider_registration_id,c.attempt_number,r.output_port
+             FROM authority_candidate_reservations c
+             JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+               AND s.state='FINALIZED'
+             JOIN authority_candidate_resources r ON r.candidate_id=c.candidate_id
+               AND r.action='artifact.write' AND r.semantic_selector='task.output'
+             JOIN authority_candidate_resources source ON source.candidate_id=c.candidate_id
+               AND source.action='artifact.read' AND source.semantic_selector=?4
+               AND source.resource_id=?5
+             WHERE c.candidate_id=?1 AND c.binding_id=?2 AND c.task_id=?3",
+                params![
+                    previous.candidate_id,
+                    previous.binding_id,
+                    previous.task_id,
+                    previous.source_selector,
+                    previous.source_artifact_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let task = self
+            .manager
+            .get_task(&task_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let old_step = self
+            .manager
+            .get_step_execution(&old.attempt_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let (grant_count, retired_count): (i64, i64) = self.manager.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='REVOKED'
+                AND revocation_reason_code='AUTHORITY_SESSION_RETIRED'
+                AND uses_consumed=0 THEN 1 ELSE 0 END),0)
+             FROM authority_grants WHERE execution_binding_id=?1",
+            [&previous.binding_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if task.state != TaskState::Planning
+            || old_step.state != super::StepState::Ready
+            || old_step.operation_id.is_some()
+            || old_step.started_at.is_some()
+            || old_step.outcome_certainty.is_some()
+            || grant_count != i64::try_from(old.grant_ids.len()).unwrap_or(-1)
+            || retired_count != grant_count
+            || attempt_number >= 100
+            || next.candidate_id == previous.candidate_id
+            || next.binding_id == previous.binding_id
+            || next.attempt_id == old.attempt_id
+            || next.operation_id == previous.operation_id
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let hash = task
+            .active_program
+            .as_ref()
+            .and_then(|program| program.get("semantic_hash"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let resources = [
+            CandidateResourceChoice {
+                action: "artifact.read".into(),
+                semantic_selector: previous.source_selector.clone(),
+                handle: CandidateResourceHandle::InputArtifact {
+                    artifact_id: previous.source_artifact_id.clone(),
+                },
+            },
+            CandidateResourceChoice {
+                action: "artifact.write".into(),
+                semantic_selector: "task.output".into(),
+                handle: CandidateResourceHandle::OutputAllocation {
+                    allocation_id: next.output_allocation_id.clone(),
+                    output_port,
+                },
+            },
+            CandidateResourceChoice {
+                action: "data.egress".into(),
+                semantic_selector: previous.destination_selector.clone(),
+                handle: CandidateResourceHandle::ExternalExport {
+                    service_id: previous.service_id.clone(),
+                    source_artifact_id: previous.source_artifact_id.clone(),
+                    operation_id: next.operation_id.clone(),
+                    purpose: previous.purpose.clone(),
+                    max_size_bytes: previous.max_size_bytes,
+                },
+            },
+        ];
+        self.manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: &next.candidate_id,
+                binding_id: &next.binding_id,
+                attempt_id: &next.attempt_id,
+                task_id: &task_id,
+                semantic_program_hash: hash,
+                registry_snapshot_id: &snapshot,
+                node_id: &node,
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: u32::try_from(attempt_number + 1)
+                    .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?,
+                resources: &resources,
+            })?;
+        let evaluation = self
+            .manager
+            .evaluate_pending_authority_candidate(&next.candidate_id)?;
+        if evaluation
+            .decisions
+            .iter()
+            .any(|decision| decision.effect != PolicyEffect::Allow)
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        Ok(PreparedLocalExport {
+            issuer_id: self.manager.artifact_scope_issuer.clone(),
+            task_id,
+            candidate_id: next.candidate_id.clone(),
+            binding_id: next.binding_id.clone(),
+            source_artifact_id: previous.source_artifact_id.clone(),
+            source_selector: previous.source_selector.clone(),
+            destination_selector: previous.destination_selector.clone(),
+            service_id: previous.service_id.clone(),
+            operation_id: next.operation_id.clone(),
+            purpose: previous.purpose.clone(),
+            max_size_bytes: previous.max_size_bytes,
+            approval_ids: vec![],
+        })
+    }
+
+    /// Admits one genuine request under the current binding and returns the
+    /// opaque session required for a protected Artifact read.
+    ///
+    /// # Errors
+    /// Returns an error if the request or binding cannot be authenticated.
+    pub fn admit_local_export_binding_claim(
+        &self,
+        prepared: &PreparedLocalExport,
+        request_id: &str,
+    ) -> Result<AdmittedLocalArtifactRead> {
+        self.verify_handle(prepared)?;
+        let session = self.manager.admit_provider_binding_request_claim(
+            &prepared.task_id,
+            &prepared.binding_id,
+            request_id,
+            &prepared.source_artifact_id,
+        )?;
+        Ok(AdmittedLocalArtifactRead {
+            session,
+            source_artifact_id: prepared.source_artifact_id.clone(),
+        })
+    }
+
+    /// Uses the admitted binding session at the Artifact service's independent
+    /// grant and resource check, returning a reader only after both admissions.
+    ///
+    /// # Errors
+    /// Returns an error if the grant, binding, Artifact, or current Task state
+    /// does not authorize a read.
+    pub fn open_admitted_local_artifact(
+        &mut self,
+        admitted: &AdmittedLocalArtifactRead,
+        grant_id: &str,
+    ) -> Result<ArtifactReader> {
+        let scope = self.manager.scope_execution_artifact_reads_with_claim(
+            &admitted.session,
+            std::slice::from_ref(&admitted.source_artifact_id),
+            grant_id,
+        )?;
+        self.manager
+            .open_artifact_reader(&scope, &admitted.source_artifact_id)
     }
 
     /// Transfers a pinned source into the sealed process-local memory sink.

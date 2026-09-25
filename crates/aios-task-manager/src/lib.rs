@@ -38,8 +38,9 @@ pub use artifact_store::{
     VerifiedArtifactExportNoEffect,
 };
 pub use coordinator::{
-    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal,
-    MemoryExportObservation, PreparedLocalExport, TrustedLocalCoordinator,
+    AdmittedLocalArtifactRead, CompletedLocalExportReference, LocalExportExecution,
+    LocalExportProposal, MemoryExportObservation, PreparedLocalExport, RestartedLocalExportAttempt,
+    TrustedLocalCoordinator,
 };
 pub use trusted_time::{SecurityClockSample, TimeSource};
 
@@ -73,6 +74,7 @@ pub struct AuthorityDenial {
 pub enum AuthorityDenialStage {
     CandidateReservation,
     ApprovalApplication,
+    BindingAdmission,
     ArtifactAdmission,
     ArtifactRead,
 }
@@ -86,6 +88,8 @@ pub enum AuthorityDenialReason {
     GrantRevoked,
     GrantPrincipalMismatch,
     GrantTaskMismatch,
+    ProviderBindingMismatch,
+    GrantBindingMismatch,
 }
 
 impl AuthorityDenialReason {
@@ -99,6 +103,8 @@ impl AuthorityDenialReason {
             Self::GrantRevoked => "AUTH_GRANT_REVOKED",
             Self::GrantPrincipalMismatch => "AUTH_GRANT_PRINCIPAL_MISMATCH",
             Self::GrantTaskMismatch => "AUTH_GRANT_TASK_MISMATCH",
+            Self::ProviderBindingMismatch => "AUTH_PROVIDER_BINDING_MISMATCH",
+            Self::GrantBindingMismatch => "AUTH_GRANT_BINDING_MISMATCH",
         }
     }
 }
@@ -151,6 +157,9 @@ impl fmt::Display for TaskManagerError {
                 }
                 AuthorityDenialStage::ApprovalApplication => {
                     formatter.write_str("authority approval application is not admissible")
+                }
+                AuthorityDenialStage::BindingAdmission => {
+                    formatter.write_str("provider binding admission is not admissible")
                 }
                 AuthorityDenialStage::ArtifactAdmission | AuthorityDenialStage::ArtifactRead => {
                     formatter.write_str("ARTIFACT_AUTHORITY_DENIED")

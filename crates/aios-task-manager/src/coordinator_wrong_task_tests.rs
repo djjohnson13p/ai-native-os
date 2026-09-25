@@ -245,11 +245,7 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
         .unwrap();
     let mut coordinator = TrustedLocalCoordinator::from_manager(manager);
     coordinator
-        .register_export_service(
-            "service://fixture/exact",
-            "fixture_remote",
-            "adapter:exact",
-        )
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
         .unwrap();
     coordinator
         .activate_policy(
@@ -362,7 +358,7 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
         )
         .expect_err("Task A's genuine grant cannot be claimed by Task B");
     assert!(matches!(
-        denied,
+        &denied,
         TaskManagerError::AuthorityDenied(AuthorityDenial {
             stage: AuthorityDenialStage::ArtifactAdmission,
             reason: AuthorityDenialReason::GrantTaskMismatch,
@@ -408,4 +404,379 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps both real attempts, the denied claims, and matching protected use together"
+)]
+fn provider_rebinding_requires_new_grant_at_binding_and_artifact_admission() {
+    let authority_cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/authority/authority-cases.json"
+    ))
+    .unwrap();
+    let matching: Vec<&Value> = authority_cases
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["name"] == "provider-rebinding-requires-new-grant")
+        .collect();
+    assert_eq!(matching.len(), 1);
+    let case = matching[0];
+    assert_eq!(case["expected"], "DENY");
+    assert_eq!(case["facts"]["grant_binding"], "XB-OLD");
+    assert_eq!(case["facts"]["runtime_binding"], "XB-NEW");
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("provider-rebinding.sqlite3");
+    let mut manager = TaskManager::open(&db).unwrap();
+    let (registry, contract_hash) = admitted_registry();
+    manager
+        .registry_store_writer()
+        .unwrap()
+        .admit_registry(&registry)
+        .unwrap();
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/aios-ir/provider-conformance-cases.json"
+    ))
+    .unwrap();
+    let mut manifest = cases[0]["provider"].clone();
+    manifest["provides"][0]["contract"]["capability"] = json!("artifact.copy");
+    manifest["provides"][0]["contract"]["contract_hash"] = json!(contract_hash);
+    manifest["provides"][0]["conformance"]["suite"] = json!("conformance://artifact.copy/1");
+    manifest["provides"][0]["conformance"]["suite_hash"] = json!(SUITE_HASH);
+    manifest["provides"][0]["effect_classes"] =
+        json!(["ARTIFACT_READ", "ARTIFACT_WRITE", "DATA_EGRESS"]);
+    manifest["provides"][0]["authority"]["actions"] =
+        json!(["artifact.read", "artifact.write", "data.egress"]);
+    let registration = manager
+        .provider_store_writer()
+        .unwrap()
+        .register(
+            &registry,
+            &serde_json::to_vec(&manifest).unwrap(),
+            BUILD_HASH,
+            ProviderTrustStatus::LocallyTrusted,
+            "2026-09-24T00:00:00Z",
+        )
+        .unwrap();
+    let evidence = json!({
+        "schema_version":"0.1", "result_id":"evidence:rebinding",
+        "provider_id":registration.provider_id, "provider_version":registration.provider_version,
+        "provider_build_identity":{"kind":"build_hash","value":BUILD_HASH},
+        "semantic_capability_ref":"artifact.copy@1", "semantic_contract_version":"1.0",
+        "semantic_contract_hash":contract_hash,
+        "conformance_suite":{"id":"conformance://artifact.copy/1","version":"0.1","hash":SUITE_HASH},
+        "harness":{"id":"fixture-harness","version":"1"},
+        "result":"pass","tests_total":1,"tests_passed":1,"tests_failed":0,
+        "executed_at":"2026-09-24T00:00:00Z","expires_at":"2030-01-01T00:00:00Z"
+    });
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .record_evidence(
+            &registration.registration_id,
+            &serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    manager
+        .provider_store_writer()
+        .unwrap()
+        .enable(&registration.registration_id, "2026-09-24T00:00:00Z")
+        .unwrap();
+    let mut coordinator = TrustedLocalCoordinator::from_manager(manager);
+    coordinator
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
+        .unwrap();
+    coordinator.activate_policy(json!({"schema_version":"0.1","rules":[
+        {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+        {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+        {"effect":"ALLOW","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+    ]}).to_string().as_bytes()).unwrap();
+
+    let proposal = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "rebind",
+    );
+    let old = coordinator
+        .prepare_local_export(&proposal, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator.start_local_export(&old).unwrap();
+    assert_eq!(
+        coordinator
+            .manager
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Runnable
+    );
+    let old_receipt = coordinator
+        .manager
+        .finalize_pending_authority_candidate(&old.candidate_id)
+        .unwrap();
+    assert_eq!(old_receipt.binding_id, old.binding_id);
+    let previous = old.replay_reference();
+    drop(coordinator);
+    let restarted = TaskManager::open(&db).unwrap();
+    assert_eq!(
+        restarted
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Planning
+    );
+    let mut coordinator = TrustedLocalCoordinator::from_manager(restarted);
+    coordinator
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
+        .unwrap();
+    let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let issued_read = |binding: &str| -> (String, String) {
+        readonly
+            .query_row(
+                "SELECT r.request_id,g.grant_id FROM authority_grants g
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+             JOIN authority_requests r ON r.request_id=d.authority_request_id
+             WHERE g.execution_binding_id=?1 AND d.action='artifact.read'
+               AND d.resolved_resource_id=?2",
+                rusqlite::params![binding, old.source_artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (old_request, old_grant) = issued_read(&old.binding_id);
+    let retired: (String, Option<String>, i64) = readonly
+        .query_row(
+            "SELECT state,revocation_reason_code,uses_consumed FROM authority_grants WHERE grant_id=?1",
+            [&old_grant],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retired,
+        (
+            "REVOKED".into(),
+            Some("AUTHORITY_SESSION_RETIRED".into()),
+            0
+        )
+    );
+    let retry = RestartedLocalExportAttempt {
+        candidate_id: "candidate:public-export-rebind-2".into(),
+        binding_id: "binding:public-export-rebind-2".into(),
+        attempt_id: "attempt:public-export-rebind-2".into(),
+        output_allocation_id: "allocation:public-export-rebind-2".into(),
+        operation_id: "export:public-export-rebind-2".into(),
+    };
+    let fresh = coordinator
+        .prepare_restarted_local_export(&previous, &retry)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .manager
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Planning
+    );
+    coordinator.start_local_export(&fresh).unwrap();
+    assert_eq!(
+        coordinator
+            .manager
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Runnable
+    );
+    let (fresh_request, fresh_grant) = issued_read(&fresh.binding_id);
+    assert_ne!(old_grant, fresh_grant);
+    let stored_old_binding: String = readonly
+        .query_row(
+            "SELECT execution_binding_id FROM authority_grants WHERE grant_id=?1",
+            [&old_grant],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored_new_binding: String = readonly
+        .query_row(
+            "SELECT execution_binding_id FROM authority_grants WHERE grant_id=?1",
+            [&fresh_grant],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let binding_alias = |alias: &str| match alias {
+        "XB-OLD" => old.binding_id.as_str(),
+        "XB-NEW" => fresh.binding_id.as_str(),
+        _ => panic!("unknown authority fixture binding alias"),
+    };
+    assert_eq!(
+        binding_alias(case["facts"]["grant_binding"].as_str().unwrap()),
+        stored_old_binding
+    );
+    assert_eq!(
+        binding_alias(case["facts"]["runtime_binding"].as_str().unwrap()),
+        stored_new_binding
+    );
+    assert_ne!(stored_old_binding, stored_new_binding);
+    let attempts: Vec<(String, i64)> = {
+        let mut statement = readonly
+            .prepare(
+                "SELECT binding_id,attempt_number FROM authority_candidate_reservations
+             WHERE task_id=?1 ORDER BY attempt_number",
+            )
+            .unwrap();
+        statement
+            .query_map([&proposal.task.task_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        attempts,
+        vec![(old.binding_id.clone(), 1), (fresh.binding_id.clone(), 2)]
+    );
+    let counts = || -> (i64, i64, i64, i64) {
+        readonly.query_row(
+            "SELECT (SELECT COUNT(*) FROM authority_grants WHERE task_id=?1),
+                    (SELECT COALESCE(SUM(uses_consumed),0) FROM authority_grants WHERE task_id=?1),
+                    (SELECT COUNT(*) FROM operations WHERE task_id=?1),
+                    (SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND event_type='execution.started')",
+            [&proposal.task.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap()
+    };
+    let before = counts();
+    let sink_before = coordinator
+        .memory_export_observation(&fresh.service_id)
+        .unwrap();
+    let denied = coordinator
+        .admit_local_export_binding_claim(&fresh, &old_request)
+        .unwrap_err();
+    assert!(matches!(
+        &denied,
+        TaskManagerError::AuthorityDenied(AuthorityDenial {
+            stage: AuthorityDenialStage::BindingAdmission,
+            reason: AuthorityDenialReason::ProviderBindingMismatch,
+        })
+    ));
+    assert_eq!(
+        denied.authority_denial().unwrap().reason.code(),
+        case["reason_code"]
+    );
+    assert_eq!(counts(), before);
+    assert_eq!(
+        coordinator
+            .memory_export_observation(&fresh.service_id)
+            .unwrap(),
+        sink_before
+    );
+
+    let admitted = coordinator
+        .admit_local_export_binding_claim(&fresh, &fresh_request)
+        .unwrap();
+    let prelaunch = match coordinator.open_admitted_local_artifact(&admitted, &fresh_grant) {
+        Ok(_) => panic!("provider execution must not read before Task launch"),
+        Err(error) => error,
+    };
+    assert_eq!(prelaunch.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+    assert!(prelaunch.authority_denial().is_none());
+    assert_eq!(counts(), before);
+    assert_eq!(
+        coordinator
+            .memory_export_observation(&fresh.service_id)
+            .unwrap(),
+        sink_before
+    );
+
+    let retired_session = coordinator
+        .manager
+        .issue_provider_artifact_session(&old.task_id, &old.binding_id)
+        .unwrap();
+    assert!(
+        coordinator
+            .manager
+            .scope_artifact_reads_with_claim(
+                &retired_session,
+                std::slice::from_ref(&old.source_artifact_id),
+                &old_grant,
+            )
+            .is_err(),
+        "the retired grant cannot be used in its own historical context"
+    );
+    assert_eq!(counts(), before);
+
+    let runnable = coordinator
+        .manager
+        .get_task(&fresh.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runnable.state, TaskState::Runnable);
+    let running = coordinator
+        .manager
+        .transition(&TransitionRequest {
+            schema_version: "0.1".into(),
+            transition_id: "transition:public-export-rebind-running".into(),
+            task_id: fresh.task_id.clone(),
+            expected_revision: runnable.revision,
+            expected_state: TaskState::Runnable,
+            to_state: TaskState::Running,
+            requested_by: Actor {
+                kind: "system-service".into(),
+                id: "aiosd.coordinator".into(),
+            },
+            reason: TransitionReason {
+                code: "AUTHORITY_READY".into(),
+                message: None,
+                related_ids: vec![],
+            },
+            mutation: TaskMutation::default(),
+        })
+        .unwrap();
+    assert!(running.applied);
+    assert_eq!(
+        coordinator
+            .manager
+            .get_task(&fresh.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Running
+    );
+    assert_eq!(counts().3, before.3 + 1);
+
+    let after_launch = counts();
+    let denied_use = match coordinator.open_admitted_local_artifact(&admitted, &old_grant) {
+        Ok(_) => panic!("old grant must not open the new attempt's source"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        denied_use,
+        TaskManagerError::AuthorityDenied(AuthorityDenial {
+            stage: AuthorityDenialStage::ArtifactAdmission,
+            reason: AuthorityDenialReason::GrantBindingMismatch,
+        })
+    ));
+    assert_eq!(counts(), after_launch);
+    assert_eq!(
+        coordinator
+            .memory_export_observation(&fresh.service_id)
+            .unwrap(),
+        sink_before
+    );
+
+    let mut reader = coordinator
+        .open_admitted_local_artifact(&admitted, &fresh_grant)
+        .unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, SOURCE);
+    assert_eq!(counts().2, before.2 + 1);
+    // Task launch and the admitted Artifact read each append their own start.
+    assert_eq!(counts().3, before.3 + 2);
 }
