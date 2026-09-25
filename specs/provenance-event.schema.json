@@ -457,6 +457,16 @@
           "status": {"const": "success"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {"const": "artifact.exported"},
+          "details": {"required": ["export_authority"]}
+        },
+        "required": ["event_type", "details"]
+      },
+      "then": {"properties": {"details": {"required": ["size_bytes"]}}}
     }
   ],
   "$defs": {

@@ -742,6 +742,79 @@
           }
         }
       }
+    },
+    {
+      "name": "exact-export-zero-byte-count-accepted",
+      "valid": true,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:exact-zero",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "input_artifacts": ["artifact:one"],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "service://fixture/a",
+          "data_refs": ["artifact:one"],
+          "purpose": "fixture evaluation"
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "export:fixture",
+          "size_bytes": 0,
+          "export_authority": {
+            "selector": "destination:fixture_remote",
+            "service_id": "service://fixture/a",
+            "destination_class": "fixture_remote",
+            "descriptor_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "adapter_id": "adapter:memory",
+            "operation_id": "export:fixture",
+            "source_artifact_id": "artifact:one",
+            "source_content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "purpose": "fixture evaluation",
+            "sensitivity": "private",
+            "max_size_bytes": 1024
+          }
+        }
+      }
+    },
+    {
+      "name": "exact-export-missing-byte-count-rejected",
+      "valid": false,
+      "event": {
+        "schema_version": "0.1",
+        "event_id": "event:fixture:exact-missing-size",
+        "task_id": "task:fixture",
+        "event_type": "artifact.exported",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "actor": {"kind": "system-service", "id": "authority"},
+        "input_artifacts": ["artifact:one"],
+        "output_artifacts": [],
+        "external_transfer": {
+          "destination": "service://fixture/a",
+          "data_refs": ["artifact:one"],
+          "purpose": "fixture evaluation"
+        },
+        "status": "success",
+        "details": {
+          "operation_id": "export:fixture",
+          "export_authority": {
+            "selector": "destination:fixture_remote",
+            "service_id": "service://fixture/a",
+            "destination_class": "fixture_remote",
+            "descriptor_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "adapter_id": "adapter:memory",
+            "operation_id": "export:fixture",
+            "source_artifact_id": "artifact:one",
+            "source_content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "purpose": "fixture evaluation",
+            "sensitivity": "private",
+            "max_size_bytes": 1024
+          }
+        }
+      }
     }
   ]
 }

@@ -1839,8 +1839,11 @@ fn validate_export_authority_links(event: &Value) -> Result<()> {
     let source = authority.get("source_artifact_id");
     let service = authority.get("service_id");
     let purpose = authority.get("purpose");
+    let size = event.pointer("/details/size_bytes").and_then(Value::as_u64);
+    let ceiling = authority.get("max_size_bytes").and_then(Value::as_u64);
     let transfer = &event["external_transfer"];
-    if operation != event.pointer("/details/operation_id")
+    if !matches!((size, ceiling), (Some(size), Some(ceiling)) if size <= ceiling)
+        || operation != event.pointer("/details/operation_id")
         || event["input_artifacts"]
             .as_array()
             .is_none_or(|items| items.len() != 1 || items.first() != source)
@@ -4125,6 +4128,13 @@ mod tests {
         append_in_tx(&transaction, task_id, &event, &ExpectedHead::Any).unwrap();
         let stream = stream_id(task_id).unwrap();
         let head = get_head(&transaction, &stream).unwrap().unwrap();
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )
+            .unwrap();
         for mismatch in [
             "operation",
             "source",
@@ -4133,6 +4143,8 @@ mod tests {
             "extra-transfer",
             "service",
             "purpose",
+            "missing-size",
+            "over-ceiling",
         ] {
             let mut forged = event.clone();
             forged["event_id"] = json!(format!("event:forged:{mismatch}"));
@@ -4155,6 +4167,13 @@ mod tests {
                 "purpose" => {
                     forged["external_transfer"]["purpose"] = json!("unrelated purpose");
                 }
+                "missing-size" => {
+                    forged["details"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("size_bytes");
+                }
+                "over-ceiling" => forged["details"]["size_bytes"] = json!(1025),
                 _ => unreachable!(),
             }
             assert!(
@@ -4162,6 +4181,20 @@ mod tests {
                 "{mismatch} must not be recorded as authorized export"
             );
             assert_eq!(get_head(&transaction, &stream).unwrap(), Some(head.clone()));
+            let actual_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+                    [&stream],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual_count, count, "{mismatch} inserted a journal row");
+        }
+        for (name, size) in [("zero", 0), ("at-ceiling", 1024)] {
+            let mut boundary = event.clone();
+            boundary["event_id"] = json!(format!("event:{name}-export"));
+            boundary["details"]["size_bytes"] = json!(size);
+            append_in_tx(&transaction, task_id, &boundary, &ExpectedHead::Any).unwrap();
         }
         let mut legacy = event.clone();
         legacy["event_id"] = json!("event:class-only-export");
@@ -4174,6 +4207,19 @@ mod tests {
         assert_eq!(legacy["external_transfer"]["destination"], "fixture_remote");
         assert!(legacy["external_transfer"]["purpose"].is_null());
         append_in_tx(&transaction, task_id, &legacy, &ExpectedHead::Any).unwrap();
+        let mut legacy_without_size = legacy.clone();
+        legacy_without_size["event_id"] = json!("event:class-only-export-without-size");
+        legacy_without_size["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("size_bytes");
+        append_in_tx(
+            &transaction,
+            task_id,
+            &legacy_without_size,
+            &ExpectedHead::Any,
+        )
+        .unwrap();
         transaction.commit().unwrap();
         let export = export_jsonl(&connection, &stream, NOW).unwrap();
         let records = export
@@ -4181,10 +4227,17 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<ProjectedRecord>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 6);
+        assert_eq!(records[2].projected_event["details"]["size_bytes"], 0);
+        assert_eq!(records[3].projected_event["details"]["size_bytes"], 1024);
         assert!(
-            records[2].projected_event["details"]
+            records[4].projected_event["details"]
                 .get("export_authority")
+                .is_none()
+        );
+        assert!(
+            records[5].projected_event["details"]
+                .get("size_bytes")
                 .is_none()
         );
         assert!(
@@ -4207,6 +4260,28 @@ mod tests {
             assert!(
                 !result.valid,
                 "rehashed {field} mismatch must fail offline verification"
+            );
+            assert_eq!(result.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+        }
+        for mismatch in ["missing-size", "over-ceiling", "lowered-ceiling"] {
+            let forged = rehash_projection(&export, |records| {
+                let details = &mut records[1].projected_event["details"];
+                match mismatch {
+                    "missing-size" => {
+                        details.as_object_mut().unwrap().remove("size_bytes");
+                    }
+                    "over-ceiling" => details["size_bytes"] = json!(1025),
+                    "lowered-ceiling" => {
+                        details["export_authority"]["max_size_bytes"] = json!(6);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let result =
+                verify_jsonl_export(&forged.manifest_json, &forged.records_jsonl, NOW).unwrap();
+            assert!(
+                !result.valid,
+                "rehashed {mismatch} must fail offline verification"
             );
             assert_eq!(result.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
         }
