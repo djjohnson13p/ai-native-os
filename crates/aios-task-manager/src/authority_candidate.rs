@@ -1879,11 +1879,11 @@ mod tests {
     }
 
     fn coherent_planning_fixture(path: &Path) -> (TaskManager, String, String, String) {
-        fixture_at_mode(Some(path), true, false, None)
+        fixture_at_mode(Some(path), true, false, None, true)
     }
 
     fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
-        fixture_at_mode(path, false, false, None)
+        fixture_at_mode(path, false, false, None, true)
     }
 
     #[allow(
@@ -1895,6 +1895,7 @@ mod tests {
         coherent_planning: bool,
         export: bool,
         provider_id: Option<&str>,
+        seed_placeholder_source: bool,
     ) -> (TaskManager, String, String, String) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
@@ -2092,23 +2093,25 @@ mod tests {
             created_from_plan_revision,created_at)
             VALUES ('T-candidate',1,'program-candidate','0.1',?1,?2,'validation-candidate','active',?3,1,?4)",
             params![hash,registry.snapshot_id(),program_json,NOW]).unwrap();
-        manager
-            .connection
-            .execute(
-                "INSERT INTO artifacts(artifact_id,uri,semantic_type,media_type,sensitivity,
+        if seed_placeholder_source {
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO artifacts(artifact_id,uri,semantic_type,media_type,sensitivity,
             retention_class,origin_kind,integrity_state,created_at) VALUES ('artifact:source','artifact://source',
             'artifact.file@1','text/plain','local','task','user','verified',?1)",
-                [NOW],
-            )
-            .unwrap();
-        manager
-            .connection
-            .execute(
-                "INSERT INTO task_artifacts(task_id,artifact_id,role,added_at)
+                    [NOW],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO task_artifacts(task_id,artifact_id,role,added_at)
             VALUES ('T-candidate','artifact:source','input',?1)",
-                [NOW],
-            )
-            .unwrap();
+                    [NOW],
+                )
+                .unwrap();
+        }
         if coherent_planning {
             manager
                 .connection
@@ -2157,6 +2160,444 @@ mod tests {
         choices_with_source("artifact:source")
     }
 
+    fn authority_case(name: &str) -> Value {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../examples/authority/authority-cases.json"
+        ))
+        .unwrap();
+        let mut matching = cases.into_iter().filter(|case| case["name"] == name);
+        let case = matching.next().expect("named authority fixture exists");
+        assert!(
+            matching.next().is_none(),
+            "authority fixture name is unique"
+        );
+        case
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "follows one fixture claim through real admission, policy, grant, binding, and byte read"
+    )]
+    fn fixture_exact_local_read_allows_only_bound_imported_source() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("exact-local-artifact-read-allowed");
+        assert_eq!(case["expected"], "ALLOW");
+        let claim = case["facts"]["validated_semantic_request"]
+            .as_str()
+            .unwrap();
+        let (action, selector) = claim.split_once(' ').unwrap();
+        let principal = case["facts"]["principal"].as_str().unwrap();
+        let symbolic_uri = case["facts"]["resolved_resource"].as_str().unwrap();
+        let binding = case["facts"]["binding"].as_str().unwrap();
+        assert_eq!(case["facts"]["approval"], Value::Null);
+        assert_eq!(case["facts"]["policy"], "allow exact selected input");
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, Some(principal), false);
+        let bytes = b"fixture A17 local source";
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-A17".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(bytes),
+            )
+            .unwrap();
+        // A17 is a symbolic fixture URI. This public import is its concrete
+        // Task input; all runtime admission uses the returned Artifact ID.
+        assert_eq!(symbolic_uri, "artifact://A17");
+        assert_eq!(
+            source.uri.as_str(),
+            format!("artifact://{}", source.artifact_id)
+        );
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-unbound".into(),
+                principal: Actor {
+                    kind: "user".into(),
+                    id: "user:test".into(),
+                },
+                workspace_id: None,
+                original_intent: "separate source".into(),
+                normalized_intent: None,
+                active_step_ids: vec![],
+            })
+            .unwrap();
+        let other = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-other".into()),
+                    task_id: "T-unbound".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"other source"),
+            )
+            .unwrap();
+        let program_json: String = manager.connection.query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-candidate' AND semantic_hash=?1",
+            [&hash], |row| row.get(0),
+        ).unwrap();
+        let program: Value = serde_json::from_str(&program_json).unwrap();
+        assert!(
+            program_node(&program, "copy").unwrap()["authority_requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|request| request["action"] == action && request["resource"] == selector)
+        );
+        let resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:fixture-A17");
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:fixture-A17",
+                binding_id: binding,
+                attempt_id: "attempt:fixture-A17",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:fixture-A17")
+            .unwrap();
+        let (decision_id, resolved, decision_principal, reason, approval): (String, String, String, String, Option<String>) =
+            manager.connection.query_row(
+                "SELECT d.decision_id,r.resolved_resource_id,d.principal_id,d.reason_codes_json,d.approval_request_id
+                 FROM authority_requests r JOIN policy_decisions d ON d.authority_request_id=r.request_id
+                 WHERE r.action=?1 AND r.semantic_selector=?2",
+                params![action, selector],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).unwrap();
+        assert_eq!(resolved, source.artifact_id);
+        assert_eq!(decision_principal, principal);
+        assert_eq!(approval, None);
+        let read = evaluated
+            .decisions
+            .iter()
+            .find(|d| d.decision_id == decision_id)
+            .unwrap();
+        assert_eq!(read.effect, PolicyEffect::Allow);
+        assert_eq!(read.reason_code, case["reason_code"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reason).unwrap(),
+            json!([case["reason_code"]])
+        );
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:fixture-A17")
+            .unwrap();
+        assert_eq!(finalized.binding_id, binding);
+        assert_eq!(finalized.grant_ids.len(), 2);
+        let (grant_binding, grant_principal, grant_state): (String, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT g.execution_binding_id,g.principal_id,g.state FROM authority_grants g
+             WHERE g.policy_decision_id=?1",
+                [&decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                grant_binding.as_str(),
+                grant_principal.as_str(),
+                grant_state.as_str()
+            ),
+            (binding, principal, "ACTIVE")
+        );
+        let bound_principal: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM execution_bindings WHERE binding_id=?1",
+                [binding],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_principal, principal);
+        // Admission selected A17 while it was the unique semantic input. A
+        // later legitimate import into the same Task must not widen its grant.
+        let unselected = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-unselected".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"unselected same-task source"),
+            )
+            .unwrap();
+        for (id, revision, from, to) in [
+            (
+                "transition:fixture-A17-runnable",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:fixture-A17-running",
+                3,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: from,
+                        to_state: to,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+        }
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", binding)
+            .unwrap();
+        assert!(
+            manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&other.artifact_id))
+                .is_err()
+        );
+        assert!(
+            manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&unselected.artifact_id))
+                .is_err()
+        );
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source.artifact_id))
+            .unwrap();
+        assert!(
+            manager
+                .open_artifact_reader(&scope, &other.artifact_id)
+                .is_err()
+        );
+        assert!(
+            manager
+                .open_artifact_reader(&scope, &unselected.artifact_id)
+                .is_err()
+        );
+        let mut reader = manager
+            .open_artifact_reader(&scope, &source.artifact_id)
+            .unwrap();
+        let mut delivered = Vec::new();
+        reader.read_to_end(&mut delivered).unwrap();
+        assert_eq!(delivered, bytes);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "follows one private fixture source and exact destination through evaluation and pending-approval denial"
+    )]
+    fn fixture_private_egress_requires_approval_before_any_export_authority() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("private-data-egress-requires-approval");
+        assert_eq!(case["expected"], "REQUIRE_APPROVAL");
+        let action = case["facts"]["action"].as_str().unwrap();
+        let symbolic_source = case["facts"]["resource"].as_str().unwrap();
+        let destination = case["facts"]["destination"].as_str().unwrap();
+        let sensitivity = case["facts"]["sensitivity"].as_str().unwrap();
+        assert_eq!(symbolic_source, "artifact://METRICS-92");
+        assert_eq!(sensitivity, "private");
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-METRICS-92".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"private METRICS-92"),
+            )
+            .unwrap();
+        assert_eq!(
+            source.uri.as_str(),
+            format!("artifact://{}", source.artifact_id)
+        );
+        manager
+            .register_trusted_export_service(destination, "fixture_remote", "adapter:memory")
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:fixture-METRICS-92");
+        resources.push(CandidateResourceChoice {
+            action: action.into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: destination.into(),
+                source_artifact_id: source.artifact_id.clone(),
+                operation_id: "export:fixture-METRICS-92".into(),
+                purpose: "fixture private analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:fixture-METRICS-92",
+                binding_id: "binding:fixture-METRICS-92",
+                attempt_id: "attempt:fixture-METRICS-92",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let pin = load_current_export_pin(&manager.connection, "candidate:fixture-METRICS-92")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.source_artifact_id, source.artifact_id);
+        assert_eq!(pin.service_id, destination);
+        assert_eq!(pin.sensitivity, sensitivity);
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:fixture-METRICS-92")
+            .unwrap();
+        let (decision_id, request_json, decision_json, approval_id): (String, String, String, String) =
+            manager.connection.query_row(
+                "SELECT d.decision_id,r.request_json,d.decision_json,d.approval_request_id
+                 FROM authority_requests r JOIN policy_decisions d ON d.authority_request_id=r.request_id
+                 WHERE r.action=?1 AND r.semantic_selector='destination:fixture_remote'",
+                [action], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+        let decision = evaluated
+            .decisions
+            .iter()
+            .find(|d| d.decision_id == decision_id)
+            .unwrap();
+        assert_eq!(decision.effect, PolicyEffect::RequireApproval);
+        assert_eq!(decision.reason_code, case["reason_code"]);
+        assert_eq!(decision.approval_id.as_deref(), Some(approval_id.as_str()));
+        let request: Value = serde_json::from_str(&request_json).unwrap();
+        let decided: Value = serde_json::from_str(&decision_json).unwrap();
+        assert_eq!(request["egress"]["service_id"], destination);
+        assert_eq!(request["egress"]["data_refs"], json!([source.artifact_id]));
+        assert_eq!(request["resource"]["sensitivity"], sensitivity);
+        assert_eq!(decided["decision"], case["expected"]);
+        assert_eq!(decided["reason_codes"], json!([case["reason_code"]]));
+        assert_eq!(
+            decided["resource"]["external_export"]["source_artifact_id"],
+            source.artifact_id
+        );
+        let (status, prompt_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT status,request_json FROM approval_requests WHERE approval_id=?1",
+                [&approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "PENDING");
+        let prompt: Value = serde_json::from_str(&prompt_json).unwrap();
+        assert_eq!(prompt["destination"]["service_id"], destination);
+        assert_eq!(prompt["export"]["source_artifact_id"], source.artifact_id);
+        assert_eq!(prompt["resource"]["sensitivity"], sensitivity);
+        assert_eq!(prompt["policy_reason_codes"], json!([case["reason_code"]]));
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:fixture-METRICS-92")
+                .is_err()
+        );
+        assert!(
+            manager
+                .issue_provider_artifact_session("T-candidate", "binding:fixture-METRICS-92")
+                .is_err()
+        );
+        for (table, predicate) in [
+            (
+                "authority_grants",
+                "execution_binding_id='binding:fixture-METRICS-92'",
+            ),
+            (
+                "execution_bindings",
+                "binding_id='binding:fixture-METRICS-92'",
+            ),
+            (
+                "artifact_output_allocations",
+                "allocation_id='allocation:fixture-METRICS-92'",
+            ),
+            ("operations", "operation_id='export:fixture-METRICS-92'"),
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} escaped pending approval");
+        }
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -2185,7 +2626,7 @@ mod tests {
         assert!(runtime_service.starts_with("service://"));
 
         let (mut manager, hash, snapshot, registration) =
-            fixture_at_mode(None, false, false, Some(principal));
+            fixture_at_mode(None, false, false, Some(principal), true);
         let registered_principal: String = manager
             .connection
             .query_row(
@@ -2405,7 +2846,8 @@ mod tests {
                 self.flush()
             }
         }
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true, None);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, true);
         let bytes = b"private fixture export";
         let imported = manager
             .import_artifact(
@@ -2836,7 +3278,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("exact-export.sqlite3");
         let (mut manager, hash, snapshot, registration) =
-            fixture_at_mode(Some(&path), true, true, None);
+            fixture_at_mode(Some(&path), true, true, None, true);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -3001,7 +3443,8 @@ mod tests {
     )]
     fn pending_exact_export_fixture() -> (TaskManager, String) {
         use crate::authority_policy::AuthenticatedApprover;
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true, None);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, true);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -3166,7 +3609,7 @@ mod tests {
         use crate::authority_policy::AuthenticatedApprover;
         for scenario in ["service", "approval", "policy", "read-grant"] {
             let (mut manager, hash, snapshot, registration) =
-                fixture_at_mode(None, true, true, None);
+                fixture_at_mode(None, true, true, None, true);
             let imported = manager
                 .import_artifact(
                     &ImportArtifactRequest {
@@ -5992,7 +6435,8 @@ mod tests {
         reason = "proves coordinator grant admission, active use, and durable expiry under one frozen wall fixture"
     )]
     fn run_frozen_wall_coordinator_grant(expire_before_running: bool) {
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, false, None);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, None, true);
         let contract = contract_hash(&manager, &snapshot);
         manager
             .reserve_authority_candidate(&ReserveAuthorityCandidate {
