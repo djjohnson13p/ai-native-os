@@ -1915,6 +1915,31 @@ mod tests {
         provider_id: Option<&str>,
         seed_placeholder_source: bool,
     ) -> (TaskManager, String, String, String) {
+        let (manager, hash, snapshot, registration, _) = fixture_at_mode_with_nodes(
+            path,
+            coherent_planning,
+            export,
+            provider_id,
+            seed_placeholder_source,
+            false,
+        );
+        (manager, hash, snapshot, registration)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "builds a two-node validated fixture with distinct real provider registrations"
+    )]
+    fn fixture_at_mode_with_nodes(
+        path: Option<&Path>,
+        coherent_planning: bool,
+        export: bool,
+        provider_id: Option<&str>,
+        seed_placeholder_source: bool,
+        two_nodes: bool,
+    ) -> (TaskManager, String, String, String, Option<String>) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
             None => TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap(),
@@ -1929,7 +1954,11 @@ mod tests {
                 workspace_id: None,
                 original_intent: "copy source".into(),
                 normalized_intent: None,
-                active_step_ids: vec!["copy".into()],
+                active_step_ids: if two_nodes {
+                    vec!["copy".into(), "copy-other".into()]
+                } else {
+                    vec!["copy".into()]
+                },
             })
             .unwrap();
         if !coherent_planning {
@@ -2067,6 +2096,41 @@ mod tests {
             .unwrap()
             .enable(&registration.registration_id, NOW)
             .unwrap();
+        let other_registration = if two_nodes {
+            let mut other_manifest = manifest.clone();
+            other_manifest["id"] = json!("org.ainative.provider.other");
+            let other = manager
+                .provider_store_writer()
+                .unwrap()
+                .register(
+                    &registry,
+                    &serde_json::to_vec(&other_manifest).unwrap(),
+                    build,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            let mut other_evidence = evidence;
+            other_evidence["result_id"] = json!("evidence-candidate-other");
+            other_evidence["provider_id"] = json!(other.provider_id);
+            other_evidence["provider_version"] = json!(other.provider_version);
+            manager
+                .provider_store_writer()
+                .unwrap()
+                .record_evidence(
+                    &other.registration_id,
+                    &serde_json::to_vec(&other_evidence).unwrap(),
+                )
+                .unwrap();
+            manager
+                .provider_store_writer()
+                .unwrap()
+                .enable(&other.registration_id, NOW)
+                .unwrap();
+            Some(other.registration_id)
+        } else {
+            None
+        };
         let mut program = json!({
             "ir_version":"0.1","program_id":"program-candidate","kind":"task_graph",
             "inputs":{"source":{"type":"artifact.file@1"}},
@@ -2086,18 +2150,54 @@ mod tests {
             program["nodes"][0]["egress"] = json!({"mode":"policy",
                 "destination_classes":["fixture_remote"]});
         }
+        if two_nodes {
+            let mut other_node = program["nodes"][0].clone();
+            other_node["id"] = json!("copy-other");
+            program["nodes"].as_array_mut().unwrap().push(other_node);
+            program["outputs"]["other"] =
+                json!({"source":"node","node":"copy-other","port":"copy"});
+        }
         let program_json = program.to_string();
         let hash = aios_ir::recompute_semantic_hash(program_json.as_bytes()).unwrap();
-        let validation = json!({
+        let verified_validation = if two_nodes {
+            let report =
+                aios_ir::Validator::new(registry.clone(), aios_ir::ValidationLimits::default())
+                    .validate_bytes_at(
+                        program_json.as_bytes(),
+                        time::OffsetDateTime::parse(
+                            NOW,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .unwrap(),
+                    );
+            assert!(
+                report.output.validation.valid,
+                "two-node fixture diagnostics: {:?}",
+                report.output.validation.diagnostics
+            );
+            assert_eq!(
+                report.output.validation.semantic_hash.as_deref(),
+                Some(hash.as_str())
+            );
+            Some(serde_json::to_value(report.output.validation).unwrap())
+        } else {
+            None
+        };
+        let validation = verified_validation.unwrap_or_else(|| json!({
             "schema_version":"0.1","program_id":"program-candidate","ir_version":"0.1",
             "valid":true,"semantic_hash":hash,"semantic_hash_profile":"aios-ir-v0.1",
             "registry_snapshot_id":registry.snapshot_id(),"validator":{"id":"validator:test","version":"0.1","build_hash":null},
             "diagnostics":[],"diagnostics_truncated":false,"validated_at":NOW
-        });
+        }));
+        let validator_id = validation["validator"]["id"].as_str().unwrap();
+        let validator_version = validation["validator"]["version"].as_str().unwrap();
+        let validator_build_hash = validation["validator"]["build_hash"].as_str();
         manager.connection.execute("INSERT INTO validation_results(validation_result_id,task_id,program_id,
-            ir_version,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,result_json,validated_at)
-            VALUES ('validation-candidate','T-candidate','program-candidate','0.1',1,?1,?2,'validator:test','0.1',?3,?4)",
-            params![hash,registry.snapshot_id(),validation.to_string(),NOW]).unwrap();
+            ir_version,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,
+            validator_build_hash,result_json,validated_at)
+            VALUES ('validation-candidate','T-candidate','program-candidate','0.1',1,?1,?2,?3,?4,?5,?6,?7)",
+            params![hash,registry.snapshot_id(),validator_id,validator_version,
+                validator_build_hash,validation.to_string(),NOW]).unwrap();
         manager
             .connection
             .execute(
@@ -2171,6 +2271,7 @@ mod tests {
             hash,
             registry.snapshot_id().to_owned(),
             registration.registration_id,
+            other_registration,
         )
     }
 
@@ -2375,6 +2476,218 @@ mod tests {
             grant_id,
             unbound.artifact_id,
         )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises two independently issued provider bindings through actual read admission"
+    )]
+    fn fixture_genuine_read_grant_rejects_other_provider_claim() {
+        let case = authority_case("grant-used-by-wrong-provider");
+        let grant_provider = case["facts"]["grant_principal"].as_str().unwrap();
+        let caller_provider = case["facts"]["caller_principal"].as_str().unwrap();
+        let (mut manager, hash, snapshot, registration_a, registration_b) =
+            fixture_at_mode_with_nodes(None, true, false, Some(grant_provider), false, true);
+        let registration_b = registration_b.unwrap();
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-provider-scope".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"same Task, different providers"),
+            )
+            .unwrap();
+        for (candidate, binding, attempt, node, registration, allocation) in [
+            (
+                "candidate:provider-a",
+                "binding:provider-a",
+                "attempt:provider-a",
+                "copy",
+                registration_a.as_str(),
+                "allocation:provider-a",
+            ),
+            (
+                "candidate:provider-b",
+                "binding:provider-b",
+                "attempt:provider-b",
+                "copy-other",
+                registration_b.as_str(),
+                "allocation:provider-b",
+            ),
+        ] {
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    candidate_id: candidate,
+                    binding_id: binding,
+                    attempt_id: attempt,
+                    task_id: "T-candidate",
+                    semantic_program_hash: &hash,
+                    registry_snapshot_id: &snapshot,
+                    node_id: node,
+                    capability_contract_hash: &contract_hash(&manager, &snapshot),
+                    provider_registration_id: registration,
+                    attempt_number: 1,
+                    resources: &choices_with_source_and_output(&source.artifact_id, allocation),
+                })
+                .unwrap();
+        }
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        for candidate in ["candidate:provider-a", "candidate:provider-b"] {
+            manager
+                .evaluate_pending_authority_candidate(candidate)
+                .unwrap();
+            manager
+                .finalize_pending_authority_candidate(candidate)
+                .unwrap();
+        }
+        for (id, revision, from, to) in [
+            (
+                "transition:providers-runnable",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:providers-running",
+                3,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: from,
+                        to_state: to,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+        }
+        let session_a = manager
+            .issue_provider_artifact_session("T-candidate", "binding:provider-a")
+            .unwrap();
+        let session_b = manager
+            .issue_provider_artifact_session("T-candidate", "binding:provider-b")
+            .unwrap();
+        let (grant_id, stored_task, stored_provider): (String, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT g.grant_id,g.task_id,g.principal_id FROM authority_grants g
+                 JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                 WHERE g.execution_binding_id='binding:provider-a'
+                   AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+                [&source.artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let caller_binding_provider: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM execution_bindings WHERE binding_id='binding:provider-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_task, "T-candidate");
+        assert_eq!(stored_provider, grant_provider);
+        assert_eq!(caller_binding_provider, caller_provider);
+        let counts = |manager: &TaskManager| -> (i64, i64) {
+            manager
+                .connection
+                .query_row(
+                    "SELECT
+                    (SELECT COALESCE(SUM(g.uses_consumed),0) FROM authority_grants g
+                     JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                     WHERE g.task_id='T-candidate' AND d.action='artifact.read'),
+                    (SELECT COUNT(*) FROM operations
+                     WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let before = counts(&manager);
+        assert_eq!(before, (0, 0));
+        let error = manager
+            .scope_artifact_reads_with_claim(
+                &session_b,
+                std::slice::from_ref(&source.artifact_id),
+                &grant_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, crate::AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(counts(&manager), before);
+        let unknown = manager
+            .scope_artifact_reads_with_claim(
+                &session_b,
+                std::slice::from_ref(&source.artifact_id),
+                "grant:unknown",
+            )
+            .unwrap_err();
+        assert!(unknown.authority_denial().is_none());
+        assert_eq!(counts(&manager), before);
+        let other_grant: String = manager
+            .connection
+            .query_row(
+                "SELECT g.grant_id FROM authority_grants g
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+             WHERE g.execution_binding_id='binding:provider-b'
+               AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+                [&source.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (session, claim) in [
+            (&session_a, grant_id.as_str()),
+            (&session_b, other_grant.as_str()),
+        ] {
+            let scope = manager
+                .scope_artifact_reads_with_claim(
+                    session,
+                    std::slice::from_ref(&source.artifact_id),
+                    claim,
+                )
+                .unwrap();
+            let mut reader = manager
+                .open_artifact_reader(&scope, &source.artifact_id)
+                .unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"same Task, different providers");
+        }
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub enum AuthorityDenialReason {
     GrantUsageExhausted,
     GrantExpired,
     GrantRevoked,
+    GrantPrincipalMismatch,
+    GrantTaskMismatch,
 }
 
 impl AuthorityDenialReason {
@@ -88,6 +90,8 @@ impl AuthorityDenialReason {
             Self::GrantUsageExhausted => "AUTH_GRANT_USAGE_EXHAUSTED",
             Self::GrantExpired => "AUTH_GRANT_EXPIRED",
             Self::GrantRevoked => "AUTH_GRANT_REVOKED",
+            Self::GrantPrincipalMismatch => "AUTH_GRANT_PRINCIPAL_MISMATCH",
+            Self::GrantTaskMismatch => "AUTH_GRANT_TASK_MISMATCH",
         }
     }
 }
