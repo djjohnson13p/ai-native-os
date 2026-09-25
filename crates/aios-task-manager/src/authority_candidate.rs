@@ -4856,6 +4856,10 @@ mod tests {
     )]
     fn policy_evaluation_approval_replay_and_hard_deny_do_not_issue_authority() {
         use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
+        let deny_case = authority_case("explicit-policy-deny-cannot-be-overridden-by-approval");
+        assert_eq!(deny_case["expected"], "DENY");
+        assert_eq!(deny_case["facts"]["policy"], "hard deny");
+        assert_eq!(deny_case["facts"]["approval_record_present"], true);
         let (mut manager, hash, snapshot, registration) = fixture();
         let resources = choices();
         let contract = contract_hash(&manager, &snapshot);
@@ -5119,13 +5123,27 @@ mod tests {
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(hard.decisions[1].effect, PolicyEffect::Deny);
-        assert_eq!(hard.decisions[1].reason_code, "AUTH_DENY_POLICY");
+        assert_eq!(hard.decisions[1].reason_code, deny_case["reason_code"]);
         assert_policy_decision_reason(
             &manager,
             &hard.decisions[1].decision_id,
             "DENY",
-            "AUTH_DENY_POLICY",
+            deny_case["reason_code"].as_str().unwrap(),
         );
+        let approved_record_count: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM approval_decisions WHERE approval_id=?1 AND decision='APPROVE'",
+                [approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved_record_count, 1);
+        let grant_count: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM authority_grants", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(grant_count, 0, "hard deny cannot issue a grant");
         assert!(
             manager
                 .decide_candidate_approval(
