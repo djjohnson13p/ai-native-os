@@ -639,3 +639,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "coordinator_wrong_task_tests.rs"]
+mod wrong_task_tests;
