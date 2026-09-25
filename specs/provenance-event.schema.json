@@ -264,7 +264,21 @@
             "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskOpaqueIdentifier"}]},
             "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
             "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
-            "constraints": {"type": "null"},
+            "constraints": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "privacy": {"enum": ["local-only", "local-first", "remote-allowed"]},
+                    "max_cost_microunits": {"type": ["integer", "null"], "minimum": 0},
+                    "deadline": {"type": ["string", "null"], "format": "date-time"},
+                    "preserve_inputs": {"type": "boolean"}
+                  }
+                }
+              ]
+            },
             "created_at": {"type": "string", "format": "date-time", "maxLength": 4096}
           }
         },

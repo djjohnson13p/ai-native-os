@@ -69,6 +69,43 @@ fn single_node_id(program: &Value) -> Result<String> {
         .ok_or_else(reject)
 }
 
+fn validate_initial_plan(
+    plan: &Value,
+    task_id: &str,
+    plan_id: &str,
+    program: &Value,
+    node_id: &str,
+) -> Result<()> {
+    let schema: Value = serde_json::from_str(include_str!("../../../specs/task-plan.schema.json"))
+        .map_err(|_| reject())?;
+    if !jsonschema::validator_for(&schema)
+        .map_err(|_| reject())?
+        .is_valid(plan)
+        || plan.get("plan_id").and_then(Value::as_str) != Some(plan_id)
+        || plan.get("task_id").and_then(Value::as_str) != Some(task_id)
+        || plan.get("revision").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(reject());
+    }
+    let [node] = plan["nodes"].as_array().ok_or_else(reject)?.as_slice() else {
+        return Err(reject());
+    };
+    let capability = program["nodes"][0]["operation"]["capability"]
+        .as_str()
+        .and_then(|capability| capability.split_once('@'))
+        .ok_or_else(reject)?;
+    if node.get("id").and_then(Value::as_str) != Some(node_id)
+        || node.get("capability").and_then(Value::as_str) != Some(capability.0)
+        || node
+            .get("capability_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| version != capability.1)
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 impl TaskManager {
     /// Trusted-host entry: raw IR, rather than a caller's validity or hash
     /// claim, determines the executable initial program.
@@ -85,11 +122,9 @@ impl TaskManager {
         fail_provenance: bool,
     ) -> Result<TransitionResult> {
         let plan = strict_document(input.plan_json)?;
-        if !plan.is_object() || plan.get("plan_id").and_then(Value::as_str) != Some(input.plan_id) {
-            return Err(reject());
-        }
         let program = strict_document(input.program_json)?;
         let node_id = single_node_id(&program)?;
+        validate_initial_plan(&plan, input.task_id, input.plan_id, &program, &node_id)?;
         let plan_json = std::str::from_utf8(input.plan_json)
             .map_err(|_| reject())?
             .to_owned();
@@ -313,6 +348,19 @@ mod tests {
         .into_bytes()
     }
 
+    fn plan(task_id: &str, plan_id: &str) -> Vec<u8> {
+        json!({
+            "schema_version":"0.1","plan_id":plan_id,"task_id":task_id,
+            "revision":1,"intent":"copy the source",
+            "nodes":[{"id":"copy","capability":"artifact.copy",
+                "capability_version":"1","depends_on":[],
+                "inputs":[{"name":"source","ref":"input:source","type":"artifact.file@1"}],
+                "outputs":[{"name":"copy","type":"artifact.file@1"}]}]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     fn admitted_manager(path: Option<&std::path::Path>) -> (TaskManager, String) {
         let mut manager = if let Some(path) = path {
             TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap()
@@ -384,13 +432,13 @@ mod tests {
         let (mut manager, snapshot) = admitted_manager(Some(&path));
         create(&mut manager, "T-initial");
         let raw = program();
-        let plan = br#"{"plan_id":"plan:initial","revision":1}"#;
+        let plan = plan("T-initial", "plan:initial");
         let request = InitialProgramAdmissionRequest {
             transition_id: "transition:initial-program",
             task_id: "T-initial",
             expected_revision: 1,
             plan_id: "plan:initial",
-            plan_json: plan,
+            plan_json: &plan,
             registry_snapshot_id: &snapshot,
             program_json: &raw,
         };
@@ -414,10 +462,12 @@ mod tests {
             manager.admit_initial_semantic_program(&request).unwrap(),
             first
         );
-        let changed_plan = br#"{"plan_id":"plan:initial","revision":1,"changed":true}"#;
+        let mut changed_plan: Value = serde_json::from_slice(&plan).unwrap();
+        changed_plan["intent"] = json!("changed intent");
+        let changed_plan = changed_plan.to_string().into_bytes();
         let conflict = manager
             .admit_initial_semantic_program(&InitialProgramAdmissionRequest {
-                plan_json: changed_plan,
+                plan_json: &changed_plan,
                 ..request
             })
             .unwrap();
@@ -476,13 +526,13 @@ mod tests {
         let mut bad: Value = serde_json::from_slice(&program()).unwrap();
         bad["nodes"][0]["operation"]["capability"] = json!("artifact.unknown@1");
         let raw = bad.to_string().into_bytes();
-        let plan = br#"{"plan_id":"plan:invalid"}"#;
+        let invalid_program_plan = plan("T-invalid", "plan:invalid");
         let request = InitialProgramAdmissionRequest {
             transition_id: "transition:invalid-program",
             task_id: "T-invalid",
             expected_revision: 1,
             plan_id: "plan:invalid",
-            plan_json: plan,
+            plan_json: &invalid_program_plan,
             registry_snapshot_id: &snapshot,
             program_json: &raw,
         };
@@ -492,6 +542,30 @@ mod tests {
             manager.get_task("T-invalid").unwrap().unwrap().state,
             TaskState::Created
         );
+        create(&mut manager, "T-wrong-plan");
+        let valid_program = program();
+        for (transition_id, invalid_plan) in [
+            ("transition:wrong-task-plan", plan("T-other", "plan:wrong")),
+            (
+                "transition:malformed-plan",
+                br#"{"plan_id":"plan:wrong"}"#.to_vec(),
+            ),
+        ] {
+            assert!(
+                manager
+                    .admit_initial_semantic_program(&InitialProgramAdmissionRequest {
+                        transition_id,
+                        task_id: "T-wrong-plan",
+                        expected_revision: 1,
+                        plan_id: "plan:wrong",
+                        plan_json: &invalid_plan,
+                        registry_snapshot_id: &snapshot,
+                        program_json: &valid_program,
+                    })
+                    .is_err()
+            );
+            assert_eq!(rows(&manager, "T-wrong-plan"), (0, 0, 0, 0));
+        }
         create(&mut manager, "T-retired");
         manager
             .registry_store_writer()
@@ -499,6 +573,7 @@ mod tests {
             .set_snapshot_state(&snapshot, SnapshotState::Revoked)
             .unwrap();
         let valid = program();
+        let retired_plan = plan("T-retired", "plan:invalid");
         assert!(
             manager
                 .admit_initial_semantic_program(&InitialProgramAdmissionRequest {
@@ -506,7 +581,7 @@ mod tests {
                     task_id: "T-retired",
                     expected_revision: 1,
                     plan_id: "plan:invalid",
-                    plan_json: plan,
+                    plan_json: &retired_plan,
                     registry_snapshot_id: &snapshot,
                     program_json: &valid,
                 })
@@ -524,6 +599,7 @@ mod tests {
         let (mut manager, snapshot) = admitted_manager(None);
         create(&mut manager, "T-rollback");
         let raw = program();
+        let rollback_plan = plan("T-rollback", "plan:rollback");
         let result = manager
             .admit_initial_semantic_program_with_provenance_failure(
                 &InitialProgramAdmissionRequest {
@@ -531,7 +607,7 @@ mod tests {
                     task_id: "T-rollback",
                     expected_revision: 1,
                     plan_id: "plan:rollback",
-                    plan_json: br#"{"plan_id":"plan:rollback"}"#,
+                    plan_json: &rollback_plan,
                     registry_snapshot_id: &snapshot,
                     program_json: &raw,
                 },

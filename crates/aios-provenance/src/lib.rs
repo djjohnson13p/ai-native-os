@@ -259,6 +259,17 @@ pub fn append_in_tx(
     expected_head: &ExpectedHead,
 ) -> Result<JournalRecord> {
     validate_event(task_id, event)?;
+    if string_field(event, "event_type") == Some("artifact.exported")
+        && event
+            .pointer("/external_transfer/destination")
+            .and_then(Value::as_str)
+            .is_some_and(|destination| destination.starts_with("service://"))
+        && event.pointer("/details/export_authority").is_none()
+    {
+        return Err(Error::InvalidRecord(
+            "exact service export requires export authority".to_owned(),
+        ));
+    }
     let stream_id = stream_id(task_id)?;
     let head = get_head(transaction, &stream_id)?;
     match (expected_head, &head) {
@@ -2374,8 +2385,37 @@ fn validate_creation_details(value: &Value) -> Result<()> {
             "normalized_intent_ref" => {
                 validate_commitment(value, "normalized_intent", true)?;
             }
-            "constraints" => expect_null(value)?,
+            "constraints" => validate_task_creation_constraints(value)?,
             "created_at" => expect_timestamp(value)?,
+            _ => unreachable!("object keys were checked"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_creation_constraints(value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let fields = expect_object_keys(
+        value,
+        &[
+            "privacy",
+            "max_cost_microunits",
+            "deadline",
+            "preserve_inputs",
+        ],
+    )?;
+    for (key, value) in fields {
+        match key.as_str() {
+            "privacy" => expect_one_of(value, &["local-only", "local-first", "remote-allowed"])?,
+            "max_cost_microunits" => {
+                if !value.is_null() {
+                    expect_integer(value, 0, None)?;
+                }
+            }
+            "deadline" => expect_nullable_timestamp(value)?,
+            "preserve_inputs" => expect_bool(value)?,
             _ => unreachable!("object keys were checked"),
         }
     }
@@ -4196,6 +4236,13 @@ mod tests {
             boundary["details"]["size_bytes"] = json!(size);
             append_in_tx(&transaction, task_id, &boundary, &ExpectedHead::Any).unwrap();
         }
+        let mut omitted_pin = event.clone();
+        omitted_pin["event_id"] = json!("event:missing-exact-export-authority");
+        omitted_pin["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_authority");
+        assert!(append_in_tx(&transaction, task_id, &omitted_pin, &ExpectedHead::Any).is_err());
         let mut legacy = event.clone();
         legacy["event_id"] = json!("event:class-only-export");
         legacy["details"]

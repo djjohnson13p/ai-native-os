@@ -211,6 +211,27 @@ impl TaskManager {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
+        let existing: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT s.destination_class,s.adapter_id,s.descriptor_hash,st.state
+                 FROM authority_export_services s
+                 JOIN authority_export_service_states st USING(service_id)
+                 WHERE s.service_id=?1",
+                [service_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((class, adapter, descriptor, state)) = existing {
+            if class == destination_class
+                && adapter == adapter_id
+                && descriptor == hash
+                && state == "READY"
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(reject());
+        }
         tx.execute("INSERT INTO authority_export_services(service_id,destination_class,adapter_id,descriptor_hash,registered_at)
             VALUES (?1,?2,?3,?4,?5)",params![service_id,destination_class,adapter_id,hash,now])?;
         tx.execute(
@@ -2199,6 +2220,22 @@ mod tests {
                 "adapter:memory",
             )
             .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://fixture/a",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        assert!(
+            manager
+                .register_trusted_export_service(
+                    "service://fixture/a",
+                    "other_class",
+                    "adapter:memory",
+                )
+                .is_err()
+        );
         assert!(
             manager
                 .register_trusted_export_service(

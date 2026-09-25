@@ -1064,6 +1064,17 @@ struct ArtifactExportIntent {
     exact_export: Option<super::authority_candidate::ExportPin>,
 }
 
+pub(crate) struct ExactExportReplayIdentity<'a> {
+    pub candidate_id: &'a str,
+    pub operation_id: &'a str,
+    pub service_id: &'a str,
+    pub source_artifact_id: &'a str,
+    pub source_selector: &'a str,
+    pub destination_selector: &'a str,
+    pub purpose: &'a str,
+    pub max_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreDestinationExportAdmission {
@@ -5184,6 +5195,103 @@ impl TaskManager {
         authenticate_export_operation(&self.connection, operation_id, &intent_json)?.ok_or(
             TaskManagerError::InvalidRecord("ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT"),
         )?
+    }
+
+    /// Reauthenticates an exact completed operation against its immutable
+    /// candidate pin after the trusted coordinator has been reopened. This
+    /// path never reads the source or asks for a current grant or writer.
+    pub(crate) fn replay_completed_exact_export(
+        &self,
+        session: &ProviderArtifactSession,
+        identity: &ExactExportReplayIdentity<'_>,
+    ) -> Result<u64> {
+        let pin = self
+            .connection
+            .query_row(
+                "SELECT p.semantic_selector,p.service_id,p.destination_class,p.descriptor_hash,
+                    p.adapter_id,p.operation_id,p.source_artifact_id,p.source_content_hash,
+                    p.purpose,p.sensitivity,p.max_size_bytes
+             FROM authority_candidate_export_pins p
+             JOIN authority_candidate_reservations c ON c.candidate_id=p.candidate_id
+             JOIN authority_export_services s ON s.service_id=p.service_id
+                AND s.destination_class=p.destination_class
+                AND s.descriptor_hash=p.descriptor_hash AND s.adapter_id=p.adapter_id
+             WHERE c.candidate_id=?1 AND c.task_id=?2 AND c.binding_id=?3",
+                params![
+                    identity.candidate_id,
+                    session.task_id,
+                    session.authority.binding_id
+                ],
+                |row| {
+                    Ok(super::authority_candidate::ExportPin {
+                        selector: row.get(0)?,
+                        service_id: row.get(1)?,
+                        destination_class: row.get(2)?,
+                        descriptor_hash: row.get(3)?,
+                        adapter_id: row.get(4)?,
+                        operation_id: row.get(5)?,
+                        source_artifact_id: row.get(6)?,
+                        source_content_hash: row.get(7)?,
+                        purpose: row.get(8)?,
+                        sensitivity: row.get(9)?,
+                        max_size_bytes: u64::try_from(row.get::<_, i64>(10)?)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, -1))?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ))?;
+        if pin.service_id != identity.service_id
+            || pin.operation_id != identity.operation_id
+            || pin.source_artifact_id != identity.source_artifact_id
+            || pin.selector != identity.destination_selector
+            || pin.purpose != identity.purpose
+            || pin.max_size_bytes != identity.max_size_bytes
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        let pinned_read: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM authority_candidate_resources
+             WHERE candidate_id=?1 AND action='artifact.read'
+               AND semantic_selector=?2 AND resource_kind='artifact' AND resource_id=?3)",
+            params![
+                identity.candidate_id,
+                identity.source_selector,
+                identity.source_artifact_id
+            ],
+            |row| row.get(0),
+        )?;
+        if !pinned_read {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        let intent_json: String = self
+            .connection
+            .query_row(
+                "SELECT details_json FROM operations WHERE operation_id=?1",
+                [identity.operation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ))?;
+        let intent: ArtifactExportIntent = serde_json::from_str(&intent_json)?;
+        if intent.version != EXACT_EXPORT_INTENT_VERSION
+            || intent.exact_export.as_ref() != Some(&pin)
+            || intent.artifact_id != pin.source_artifact_id
+            || intent.destination_class != pin.destination_class
+        {
+            return Err(TaskManagerError::InvalidRecord(
+                "ARTIFACT_EXPORT_OPERATION_ID_REUSE_CONFLICT",
+            ));
+        }
+        self.replay_bound_artifact_export(session, identity.operation_id)
     }
 
     /// Replays an exact durable owner export without reopening its Artifact or destination.
