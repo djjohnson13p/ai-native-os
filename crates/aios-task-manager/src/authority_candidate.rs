@@ -5211,6 +5211,17 @@ mod tests {
             fresh.decisions[1].approval_id,
             initial.decisions[1].approval_id
         );
+        let fresh_approval = fresh.decisions[1].approval_id.as_deref().unwrap();
+        manager
+            .decide_candidate_approval(
+                fresh_approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        assert!(crate::approval_not_withdrawn(&manager.connection, Some(fresh_approval)).unwrap());
         let denied = json!({"schema_version":"0.1","rules":[
             {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
             {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
@@ -5219,10 +5230,15 @@ mod tests {
         manager
             .activate_local_authority_policy(denied.to_string().as_bytes())
             .unwrap();
+        assert!(crate::approval_not_withdrawn(&manager.connection, Some(fresh_approval)).unwrap());
         let hard = manager
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(hard.decisions[1].effect, PolicyEffect::Deny);
+        assert_eq!(
+            hard.decisions[1].authority_request_id,
+            fresh.decisions[1].authority_request_id
+        );
         assert_eq!(hard.decisions[1].reason_code, deny_case["reason_code"]);
         assert_policy_decision_reason(
             &manager,
@@ -5234,7 +5250,7 @@ mod tests {
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM approval_decisions WHERE approval_id=?1 AND decision='APPROVE'",
-                [approval],
+                [fresh_approval],
                 |row| row.get(0),
             )
             .unwrap();
@@ -5249,7 +5265,7 @@ mod tests {
         assert!(
             manager
                 .decide_candidate_approval(
-                    approval,
+                    fresh_approval,
                     &AuthenticatedApprover {
                         principal_id: "user:test"
                     },
