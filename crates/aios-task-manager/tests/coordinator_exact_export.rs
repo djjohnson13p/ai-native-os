@@ -363,6 +363,19 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
     assert_eq!(prompt["export"]["source_content_hash"], source_hash());
     assert_eq!(prompt["export"]["purpose"], proposal.purpose);
     assert_eq!(prompt["export"]["max_size_bytes"], proposal.max_size_bytes);
+    assert_eq!(prompt["export"]["adapter_id"], "adapter:exact");
+    assert_eq!(prompt["resource"]["sensitivity"], "private");
+    assert_eq!(prompt["principal"]["id"], registration.provider_id);
+    let readonly_prompt =
+        Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let descriptor: String = readonly_prompt
+        .query_row(
+            "SELECT descriptor_hash FROM authority_candidate_export_pins WHERE candidate_id=?1",
+            [&proposal.candidate_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt["export"]["descriptor_hash"], descriptor);
     let replay_reference = serde_json::to_vec(&prepared.replay_reference()).unwrap();
     assert_eq!(
         coordinator
@@ -655,18 +668,14 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
     assert!(coordinator.start_local_export(&multi_prepared).is_err());
     assert!(
         coordinator
-            .cancel_local_export(&multi_prepared, "user:other")
+            .cancel_local_export(&multi_prepared, "user:other", "transition:foreign-multi")
             .is_err()
     );
     coordinator
-        .cancel_local_export(&multi_prepared, "user:test")
+        .cancel_local_export(&multi_prepared, "user:test", "transition:cancel-multi")
         .unwrap();
     coordinator
-        .cancel_task(
-            &multi.task.task_id,
-            "user:test",
-            &format!("transition:export-cancel:{}", multi.candidate_id),
-        )
+        .cancel_task(&multi.task.task_id, "user:test", "transition:cancel-multi")
         .unwrap();
     assert_eq!(
         coordinator
@@ -686,7 +695,7 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         .prepare_local_export(&all, &mut Cursor::new(SOURCE))
         .unwrap();
     assert_eq!(all_prepared.approval_ids().len(), 3);
-    for id in all_prepared.approval_ids() {
+    for id in all_prepared.approval_ids().iter().rev() {
         coordinator
             .decide_approval_for(&all_prepared, id, "user:test", true)
             .unwrap();
@@ -729,7 +738,7 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         .unwrap();
     let cancelled_execution = coordinator.start_local_export(&cancellable).unwrap();
     coordinator
-        .cancel_local_export(&cancellable, "user:test")
+        .cancel_local_export(&cancellable, "user:test", "transition:cancel-issued")
         .unwrap();
     let revoked_count: i64 = readonly
         .query_row(
@@ -1086,4 +1095,95 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         )
         .unwrap();
     assert_eq!(after_cancel, "CANCELLED");
+
+    restarted
+        .register_export_service(
+            "service://fixture/corrupt",
+            "fixture_remote",
+            "adapter:corrupt",
+        )
+        .unwrap();
+    let mut corrupt = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "missing-source",
+    );
+    corrupt.service_id = "service://fixture/corrupt".into();
+    let unique_source = b"unique source removed before export";
+    let corrupt_prepared = restarted
+        .prepare_local_export(&corrupt, &mut Cursor::new(unique_source))
+        .unwrap();
+    restarted
+        .decide_approval(&corrupt_prepared, "user:test", true)
+        .unwrap();
+    let corrupt_execution = restarted.start_local_export(&corrupt_prepared).unwrap();
+    let root: String = readonly
+        .query_row(
+            "SELECT canonical_root FROM artifact_store_binding WHERE singleton_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let storage_ref: String = readonly.query_row(
+        "SELECT b.storage_ref FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+         JOIN task_artifacts t ON t.artifact_id=a.artifact_id WHERE t.task_id=?1 LIMIT 1",
+        [&corrupt.task.task_id], |r| r.get(0)).unwrap();
+    let blob_path = std::path::Path::new(&root).join(storage_ref);
+    let backup_path = blob_path.with_extension("test-backup");
+    std::fs::rename(&blob_path, &backup_path).unwrap();
+    std::fs::create_dir(&blob_path).unwrap();
+    assert!(restarted.export_local_artifact(&corrupt_execution).is_err());
+    let no_effect_task: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&corrupt.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_effect_task, "RUNNING");
+    std::fs::remove_dir(&blob_path).unwrap();
+    std::fs::rename(&backup_path, &blob_path).unwrap();
+    assert_eq!(
+        restarted
+            .memory_export_observation("service://fixture/corrupt")
+            .unwrap()
+            .opens,
+        0
+    );
+    let no_effect_step: (String, String) = readonly
+        .query_row(
+            "SELECT state,outcome_certainty FROM step_executions WHERE attempt_id=?1",
+            [&corrupt.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(no_effect_step, ("FAILED".into(), "FAILED_NO_EFFECT".into()));
+    let no_operation: i64 = readonly
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE operation_id=?1",
+            [&corrupt.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_operation, 0);
+    restarted
+        .cancel_task(
+            &corrupt.task.task_id,
+            "user:test",
+            "transition:cancel-no-effect",
+        )
+        .unwrap();
+    drop(readonly);
+    drop(restarted);
+    let recovered = TaskManager::open(&db).unwrap();
+    assert_eq!(
+        recovered
+            .get_task(&corrupt.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Cancelled
+    );
+    assert!(recovered.verify_provenance(&corrupt.task.task_id).unwrap());
 }

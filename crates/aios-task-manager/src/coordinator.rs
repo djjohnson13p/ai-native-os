@@ -16,7 +16,7 @@ use super::{
     authority_policy::{AuthenticatedApprover, PolicyEffect},
     initial_program_admission::InitialProgramAdmissionRequest,
 };
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -550,13 +550,10 @@ impl TrustedLocalCoordinator {
         &mut self,
         prepared: &PreparedLocalExport,
         authenticated_owner_id: &str,
+        transition_id: &str,
     ) -> Result<()> {
         self.verify_handle(prepared)?;
-        self.cancel_task(
-            &prepared.task_id,
-            authenticated_owner_id,
-            &format!("transition:export-cancel:{}", prepared.candidate_id),
-        )
+        self.cancel_task(&prepared.task_id, authenticated_owner_id, transition_id)
     }
 
     /// Cancels a durable Task by authenticated owner identity. This path does
@@ -684,6 +681,10 @@ impl TrustedLocalCoordinator {
     /// # Errors
     /// Returns an error if any current read/export grant, exact pin, deadline,
     /// callback, or durable completion check fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preflight, guarded start, and exact no-effect retirement share this entry"
+    )]
     pub fn export_local_artifact(&mut self, execution: &LocalExportExecution) -> Result<u64> {
         let prepared = &execution.prepared;
         self.verify_handle(prepared)?;
@@ -702,6 +703,35 @@ impl TrustedLocalCoordinator {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        let sink_observer = Arc::clone(&service.sink);
+        let sink = Arc::clone(&service.sink);
+        let session = self
+            .manager
+            .issue_provider_artifact_session(&prepared.task_id, &prepared.binding_id)?;
+        let scope = self
+            .manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&prepared.source_artifact_id))?;
+        let mut destination = self.manager.issue_exact_bound_artifact_export_destination(
+            &session,
+            &scope,
+            &prepared.operation_id,
+            &prepared.source_artifact_id,
+            &prepared.service_id,
+            &service.adapter_id,
+            move || {
+                let mut state = sink
+                    .lock()
+                    .map_err(|_| io::Error::other("memory sink poisoned"))?;
+                state.opens += 1;
+                drop(state);
+                Ok(MemoryExportWriter {
+                    state: sink,
+                    hasher: Sha256::new(),
+                    size_bytes: 0,
+                    finalized: false,
+                })
+            },
+        )?;
         let task = self
             .manager
             .get_task(&prepared.task_id)?
@@ -731,36 +761,149 @@ impl TrustedLocalCoordinator {
         } else if task.state != TaskState::Running {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        let sink = Arc::clone(&service.sink);
-        let session = self
+        let opens_before = sink_observer
+            .lock()
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
+            .opens;
+        match self
             .manager
-            .issue_provider_artifact_session(&prepared.task_id, &prepared.binding_id)?;
-        let scope = self
-            .manager
-            .scope_artifact_reads(&session, std::slice::from_ref(&prepared.source_artifact_id))?;
-        let mut destination = self.manager.issue_exact_bound_artifact_export_destination(
-            &session,
-            &scope,
-            &prepared.operation_id,
-            &prepared.source_artifact_id,
-            &prepared.service_id,
-            &service.adapter_id,
-            move || {
-                let mut state = sink
-                    .lock()
-                    .map_err(|_| io::Error::other("memory sink poisoned"))?;
-                state.opens += 1;
-                drop(state);
-                Ok(MemoryExportWriter {
-                    state: sink,
-                    hasher: Sha256::new(),
-                    size_bytes: 0,
-                    finalized: false,
-                })
-            },
-        )?;
-        self.manager
             .export_artifact(&scope, &prepared.source_artifact_id, &mut destination)
+        {
+            Ok(size) => Ok(size),
+            Err(error) => {
+                let operation: Option<(String, Option<String>)> = self.manager.connection.query_row(
+                    "SELECT state,outcome_certainty FROM operations WHERE operation_id=?1 AND task_id=?2",
+                    params![prepared.operation_id, prepared.task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional()?;
+                let authenticated_no_effect = match operation.as_ref() {
+                    None => true,
+                    Some((state, Some(certainty)))
+                        if state == "FAILED" && certainty == "FAILED_NO_EFFECT" =>
+                    {
+                        matches!(
+                            self.manager
+                                .replay_bound_artifact_export(&session, &prepared.operation_id),
+                            Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+                            ))
+                        )
+                    }
+                    _ => false,
+                };
+                if authenticated_no_effect {
+                    self.retire_no_effect_export_attempt(
+                        prepared,
+                        &sink_observer,
+                        opens_before,
+                        operation.is_some(),
+                    )?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Retires only an exact attempt with authenticated no-effect evidence.
+    /// An armed/unknown operation or any observed sink open is never cleaned up.
+    fn retire_no_effect_export_attempt(
+        &mut self,
+        prepared: &PreparedLocalExport,
+        sink: &Arc<Mutex<MemorySinkState>>,
+        opens_before: u64,
+        failed_operation_authenticated: bool,
+    ) -> Result<()> {
+        if sink
+            .lock()
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
+            .opens
+            != opens_before
+        {
+            return Ok(());
+        }
+        super::trusted_time::with_protected_immediate(
+            &self.manager.connection,
+            &self.manager.clock,
+            |tx, now| {
+                super::assert_manager_lease(
+                    tx,
+                    &self.manager.lease_owner,
+                    self.manager.lease_epoch,
+                )?;
+                let attempt: Option<(String, String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT c.attempt_id,e.state,e.outcome_certainty
+                     FROM authority_candidate_reservations c
+                     JOIN authority_candidate_status cs USING(candidate_id)
+                     JOIN step_executions e ON e.attempt_id=c.attempt_id AND e.task_id=c.task_id
+                        AND e.binding_id=c.binding_id
+                     JOIN tasks t ON t.task_id=c.task_id
+                     WHERE c.candidate_id=?1 AND c.task_id=?2 AND c.binding_id=?3
+                       AND cs.state='FINALIZED' AND t.state='RUNNING'",
+                        params![prepared.candidate_id, prepared.task_id, prepared.binding_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((attempt_id, state, certainty)) = attempt else {
+                    return Ok(());
+                };
+                if state != "RUNNING" || certainty.is_some() {
+                    return Ok(());
+                }
+                let operation: Option<(String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT state,outcome_certainty FROM operations
+                     WHERE operation_id=?1 AND task_id=?2 AND attempt_id=?3",
+                        params![prepared.operation_id, prepared.task_id, attempt_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let exact_no_effect = match operation.as_ref() {
+                    None => !failed_operation_authenticated,
+                    Some((state, Some(certainty))) => {
+                        failed_operation_authenticated
+                            && state == "FAILED"
+                            && certainty == "FAILED_NO_EFFECT"
+                    }
+                    _ => false,
+                };
+                if !exact_no_effect {
+                    return Ok(());
+                }
+                let other_effects: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE task_id=?1 AND attempt_id=?2 AND operation_id<>?3)
+                        OR EXISTS(SELECT 1 FROM provider_invocations WHERE task_id=?1 AND attempt_id=?2)
+                        OR EXISTS(SELECT 1 FROM credential_use_records WHERE task_id=?1)",
+                    params![prepared.task_id, attempt_id, prepared.operation_id], |r| r.get(0))?;
+                if other_effects {
+                    return Ok(());
+                }
+                if tx.execute(
+                    "UPDATE step_executions SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',
+                     revision=revision+1,finished_at=?2,updated_at=?2
+                     WHERE attempt_id=?1 AND state='RUNNING' AND outcome_certainty IS NULL",
+                    params![attempt_id, now],
+                )? != 1 { return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")); }
+                let mut event_id = String::from("event:export-no-effect:");
+                for byte in Sha256::digest(attempt_id.as_bytes()) {
+                    use std::fmt::Write as _;
+                    write!(&mut event_id, "{byte:02x}").expect("string write");
+                }
+                super::append_event(
+                    tx,
+                    &prepared.task_id,
+                    &serde_json::json!({
+                        "schema_version":"0.1", "event_id":event_id,
+                        "task_id":prepared.task_id,"event_type":"execution.failed",
+                        "timestamp":now,"actor":{"kind":"system-service","id":"aiosd.coordinator"},
+                        "status":"failure", "details":{"operation_id":prepared.operation_id,
+                        "outcome_certainty":"FAILED_NO_EFFECT", "effect_boundary":"destination-not-invoked",
+                            "reason_code":"ARTIFACT_EXPORT_FAILED_NO_EFFECT"}
+                    }),
+                )?;
+                Ok(())
+            },
+        )
     }
 
     /// Returns the authenticated durable result of an already completed export.
