@@ -65,11 +65,16 @@ pub struct AuthorityDenial {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityDenialStage {
     CandidateReservation,
+    ArtifactAdmission,
+    ArtifactRead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityDenialReason {
     SemanticRequestMismatch,
+    GrantUsageExhausted,
+    GrantExpired,
+    GrantRevoked,
 }
 
 impl AuthorityDenialReason {
@@ -77,6 +82,9 @@ impl AuthorityDenialReason {
     pub const fn code(self) -> &'static str {
         match self {
             Self::SemanticRequestMismatch => "AUTH_SEMANTIC_REQUEST_MISMATCH",
+            Self::GrantUsageExhausted => "AUTH_GRANT_USAGE_EXHAUSTED",
+            Self::GrantExpired => "AUTH_GRANT_EXPIRED",
+            Self::GrantRevoked => "AUTH_GRANT_REVOKED",
         }
     }
 }
@@ -123,9 +131,14 @@ impl fmt::Display for TaskManagerError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Provider(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
-            Self::AuthorityDenied(_) => {
-                formatter.write_str("authority candidate reservation is not admissible")
-            }
+            Self::AuthorityDenied(denial) => match denial.stage {
+                AuthorityDenialStage::CandidateReservation => {
+                    formatter.write_str("authority candidate reservation is not admissible")
+                }
+                AuthorityDenialStage::ArtifactAdmission | AuthorityDenialStage::ArtifactRead => {
+                    formatter.write_str("ARTIFACT_AUTHORITY_DENIED")
+                }
+            },
         }
     }
 }

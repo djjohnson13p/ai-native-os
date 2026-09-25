@@ -2174,6 +2174,464 @@ mod tests {
         case
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issues one genuine coordinator read grant for lifecycle fixtures"
+    )]
+    fn issued_fixture_read(
+        read_requires_approval: bool,
+        enter_running: bool,
+    ) -> (
+        TaskManager,
+        String,
+        crate::artifact_store::ProviderArtifactSession,
+        String,
+        String,
+    ) {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-lifecycle".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"grant lifecycle source"),
+            )
+            .unwrap();
+        let resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:grant-lifecycle");
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:grant-lifecycle",
+                binding_id: "binding:grant-lifecycle",
+                attempt_id: "attempt:grant-lifecycle",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let read_effect = if read_requires_approval {
+            "REQUIRE_APPROVAL"
+        } else {
+            "ALLOW"
+        };
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":read_effect,"action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluation = manager
+            .evaluate_pending_authority_candidate("candidate:grant-lifecycle")
+            .unwrap();
+        let mut revision = 2;
+        let mut state = TaskState::Planning;
+        if read_requires_approval {
+            let approval = evaluation.decisions[0].approval_id.as_deref().unwrap();
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: "transition:grant-waiting".into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: 2,
+                        expected_state: TaskState::Planning,
+                        to_state: TaskState::WaitingForAuth,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "APPROVAL_REQUIRED".into(),
+                            message: None,
+                            related_ids: vec![approval.into()]
+                        },
+                        mutation: TaskMutation {
+                            waiting_on: Some(vec![WaitingOn {
+                                kind: WaitingKind::Approval,
+                                id: approval.into(),
+                                message: None
+                            }]),
+                            ..TaskMutation::default()
+                        },
+                    })
+                    .unwrap()
+                    .applied
+            );
+            manager
+                .decide_candidate_approval(
+                    approval,
+                    &AuthenticatedApprover {
+                        principal_id: "user:test",
+                    },
+                    true,
+                )
+                .unwrap();
+            revision = 3;
+            state = TaskState::WaitingForAuth;
+        }
+        manager
+            .finalize_pending_authority_candidate("candidate:grant-lifecycle")
+            .unwrap();
+        // Admit the unique selected input first; a later same-Task import
+        // cannot widen the finalized exact-resource grant.
+        let unbound = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-lifecycle-unbound".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"same task but unbound"),
+            )
+            .unwrap();
+        for (id, next) in [
+            ("transition:grant-runnable", TaskState::Runnable),
+            ("transition:grant-running", TaskState::Running),
+        ] {
+            if next == TaskState::Running && !enter_running {
+                break;
+            }
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: state,
+                        to_state: next,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+            revision += 1;
+            state = next;
+        }
+        let grant_id: String = manager.connection.query_row(
+            "SELECT g.grant_id FROM authority_grants g JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+             WHERE g.execution_binding_id='binding:grant-lifecycle' AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+            [&source.artifact_id], |row| row.get(0),
+        ).unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:grant-lifecycle")
+            .unwrap();
+        (
+            manager,
+            source.artifact_id,
+            session,
+            grant_id,
+            unbound.artifact_id,
+        )
+    }
+
+    #[test]
+    fn fixture_one_shot_read_exhaustion_preserves_only_authenticated_replay() {
+        let case = authority_case("one-shot-grant-already-consumed");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, source, session, grant_id, unbound) = issued_fixture_read(true, true);
+        let (scope, maximum, consumed, state): (String, Option<i64>, i64, String) = manager
+            .connection
+            .query_row(
+                "SELECT scope,max_uses,uses_consumed,state FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(scope, case["facts"]["scope"]);
+        assert_eq!(maximum, Some(case["facts"]["max_uses"].as_i64().unwrap()));
+        assert_eq!((consumed, state.as_str()), (0, "ACTIVE"));
+        let read_scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let first = manager.open_artifact_reader(&read_scope, &source).unwrap();
+        let operation: String = manager.connection.query_row(
+            "SELECT operation_id FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(first); // no bytes delivered: the same pending admission may replay
+        let mut replay = manager.open_artifact_reader(&read_scope, &source).unwrap();
+        let replayed_operation: String = manager.connection.query_row(
+            "SELECT operation_id FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(replayed_operation, operation);
+        let mut bytes = Vec::new();
+        replay.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"grant lifecycle source");
+        let (consumed, state, operations): (i64, String, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,g.state,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(consumed, case["facts"]["uses_consumed"]);
+        assert_eq!(state, "CONSUMED");
+        assert_eq!(operations, 1);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let old_scope_error = match manager.open_artifact_reader(&read_scope, &source) {
+            Ok(_) => panic!("delivered one-shot admission reopened a reader"),
+            Err(error) => error,
+        };
+        assert_eq!(old_scope_error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let old_scope_denial = old_scope_error.authority_denial().unwrap();
+        assert_eq!(
+            old_scope_denial.stage,
+            AuthorityDenialStage::ArtifactAdmission
+        );
+        assert_eq!(old_scope_denial.reason.code(), case["reason_code"]);
+        let wrong_artifact = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&unbound))
+            .unwrap_err();
+        assert_eq!(wrong_artifact.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        assert!(wrong_artifact.authority_denial().is_none());
+        let (uses_after_denial, operations_after_denial): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (uses_after_denial, operations_after_denial),
+            (consumed, operations)
+        );
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        let mut again = Vec::new();
+        replay.read_to_end(&mut again).unwrap();
+        assert_eq!(again, bytes);
+        let operation_count: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(operation_count, 1);
+    }
+
+    #[test]
+    fn fixture_expired_grant_denies_retained_bytes_and_new_admission() {
+        let case = authority_case("expired-grant");
+        assert_eq!(case["expected"], "DENY");
+        assert_eq!(case["facts"]["effective_grant_state"], "EXPIRED");
+        assert_eq!(
+            case["facts"]["expiry_evidence"],
+            "authenticated_expiry_latch"
+        );
+        let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, true);
+        let (issued, deadline): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT issued_monotonic_nanos,deadline_monotonic_nanos
+             FROM authority_grant_deadlines WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let high_water: i64 = manager
+            .connection
+            .query_row(
+                "SELECT MAX(monotonic_nanos) FROM trusted_time_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let baseline = issued.max(high_water) + 1_000_000_000;
+        assert!(baseline < deadline);
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+            u64::try_from(baseline).unwrap(),
+        ));
+        manager.clock = Arc::new(FrozenWallClock {
+            monotonic: Arc::clone(&monotonic),
+        });
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        let position = reader.raw_position_for_test().unwrap();
+        let before_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        monotonic.store(u64::try_from(deadline + 1).unwrap(), Ordering::SeqCst);
+        let mut denied = [0xa5_u8; 1];
+        let error = reader.read(&mut denied).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let inner = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<TaskManagerError>()
+            .unwrap();
+        let denial = inner.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactRead);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(denied, [0xa5]);
+        assert_eq!(reader.raw_position_for_test().unwrap(), position);
+        let latched: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM authority_grant_expiry_latches WHERE grant_id=?1",
+                [&grant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latched, 1);
+        let persisted_state: String = manager
+            .connection
+            .query_row(
+                "SELECT state FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_state, case["facts"]["persisted_grant_state"]);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let after_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(after_denial, before_denial);
+    }
+
+    #[test]
+    fn fixture_cancel_revokes_real_grant_and_retained_reader() {
+        let case = authority_case("revoked-grant-after-task-cancel");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, false);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        let position = reader.raw_position_for_test().unwrap();
+        let before_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let completed: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE task_id='T-candidate'
+             AND effect_class='ARTIFACT_READ' AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
+             AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-delivered'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(completed, 1);
+        let cancellation = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:fixture-grant-cancel".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 3,
+                expected_state: TaskState::Runnable,
+                to_state: TaskState::Cancelled,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "TASK_CANCELLED".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(cancellation.applied, "{cancellation:?}");
+        assert_eq!(
+            manager
+                .get_task("T-candidate")
+                .unwrap()
+                .unwrap()
+                .state
+                .as_str(),
+            case["facts"]["task_state"]
+        );
+        let (state, reason, revoked_at): (String, Option<String>, Option<String>) = manager.connection.query_row(
+            "SELECT state,revocation_reason_code,revoked_at FROM authority_grants WHERE grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(state, case["facts"]["grant_state"]);
+        assert_eq!(reason.as_deref(), Some("AUTH_GRANT_REVOKED"));
+        assert!(revoked_at.is_some());
+        let mut denied = [0xa5_u8; 1];
+        let error = reader.read(&mut denied).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let inner = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<TaskManagerError>()
+            .unwrap();
+        let denial = inner.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactRead);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(denied, [0xa5]);
+        assert_eq!(reader.raw_position_for_test().unwrap(), position);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let after_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(after_denial, before_denial);
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,

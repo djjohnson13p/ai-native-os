@@ -27,8 +27,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    Actor, Clock, Result, SCHEMA_VERSION, StoreIdentity, StoreLock, TaskManager, TaskManagerError,
-    append_event, assert_manager_lease, canonical_json, provenance_hash, unresolved_execution_ids,
+    Actor, AuthorityDenial, AuthorityDenialReason, AuthorityDenialStage, Clock, Result,
+    SCHEMA_VERSION, StoreIdentity, StoreLock, TaskManager, TaskManagerError, append_event,
+    assert_manager_lease, canonical_json, provenance_hash, unresolved_execution_ids,
 };
 
 const IMPORT_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
@@ -1262,6 +1263,11 @@ impl ArtifactReader {
     pub fn handle(&self) -> &ArtifactHandle {
         &self.handle
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_position_for_test(&mut self) -> std::io::Result<u64> {
+        self.file.stream_position()
+    }
 }
 
 impl Read for ArtifactReader {
@@ -1324,13 +1330,50 @@ impl Read for ArtifactReader {
                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                 })?;
                 if !admitted {
+                    let reason = authenticated_read_grant_denial_in(
+                        &transaction,
+                        &self.task_id,
+                        execution,
+                        &self.artifact_id,
+                        &self.lease_owner,
+                        self.lease_epoch,
+                        true,
+                    )
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                    })?;
                     transaction.commit().map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                     })?;
                     locked_time = None;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        "ARTIFACT_AUTHORITY_DENIED",
+                        reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ),
+                    ));
+                }
+                if let Some(reason) = authenticated_read_grant_denial_in(
+                    &transaction,
+                    &self.task_id,
+                    execution,
+                    &self.artifact_id,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    true,
+                )
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?
+                {
+                    transaction.commit().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                    })?;
+                    locked_time = None;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason),
                     ));
                 }
             }
@@ -4429,6 +4472,10 @@ impl TaskManager {
             .map_err(Into::into)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps locked scope admission and denial classification on one fence"
+    )]
     pub fn scope_artifact_reads(
         &self,
         session: &ProviderArtifactSession,
@@ -4470,7 +4517,48 @@ impl TaskManager {
                         lease_epoch,
                         time,
                     )? {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                        let reason = if let [artifact_id] = artifact_ids {
+                            authenticated_read_grant_denial_in(
+                                transaction,
+                                task_id,
+                                &session.authority,
+                                artifact_id,
+                                &lease_owner,
+                                lease_epoch,
+                                false,
+                            )?
+                            .filter(|reason| *reason != AuthorityDenialReason::GrantUsageExhausted)
+                        } else {
+                            None
+                        };
+                        return Err(reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(
+                                    AuthorityDenialStage::ArtifactAdmission,
+                                    reason,
+                                )
+                            },
+                        ));
+                    }
+                    if let [artifact_id] = artifact_ids {
+                        if let Some(
+                            reason @ (AuthorityDenialReason::GrantRevoked
+                            | AuthorityDenialReason::GrantExpired),
+                        ) = authenticated_read_grant_denial_in(
+                            transaction,
+                            task_id,
+                            &session.authority,
+                            artifact_id,
+                            &lease_owner,
+                            lease_epoch,
+                            false,
+                        )? {
+                            return Err(artifact_grant_denial(
+                                AuthorityDenialStage::ArtifactAdmission,
+                                reason,
+                            ));
+                        }
                     }
                     let now = time.now();
                     let authority =
@@ -4516,12 +4604,27 @@ impl TaskManager {
                             None,
                         )? {
                             grant.grant_id
+                        } else if let Some(admission) = replay {
+                            admission.grant_admission.grant_id
                         } else {
-                            replay
-                                .map(|admission| admission.grant_admission.grant_id)
-                                .ok_or(TaskManagerError::InvalidRecord(
-                                    "ARTIFACT_AUTHORITY_DENIED",
-                                ))?
+                            let reason = authenticated_read_grant_denial_in(
+                                transaction,
+                                task_id,
+                                execution,
+                                artifact_id,
+                                &lease_owner,
+                                lease_epoch,
+                                false,
+                            )?;
+                            return Err(reason.map_or(
+                                TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                                |reason| {
+                                    artifact_grant_denial(
+                                        AuthorityDenialStage::ArtifactAdmission,
+                                        reason,
+                                    )
+                                },
+                            ));
                         };
                         grant_ids.insert(artifact_id.clone(), grant_id);
                     }
@@ -4746,8 +4849,22 @@ impl TaskManager {
             match admitted {
                 Ok(true) => {}
                 Ok(false) => {
+                    let reason = authenticated_read_grant_denial_in(
+                        &transaction,
+                        &scope.task_id,
+                        execution,
+                        artifact_id,
+                        &lease_owner,
+                        lease_epoch,
+                        false,
+                    )?;
                     transaction.commit()?;
-                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    return Err(reason.map_or(
+                        TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                        |reason| {
+                            artifact_grant_denial(AuthorityDenialStage::ArtifactAdmission, reason)
+                        },
+                    ));
                 }
                 Err(error) => {
                     drop(transaction);
@@ -4775,9 +4892,35 @@ impl TaskManager {
         let reader_admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
+                let typed = if matches!(
+                    error,
+                    TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")
+                ) {
+                    scope
+                        .authority
+                        .execution
+                        .as_ref()
+                        .map(|execution| {
+                            authenticated_read_grant_denial_in(
+                                &transaction,
+                                &scope.task_id,
+                                execution,
+                                artifact_id,
+                                &lease_owner,
+                                lease_epoch,
+                                false,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
                 drop(transaction);
                 fresh.commit(&self.connection)?;
-                return Err(error);
+                return Err(typed.map_or(error, |reason| {
+                    artifact_grant_denial(AuthorityDenialStage::ArtifactAdmission, reason)
+                }));
             }
         };
         if let Err(error) = transaction.commit() {
@@ -8775,6 +8918,194 @@ fn coordinator_grants_valid_in(
     Ok(all_valid)
 }
 
+fn artifact_grant_denial(
+    stage: AuthorityDenialStage,
+    reason: AuthorityDenialReason,
+) -> TaskManagerError {
+    TaskManagerError::AuthorityDenied(AuthorityDenial { stage, reason })
+}
+
+/// Classify only a grant whose immutable coordinator binding, issuance receipt,
+/// decision, request, and exact read resource all match the authenticated session.
+/// Any incomplete or ambiguous intersection keeps the coarse denial.
+#[allow(
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    reason = "the exact issued read tuple precedes every typed lifecycle reason"
+)]
+fn authenticated_read_grant_denial_in(
+    connection: &Connection,
+    task_id: &str,
+    execution: &ExecutionAuthority,
+    artifact_id: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+    admitted_replay: bool,
+) -> Result<Option<AuthorityDenialReason>> {
+    let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
+    let policy_ids: Vec<String> = serde_json::from_str(&execution.policy_decision_refs_json)?;
+    if grant_ids.is_empty() || grant_ids.len() > 64 || !all_unique(&grant_ids) {
+        return Ok(None);
+    }
+    let mut matched = None;
+    for grant_id in grant_ids {
+        if !super::coordinator_grant_policy_current(connection, &grant_id)? {
+            continue;
+        }
+        let row: Option<(
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = connection
+            .query_row(
+                "SELECT g.state,g.scope,g.revocation_reason_code,g.grants_json,g.max_uses,
+                    g.uses_consumed,g.policy_decision_id,r.semantic_selector,
+                    g.approval_id,g.revoked_at
+             FROM authority_grants g
+             JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+               AND i.token_id=g.token_id AND i.task_id=g.task_id
+               AND i.execution_binding_id=g.execution_binding_id
+               AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id
+               AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+               AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
+               AND d.node_id=g.node_id AND d.policy_snapshot_id=g.policy_snapshot_id
+             JOIN authority_requests r ON r.request_id=d.authority_request_id
+               AND r.task_id=g.task_id AND r.semantic_program_hash=g.semantic_program_hash
+               AND r.node_id=g.node_id AND r.execution_binding_id=g.execution_binding_id
+               AND r.attempt_id=g.attempt_id
+             JOIN authority_candidate_reservations c ON c.task_id=g.task_id
+               AND c.semantic_program_hash=g.semantic_program_hash AND c.node_id=g.node_id
+               AND c.binding_id=g.execution_binding_id AND c.attempt_id=g.attempt_id
+             JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+               AND s.state='FINALIZED'
+             JOIN authority_candidate_resources cr ON cr.candidate_id=c.candidate_id
+               AND cr.action=r.action AND cr.semantic_selector=r.semantic_selector
+               AND cr.resource_kind=r.resolved_resource_kind
+               AND cr.resource_id=r.resolved_resource_id
+             WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
+               AND g.node_id=?4 AND g.execution_binding_id=?5 AND g.attempt_id=?6
+               AND g.principal_kind='provider' AND g.principal_id=?7
+               AND g.delegable=0 AND g.max_delegation_depth=0
+               AND g.capability=?8 AND d.decision='ALLOW'
+               AND c.provider_id=?7
+               AND d.principal_kind='provider' AND d.principal_id=?7
+               AND r.principal_kind='provider' AND r.principal_id=?7
+               AND r.capability=?8 AND d.action='artifact.read'
+               AND r.action=d.action AND d.resolved_resource_kind='artifact'
+               AND r.resolved_resource_kind=d.resolved_resource_kind
+               AND d.resolved_resource_id=?9 AND r.resolved_resource_id=?9
+               AND g.approval_id IS d.approval_request_id",
+                params![
+                    grant_id,
+                    task_id,
+                    execution.semantic_program_hash,
+                    execution.node_id,
+                    execution.binding_id,
+                    execution.attempt_id,
+                    execution.principal_id,
+                    execution.capability,
+                    artifact_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            state,
+            scope,
+            revoked_reason,
+            grants_json,
+            max_uses,
+            uses_consumed,
+            decision_id,
+            selector,
+            approval_id,
+            revoked_at,
+        )) = row
+        else {
+            continue;
+        };
+        if !policy_ids.contains(&decision_id)
+            || !super::approval_not_withdrawn(connection, approval_id.as_deref())?
+            || matched.is_some()
+        {
+            return Ok(None);
+        }
+        let items: serde_json::Value = serde_json::from_str(&grants_json)?;
+        let Some([item]) = items.as_array().map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        if item.get("action").and_then(serde_json::Value::as_str) != Some("artifact.read")
+            || item
+                .get("resource_kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("artifact")
+            || item.get("resource_id").and_then(serde_json::Value::as_str) != Some(artifact_id)
+            || item
+                .get("semantic_selector")
+                .and_then(serde_json::Value::as_str)
+                != selector.as_deref()
+        {
+            return Ok(None);
+        }
+        matched = Some((
+            grant_id,
+            state,
+            scope,
+            revoked_reason,
+            revoked_at,
+            max_uses,
+            uses_consumed,
+        ));
+    }
+    let Some((grant_id, state, scope, revoked_reason, revoked_at, max_uses, uses_consumed)) =
+        matched
+    else {
+        return Ok(None);
+    };
+    if state == "REVOKED" {
+        return Ok(
+            if revoked_reason.as_deref() == Some("AUTH_GRANT_REVOKED") && revoked_at.is_some() {
+                Some(AuthorityDenialReason::GrantRevoked)
+            } else {
+                None
+            },
+        );
+    }
+    if super::authority_deadline::authenticated_expiry_latch(
+        connection,
+        &grant_id,
+        lease_owner,
+        lease_epoch,
+    )? {
+        return Ok(Some(AuthorityDenialReason::GrantExpired));
+    }
+    if !admitted_replay && consumed_one_shot_grant(&scope, &state, max_uses, uses_consumed) {
+        return Ok(Some(AuthorityDenialReason::GrantUsageExhausted));
+    }
+    Ok(None)
+}
+
 fn capture_read_authority(
     connection: &Connection,
     task_id: &str,
@@ -10230,7 +10561,35 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                         reader.lease_epoch,
                         time,
                     )? {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                        let reason = authenticated_read_grant_denial_in(
+                            transaction,
+                            &reader.task_id,
+                            execution,
+                            &reader.artifact_id,
+                            &reader.lease_owner,
+                            reader.lease_epoch,
+                            true,
+                        )?;
+                        return Err(reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ));
+                    }
+                    if let Some(reason) = authenticated_read_grant_denial_in(
+                        transaction,
+                        &reader.task_id,
+                        execution,
+                        &reader.artifact_id,
+                        &reader.lease_owner,
+                        reader.lease_epoch,
+                        true,
+                    )? {
+                        return Err(artifact_grant_denial(
+                            AuthorityDenialStage::ArtifactRead,
+                            reason,
+                        ));
                     }
                 }
                 validate_reader_fence_in_connection(
