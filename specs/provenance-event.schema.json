@@ -241,7 +241,7 @@
           "outcome_certainty", "effect_boundary", "certainty", "export_reconciliation", "recovery_ref", "inventory_id", "safe_action", "reason_code", "attempt", "duration_ms",
           "content_hash", "size_bytes", "blob_reused", "import_id", "request_digest", "source",
           "allocation_id", "publication_id", "type", "observation_ordinal", "previous_durability_state", "durability_state", "resulted_at",
-          "index", "verified_claims", "failed_claims", "external_egress", "verified"
+          "index", "verified_claims", "failed_claims", "external_egress", "verified", "export_authority"
         ]
       },
       "properties": {
@@ -264,7 +264,21 @@
             "workspace_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskOpaqueIdentifier"}]},
             "original_intent_ref": {"$ref": "#/$defs/originalIntentCommitment"},
             "normalized_intent_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/normalizedIntentCommitment"}]},
-            "constraints": {"type": "null"},
+            "constraints": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "privacy": {"enum": ["local-only", "local-first", "remote-allowed"]},
+                    "max_cost_microunits": {"type": ["integer", "null"], "minimum": 0},
+                    "deadline": {"type": ["string", "null"], "format": "date-time"},
+                    "preserve_inputs": {"type": "boolean"}
+                  }
+                }
+              ]
+            },
             "created_at": {"type": "string", "format": "date-time", "maxLength": 4096}
           }
         },
@@ -331,6 +345,22 @@
         "verified_claims": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
         "failed_claims": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
         "external_egress": {"type": "boolean"},
+        "export_authority": {"type":"object","additionalProperties":false,
+          "required":["selector","service_id","destination_class","descriptor_hash","adapter_id","operation_id","source_artifact_id","source_content_hash","purpose","sensitivity","max_size_bytes"],
+          "properties":{
+            "selector":{"type":"string","minLength":1,"maxLength":512},
+            "service_id":{"type":"string","pattern":"^service://","maxLength":512},
+            "destination_class":{"type":"string","minLength":1,"maxLength":128},
+            "descriptor_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+            "adapter_id":{"type":"string","minLength":1,"maxLength":256},
+            "operation_id":{"type":"string","minLength":1,"maxLength":256},
+            "source_artifact_id":{"type":"string","minLength":1,"maxLength":256},
+            "source_content_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+            "purpose":{"type":"string","minLength":1,"maxLength":256},
+            "sensitivity":{"enum":["public","local","private","confidential","secret"]},
+            "max_size_bytes":{"type":"integer","minimum":1,"maximum":8388608}
+          }
+        },
         "verified": {"type": "boolean"}
       },
       "additionalProperties": true
@@ -375,7 +405,7 @@
     },
     {
       "if": {"properties": {"event_type": {"const":"artifact.exported"}}},
-      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","size_bytes"]}}}}
+      "then": {"properties": {"details": {"propertyNames": {"enum": ["operation_id","size_bytes","export_authority"]}}}}
     },
     {
       "if": {"properties": {"event_type": {"const":"artifact.integrity-failed"}}},
@@ -441,6 +471,16 @@
           "status": {"const": "success"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {"const": "artifact.exported"},
+          "details": {"required": ["export_authority"]}
+        },
+        "required": ["event_type", "details"]
+      },
+      "then": {"properties": {"details": {"required": ["size_bytes"]}}}
     }
   ],
   "$defs": {

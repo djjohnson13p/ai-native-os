@@ -119,6 +119,7 @@ fn preflight_store_migration(connection: &Connection) -> Result<()> {
             "0021_authority_grant_deadlines",
             "authority-grant-deadlines-v0.1",
         ),
+        ("0022_exact_export_authority", "exact-export-authority-v0.1"),
     ];
     let mut stamped = false;
     let mut baseline = false;

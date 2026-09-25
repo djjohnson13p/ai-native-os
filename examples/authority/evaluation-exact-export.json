@@ -1,0 +1,31 @@
+{
+  "schema_version": "0.1",
+  "request_id": "request:exact-export",
+  "task_id": "T-exact-export",
+  "semantic_program_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "registry_snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "node_id": "export",
+  "capability": "artifact.export@1",
+  "principal": {"kind": "provider", "id": "provider:fixture"},
+  "action": "data.egress",
+  "resource": {
+    "semantic_selector": "output:export",
+    "resolved_kind": "external-destination",
+    "resolved_id": "service://fixture/export",
+    "sensitivity": "private"
+  },
+  "execution_binding_id": "binding:exact-export",
+  "effect_classes": ["DATA_EGRESS"],
+  "egress": {
+    "destination_class": "fixture-export",
+    "service_id": "service://fixture/export",
+    "data_refs": ["artifact:source"],
+    "purpose": "fixture transfer",
+    "source_content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "operation_id": "export:exact",
+    "adapter_id": "adapter:memory",
+    "descriptor_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "max_size_bytes": 1024
+  },
+  "requested_at": "2026-09-24T00:00:00Z"
+}

@@ -259,6 +259,17 @@ pub fn append_in_tx(
     expected_head: &ExpectedHead,
 ) -> Result<JournalRecord> {
     validate_event(task_id, event)?;
+    if string_field(event, "event_type") == Some("artifact.exported")
+        && event
+            .pointer("/external_transfer/destination")
+            .and_then(Value::as_str)
+            .is_some_and(|destination| destination.starts_with("service://"))
+        && event.pointer("/details/export_authority").is_none()
+    {
+        return Err(Error::InvalidRecord(
+            "exact service export requires export authority".to_owned(),
+        ));
+    }
     let stream_id = stream_id(task_id)?;
     let head = get_head(transaction, &stream_id)?;
     match (expected_head, &head) {
@@ -1329,7 +1340,7 @@ fn alias_namespace(path: &[String], key: &str) -> &'static str {
         "plan_id" => "plan",
         "step_id" | "node_id" | "active_step_ids" => "step",
         "related_ids" => "related",
-        "input_artifacts" | "output_artifacts" | "data_refs" => "artifact",
+        "input_artifacts" | "output_artifacts" | "data_refs" | "source_artifact_id" => "artifact",
         "id" if path
             .iter()
             .any(|part| part == "actor" || part == "principal") =>
@@ -1525,7 +1536,10 @@ fn validate_projected_event(event: &Value) -> Result<()> {
     }
     let source_shape = projected_source_shape(event, &mut Vec::new())?;
     let task_id = string_field(&source_shape, "task_id").unwrap_or_default();
-    validate_event_contract(task_id, &source_shape, false)
+    validate_event_contract(task_id, &source_shape, false)?;
+    // Compare original aliases: reconstructed service placeholders have a
+    // required prefix that the transfer destination placeholder does not.
+    validate_export_authority_links(event)
 }
 
 fn projected_source_shape(value: &Value, path: &mut Vec<String>) -> Result<Value> {
@@ -1600,6 +1614,14 @@ fn projected_placeholder(
         .get("alias")
         .and_then(Value::as_str)
         .expect("validated alias has a digest");
+    if path.iter().any(|part| part == "export_authority") {
+        if key == "service_id" {
+            return format!("service://{digest}");
+        }
+        if key == "sensitivity" {
+            return "private".to_owned();
+        }
+    }
     if matches!(
         key,
         "semantic_program_hash"
@@ -1812,7 +1834,41 @@ fn projection_verification_result_validator() -> Result<&'static jsonschema::Val
 }
 
 fn validate_event(task_id: &str, event: &Value) -> Result<()> {
-    validate_event_contract(task_id, event, true)
+    validate_event_contract(task_id, event, true)?;
+    validate_export_authority_links(event)
+}
+
+fn validate_export_authority_links(event: &Value) -> Result<()> {
+    if string_field(event, "event_type") != Some("artifact.exported") {
+        return Ok(());
+    }
+    let Some(authority) = event.pointer("/details/export_authority") else {
+        // Earlier export events have no exact authority projection.
+        return Ok(());
+    };
+    let operation = authority.get("operation_id");
+    let source = authority.get("source_artifact_id");
+    let service = authority.get("service_id");
+    let purpose = authority.get("purpose");
+    let size = event.pointer("/details/size_bytes").and_then(Value::as_u64);
+    let ceiling = authority.get("max_size_bytes").and_then(Value::as_u64);
+    let transfer = &event["external_transfer"];
+    if !matches!((size, ceiling), (Some(size), Some(ceiling)) if size <= ceiling)
+        || operation != event.pointer("/details/operation_id")
+        || event["input_artifacts"]
+            .as_array()
+            .is_none_or(|items| items.len() != 1 || items.first() != source)
+        || transfer["data_refs"]
+            .as_array()
+            .is_none_or(|items| items.len() != 1 || items.first() != source)
+        || service != transfer.get("destination")
+        || purpose != transfer.get("purpose")
+    {
+        return Err(Error::InvalidRecord(
+            "exact export authority conflicts with export event".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_event_contract(task_id: &str, event: &Value, source_size_bounds: bool) -> Result<()> {
@@ -2156,7 +2212,7 @@ fn allowed_detail_key(event_type: &str, key: &str) -> bool {
                 | "blob_reused"
                 | "type"
         ),
-        "artifact.exported" => matches!(key, "operation_id" | "size_bytes"),
+        "artifact.exported" => matches!(key, "operation_id" | "size_bytes" | "export_authority"),
         "artifact.integrity-failed" => matches!(
             key,
             "content_hash"
@@ -2288,6 +2344,7 @@ fn validate_detail_value(event_type: &str, key: &str, value: &Value) -> Result<(
         }
         ("artifact.created", "type") => expect_token(value, 256),
         ("artifact.exported", "operation_id") => expect_artifact_identifier(value),
+        ("artifact.exported", "export_authority") => validate_exact_export_authority(value),
         ("artifact.integrity-failed", "observation_ordinal") => expect_integer(value, 1, None),
         ("artifact.integrity-failed", "previous_durability_state") => {
             expect_nullable_durability_state(value)
@@ -2328,8 +2385,37 @@ fn validate_creation_details(value: &Value) -> Result<()> {
             "normalized_intent_ref" => {
                 validate_commitment(value, "normalized_intent", true)?;
             }
-            "constraints" => expect_null(value)?,
+            "constraints" => validate_task_creation_constraints(value)?,
             "created_at" => expect_timestamp(value)?,
+            _ => unreachable!("object keys were checked"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_creation_constraints(value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let fields = expect_object_keys(
+        value,
+        &[
+            "privacy",
+            "max_cost_microunits",
+            "deadline",
+            "preserve_inputs",
+        ],
+    )?;
+    for (key, value) in fields {
+        match key.as_str() {
+            "privacy" => expect_one_of(value, &["local-only", "local-first", "remote-allowed"])?,
+            "max_cost_microunits" => {
+                if !value.is_null() {
+                    expect_integer(value, 0, None)?;
+                }
+            }
+            "deadline" => expect_nullable_timestamp(value)?,
+            "preserve_inputs" => expect_bool(value)?,
             _ => unreachable!("object keys were checked"),
         }
     }
@@ -2426,6 +2512,45 @@ fn validate_export_reconciliation(value: &Value) -> Result<()> {
     expect_timestamp(&object["observed_at"])?;
     expect_digest(&object["subject_hash"])?;
     expect_identifier(&object["recovery_ref"], 256)
+}
+
+fn validate_exact_export_authority(value: &Value) -> Result<()> {
+    let object = expect_exact_object(
+        value,
+        &[
+            "selector",
+            "service_id",
+            "destination_class",
+            "descriptor_hash",
+            "adapter_id",
+            "operation_id",
+            "source_artifact_id",
+            "source_content_hash",
+            "purpose",
+            "sensitivity",
+            "max_size_bytes",
+        ],
+    )?;
+    expect_identifier(&object["selector"], 512)?;
+    expect_identifier(&object["service_id"], 512)?;
+    if !object["service_id"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("service://"))
+    {
+        return Err(invalid_details("export service identity is invalid"));
+    }
+    expect_identifier(&object["destination_class"], 128)?;
+    expect_digest(&object["descriptor_hash"])?;
+    expect_identifier(&object["adapter_id"], 256)?;
+    expect_artifact_identifier(&object["operation_id"])?;
+    expect_artifact_identifier(&object["source_artifact_id"])?;
+    expect_digest(&object["source_content_hash"])?;
+    expect_task_string(&object["purpose"], 256, true)?;
+    expect_one_of(
+        &object["sensitivity"],
+        &["public", "local", "private", "confidential", "secret"],
+    )?;
+    expect_integer(&object["max_size_bytes"], 1, Some(8 * 1024 * 1024))
 }
 
 fn validate_commitment(value: &Value, expected_field: &str, nullable: bool) -> Result<()> {
@@ -3982,6 +4107,231 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exact export append and portable proof share one event fixture"
+    )]
+    fn exact_export_authority_is_typed_and_privacy_projectable() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let event = json!({
+            "schema_version":"0.1","event_id":"event:exact-export",
+            "task_id":"T-exact-export","event_type":"artifact.exported",
+            "timestamp":NOW,"actor":{"kind":"provider","id":"provider:fixture"},
+            "input_artifacts":["artifact:source"],"output_artifacts":[],
+            "external_transfer":{"destination":"service://fixture/a",
+                "data_refs":["artifact:source"],"purpose":"fixture evaluation"},
+            "status":"success","details":{"operation_id":"export:fixture",
+                "size_bytes":7,"export_authority":{
+                    "selector":"destination:fixture_remote","service_id":"service://fixture/a",
+                    "destination_class":"fixture_remote","descriptor_hash":hash.clone(),
+                    "adapter_id":"adapter:memory","operation_id":"export:fixture",
+                    "source_artifact_id":"artifact:source","source_content_hash":hash,
+                    "purpose":"fixture evaluation","sensitivity":"private","max_size_bytes":1024
+                }}
+        });
+        validate_stored_event(&event).unwrap();
+        let projected = project_event(&event, &[7_u8; 32]).unwrap();
+        validate_projected_event(&projected).unwrap();
+        let source_alias = &projected["details"]["export_authority"]["source_artifact_id"];
+        assert_eq!(source_alias["namespace"], "artifact");
+        assert_eq!(source_alias, &projected["input_artifacts"][0]);
+        assert_eq!(
+            source_alias,
+            &projected["external_transfer"]["data_refs"][0]
+        );
+        let mut wrong_namespace = projected.clone();
+        wrong_namespace["details"]["export_authority"]["source_artifact_id"]["namespace"] =
+            json!("opaque-value");
+        assert!(validate_projected_event(&wrong_namespace).is_err());
+        assert_ne!(
+            projected["details"]["export_authority"]["service_id"],
+            event["details"]["export_authority"]["service_id"]
+        );
+        assert_ne!(
+            projected["details"]["export_authority"]["purpose"],
+            event["details"]["export_authority"]["purpose"]
+        );
+
+        let task_id = "T-exact-export";
+        let mut connection = connection();
+        let transaction = connection.transaction().unwrap();
+        append_in_tx(
+            &transaction,
+            task_id,
+            &typed_creation_event(task_id, 1),
+            &ExpectedHead::Empty,
+        )
+        .unwrap();
+        append_in_tx(&transaction, task_id, &event, &ExpectedHead::Any).unwrap();
+        let stream = stream_id(task_id).unwrap();
+        let head = get_head(&transaction, &stream).unwrap().unwrap();
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+                [&stream],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for mismatch in [
+            "operation",
+            "source",
+            "extra-input",
+            "transfer-source",
+            "extra-transfer",
+            "service",
+            "purpose",
+            "missing-size",
+            "over-ceiling",
+        ] {
+            let mut forged = event.clone();
+            forged["event_id"] = json!(format!("event:forged:{mismatch}"));
+            match mismatch {
+                "operation" => forged["details"]["operation_id"] = json!("export:other"),
+                "source" => forged["input_artifacts"][0] = json!("artifact:other"),
+                "extra-input" => {
+                    forged["input_artifacts"] = json!(["artifact:source", "artifact:other"]);
+                }
+                "transfer-source" => {
+                    forged["external_transfer"]["data_refs"][0] = json!("artifact:other");
+                }
+                "extra-transfer" => {
+                    forged["external_transfer"]["data_refs"] =
+                        json!(["artifact:source", "artifact:other"]);
+                }
+                "service" => {
+                    forged["external_transfer"]["destination"] = json!("service://fixture/b");
+                }
+                "purpose" => {
+                    forged["external_transfer"]["purpose"] = json!("unrelated purpose");
+                }
+                "missing-size" => {
+                    forged["details"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("size_bytes");
+                }
+                "over-ceiling" => forged["details"]["size_bytes"] = json!(1025),
+                _ => unreachable!(),
+            }
+            assert!(
+                append_in_tx(&transaction, task_id, &forged, &ExpectedHead::Any).is_err(),
+                "{mismatch} must not be recorded as authorized export"
+            );
+            assert_eq!(get_head(&transaction, &stream).unwrap(), Some(head.clone()));
+            let actual_count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM provenance_events WHERE stream_id=?1",
+                    [&stream],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual_count, count, "{mismatch} inserted a journal row");
+        }
+        for (name, size) in [("zero", 0), ("at-ceiling", 1024)] {
+            let mut boundary = event.clone();
+            boundary["event_id"] = json!(format!("event:{name}-export"));
+            boundary["details"]["size_bytes"] = json!(size);
+            append_in_tx(&transaction, task_id, &boundary, &ExpectedHead::Any).unwrap();
+        }
+        let mut omitted_pin = event.clone();
+        omitted_pin["event_id"] = json!("event:missing-exact-export-authority");
+        omitted_pin["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_authority");
+        assert!(append_in_tx(&transaction, task_id, &omitted_pin, &ExpectedHead::Any).is_err());
+        let mut legacy = event.clone();
+        legacy["event_id"] = json!("event:class-only-export");
+        legacy["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("export_authority");
+        legacy["external_transfer"]["destination"] = json!("fixture_remote");
+        legacy["external_transfer"]["purpose"] = Value::Null;
+        assert_eq!(legacy["external_transfer"]["destination"], "fixture_remote");
+        assert!(legacy["external_transfer"]["purpose"].is_null());
+        append_in_tx(&transaction, task_id, &legacy, &ExpectedHead::Any).unwrap();
+        let mut legacy_without_size = legacy.clone();
+        legacy_without_size["event_id"] = json!("event:class-only-export-without-size");
+        legacy_without_size["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("size_bytes");
+        append_in_tx(
+            &transaction,
+            task_id,
+            &legacy_without_size,
+            &ExpectedHead::Any,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let export = export_jsonl(&connection, &stream, NOW).unwrap();
+        let records = export
+            .records_jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<ProjectedRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 6);
+        assert_eq!(records[2].projected_event["details"]["size_bytes"], 0);
+        assert_eq!(records[3].projected_event["details"]["size_bytes"], 1024);
+        assert!(
+            records[4].projected_event["details"]
+                .get("export_authority")
+                .is_none()
+        );
+        assert!(
+            records[5].projected_event["details"]
+                .get("size_bytes")
+                .is_none()
+        );
+        assert!(
+            verify_jsonl_export(&export.manifest_json, &export.records_jsonl, NOW)
+                .unwrap()
+                .valid
+        );
+        for (field, namespace) in [
+            ("source_artifact_id", "artifact"),
+            ("operation_id", "operation"),
+            ("service_id", "opaque-value"),
+            ("purpose", "opaque-value"),
+        ] {
+            let forged = rehash_projection(&export, |records| {
+                records[1].projected_event["details"]["export_authority"][field] =
+                    alias_value(&[9_u8; 32], namespace, "unrelated");
+            });
+            let result =
+                verify_jsonl_export(&forged.manifest_json, &forged.records_jsonl, NOW).unwrap();
+            assert!(
+                !result.valid,
+                "rehashed {field} mismatch must fail offline verification"
+            );
+            assert_eq!(result.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+        }
+        for mismatch in ["missing-size", "over-ceiling", "lowered-ceiling"] {
+            let forged = rehash_projection(&export, |records| {
+                let details = &mut records[1].projected_event["details"];
+                match mismatch {
+                    "missing-size" => {
+                        details.as_object_mut().unwrap().remove("size_bytes");
+                    }
+                    "over-ceiling" => details["size_bytes"] = json!(1025),
+                    "lowered-ceiling" => {
+                        details["export_authority"]["max_size_bytes"] = json!(6);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let result =
+                verify_jsonl_export(&forged.manifest_json, &forged.records_jsonl, NOW).unwrap();
+            assert!(
+                !result.valid,
+                "rehashed {mismatch} must fail offline verification"
+            );
+            assert_eq!(result.diagnostics[0].code, "PROJECTION_RECORD_INVALID");
+        }
     }
 
     #[test]

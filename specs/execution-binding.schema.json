@@ -101,6 +101,7 @@
         "expires_at": {"type": ["string", "null"], "format": "date-time"}
       }
     },
+    "external_export": {"$ref":"#/$defs/exactExport"},
     "execution_profile": {
       "type": "object",
       "additionalProperties": false,
@@ -126,5 +127,23 @@
     "model_descriptor_ref": {"type": ["string", "null"], "maxLength": 512},
     "attempt": {"type": "integer", "minimum": 1, "maximum": 100},
     "created_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "exactExport": {"type":"object","additionalProperties":false,
+      "required":["selector","service_id","destination_class","descriptor_hash","adapter_id","operation_id","source_artifact_id","source_content_hash","purpose","sensitivity","max_size_bytes"],
+      "properties":{
+        "selector":{"type":"string","minLength":1,"maxLength":512},
+        "service_id":{"type":"string","pattern":"^service://","maxLength":512},
+        "destination_class":{"type":"string","minLength":1,"maxLength":128},
+        "descriptor_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+        "adapter_id":{"type":"string","minLength":1,"maxLength":256},
+        "operation_id":{"type":"string","minLength":1,"maxLength":256},
+        "source_artifact_id":{"type":"string","minLength":1,"maxLength":256},
+        "source_content_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
+        "purpose":{"type":"string","minLength":1,"maxLength":256},
+        "sensitivity":{"enum":["public","local","private","confidential","secret"]},
+        "max_size_bytes":{"type":"integer","minimum":1,"maximum":8388608}
+      }
+    }
   }
 }

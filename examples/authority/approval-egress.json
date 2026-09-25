@@ -7,9 +7,9 @@
   "node_id": "draft_summary",
   "action": "data.egress",
   "resource": {
-    "kind": "artifact",
-    "id": "artifact://METRICS-92",
-    "display_class": "Task metrics",
+    "kind": "external-destination",
+    "id": "service://model/fixture-remote",
+    "display_class": "Remote model destination",
     "sensitivity": "private"
   },
   "principal": {
@@ -21,6 +21,19 @@
     "class": "remote-model",
     "service_id": "service://model/fixture-remote",
     "region_or_jurisdiction": "fixture-region"
+  },
+  "export": {
+    "selector": "destination:fixture-remote",
+    "service_id": "service://model/fixture-remote",
+    "destination_class": "remote-model",
+    "descriptor_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "adapter_id": "adapter:memory",
+    "operation_id": "export:T92-metrics",
+    "source_artifact_id": "artifact://METRICS-92",
+    "source_content_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "purpose": "Draft a remote summary",
+    "sensitivity": "private",
+    "max_size_bytes": 1024
   },
   "effect_classes": ["NETWORK", "DATA_EGRESS"],
   "irreversibility": "reversible",

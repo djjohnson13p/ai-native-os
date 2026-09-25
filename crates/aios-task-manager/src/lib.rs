@@ -16,6 +16,8 @@ mod artifact_store;
 mod authority_candidate;
 mod authority_deadline;
 mod authority_policy;
+mod coordinator;
+mod initial_program_admission;
 mod trusted_time;
 
 pub use aios_provenance::{
@@ -35,6 +37,10 @@ pub use artifact_store::{
     OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
     VerifiedArtifactExportNoEffect,
 };
+pub use coordinator::{
+    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal,
+    MemoryExportObservation, PreparedLocalExport, TrustedLocalCoordinator,
+};
 pub use trusted_time::{SecurityClockSample, TimeSource};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool};
 
 use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
+use initial_program_admission::{InitialProgramAdmission, persist_initial_program_admission_in};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -978,11 +985,22 @@ impl TaskManager {
     ///
     /// # Errors
     /// Returns an error for an invalid record or failed `SQLite` commit.
+    pub(crate) fn create_task(&mut self, request: &CreateTask) -> Result<TaskRecord> {
+        self.create_task_with_constraints(request, None)
+    }
+
+    /// Trusted-host Task creation with privacy constraints committed in the
+    /// same genesis event and material row. Provider input cannot call this.
     #[allow(
         clippy::too_many_lines,
         reason = "keeps Task creation, private commitments, and genesis provenance in one transaction"
     )]
-    pub(crate) fn create_task(&mut self, request: &CreateTask) -> Result<TaskRecord> {
+    pub(crate) fn create_task_with_constraints(
+        &mut self,
+        request: &CreateTask,
+        constraints: Option<&Value>,
+    ) -> Result<TaskRecord> {
+        validate_task_creation_constraints(constraints)?;
         let unique_steps = request
             .active_step_ids
             .iter()
@@ -1038,8 +1056,9 @@ impl TaskManager {
                 })
             })
             .transpose()?;
+        let constraints_json = constraints.map(canonical_json).transpose()?;
         transaction.execute(
-            "INSERT INTO tasks (task_id, revision, state, principal_kind, principal_id, workspace_id, original_intent, normalized_intent_json, intent_commitment_nonce, active_step_ids_json, waiting_on_json, created_at, updated_at) VALUES (?1, 1, 'CREATED', ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?9)",
+            "INSERT INTO tasks (task_id, revision, state, principal_kind, principal_id, workspace_id, original_intent, normalized_intent_json, intent_commitment_nonce, active_step_ids_json, waiting_on_json, constraints_json, created_at, updated_at) VALUES (?1, 1, 'CREATED', ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10, ?10)",
             params![
                 request.task_id,
                 request.principal.kind,
@@ -1049,6 +1068,7 @@ impl TaskManager {
                 encode_optional(request.normalized_intent.as_ref())?,
                 intent_nonce,
                 serde_json::to_string(&request.active_step_ids)?,
+                constraints_json,
                 created_at,
             ],
         )?;
@@ -1067,7 +1087,7 @@ impl TaskManager {
                     "workspace_id": request.workspace_id,
                     "original_intent_ref": original_intent_ref,
                     "normalized_intent_ref": normalized_intent_ref,
-                    "constraints": null,
+                    "constraints": constraints,
                     "created_at": created_at
                 },
                 "active_plan": null,
@@ -1439,7 +1459,7 @@ impl TaskManager {
     /// Returns an error for storage/serialization failures. State-machine
     /// rejections are represented by a successful `TransitionResult` value.
     pub(crate) fn transition(&mut self, request: &TransitionRequest) -> Result<TransitionResult> {
-        self.transition_impl(request, false, false)
+        self.transition_impl(request, false, false, None)
     }
 
     /// Retire a previous clock session's unused, coordinator-issued preparation.
@@ -1570,6 +1590,7 @@ impl TaskManager {
                     },
                     false,
                     false,
+                    None,
                 )?;
                 if !result.applied {
                     return Err(TaskManagerError::InvalidRecord(
@@ -1664,6 +1685,7 @@ impl TaskManager {
                 },
                 false,
                 true,
+                None,
             )?;
             if !result.applied {
                 return Err(TaskManagerError::InvalidRecord(
@@ -1913,6 +1935,7 @@ impl TaskManager {
             },
             false,
             true,
+            None,
         )?;
         if !result.applied {
             return Err(TaskManagerError::InvalidRecord(
@@ -2507,6 +2530,7 @@ impl TaskManager {
         request: &TransitionRequest,
         fail_provenance: bool,
         internal_recovery: bool,
+        initial_admission: Option<&InitialProgramAdmission>,
     ) -> Result<TransitionResult> {
         validate_transition_request(request, internal_recovery)?;
         let mut resulted_at = if request.to_state == TaskState::Running {
@@ -2557,7 +2581,7 @@ impl TaskManager {
                 ));
             }
 
-            let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
+            let Some((revision, state, waiting_json, steps_json, failure_json, mut active_program)) =
                 load_transition_state(&transaction, &request.task_id)?
             else {
                 let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
@@ -2683,6 +2707,15 @@ impl TaskManager {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            if let Some(admission) = initial_admission {
+                persist_initial_program_admission_in(
+                    &transaction,
+                    request,
+                    admission,
+                    &resulted_at,
+                )?;
+                active_program = Some(1);
+            }
             let active_program_row = active_program
             .map(|program_revision| {
                 transaction.query_row(
@@ -2820,6 +2853,14 @@ impl TaskManager {
                     observed,
                     &resulted_at,
                 ));
+            }
+            if request.to_state == TaskState::Cancelled {
+                transaction.execute(
+                    "UPDATE authority_grants SET state='REVOKED', revoked_at=?2,
+                     revocation_reason_code='AUTH_GRANT_REVOKED'
+                     WHERE task_id=?1 AND state='ACTIVE'",
+                    params![request.task_id, resulted_at],
+                )?;
             }
             if let Some(plan) = &request.mutation.active_plan {
                 let changed = transaction.execute(
@@ -3016,7 +3057,7 @@ impl TaskManager {
         &mut self,
         request: &TransitionRequest,
     ) -> Result<TransitionResult> {
-        self.transition_impl(request, true, false)
+        self.transition_impl(request, true, false, None)
     }
 }
 
@@ -3347,6 +3388,40 @@ fn reason_code_valid(value: &str) -> bool {
                 byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
             }
         })
+}
+
+fn validate_task_creation_constraints(constraints: Option<&Value>) -> Result<()> {
+    let Some(constraints) = constraints else {
+        return Ok(());
+    };
+    let invalid = || TaskManagerError::InvalidRecord("invalid Task creation constraints");
+    let fields = constraints.as_object().ok_or_else(invalid)?;
+    for (key, value) in fields {
+        let valid = match key.as_str() {
+            "privacy" => matches!(
+                value.as_str(),
+                Some("local-only" | "local-first" | "remote-allowed")
+            ),
+            "max_cost_microunits" => {
+                value.is_null()
+                    || value
+                        .as_u64()
+                        .is_some_and(|cost| cost <= 9_007_199_254_740_991)
+            }
+            "deadline" => {
+                value.is_null()
+                    || value
+                        .as_str()
+                        .is_some_and(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).is_ok())
+            }
+            "preserve_inputs" => value.is_boolean(),
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -5068,6 +5143,43 @@ fn authority_candidate_objects_current(connection: &Connection, stamped: bool) -
     Ok(true)
 }
 
+fn exact_export_objects_current(connection: &Connection) -> Result<bool> {
+    const OBJECTS: [&str; 9] = [
+        "authority_export_services",
+        "authority_export_service_states",
+        "authority_candidate_export_pins",
+        "authority_export_service_no_update",
+        "authority_export_service_no_delete",
+        "authority_export_service_state_guard",
+        "authority_export_service_state_no_delete",
+        "authority_candidate_export_pin_no_update",
+        "authority_candidate_export_pin_no_delete",
+    ];
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(MIGRATION)?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0016-authority-candidate-reservations.sql"
+    ))?;
+    canonical.execute_batch(include_str!(
+        "../../../specs/persistence-v0.1-0022-exact-export-authority.sql"
+    ))?;
+    for name in OBJECTS {
+        let sql =
+            |db: &Connection| -> Result<Option<String>> {
+                Ok(db.query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type IN ('table','trigger')",
+                [name], |row| row.get(0),
+            ).optional()?)
+            };
+        if sql(connection)?.map(|value| normalize_schema_sql(&value))
+            != sql(&canonical)?.map(|value| normalize_schema_sql(&value))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "keeps the read-only migration and required-core-schema preflight contiguous"
@@ -5101,7 +5213,7 @@ fn preflight_migration_state_with_mode(
         return Ok(());
     }
     let unknown_migrations = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time', '0020_artifact_placement_receipts', '0021_authority_grant_deadlines')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id NOT IN ('0001_v0_1_trusted_control_plane', '0002_task_manager_contract_reconciliation', '0003_task_manager_recovery_fencing_privacy', '0004_task_manager_review_hardening', '0005_artifact_store_root_binding', '0006_artifact_writer_admission', '0007_artifact_owner_export_context', '0008_artifact_export_reconciliation_challenge', '0009_artifact_writer_session_fencing', '0010_keyed_import_causal_receipts', '0011_provenance_service_boundary', '0012_semantic_registry_store', '0013_provider_registry', '0014_semantic_repair_fence', '0015_authority_issuance_fence', '0016_authority_candidate_reservations', '0017_authority_policy_evaluation', '0018_trusted_time', '0019_inflight_time', '0020_artifact_placement_receipts', '0021_authority_grant_deadlines', '0022_exact_export_authority')",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -5206,6 +5318,11 @@ fn preflight_migration_state_with_mode(
         connection,
         "0021_authority_grant_deadlines",
         "authority-grant-deadlines-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0022_exact_export_authority",
+        "exact-export-authority-v0.1",
     )?;
     let has_v1 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id = '0001_v0_1_trusted_control_plane')",
@@ -5333,6 +5450,38 @@ fn preflight_migration_state_with_mode(
             return Err(TaskManagerError::InvalidRecord(
                 "authority grant deadline schema requires operator quarantine",
             ));
+        }
+        let has_exact_export:bool=connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0022_exact_export_authority')",
+            [],|row|row.get(0))?;
+        if !has_exact_export {
+            let squatted: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE name GLOB 'authority_export_*'
+                    OR name GLOB 'authority_candidate_export_pin*')",
+                [],
+                |row| row.get(0),
+            )?;
+            if squatted {
+                return Err(TaskManagerError::InvalidRecord(
+                    "unstamped exact export authority objects require operator quarantine",
+                ));
+            }
+        }
+        if has_exact_export {
+            require_migration_tables(
+                connection,
+                &[
+                    "authority_export_services",
+                    "authority_export_service_states",
+                    "authority_candidate_export_pins",
+                ],
+            )?;
+            if !exact_export_objects_current(connection)? {
+                return Err(TaskManagerError::InvalidRecord(
+                    "exact export authority schema requires operator quarantine",
+                ));
+            }
         }
         let has_v3 = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE migration_id='0003_task_manager_recovery_fencing_privacy')",
@@ -5715,6 +5864,11 @@ fn migrate_task_manager_schema(
         connection,
         "0021_authority_grant_deadlines",
         "authority-grant-deadlines-v0.1",
+    )?;
+    verify_migration_checksum(
+        connection,
+        "0022_exact_export_authority",
+        "exact-export-authority-v0.1",
     )?;
     let transition_has_foreign_key = {
         let mut statement = connection.prepare("PRAGMA foreign_key_list(task_transitions)")?;
@@ -6132,6 +6286,13 @@ fn migrate_task_manager_schema(
         ))?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0021_authority_grant_deadlines', 'authority-grant-deadlines-v0.1', '2026-09-24T00:00:00Z')",
+            [],
+        )?;
+        connection.execute_batch(include_str!(
+            "../../../specs/persistence-v0.1-0022-exact-export-authority.sql"
+        ))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(migration_id, checksum, applied_at) VALUES ('0022_exact_export_authority', 'exact-export-authority-v0.1', '2026-09-24T00:00:00Z')",
             [],
         )?;
         Ok(())
@@ -9541,6 +9702,32 @@ fn execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Resul
         && live_credential_uses == 0)
 }
 
+// Cancellation retires active grants in the same transaction as the Task
+// transition. It still cannot conceal a live attempt or uncertain effect.
+fn cancellation_execution_is_contained(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+) -> Result<bool> {
+    let live_attempts: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM step_executions WHERE task_id=?1 AND
+         (state IN ('STARTING','RUNNING','UNKNOWN') OR
+          outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'))",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let live_effects: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM operations WHERE task_id=?1 AND
+         (state IN ('PREPARED','STARTED','UNKNOWN') OR
+          outcome_certainty IN ('FAILED_PARTIAL_EFFECT','OUTCOME_UNKNOWN'))",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(live_attempts == 0
+        && live_effects == 0
+        && unresolved_provider_invocation_ids(transaction, task_id)?.is_empty()
+        && unresolved_credential_use_ids(transaction, task_id)?.is_empty())
+}
+
 fn active_execution_is_contained(transaction: &Transaction<'_>, task_id: &str) -> Result<bool> {
     let active_attempts = transaction.query_row(
         "SELECT COUNT(*) FROM step_executions WHERE task_id = ?1 AND state IN ('STARTING', 'RUNNING', 'UNKNOWN')",
@@ -10444,11 +10631,15 @@ fn guard_failure(
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
         }
+        TaskState::Cancelled
+            if !cancellation_execution_is_contained(transaction, &request.task_id)? =>
+        {
+            Some("TASK_TRANSITION_GUARD_FAILED")
+        }
         TaskState::Planning
         | TaskState::WaitingForInput
         | TaskState::WaitingForAuth
         | TaskState::Paused
-        | TaskState::Cancelled
             if !execution_is_contained(transaction, &request.task_id)? =>
         {
             Some("TASK_TRANSITION_GUARD_FAILED")
@@ -10625,6 +10816,48 @@ mod tests {
             )
             .unwrap();
         assert!(preflight_migration_state(&manager.connection).is_err());
+    }
+
+    #[test]
+    fn unstamped_exact_export_objects_cannot_be_adopted_as_migration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("unstamped-export.sqlite3");
+        let manager = TaskManager::open_with_clock(&path, Box::new(FixedClock)).unwrap();
+        let lease_epoch = manager.lease_epoch;
+        drop(manager);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM schema_migrations WHERE migration_id='0022_exact_export_authority';
+             DROP TRIGGER authority_candidate_export_pin_no_update;
+             CREATE TRIGGER authority_candidate_export_pin_no_update
+             BEFORE UPDATE ON authority_candidate_export_pins BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+        let malicious: String = db.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='authority_candidate_export_pin_no_update'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(db);
+        assert!(TaskManager::open_with_clock(&path, Box::new(FixedClock)).is_err());
+        let db = Connection::open(&path).unwrap();
+        let stamp: i64 = db.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='0022_exact_export_authority'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let after: String = db.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='authority_candidate_export_pin_no_update'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let epoch: i64 = db
+            .query_row(
+                "SELECT fence_epoch FROM task_manager_lease WHERE singleton_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, 0);
+        assert_eq!(after, malicious);
+        assert_eq!(epoch, lease_epoch);
     }
 
     #[test]

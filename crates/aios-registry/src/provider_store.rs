@@ -1494,6 +1494,7 @@ fn preflight_migrations(connection: &Connection) -> Result<()> {
             "0021_authority_grant_deadlines",
             "authority-grant-deadlines-v0.1",
         ),
+        ("0022_exact_export_authority", "exact-export-authority-v0.1"),
     ];
     let mut statement =
         connection.prepare("SELECT migration_id,checksum FROM schema_migrations")?;

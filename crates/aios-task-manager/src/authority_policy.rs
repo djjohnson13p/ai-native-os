@@ -2,7 +2,7 @@
 use super::{Result, TaskManager, TaskManagerError, assert_manager_lease, canonical_json};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -31,6 +31,51 @@ fn digest(domain: &[u8], data: &str) -> String {
 
 fn checked_time(raw: &str) -> Result<OffsetDateTime> {
     OffsetDateTime::parse(raw, &Rfc3339).map_err(|_| reject())
+}
+
+fn validate_exact_export_request_links(request: &Value) -> Result<()> {
+    let action = request.pointer("/action").and_then(Value::as_str);
+    let kind = request
+        .pointer("/resource/resolved_kind")
+        .and_then(Value::as_str);
+    if action == Some("data.egress") || kind == Some("external-destination") {
+        let resolved_id = request
+            .pointer("/resource/resolved_id")
+            .and_then(Value::as_str);
+        let service_id = request
+            .pointer("/egress/service_id")
+            .and_then(Value::as_str);
+        if action != Some("data.egress")
+            || kind != Some("external-destination")
+            || !matches!((resolved_id, service_id), (Some(id), Some(service)) if id == service && id.starts_with("service://"))
+        {
+            return Err(reject());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exact_export_request_link_tests {
+    use super::validate_exact_export_request_links;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn conflicting_egress_service_cannot_name_a_different_resolved_destination() {
+        let mut request: Value = serde_json::from_str(include_str!(
+            "../../../examples/authority/evaluation-exact-export.json"
+        ))
+        .unwrap();
+        assert!(validate_exact_export_request_links(&request).is_ok());
+        request["egress"]["service_id"] = json!("service://fixture/other");
+        assert!(validate_exact_export_request_links(&request).is_err());
+        request["egress"]["service_id"] = request["resource"]["resolved_id"].clone();
+        request["resource"]["resolved_id"] = json!("service://fixture/other");
+        assert!(validate_exact_export_request_links(&request).is_err());
+        request["resource"]["resolved_id"] = json!("fixture-export");
+        request["egress"]["service_id"] = json!("fixture-export");
+        assert!(validate_exact_export_request_links(&request).is_err());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -107,18 +152,20 @@ impl LocalPolicy {
             || policy.rules.is_empty()
             || policy.rules.len() > 64
             || policy.rules.iter().any(|rule| {
-                !matches!(rule.action.as_str(), "artifact.read" | "artifact.write")
-                    || !matches!(
-                        rule.resource_kind.as_str(),
-                        "artifact" | "output-allocation"
-                    )
-                    || !matches!(
-                        rule.sensitivity.as_str(),
-                        "public" | "local" | "private" | "confidential" | "secret"
-                    )
-                    || (rule.action == "artifact.read" && rule.resource_kind != "artifact")
+                !matches!(
+                    rule.action.as_str(),
+                    "artifact.read" | "artifact.write" | "data.egress"
+                ) || !matches!(
+                    rule.resource_kind.as_str(),
+                    "artifact" | "output-allocation" | "external-destination"
+                ) || !matches!(
+                    rule.sensitivity.as_str(),
+                    "public" | "local" | "private" | "confidential" | "secret"
+                ) || (rule.action == "artifact.read" && rule.resource_kind != "artifact")
                     || (rule.action == "artifact.write"
                         && rule.resource_kind != "output-allocation")
+                    || (rule.action == "data.egress"
+                        && rule.resource_kind != "external-destination")
             })
         {
             return Err(reject());
@@ -252,19 +299,32 @@ fn replay_finalized_candidate(
         .ok_or_else(reject)?;
     let grants: Vec<String> = serde_json::from_str(&grant_refs).map_err(|_| reject())?;
     let decisions: Vec<String> = serde_json::from_str(&decision_refs).map_err(|_| reject())?;
+    let export_pin = super::authority_candidate::load_export_pin(connection, candidate_id)?;
     if grants.is_empty()
         || grants.len() != decisions.len()
-        || grants.len() != usize::try_from(resource_count).map_err(|_| reject())?
+        || grants.len()
+            != usize::try_from(resource_count).map_err(|_| reject())?
+                + usize::from(export_pin.is_some())
         || !super::all_unique(&grants)
         || !super::all_unique(&decisions)
     {
         return Err(reject());
     }
-    let resources: Vec<(String,String,String,String,Option<String>,String)> = connection.prepare(
+    let mut resources: Vec<(String,String,String,String,Option<String>,String)> = connection.prepare(
         "SELECT action,semantic_selector,resource_kind,resource_id,output_port,expected_semantic_type
          FROM authority_candidate_resources WHERE candidate_id=?1 ORDER BY action,semantic_selector",
     )?.query_map([candidate_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?
         .collect::<std::result::Result<_,_>>()?;
+    if let Some(pin) = export_pin {
+        resources.push((
+            "data.egress".into(),
+            pin.selector,
+            "external-destination".into(),
+            pin.service_id,
+            None,
+            "external.export@1".into(),
+        ));
+    }
     if resources.len() != grants.len() {
         return Err(reject());
     }
@@ -398,6 +458,7 @@ struct ResourceFacts {
     sensitivity: String,
     retention: Option<String>,
     expires_at: Option<String>,
+    export: Option<super::authority_candidate::ExportPin>,
 }
 
 fn finalization_state_allows(
@@ -732,6 +793,33 @@ impl CandidateFacts {
                 sensitivity,
                 retention,
                 expires_at,
+                export: None,
+            });
+        }
+        let export = super::authority_candidate::load_current_export_pin(connection, candidate_id)?;
+        if let Some(pin) = export {
+            if !matches!(
+                map.get("privacy").and_then(serde_json::Value::as_str),
+                Some("local-first" | "remote-allowed")
+            ) || !facts.resources.iter().any(|r| {
+                r.action == "artifact.read"
+                    && r.kind == "artifact"
+                    && r.id == pin.source_artifact_id
+                    && r.sensitivity == pin.sensitivity
+            }) {
+                return Err(reject());
+            }
+            facts.resources.push(ResourceFacts {
+                action: "data.egress".into(),
+                selector: pin.selector.clone(),
+                kind: "external-destination".into(),
+                id: pin.service_id.clone(),
+                output_port: None,
+                semantic_type: "external.export@1".into(),
+                sensitivity: pin.sensitivity.clone(),
+                retention: None,
+                expires_at: None,
+                export: Some(pin),
             });
         }
         let rank = |s: &str| match s {
@@ -787,7 +875,9 @@ impl CandidateFacts {
             |r| r.get(0),
         )?;
         if facts.resources.is_empty()
-            || facts.resources.len() != usize::try_from(count).map_err(|_| reject())?
+            || facts.resources.len()
+                != usize::try_from(count).map_err(|_| reject())?
+                    + usize::from(facts.resources.iter().any(|r| r.export.is_some()))
         {
             return Err(reject());
         }
@@ -801,6 +891,48 @@ impl CandidateFacts {
         )
         .map_err(|_| reject())?;
         let node = super::program_node(&program, &facts.node).ok_or_else(reject)?;
+        let declared = node
+            .get("authority_requests")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(reject)?;
+        if declared.len() != facts.resources.len()
+            || declared.iter().any(|semantic| {
+                let action = semantic.get("action").and_then(serde_json::Value::as_str);
+                let selector = semantic.get("resource").and_then(serde_json::Value::as_str);
+                facts
+                    .resources
+                    .iter()
+                    .filter(|r| {
+                        Some(r.action.as_str()) == action && Some(r.selector.as_str()) == selector
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return Err(reject());
+        }
+        let exported = facts.resources.iter().find_map(|r| r.export.as_ref());
+        if (node
+            .pointer("/egress/mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("policy"))
+            != exported.is_some()
+        {
+            return Err(reject());
+        }
+        if let Some(pin) = exported {
+            if !node
+                .pointer("/egress/destination_classes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|classes| {
+                    classes
+                        .iter()
+                        .any(|c| c.as_str() == Some(pin.destination_class.as_str()))
+                })
+            {
+                return Err(reject());
+            }
+        }
         let inputs = node
             .get("inputs")
             .and_then(serde_json::Value::as_object)
@@ -844,7 +976,7 @@ impl CandidateFacts {
         revision: i64,
         content_hash: &str,
     ) -> Result<String> {
-        let value = json!({
+        let mut value = json!({
             "schema_version":"0.1","candidate_id":self.candidate_id,"binding_id":self.binding_id,
             "attempt_id":self.attempt_id,"task_id":self.task_id,
             "task_principal_kind":self.task_principal_kind,
@@ -856,7 +988,8 @@ impl CandidateFacts {
             "provider_build_hash":self.build_hash,"conformance_evidence_id":self.evidence_id,
             "provider_trust_source_id":self.trust_source_id,"execution_profile_ref":self.profile,
             "isolation_class":self.isolation,"attempt_number":self.attempt_number,
-            "placement_locality":"local","egress":"deny","network":"none",
+            "placement_locality":"local","egress":if self.resources.iter().any(|r|r.export.is_some()) {
+                "policy" } else { "deny" },"network":"none",
             "resource":{"action":resource.action,"selector":resource.selector,"kind":resource.kind,
                 "id":resource.id,"output_port":resource.output_port,"semantic_type":resource.semantic_type,
                 "sensitivity":resource.sensitivity,"retention":resource.retention,"expires_at":resource.expires_at},
@@ -865,6 +998,9 @@ impl CandidateFacts {
                 "sensitivity":r.sensitivity,"retention":r.retention,"expires_at":r.expires_at})).collect::<Vec<_>>(),
             "policy_activation_revision":revision,"policy_content_hash":content_hash,
         });
+        if let Some(pin) = self.resources.iter().find_map(|r| r.export.as_ref()) {
+            value["external_export"] = json!(pin);
+        }
         Ok(digest(
             b"AIOS-AUTHORITY-EVALUATION\0v1\0",
             &canonical_json(&value)?,
@@ -948,16 +1084,31 @@ fn approval_prompt(
     created: &str,
     expires: &str,
 ) -> Result<String> {
-    canonical_json(&json!({"schema_version":"0.1","approval_id":approval_id,
+    let mut prompt = json!({"schema_version":"0.1","approval_id":approval_id,
         "authority_request_id":request_id,"task_id":facts.task_id,
         "semantic_program_hash":facts.hash,"node_id":facts.node,"action":resource.action,
         "resource":{"kind":resource.kind,"id":resource.id,"display_class":resource.kind,
             "sensitivity":resource.sensitivity},
         "principal":{"kind":"provider","id":facts.provider_id,"version":facts.provider_version},
-        "scope":"ONE_SHOT","effect_classes":[if resource.action=="artifact.read"{"ARTIFACT_READ"}else{"ARTIFACT_WRITE"}],
+        "scope":"ONE_SHOT","effect_classes":[match resource.action.as_str(){
+            "artifact.read"=>"ARTIFACT_READ","artifact.write"=>"ARTIFACT_WRITE",_=>"DATA_EGRESS"}],
         "status":"PENDING","created_at":created,"expires_at":expires,
         "policy_reason_codes":["AUTH_REQUIRE_APPROVAL"],
-        "trusted_summary":format!("{} on {}",resource.action,resource.id)}))
+        "trusted_summary":format!("{} on {}",resource.action,resource.id)});
+    if let Some(pin) = &resource.export {
+        prompt["destination"] = json!({"class":pin.destination_class,"service_id":pin.service_id});
+        prompt["export"] = json!(pin);
+    }
+    canonical_json(&prompt)
+}
+
+fn decision_resource(resource: &ResourceFacts) -> serde_json::Value {
+    let mut value = json!({"resolved_kind":resource.kind,"resolved_id":resource.id,
+        "semantic_selector":resource.selector,"sensitivity":resource.sensitivity});
+    if let Some(pin) = &resource.export {
+        value["external_export"] = json!(pin);
+    }
+    value
 }
 
 #[allow(
@@ -1004,8 +1155,7 @@ fn checked_approval_request(
         "principal":{"kind":"provider","id":facts.provider_id,
             "version":facts.provider_version,"package_or_build_hash":facts.build_hash},
         "action":resource.action,
-        "resource":{"resolved_kind":resource.kind,"resolved_id":resource.id,
-            "semantic_selector":resource.selector,"sensitivity":resource.sensitivity},
+        "resource":decision_resource(resource),
         "decision":"REQUIRE_APPROVAL","policy_snapshot_id":snapshot_id,
         "reason_codes":["AUTH_REQUIRE_APPROVAL"],
         "approval_request_id":approval_id,
@@ -1117,6 +1267,113 @@ pub(super) fn policy_objects_current(connection: &Connection, stamped: bool) -> 
 }
 
 impl TaskManager {
+    /// Read the persisted trusted prompt only after rechecking its canonical
+    /// sidecars, candidate membership, current policy, and authenticated owner.
+    #[allow(
+        clippy::type_complexity,
+        reason = "single sealed approval row binds all prompt facts"
+    )]
+    pub(crate) fn candidate_approval_prompt(
+        &self,
+        approval_id: &str,
+        candidate_id: &str,
+        approver: &AuthenticatedApprover<'_>,
+    ) -> Result<Value> {
+        super::trusted_time::with_protected_observation(
+            &self.connection,
+            &self.clock,
+            |tx, time| {
+                assert_manager_lease(tx, &self.lease_owner, self.lease_epoch)?;
+                let checked = checked_time(time.now())?;
+                let row: Option<(String, String, i64, String, String, String, String, String, String, String, String, String)> =
+            tx.query_row(
+                "SELECT b.candidate_id,b.fingerprint,b.activation_revision,a.status,a.created_at,
+                    a.expires_at,a.request_json,t.principal_id,r.request_id,r.action,
+                    r.semantic_selector,r.resolved_resource_id
+                 FROM authority_approval_bindings b JOIN approval_requests a USING(approval_id)
+                 JOIN tasks t ON t.task_id=a.task_id
+                 JOIN authority_requests r ON r.request_id=a.authority_request_id
+                 WHERE b.approval_id=?1",
+                [approval_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,
+                    r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
+            ).optional()?;
+                let (
+                    bound,
+                    pin,
+                    revision,
+                    status,
+                    created,
+                    expires,
+                    prompt,
+                    owner,
+                    request_id,
+                    action,
+                    selector,
+                    id,
+                ) = row.ok_or_else(reject)?;
+                if bound != candidate_id
+                    || owner != approver.principal_id
+                    || owner.is_empty()
+                    || !matches!(status.as_str(), "PENDING" | "APPROVED")
+                    || checked_time(&created)? > checked
+                    || checked_time(&expires)? <= checked
+                {
+                    return Err(reject());
+                }
+                let current: (i64, String) = tx.query_row(
+            "SELECT revision,content_hash FROM authority_policy_activations ORDER BY revision DESC LIMIT 1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                if current.0 != revision {
+                    return Err(reject());
+                }
+                let policy_json: String = tx
+                    .query_row(
+                        "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
+                        [&current.1],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(reject)?;
+                if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != current.1 {
+                    return Err(reject());
+                }
+                let policy = LocalPolicy::parse(policy_json.as_bytes())?;
+                if canonical_json(&policy)? != policy_json {
+                    return Err(reject());
+                }
+                let facts = CandidateFacts::load(tx, candidate_id, checked)?;
+                if facts.task_state != "WAITING_FOR_AUTH" {
+                    return Err(reject());
+                }
+                let resource = facts
+                    .resources
+                    .iter()
+                    .find(|r| r.action == action && r.selector == selector && r.id == id)
+                    .ok_or_else(reject)?;
+                if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
+                    != PolicyBasis::RequireApproval
+                {
+                    return Err(reject());
+                }
+                if facts.fingerprint(resource, revision, &current.1)? != pin {
+                    return Err(reject());
+                }
+                checked_approval_request(
+                    tx,
+                    &facts,
+                    resource,
+                    approval_id,
+                    &request_id,
+                    &pin,
+                    revision,
+                    &current.1,
+                    &created,
+                    &expires,
+                )?;
+                serde_json::from_str(&prompt).map_err(|_| reject())
+            },
+        )
+    }
     /// Finalizes one already reserved candidate under a single protected
     /// transaction. The Task remains `WAITING_FOR_AUTH` until its ordinary
     /// guarded transition admits execution.
@@ -1457,17 +1714,25 @@ impl TaskManager {
             if checked_time(requested_at)? > started_at {
                 return Err(reject());
             }
-            let request_json = canonical_json(
-                &json!({"schema_version":"0.1","request_id":request_id,
+            let mut request_value = json!({"schema_version":"0.1","request_id":request_id,
                 "task_id":facts.task_id,"semantic_program_hash":facts.hash,"registry_snapshot_id":facts.snapshot,
                 "node_id":facts.node,"capability":facts.capability,"principal":{"kind":"provider",
                     "id":facts.provider_id,"version":facts.provider_version,"package_or_build_hash":facts.build_hash},
                 "action":resource.action,"resource":{"semantic_selector":resource.selector,
                     "resolved_kind":resource.kind,"resolved_id":resource.id,"sensitivity":resource.sensitivity},
                 "execution_binding_id":facts.binding_id,"attempt_id":facts.attempt_id,
-                "effect_classes":[if resource.action=="artifact.read"{"ARTIFACT_READ"}else{"ARTIFACT_WRITE"}],
-                "requested_at":requested_at}),
-            )?;
+                "effect_classes":[match resource.action.as_str(){"artifact.read"=>"ARTIFACT_READ",
+                    "artifact.write"=>"ARTIFACT_WRITE",_=>"DATA_EGRESS"}],
+                "requested_at":requested_at});
+            if let Some(pin) = &resource.export {
+                request_value["egress"] = json!({"destination_class":pin.destination_class,
+                    "service_id":pin.service_id,"data_refs":[pin.source_artifact_id],
+                    "purpose":pin.purpose,"source_content_hash":pin.source_content_hash,
+                    "operation_id":pin.operation_id,"adapter_id":pin.adapter_id,
+                    "descriptor_hash":pin.descriptor_hash,"max_size_bytes":pin.max_size_bytes});
+            }
+            validate_exact_export_request_links(&request_value)?;
+            let request_json = canonical_json(&request_value)?;
             if let Some((prior, _)) = prior {
                 let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM authority_requests WHERE request_id=?1
                     AND task_id=?2 AND semantic_program_hash=?3 AND registry_snapshot_id=?4
@@ -1654,8 +1919,7 @@ impl TaskManager {
                 "registry_snapshot_id":facts.snapshot,"node_id":facts.node,"capability":facts.capability,
                 "principal":{"kind":"provider","id":facts.provider_id,"version":facts.provider_version,
                     "package_or_build_hash":facts.build_hash},"action":resource.action,
-                "resource":{"resolved_kind":resource.kind,"resolved_id":resource.id,
-                    "semantic_selector":resource.selector,"sensitivity":resource.sensitivity},
+                "resource":decision_resource(resource),
                 "decision":effect.as_str(),"policy_snapshot_id":snapshot_id,"reason_codes":[reason],
                 "approval_request_id":approval_id,"engine":{"id":"aios-deterministic","version":"0.1"},
                 "decided_at":decided_at}),
@@ -1937,10 +2201,12 @@ impl TaskManager {
             );
             let grant_id = format!("grant:{}", digest(b"AIOS-CANDIDATE-GRANT\0v1\0", &identity));
             let token_id = format!("token:{}", digest(b"AIOS-CANDIDATE-TOKEN\0v1\0", &identity));
-            let grants_json = canonical_json(&vec![json!({
-                "action":resource.action,"resource_kind":resource.kind,
-                "resource_id":resource.id,"semantic_selector":resource.selector
-            })])?;
+            let mut grant_item = json!({"action":resource.action,"resource_kind":resource.kind,
+                "resource_id":resource.id,"semantic_selector":resource.selector});
+            if let Some(pin) = &resource.export {
+                grant_item["external_export"] = json!(pin);
+            }
+            let grants_json = canonical_json(&vec![grant_item])?;
             tx.execute(
                 "INSERT INTO authority_grants(grant_id,token_id,task_id,semantic_program_hash,
                     node_id,capability,principal_kind,principal_id,execution_binding_id,
@@ -1962,12 +2228,12 @@ impl TaskManager {
                     policy_snapshot_id,
                     decision.approval_id,
                     grants_json,
-                    if approval.is_some() {
+                    if approval.is_some() || resource.export.is_some() {
                         "ONE_SHOT"
                     } else {
                         "TASK"
                     },
-                    approval.as_ref().map(|_| 1_i64),
+                    (approval.is_some() || resource.export.is_some()).then_some(1_i64),
                     time.now(),
                     prepared.grant_expires_at
                 ],
