@@ -1682,6 +1682,15 @@ mod tests {
             Some(crate::trusted_time::synthetic_sample(self.now()))
         }
     }
+    struct ApprovalExpiredClock;
+    impl Clock for ApprovalExpiredClock {
+        fn now(&self) -> String {
+            "2026-09-19T02:00:00Z".into()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
     struct FrozenWallClock {
         monotonic: Arc<std::sync::atomic::AtomicU64>,
     }
@@ -3154,6 +3163,382 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table} escaped pending approval");
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "creates a real approved exact-export candidate for stale-claim fixtures"
+    )]
+    fn approved_export_claim_fixture() -> (TaskManager, String, String, String, String, String) {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:stale-approval-source".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"private stale approval source"),
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://model/fixture-remote",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://model/other-remote",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:stale-old");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: "service://model/fixture-remote".into(),
+                source_artifact_id: source.artifact_id.clone(),
+                operation_id: "export:stale-old".into(),
+                purpose: "fixture analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:stale-old",
+                binding_id: "binding:stale-old",
+                attempt_id: "attempt:stale-old",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:stale-old")
+            .unwrap();
+        let approval = evaluated
+            .decisions
+            .iter()
+            .find(|decision| decision.action == "data.egress")
+            .unwrap()
+            .approval_id
+            .clone()
+            .unwrap();
+        assert!(
+            manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:stale-waiting".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 2,
+                    expected_state: TaskState::Planning,
+                    to_state: TaskState::WaitingForAuth,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into()
+                    },
+                    reason: TransitionReason {
+                        code: "APPROVAL_REQUIRED".into(),
+                        message: None,
+                        related_ids: vec![approval.clone()]
+                    },
+                    mutation: TaskMutation {
+                        waiting_on: Some(vec![WaitingOn {
+                            kind: WaitingKind::Approval,
+                            id: approval.clone(),
+                            message: None,
+                        }]),
+                        ..TaskMutation::default()
+                    },
+                })
+                .unwrap()
+                .applied
+        );
+        manager
+            .decide_candidate_approval(
+                &approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        (
+            manager,
+            hash,
+            snapshot,
+            registration,
+            source.artifact_id,
+            approval,
+        )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises both exact approval application and same-class service substitution"
+    )]
+    fn fixture_approval_stale_after_destination_change() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("approval-stale-after-destination-change");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, hash, snapshot, registration, source, approval) =
+            approved_export_claim_fixture();
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        let accepted = exact
+            .decisions
+            .iter()
+            .find(|d| d.action == "data.egress")
+            .unwrap();
+        assert_eq!(accepted.effect, PolicyEffect::Allow);
+        assert_eq!(accepted.approval_id.as_deref(), Some(approval.as_str()));
+        assert_eq!(
+            case["facts"]["approved_destination"],
+            "service://model/fixture-remote"
+        );
+        let changed_service = case["facts"]["runtime_destination"].as_str().unwrap();
+        let mut resources = choices_with_source_and_output(&source, "allocation:stale-new");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: changed_service.into(),
+                source_artifact_id: source.clone(),
+                operation_id: "export:stale-new".into(),
+                purpose: "fixture analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:stale-new",
+                binding_id: "binding:stale-new",
+                attempt_id: "attempt:stale-new",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 2,
+                resources: &resources,
+            })
+            .unwrap();
+        let pin = load_current_export_pin(&manager.connection, "candidate:stale-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.service_id, changed_service);
+        assert_eq!(pin.destination_class, "fixture_remote");
+        let authority_rows = |manager: &TaskManager| -> Vec<i64> {
+            [
+                "authority_requests",
+                "policy_decisions",
+                "approval_requests",
+                "authority_approval_bindings",
+                "authority_evaluation_fingerprints",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .iter()
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+        };
+        let before_claim = authority_rows(&manager);
+        let invalid = manager
+            .apply_candidate_approval_claim("candidate:stale-new", "approval:unknown")
+            .unwrap_err();
+        assert!(invalid.authority_denial().is_none());
+        let stale = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert_eq!(
+            stale.to_string(),
+            "authority approval application is not admissible"
+        );
+        let denial = stale.authority_denial().unwrap();
+        assert_eq!(
+            denial.stage,
+            crate::AuthorityDenialStage::ApprovalApplication
+        );
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(authority_rows(&manager), before_claim);
+        let (revision, snapshot_id, snapshot_json): (i64, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.revision,a.content_hash,p.snapshot_json
+                 FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let malformed_snapshot = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(malformed_snapshot.authority_denial().is_none());
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                params![snapshot_id, snapshot_json],
+            )
+            .unwrap();
+        // The activation table itself refuses a late timestamp rewrite; the
+        // verifier still checks the temporal relation if evidence is imported.
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_policy_activations SET activated_at='2026-09-19T00:05:00Z'
+             WHERE revision=?1",
+                    [revision],
+                )
+                .is_err()
+        );
+        assert_eq!(authority_rows(&manager), before_claim);
+        for (table, predicate) in [
+            (
+                "authority_grants",
+                "execution_binding_id='binding:stale-new'",
+            ),
+            ("execution_bindings", "binding_id='binding:stale-new'"),
+            ("operations", "operation_id='export:stale-new'"),
+            (
+                "artifact_output_allocations",
+                "allocation_id='allocation:stale-new'",
+            ),
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} escaped stale approval denial");
+        }
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let denied = manager
+            .evaluate_pending_authority_candidate("candidate:stale-new")
+            .unwrap();
+        let egress = denied
+            .decisions
+            .iter()
+            .find(|decision| decision.action == "data.egress")
+            .unwrap();
+        assert_eq!(egress.effect, PolicyEffect::Deny);
+        assert_eq!(egress.reason_code, "AUTH_DENY_POLICY");
+        assert!(
+            manager
+                .apply_candidate_approval_claim("candidate:stale-new", &approval)
+                .is_err()
+        );
+        manager
+            .revoke_candidate_approval(
+                &approval,
+                &crate::authority_policy::AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+            )
+            .unwrap();
+        let withdrawn: Option<String> = manager
+            .connection
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(withdrawn.is_some());
+        let withdrawn_claim = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(withdrawn_claim.authority_denial().is_none());
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:stale-new")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_approved_claim_is_generic_and_creates_no_authority() {
+        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture();
+        let before: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        manager.clock = Arc::new(ApprovalExpiredClock);
+        let error = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap_err();
+        assert!(error.authority_denial().is_none());
+        let after: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
