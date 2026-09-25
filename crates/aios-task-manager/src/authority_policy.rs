@@ -1267,6 +1267,113 @@ pub(super) fn policy_objects_current(connection: &Connection, stamped: bool) -> 
 }
 
 impl TaskManager {
+    /// Read the persisted trusted prompt only after rechecking its canonical
+    /// sidecars, candidate membership, current policy, and authenticated owner.
+    #[allow(
+        clippy::type_complexity,
+        reason = "single sealed approval row binds all prompt facts"
+    )]
+    pub(crate) fn candidate_approval_prompt(
+        &self,
+        approval_id: &str,
+        candidate_id: &str,
+        approver: &AuthenticatedApprover<'_>,
+    ) -> Result<Value> {
+        super::trusted_time::with_protected_observation(
+            &self.connection,
+            &self.clock,
+            |tx, time| {
+                assert_manager_lease(tx, &self.lease_owner, self.lease_epoch)?;
+                let checked = checked_time(time.now())?;
+                let row: Option<(String, String, i64, String, String, String, String, String, String, String, String, String)> =
+            tx.query_row(
+                "SELECT b.candidate_id,b.fingerprint,b.activation_revision,a.status,a.created_at,
+                    a.expires_at,a.request_json,t.principal_id,r.request_id,r.action,
+                    r.semantic_selector,r.resolved_resource_id
+                 FROM authority_approval_bindings b JOIN approval_requests a USING(approval_id)
+                 JOIN tasks t ON t.task_id=a.task_id
+                 JOIN authority_requests r ON r.request_id=a.authority_request_id
+                 WHERE b.approval_id=?1",
+                [approval_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,
+                    r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
+            ).optional()?;
+                let (
+                    bound,
+                    pin,
+                    revision,
+                    status,
+                    created,
+                    expires,
+                    prompt,
+                    owner,
+                    request_id,
+                    action,
+                    selector,
+                    id,
+                ) = row.ok_or_else(reject)?;
+                if bound != candidate_id
+                    || owner != approver.principal_id
+                    || owner.is_empty()
+                    || !matches!(status.as_str(), "PENDING" | "APPROVED")
+                    || checked_time(&created)? > checked
+                    || checked_time(&expires)? <= checked
+                {
+                    return Err(reject());
+                }
+                let current: (i64, String) = tx.query_row(
+            "SELECT revision,content_hash FROM authority_policy_activations ORDER BY revision DESC LIMIT 1",
+            [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                if current.0 != revision {
+                    return Err(reject());
+                }
+                let policy_json: String = tx
+                    .query_row(
+                        "SELECT policy_json FROM authority_policy_payloads WHERE content_hash=?1",
+                        [&current.1],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(reject)?;
+                if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != current.1 {
+                    return Err(reject());
+                }
+                let policy = LocalPolicy::parse(policy_json.as_bytes())?;
+                if canonical_json(&policy)? != policy_json {
+                    return Err(reject());
+                }
+                let facts = CandidateFacts::load(tx, candidate_id, checked)?;
+                if facts.task_state != "WAITING_FOR_AUTH" {
+                    return Err(reject());
+                }
+                let resource = facts
+                    .resources
+                    .iter()
+                    .find(|r| r.action == action && r.selector == selector && r.id == id)
+                    .ok_or_else(reject)?;
+                if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
+                    != PolicyBasis::RequireApproval
+                {
+                    return Err(reject());
+                }
+                if facts.fingerprint(resource, revision, &current.1)? != pin {
+                    return Err(reject());
+                }
+                checked_approval_request(
+                    tx,
+                    &facts,
+                    resource,
+                    approval_id,
+                    &request_id,
+                    &pin,
+                    revision,
+                    &current.1,
+                    &created,
+                    &expires,
+                )?;
+                serde_json::from_str(&prompt).map_err(|_| reject())
+            },
+        )
+    }
     /// Finalizes one already reserved candidate under a single protected
     /// transaction. The Task remains `WAITING_FOR_AUTH` until its ordinary
     /// guarded transition admits execution.

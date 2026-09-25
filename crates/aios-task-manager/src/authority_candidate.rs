@@ -87,6 +87,12 @@ fn valid_export_identifier(value: &str) -> bool {
     valid_id(value) && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+fn valid_service_id(value: &str) -> bool {
+    value.starts_with("service://")
+        && value.chars().count() <= 512
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn export_service_hash(service_id: &str, class: &str, adapter_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"AIOS-TRUSTED-EXPORT-SERVICE\0v1\0");
@@ -175,7 +181,7 @@ pub(super) fn load_current_export_pin(
         |r| r.get(0),
     )?;
     if !current
-        || !valid_export_identifier(&pin.service_id)
+        || !valid_service_id(&pin.service_id)
         || !valid_export_identifier(&pin.adapter_id)
         || !valid_export_identifier(&pin.operation_id)
         || export_service_hash(&pin.service_id, &pin.destination_class, &pin.adapter_id)
@@ -195,8 +201,7 @@ impl TaskManager {
         destination_class: &str,
         adapter_id: &str,
     ) -> Result<()> {
-        if !service_id.starts_with("service://")
-            || !valid_export_identifier(service_id)
+        if !valid_service_id(service_id)
             || !valid_export_identifier(destination_class)
             || !valid_export_identifier(adapter_id)
             || !destination_class

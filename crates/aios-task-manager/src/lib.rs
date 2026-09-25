@@ -38,8 +38,8 @@ pub use artifact_store::{
     VerifiedArtifactExportNoEffect,
 };
 pub use coordinator::{
-    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal, PreparedLocalExport,
-    TrustedExportAdapter, TrustedLocalCoordinator,
+    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal,
+    MemoryExportObservation, PreparedLocalExport, TrustedLocalCoordinator,
 };
 pub use trusted_time::{SecurityClockSample, TimeSource};
 
