@@ -109,10 +109,20 @@
         "required": ["egress"],
         "properties": {
           "action": {"const": "data.egress"},
-          "resource": {"properties": {"resolved_kind": {"const": "external-destination"}}},
+          "resource": {
+            "required": ["sensitivity"],
+            "properties": {
+              "resolved_kind": {"const": "external-destination"},
+              "sensitivity": {"type": "string"}
+            }
+          },
           "egress": {
             "type": "object",
-            "required": ["source_content_hash", "operation_id", "adapter_id", "descriptor_hash", "max_size_bytes"]
+            "required": ["purpose", "source_content_hash", "operation_id", "adapter_id", "descriptor_hash", "max_size_bytes"],
+            "properties": {
+              "data_refs": {"minItems": 1, "maxItems": 1, "items": {"minLength": 1}},
+              "purpose": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
           }
         }
       }

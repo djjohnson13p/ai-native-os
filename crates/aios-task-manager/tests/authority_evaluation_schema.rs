@@ -42,6 +42,7 @@ fn exact_export_requires_the_sealed_tuple() {
         "destination_class",
         "service_id",
         "data_refs",
+        "purpose",
         "source_content_hash",
         "operation_id",
         "adapter_id",
@@ -52,6 +53,45 @@ fn exact_export_requires_the_sealed_tuple() {
         incomplete["egress"].as_object_mut().unwrap().remove(field);
         assert!(!validator.is_valid(&incomplete), "missing {field}");
     }
+
+    for field in [
+        "purpose",
+        "source_content_hash",
+        "operation_id",
+        "adapter_id",
+        "descriptor_hash",
+        "max_size_bytes",
+    ] {
+        let mut null_field = valid.clone();
+        null_field["egress"][field] = Value::Null;
+        assert!(!validator.is_valid(&null_field), "null {field}");
+    }
+
+    let mut empty_purpose = valid.clone();
+    empty_purpose["egress"]["purpose"] = json!("");
+    assert!(!validator.is_valid(&empty_purpose), "empty purpose");
+
+    let mut missing_sensitivity = valid.clone();
+    missing_sensitivity["resource"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sensitivity");
+    assert!(
+        !validator.is_valid(&missing_sensitivity),
+        "missing sensitivity"
+    );
+
+    let mut null_sensitivity = valid.clone();
+    null_sensitivity["resource"]["sensitivity"] = Value::Null;
+    assert!(!validator.is_valid(&null_sensitivity), "null sensitivity");
+
+    let mut multiple_sources = valid.clone();
+    multiple_sources["egress"]["data_refs"] = json!(["artifact:source", "artifact:other"]);
+    assert!(!validator.is_valid(&multiple_sources), "multiple sources");
+
+    let mut empty_source = valid;
+    empty_source["egress"]["data_refs"] = json!([""]);
+    assert!(!validator.is_valid(&empty_source), "empty source reference");
 }
 
 #[test]

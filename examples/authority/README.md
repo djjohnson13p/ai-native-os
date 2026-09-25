@@ -21,4 +21,5 @@ A provider/model may request authority but cannot create policy decisions, appro
 `evaluation-exact-export.json` is a positive sealed `data.egress` request.
 `crates/aios-task-manager/tests/authority_evaluation_schema.rs` checks it,
 omitted/null egress and sealed fields, action/resource-kind mismatches, and
-the historical local-read request shape.
+the historical local-read request shape. It also rejects missing/null
+purpose or sensitivity and multiple source references.
