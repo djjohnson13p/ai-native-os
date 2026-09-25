@@ -789,7 +789,7 @@ impl TrustedLocalCoordinator {
             [&previous.binding_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if task.state != TaskState::Planning
+        if !matches!(task.state, TaskState::Planning | TaskState::WaitingForAuth)
             || old_step.state != super::StepState::Ready
             || old_step.operation_id.is_some()
             || old_step.started_at.is_some()
@@ -804,6 +804,38 @@ impl TrustedLocalCoordinator {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
+        let waiting_transition_id = format!("transition:export-waiting:{}", next.candidate_id);
+        // An approval-wait retry is admitted only for this candidate's exact
+        // previously committed transition at the current Task revision.
+        let waiting_replay = if task.state == TaskState::WaitingForAuth {
+            let stored: Option<(String, i64)> = self
+                .manager
+                .connection
+                .query_row(
+                    "SELECT request_json,result_revision FROM task_transitions
+                 WHERE transition_id=?1 AND task_id=?2 AND outcome='COMMITTED'
+                   AND expected_state='PLANNING' AND to_state='WAITING_FOR_AUTH'",
+                    params![waiting_transition_id, task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (stored, revision) =
+                stored.ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+            let previous: TransitionRequest = serde_json::from_str(&stored)
+                .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+            if u64::try_from(revision).ok() != Some(task.revision)
+                || previous.expected_revision.checked_add(1) != Some(task.revision)
+                || previous.mutation.waiting_on.as_ref() != Some(&task.waiting_on)
+                || previous.reason.code != "APPROVAL_REQUIRED"
+                || previous.requested_by.kind != "system-service"
+                || previous.requested_by.id != "aiosd.coordinator"
+            {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            Some(previous)
+        } else {
+            None
+        };
         let hash = task
             .active_program
             .as_ref()
@@ -859,8 +891,59 @@ impl TrustedLocalCoordinator {
         if evaluation
             .decisions
             .iter()
-            .any(|decision| decision.effect != PolicyEffect::Allow)
+            .any(|decision| decision.effect == PolicyEffect::Deny)
         {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let approval_ids: Vec<String> = evaluation
+            .decisions
+            .iter()
+            .filter_map(|decision| decision.approval_id.clone())
+            .collect();
+        if !approval_ids.is_empty() {
+            let waiting_request = TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: waiting_transition_id,
+                task_id: task_id.clone(),
+                expected_revision: waiting_replay
+                    .as_ref()
+                    .map_or(task.revision, |prior| prior.expected_revision),
+                expected_state: TaskState::Planning,
+                to_state: TaskState::WaitingForAuth,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "APPROVAL_REQUIRED".into(),
+                    message: None,
+                    related_ids: approval_ids.clone(),
+                },
+                mutation: TaskMutation {
+                    waiting_on: Some(
+                        approval_ids
+                            .iter()
+                            .map(|id| WaitingOn {
+                                kind: WaitingKind::Approval,
+                                id: id.clone(),
+                                message: None,
+                            })
+                            .collect(),
+                    ),
+                    ..TaskMutation::default()
+                },
+            };
+            if waiting_replay
+                .as_ref()
+                .is_some_and(|prior| prior != &waiting_request)
+            {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+            let waiting = self.manager.transition(&waiting_request)?;
+            if !waiting.applied {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
+        } else if waiting_replay.is_some() {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         Ok(PreparedLocalExport {
@@ -875,7 +958,7 @@ impl TrustedLocalCoordinator {
             operation_id: next.operation_id.clone(),
             purpose: previous.purpose.clone(),
             max_size_bytes: previous.max_size_bytes,
-            approval_ids: vec![],
+            approval_ids,
         })
     }
 
@@ -1277,3 +1360,7 @@ mod tests {
 #[cfg(test)]
 #[path = "coordinator_wrong_task_tests.rs"]
 mod wrong_task_tests;
+
+#[cfg(test)]
+#[path = "coordinator_restart_approval_tests.rs"]
+mod restart_approval_tests;

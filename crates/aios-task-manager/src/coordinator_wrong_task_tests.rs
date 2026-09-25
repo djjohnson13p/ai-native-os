@@ -186,6 +186,19 @@ fn fresh_proposal(
     reason = "keeps both real Task admissions and the wrong-Task claim visible together"
 )]
 fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
+    let authority_cases: Value = serde_json::from_str(include_str!(
+        "../../../examples/authority/authority-cases.json"
+    ))
+    .unwrap();
+    let matching: Vec<&Value> = authority_cases
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["name"] == "grant-used-for-wrong-task")
+        .collect();
+    assert_eq!(matching.len(), 1);
+    let case = matching[0];
+    assert_eq!(case["expected"], "DENY");
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("wrong-task.sqlite3");
     let mut manager = TaskManager::open(&db).unwrap();
@@ -277,6 +290,19 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
     let prepared_b = coordinator
         .prepare_local_export(&b, &mut Cursor::new(SOURCE))
         .unwrap();
+    let task_alias = |alias: &str| match alias {
+        "T91" => a.task.task_id.as_str(),
+        "T999" => b.task.task_id.as_str(),
+        _ => panic!("unknown authority fixture task alias"),
+    };
+    assert_eq!(
+        task_alias(case["facts"]["grant_task"].as_str().unwrap()),
+        prepared_a.task_id
+    );
+    assert_eq!(
+        task_alias(case["facts"]["caller_task"].as_str().unwrap()),
+        prepared_b.task_id
+    );
     assert!(prepared_a.approval_id().is_none());
     assert!(prepared_b.approval_id().is_none());
     coordinator.start_local_export(&prepared_a).unwrap();
@@ -364,6 +390,10 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
             reason: AuthorityDenialReason::GrantTaskMismatch,
         })
     ));
+    assert_eq!(
+        denied.authority_denial().unwrap().reason.code(),
+        case["reason_code"]
+    );
     let after: (i64, i64, i64, i64) = readonly
         .query_row(
             "SELECT (SELECT COUNT(*) FROM operations WHERE effect_class='ARTIFACT_READ'),
