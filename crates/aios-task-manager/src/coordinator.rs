@@ -217,6 +217,26 @@ pub struct TrustedLocalCoordinator {
     services: BTreeMap<String, RegisteredService>,
 }
 
+fn export_waiting_transition_id(task_id: &str, candidate_id: &str, revision: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"AIOS-EXPORT-WAITING-V1\0");
+    for identity in [task_id.as_bytes(), candidate_id.as_bytes()] {
+        digest.update(
+            u64::try_from(identity.len())
+                .expect("bounded ID length")
+                .to_be_bytes(),
+        );
+        digest.update(identity);
+    }
+    digest.update(revision.to_be_bytes());
+    let mut id = String::from("transition:export-waiting:");
+    for byte in digest.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut id, "{byte:02x}").expect("string write");
+    }
+    id
+}
+
 impl TrustedLocalCoordinator {
     /// Takes exclusive ownership of a Task Manager opened by the trusted host.
     /// Registry and provider evidence can be admitted through the manager's
@@ -804,10 +824,24 @@ impl TrustedLocalCoordinator {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        let waiting_transition_id = format!("transition:export-waiting:{}", next.candidate_id);
+        // Startup may return an unused WAITING_FOR_AUTH attempt to PLANNING.
+        // A later wait is a new transition, while response-loss replay at the
+        // same revision must retain the original transition identity.
+        let waiting_revision = if task.state == TaskState::WaitingForAuth {
+            task.revision
+                .checked_sub(1)
+                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
+        } else {
+            task.revision
+        };
+        let waiting_transition_id =
+            export_waiting_transition_id(&task_id, &next.candidate_id, waiting_revision);
         // An approval-wait retry is admitted only for this candidate's exact
         // previously committed transition at the current Task revision.
         let waiting_replay = if task.state == TaskState::WaitingForAuth {
+            if !self.manager.verify_provenance(&task_id)? {
+                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+            }
             let stored: Option<(String, i64)> = self
                 .manager
                 .connection
@@ -905,9 +939,7 @@ impl TrustedLocalCoordinator {
                 schema_version: "0.1".into(),
                 transition_id: waiting_transition_id,
                 task_id: task_id.clone(),
-                expected_revision: waiting_replay
-                    .as_ref()
-                    .map_or(task.revision, |prior| prior.expected_revision),
+                expected_revision: waiting_revision,
                 expected_state: TaskState::Planning,
                 to_state: TaskState::WaitingForAuth,
                 requested_by: Actor {

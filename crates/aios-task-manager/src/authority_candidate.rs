@@ -2674,6 +2674,7 @@ mod tests {
         assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
         let denial = error.authority_denial().unwrap();
         assert_eq!(denial.stage, crate::AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(case["expected"], "DENY");
         assert_eq!(denial.reason.code(), case["reason_code"]);
         assert_eq!(counts(&manager), before);
         let unknown = manager

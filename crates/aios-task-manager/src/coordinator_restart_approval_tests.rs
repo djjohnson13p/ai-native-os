@@ -293,6 +293,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
     let [approval_id] = prepared.approval_ids() else {
         panic!("expected one fresh approval");
     };
+    let approval_id = approval_id.clone();
     assert_eq!(
         coordinator
             .manager
@@ -303,7 +304,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         TaskState::WaitingForAuth
     );
     let prompt = coordinator
-        .approval_prompt(&prepared, approval_id, "user:test")
+        .approval_prompt(&prepared, &approval_id, "user:test")
         .unwrap();
     assert_eq!(prompt["approval_id"], approval_id.as_str());
     let state = |coordinator: &TrustedLocalCoordinator| -> Vec<i64> {
@@ -361,10 +362,113 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .unwrap();
     assert_eq!(exact.approval_ids(), prepared.approval_ids());
     assert_eq!(state(&coordinator), before_retry);
+    drop(coordinator);
+    let restarted_again = TaskManager::open(&db).unwrap();
+    assert_eq!(
+        restarted_again
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Planning
+    );
+    let mut coordinator = TrustedLocalCoordinator::from_manager(restarted_again);
+    coordinator
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
+        .unwrap();
+    let before_second_wait = state(&coordinator);
+    assert!(
+        coordinator
+            .prepare_restarted_local_export(&previous, &changed_binding)
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .prepare_restarted_local_export(&previous, &different)
+            .is_err()
+    );
+    assert_eq!(state(&coordinator), before_second_wait);
+    let prepared = coordinator
+        .prepare_restarted_local_export(&previous, &next)
+        .unwrap();
+    assert_eq!(prepared.approval_ids(), &[approval_id.clone()]);
+    assert_eq!(
+        coordinator
+            .manager
+            .get_task(&proposal.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::WaitingForAuth
+    );
+    let after_second_wait = state(&coordinator);
+    assert_eq!(after_second_wait[0], before_second_wait[0] + 1);
+    assert_eq!(after_second_wait[1], before_second_wait[1] + 1);
+    assert_eq!(&after_second_wait[2..], &before_second_wait[2..]);
+    let retired: (i64, i64) = coordinator
+        .manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='REVOKED'
+             AND revocation_reason_code='AUTHORITY_SESSION_RETIRED'
+             AND uses_consumed=0 THEN 1 ELSE 0 END),0)
+             FROM authority_grants WHERE execution_binding_id=?1",
+            [&previous.binding_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(retired.0 > 0);
+    assert_eq!(retired.0, retired.1);
+    let waiting_ids: Vec<String> = coordinator
+        .manager
+        .connection
+        .prepare(
+            "SELECT transition_id FROM task_transitions WHERE task_id=?1
+                  AND json_extract(request_json,'$.reason.code')='APPROVAL_REQUIRED'
+                  AND outcome='COMMITTED'
+                  ORDER BY result_revision",
+        )
+        .unwrap()
+        .query_map([&proposal.task.task_id], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(waiting_ids.len(), 2);
+    assert_ne!(waiting_ids[0], waiting_ids[1]);
+    let provenance_before_exact: i64 = coordinator
+        .manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1",
+            [&proposal.task.task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let second_exact = coordinator
+        .prepare_restarted_local_export(&previous, &next)
+        .unwrap();
+    assert_eq!(second_exact.approval_ids(), prepared.approval_ids());
+    assert_eq!(state(&coordinator), after_second_wait);
+    let provenance_after_exact: i64 = coordinator
+        .manager
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1",
+            [&proposal.task.task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(provenance_after_exact, provenance_before_exact);
+    assert_eq!(
+        coordinator
+            .approval_prompt(&prepared, &approval_id, "user:test")
+            .unwrap(),
+        prompt
+    );
     coordinator.manager.stop_local_policy_backend();
     assert_eq!(
         coordinator
-            .approval_prompt(&prepared, approval_id, "user:test")
+            .approval_prompt(&prepared, &approval_id, "user:test")
             .unwrap(),
         prompt
     );
@@ -383,7 +487,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .connection
         .query_row(
             "SELECT request_json FROM approval_requests WHERE approval_id=?1",
-            [approval_id],
+            [approval_id.as_str()],
             |row| row.get(0),
         )
         .unwrap();
@@ -401,11 +505,11 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .connection
         .execute(
             "UPDATE approval_requests SET request_json='{}' WHERE approval_id=?1",
-            [approval_id],
+            [approval_id.as_str()],
         )
         .unwrap();
     let bad_prompt = coordinator
-        .approval_prompt(&prepared, approval_id, "user:test")
+        .approval_prompt(&prepared, &approval_id, "user:test")
         .unwrap_err();
     assert!(bad_prompt.authority_denial().is_none());
     coordinator
@@ -413,7 +517,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .connection
         .execute(
             "UPDATE approval_requests SET request_json=?2 WHERE approval_id=?1",
-            rusqlite::params![approval_id, sealed_prompt],
+            rusqlite::params![&approval_id, sealed_prompt],
         )
         .unwrap();
     coordinator
@@ -450,7 +554,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         )
         .unwrap();
     let bad_policy = coordinator
-        .approval_prompt(&prepared, approval_id, "user:test")
+        .approval_prompt(&prepared, &approval_id, "user:test")
         .unwrap_err();
     assert!(bad_policy.authority_denial().is_none());
     coordinator
@@ -468,7 +572,7 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .unwrap();
     assert_eq!(
         coordinator
-            .approval_prompt(&prepared, approval_id, "user:test")
+            .approval_prompt(&prepared, &approval_id, "user:test")
             .unwrap(),
         prompt
     );
