@@ -380,7 +380,7 @@ pub(crate) struct FinalizedAuthorityCandidate {
     clippy::too_many_lines,
     reason = "reconstructs the complete immutable issuance after a lost response"
 )]
-fn replay_finalized_candidate(
+pub(super) fn replay_finalized_candidate(
     connection: &Connection,
     candidate_id: &str,
 ) -> Result<Option<FinalizedAuthorityCandidate>> {
@@ -590,7 +590,6 @@ fn authenticate_approved_claim(
     tx: &rusqlite::Transaction<'_>,
     approval_id: &str,
     now: OffsetDateTime,
-    backend: &LocalPolicyBackend,
 ) -> Result<AuthenticatedApprovalClaim> {
     let prior: Option<(
         String,
@@ -734,7 +733,13 @@ fn authenticate_approved_claim(
     }
     let policy = LocalPolicy::parse(policy_json.as_bytes())?;
     if canonical_json(&policy)? != policy_json
-        || backend.decide(
+        // This verifies the sealed historical decision, not current authority.
+        // An unavailable live evaluator must not invalidate an earlier genuine
+        // approval before current policy can record its outage denial.
+        || (DeterministicEvaluator {
+            max_rules: LOCAL_POLICY_RULE_LIMIT,
+        })
+        .decide(
             &policy,
             &resource.action,
             &resource.kind,
@@ -2012,6 +2017,8 @@ impl TaskManager {
     /// Provider output cannot call this crate-private method or make a
     /// historical approval executable. An exact claim delegates to ordinary
     /// current policy evaluation; a mismatched genuine claim is denial-only.
+    /// A successful call may contain only durable DENY decisions during a
+    /// backend outage. Callers must inspect the effects, not treat `Ok` as a grant.
     #[allow(
         clippy::too_many_lines,
         reason = "old-claim authentication and current-candidate policy evaluation share one fence"
@@ -2038,8 +2045,7 @@ impl TaskManager {
             if !super::active_program_validation_valid(tx, &current.task_id, &current.hash)? {
                 return Err(reject());
             }
-            let old =
-                authenticate_approved_claim(tx, approval_id, checked, &self.local_policy_backend)?;
+            let old = authenticate_approved_claim(tx, approval_id, checked)?;
             if old.task_id != current.task_id {
                 return Err(reject());
             }
@@ -2083,12 +2089,22 @@ impl TaskManager {
                 now,
                 &self.local_policy_backend,
             )?;
-            if !evaluated.decisions.iter().any(|decision| {
+            let approved = evaluated.decisions.iter().any(|decision| {
                 decision.action == old.action
                     && decision.semantic_selector == old.selector
                     && decision.approval_id.as_deref() == Some(approval_id)
                     && decision.effect == PolicyEffect::Allow
-            }) {
+            });
+            let backend_unavailable = evaluated.decisions.iter().any(|decision| {
+                decision.action == old.action
+                    && decision.semantic_selector == old.selector
+                    && decision.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+            }) && evaluated.decisions.iter().all(|decision| {
+                decision.effect == PolicyEffect::Deny
+                    && decision.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+                    && decision.approval_id.is_none()
+            });
+            if !approved && !backend_unavailable {
                 return Err(reject());
             }
             Ok(evaluated)

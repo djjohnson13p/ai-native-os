@@ -6058,6 +6058,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps historical approval, outage denial, and recovery evidence in one lifecycle"
+    )]
     fn approved_candidate_cannot_issue_while_policy_engine_is_stopped() {
         use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
         let (mut manager, hash, snapshot, registration) = fixture();
@@ -6104,9 +6108,75 @@ mod tests {
                 .all(|d| d.effect == PolicyEffect::Allow)
         );
         manager.stop_local_policy_backend();
+        let (snapshot_id, snapshot_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.content_hash,p.snapshot_json FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let corrupt_history = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", approval_id)
+            .unwrap_err();
+        assert!(corrupt_history.authority_denial().is_none());
+        let outage_before_restore: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM policy_decisions
+                 WHERE reason_codes_json LIKE '%AUTH_POLICY_ENGINE_UNAVAILABLE%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outage_before_restore, 0);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                rusqlite::params![snapshot_id, snapshot_json],
+            )
+            .unwrap();
+        let unknown_claim = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", "approval:unknown")
+            .unwrap_err();
+        assert!(unknown_claim.authority_denial().is_none());
+        let claimed_outage = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", approval_id)
+            .expect("a genuine approved claim must reach current outage evaluation");
+        assert!(claimed_outage.decisions.iter().all(|d| {
+            d.effect == PolicyEffect::Deny
+                && d.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+                && d.approval_id.is_none()
+        }));
+        for decision in &claimed_outage.decisions {
+            let (effect, reasons): (String, String) = manager
+                .connection
+                .query_row(
+                    "SELECT decision,reason_codes_json FROM policy_decisions WHERE decision_id=?1",
+                    [&decision.decision_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(effect, "DENY");
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&reasons).unwrap(),
+                vec!["AUTH_POLICY_ENGINE_UNAVAILABLE".to_owned()]
+            );
+        }
         let outage = manager
             .evaluate_pending_authority_candidate("candidate:approved-outage")
             .unwrap();
+        assert_eq!(claimed_outage, outage);
         assert!(
             outage
                 .decisions

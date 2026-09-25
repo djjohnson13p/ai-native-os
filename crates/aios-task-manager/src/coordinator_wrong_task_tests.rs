@@ -503,6 +503,57 @@ fn provider_rebinding_requires_new_grant_at_binding_and_artifact_admission() {
     let old = coordinator
         .prepare_local_export(&proposal, &mut Cursor::new(SOURCE))
         .unwrap();
+    let authority_state = |manager: &TaskManager| -> (String, Vec<i64>) {
+        manager
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT state FROM authority_candidate_status WHERE candidate_id=?1),
+                    (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM authority_issuance_receipts),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM step_executions),
+                    (SELECT COUNT(*) FROM artifact_output_allocations),
+                    (SELECT COUNT(*) FROM provenance_events),
+                    (SELECT COUNT(*) FROM authority_requests),
+                    (SELECT COUNT(*) FROM policy_decisions),
+                    (SELECT COUNT(*) FROM authority_candidate_reservations)",
+                [&old.candidate_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        vec![
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ],
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before_probe = authority_state(&coordinator.manager);
+    assert_eq!(before_probe.0, "PENDING");
+    let probe = RestartedLocalExportAttempt {
+        candidate_id: "candidate:rebind-premature-probe".into(),
+        binding_id: "binding:rebind-premature-probe".into(),
+        attempt_id: "attempt:rebind-premature-probe".into(),
+        output_allocation_id: "allocation:rebind-premature-probe".into(),
+        operation_id: "export:rebind-premature-probe".into(),
+    };
+    assert!(
+        coordinator
+            .prepare_restarted_local_export(&old.replay_reference(), &probe)
+            .is_err(),
+        "a serialized pending reference must not finalize its candidate"
+    );
+    assert_eq!(authority_state(&coordinator.manager), before_probe);
     coordinator.start_local_export(&old).unwrap();
     assert_eq!(
         coordinator
@@ -519,6 +570,17 @@ fn provider_rebinding_requires_new_grant_at_binding_and_artifact_admission() {
         .unwrap();
     assert_eq!(old_receipt.binding_id, old.binding_id);
     let previous = old.replay_reference();
+    let mut tampered = serde_json::to_value(&previous).unwrap();
+    tampered["binding_id"] = json!("binding:forged-restart-reference");
+    let tampered: CompletedLocalExportReference = serde_json::from_value(tampered).unwrap();
+    let before_tampered = authority_state(&coordinator.manager);
+    assert!(
+        coordinator
+            .prepare_restarted_local_export(&tampered, &probe)
+            .is_err(),
+        "a deserialized reference with a changed binding must not create authority"
+    );
+    assert_eq!(authority_state(&coordinator.manager), before_tampered);
     drop(coordinator);
     let restarted = TaskManager::open(&db).unwrap();
     assert_eq!(

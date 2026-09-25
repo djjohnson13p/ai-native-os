@@ -707,9 +707,14 @@ impl TrustedLocalCoordinator {
         previous: &CompletedLocalExportReference,
         next: &RestartedLocalExportAttempt,
     ) -> Result<PreparedLocalExport> {
-        let old = self
-            .manager
-            .finalize_pending_authority_candidate(&previous.candidate_id)?;
+        // A restart reference is untrusted serialized data. Only an already
+        // finalized receipt may be read here; finalizing a pending candidate
+        // would create authority before the reference tuple is authenticated.
+        let old = super::authority_policy::replay_finalized_candidate(
+            &self.manager.connection,
+            &previous.candidate_id,
+        )?
+        .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
         if old.binding_id != previous.binding_id {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
