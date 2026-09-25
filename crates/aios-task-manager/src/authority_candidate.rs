@@ -2545,7 +2545,7 @@ mod tests {
 
     #[test]
     fn classifier_failure_after_expiry_latch_keeps_durable_denial() {
-        for retained_read in [true, false] {
+        for boundary in ["read", "open", "scope", "seek"] {
             let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, true);
             let (issued, deadline): (i64, i64) = manager
                 .connection
@@ -2593,21 +2593,37 @@ mod tests {
                     "injected diagnostic failure",
                 ))
             });
-            if retained_read {
-                let mut denied = [0xa5_u8; 1];
-                let error = reader.read(&mut denied).unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
-                assert_eq!(denied, [0xa5]);
-                assert_eq!(reader.raw_position_for_test().unwrap(), position);
-            } else {
-                let error = match manager.open_artifact_reader(&scope, &source) {
-                    Ok(_) => panic!("expired reader admission unexpectedly succeeded"),
-                    Err(error) => error,
-                };
-                assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
-                assert!(error.authority_denial().is_none());
+            match boundary {
+                "read" => {
+                    let mut denied = [0xa5_u8; 1];
+                    let error = reader.read(&mut denied).unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert_eq!(denied, [0xa5]);
+                }
+                "open" => {
+                    let error = match manager.open_artifact_reader(&scope, &source) {
+                        Ok(_) => panic!("expired reader admission unexpectedly succeeded"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert!(error.authority_denial().is_none());
+                }
+                "scope" => {
+                    let error = manager
+                        .scope_artifact_reads(&session, std::slice::from_ref(&source))
+                        .unwrap_err();
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert!(error.authority_denial().is_none());
+                }
+                "seek" => {
+                    let error = reader.seek(SeekFrom::Start(0)).unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                }
+                _ => unreachable!(),
             }
+            assert_eq!(reader.raw_position_for_test().unwrap(), position);
             assert_eq!(classified.load(Ordering::SeqCst), 1);
             let latched: i64 = manager
                 .connection

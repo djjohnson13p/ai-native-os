@@ -4529,7 +4529,9 @@ impl TaskManager {
                                 &lease_owner,
                                 lease_epoch,
                                 false,
-                            )?
+                            )
+                            .ok()
+                            .flatten()
                             .filter(|reason| *reason != AuthorityDenialReason::GrantUsageExhausted)
                         } else {
                             None
@@ -4545,10 +4547,7 @@ impl TaskManager {
                         ));
                     }
                     if let [artifact_id] = artifact_ids {
-                        if let Some(
-                            reason @ (AuthorityDenialReason::GrantRevoked
-                            | AuthorityDenialReason::GrantExpired),
-                        ) = authenticated_read_grant_denial_in(
+                        let classified = authenticated_read_grant_denial_in(
                             transaction,
                             task_id,
                             &session.authority,
@@ -4556,11 +4555,23 @@ impl TaskManager {
                             &lease_owner,
                             lease_epoch,
                             false,
-                        )? {
-                            return Err(artifact_grant_denial(
-                                AuthorityDenialStage::ArtifactAdmission,
-                                reason,
-                            ));
+                        );
+                        match classified {
+                            Ok(Some(
+                                reason @ (AuthorityDenialReason::GrantRevoked
+                                | AuthorityDenialReason::GrantExpired),
+                            )) => {
+                                return Err(artifact_grant_denial(
+                                    AuthorityDenialStage::ArtifactAdmission,
+                                    reason,
+                                ));
+                            }
+                            Err(_) => {
+                                return Err(TaskManagerError::InvalidRecord(
+                                    "ARTIFACT_AUTHORITY_DENIED",
+                                ));
+                            }
+                            _ => {}
                         }
                     }
                     let now = time.now();
@@ -4618,7 +4629,9 @@ impl TaskManager {
                                 &lease_owner,
                                 lease_epoch,
                                 false,
-                            )?;
+                            )
+                            .ok()
+                            .flatten();
                             return Err(reason.map_or(
                                 TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
                                 |reason| {
@@ -10591,7 +10604,9 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                             &reader.lease_owner,
                             reader.lease_epoch,
                             true,
-                        )?;
+                        )
+                        .ok()
+                        .flatten();
                         return Err(reason.map_or(
                             TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
                             |reason| {
@@ -10599,7 +10614,7 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                             },
                         ));
                     }
-                    if let Some(reason) = authenticated_read_grant_denial_in(
+                    let classified = authenticated_read_grant_denial_in(
                         transaction,
                         &reader.task_id,
                         execution,
@@ -10607,11 +10622,20 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                         &reader.lease_owner,
                         reader.lease_epoch,
                         true,
-                    )? {
-                        return Err(artifact_grant_denial(
-                            AuthorityDenialStage::ArtifactRead,
-                            reason,
-                        ));
+                    );
+                    match classified {
+                        Ok(Some(reason)) => {
+                            return Err(artifact_grant_denial(
+                                AuthorityDenialStage::ArtifactRead,
+                                reason,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_AUTHORITY_DENIED",
+                            ));
+                        }
+                        Ok(None) => {}
                     }
                 }
                 validate_reader_fence_in_connection(
