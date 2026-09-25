@@ -13,7 +13,7 @@ use aios_registry::{
 use aios_task_manager::{
     Actor, ArtifactExportWriter, ArtifactOriginKind, CompletedLocalExportReference, CreateTask,
     ImportArtifactRequest, LocalExportProposal, RetentionClass, Sensitivity, TaskManager,
-    TaskState, TrustedExportAdapter, TrustedLocalCoordinator,
+    TaskManagerError, TaskState, TrustedExportAdapter, TrustedLocalCoordinator,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -287,6 +287,7 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
 
     let observed = Arc::new(ObservedExport::default());
     let other = Arc::new(ObservedExport::default());
+    let second_service = Arc::new(ObservedExport::default());
     let mut coordinator = TrustedLocalCoordinator::from_manager(manager);
     coordinator
         .register_export_service(
@@ -319,6 +320,14 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             .is_err()
     );
     assert_eq!(other.opens.load(Ordering::SeqCst), 0);
+    coordinator
+        .register_export_service(
+            "service://fixture/second",
+            "fixture_remote",
+            "adapter:second",
+            Arc::new(CapturingAdapter(Arc::clone(&second_service))),
+        )
+        .unwrap();
     coordinator.activate_policy(json!({"schema_version":"0.1","rules":[
         {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
         {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
@@ -333,6 +342,21 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
     let prepared = coordinator
         .prepare_local_export(&proposal, &mut Cursor::new(SOURCE))
         .unwrap();
+    let mut substituted_service = crate::proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+    );
+    substituted_service.service_id = "service://fixture/second".into();
+    let conflict = coordinator
+        .prepare_local_export(&substituted_service, &mut Cursor::new(&[]))
+        .err()
+        .expect("same candidate must reject a same-class service change");
+    assert!(matches!(
+        conflict,
+        TaskManagerError::InvalidRecord("authority candidate reservation is not admissible")
+    ));
+    assert_eq!(second_service.opens.load(Ordering::SeqCst), 0);
     let replayed_prepare = coordinator
         .prepare_local_export(&proposal, &mut Cursor::new(&[]))
         .unwrap();
@@ -354,6 +378,7 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
     assert_eq!(observed.finalizes.load(Ordering::SeqCst), 1);
     assert_eq!(*observed.bytes.lock().unwrap(), SOURCE);
     assert_eq!(other.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(second_service.opens.load(Ordering::SeqCst), 0);
     assert_eq!(
         coordinator
             .replay_local_artifact_export(&replayed_start)
@@ -383,6 +408,13 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         .unwrap();
     assert_eq!((grants, issuance), (3, 3));
     assert_eq!(consumed_egress, 1);
+    let substituted_grants: i64 = readonly.query_row(
+        "SELECT COUNT(*) FROM authority_grants WHERE task_id=?1 AND grants_json LIKE '%service://fixture/second%'",
+        [&proposal.task.task_id], |row| row.get(0)).unwrap();
+    let substituted_operations: i64 = readonly.query_row(
+        "SELECT COUNT(*) FROM operations WHERE task_id=?1 AND details_json LIKE '%service://fixture/second%'",
+        [&proposal.task.task_id], |row| row.get(0)).unwrap();
+    assert_eq!((substituted_grants, substituted_operations), (0, 0));
     let creation_events: i64 = readonly
         .query_row(
             "SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND event_type='task.created'",
@@ -514,10 +546,17 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             }
             _ => unreachable!(),
         }
+        let error = restarted
+            .prepare_local_export(&denied_proposal, &mut Cursor::new(SOURCE))
+            .err()
+            .expect("denied proposal must fail");
+        let expected = if denied == "invalid-ir" {
+            "initial semantic program admission is not admissible"
+        } else {
+            "ARTIFACT_AUTHORITY_DENIED"
+        };
         assert!(
-            restarted
-                .prepare_local_export(&denied_proposal, &mut Cursor::new(SOURCE))
-                .is_err(),
+            matches!(error, TaskManagerError::InvalidRecord(reason) if reason == expected),
             "{denied}"
         );
         assert_eq!(restarted_writer.opens.load(Ordering::SeqCst), 0, "{denied}");
