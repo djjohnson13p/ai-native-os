@@ -50,6 +50,15 @@ decisions can enter the existing atomic finalizer, which
 issues exact grants and immutable receipts under its Task ownership and
 trusted-time fences.
 
+An authority evaluation request with either `action=data.egress` or
+`resource.resolved_kind=external-destination` must carry both values together
+and a non-null `egress` object. Its source content hash, operation ID, adapter
+ID, descriptor hash, and whole-operation byte ceiling are required alongside
+the destination class, exact service ID, and source data references. This is a
+validation tightening of the v0.1 request schema: the earlier optional fields
+allowed a class-only policy request even though the coordinator already
+persisted the sealed tuple. No historical request is inferred into a grant.
+
 The export boundary must compare the exact tuple before creating a destination
 writer and again at protected use. Its intent, effect marker, provenance, and
 recovery evidence must carry the service identity and source identity. Existing
@@ -78,6 +87,11 @@ The public-path evidence map for this decision is:
 | Finalization | Recheck fresh evidence and approval before atomically issuing an exact `external-destination` grant with the binding. | No grant or runnable binding on stale or denied authority. |
 | Export use | The trusted destination issuer, writer construction, write/flush, and completion check the same tuple, source-read authority, expiry, revocation, and whole-operation byte ceiling. | An unauthorized request invokes no writer and releases zero bytes; withdrawal after an external effect prevents further bytes and records an unknown outcome when appropriate. |
 | Recovery | Authenticated intent, effect marker, provenance, and reconciliation retain the exact tuple. Historical class-only intents cannot acquire it by replay. | Response-loss replay creates no second writer or transfer; uncertain effects remain fenced until trusted reconciliation. |
+
+Schema regressions reject missing or null egress, every omitted sealed field,
+and either action/resource-kind mismatch, while retaining local read requests
+with null or omitted egress. Persisted exact-export requests are validated
+against the tightened schema without rewriting their stored JSON.
 
 Tests must enter through the coordinator's real reservation, evaluation,
 finalization, and Artifact export APIs. A helper-level grant check or synthetic

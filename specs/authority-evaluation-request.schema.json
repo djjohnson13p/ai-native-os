@@ -79,11 +79,11 @@
           "items": {"type": "string", "maxLength": 1024}
         },
         "purpose": {"type": ["string", "null"], "maxLength": 1024},
-        "source_content_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
-        "operation_id":{"type":"string","minLength":1,"maxLength":256},
-        "adapter_id":{"type":"string","minLength":1,"maxLength":256},
-        "descriptor_hash":{"type":"string","pattern":"^sha256:[a-f0-9]{64}$"},
-        "max_size_bytes":{"type":"integer","minimum":1,"maximum":8388608}
+        "source_content_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "operation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "adapter_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "descriptor_hash": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "max_size_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}
       }
     },
     "constraints": {
@@ -96,5 +96,26 @@
       }
     },
     "requested_at": {"type": "string", "format": "date-time"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          {"properties": {"action": {"const": "data.egress"}}},
+          {"properties": {"resource": {"properties": {"resolved_kind": {"const": "external-destination"}}}}}
+        ]
+      },
+      "then": {
+        "required": ["egress"],
+        "properties": {
+          "action": {"const": "data.egress"},
+          "resource": {"properties": {"resolved_kind": {"const": "external-destination"}}},
+          "egress": {
+            "type": "object",
+            "required": ["source_content_hash", "operation_id", "adapter_id", "descriptor_hash", "max_size_bytes"]
+          }
+        }
+      }
+    }
+  ]
 }

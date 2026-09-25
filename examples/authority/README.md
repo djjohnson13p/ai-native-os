@@ -17,3 +17,8 @@ The fixtures test deterministic scoping/approval/grant behavior. They do not con
 A provider/model may request authority but cannot create policy decisions, approvals, or grants directly.
 
 `candidate-reservation.json` is a synthetic positive pending reservation with both input-read and output-allocation-write resources. `candidate-reservation-cases.json` names declarative negative mutations; the executable reservation and migration regressions are in the Task Manager Rust tests. A candidate carries no executable authority, even if its reserved IDs match a later binding.
+
+`evaluation-exact-export.json` is a positive sealed `data.egress` request.
+`crates/aios-task-manager/tests/authority_evaluation_schema.rs` checks it,
+omitted/null egress and sealed fields, action/resource-kind mismatches, and
+the historical local-read request shape.
