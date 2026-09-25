@@ -700,6 +700,142 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "captures complete finalized authority before and after a denied revision"
+    )]
+    fn revised_admission_rejects_existing_finalized_authority_without_mutation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("finalized-authority.sqlite3");
+        let mut f = fixture(&path);
+        f.manager
+            .decide_candidate_approval(
+                &f.approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        f.manager
+            .finalize_pending_authority_candidate("candidate:A")
+            .unwrap();
+        let before_task = f.manager.get_task("T-revised").unwrap().unwrap();
+        assert_eq!(before_task.state, TaskState::WaitingForAuth);
+        let before_candidate = status(&f.manager, "candidate:A");
+        let before_approval: String = f
+            .manager
+            .connection
+            .query_row(
+                "SELECT status FROM approval_requests WHERE approval_id=?1",
+                [&f.approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let counts = |manager: &TaskManager| -> (i64, i64, i64, i64, i64, i64) {
+            manager
+                .connection
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM execution_bindings WHERE task_id='T-revised'),
+                        (SELECT COUNT(*) FROM authority_grants WHERE task_id='T-revised'),
+                        (SELECT COUNT(*) FROM step_executions WHERE task_id='T-revised'),
+                        (SELECT COUNT(*) FROM artifact_output_allocations WHERE task_id='T-revised'),
+                        (SELECT COUNT(*) FROM plan_revisions WHERE task_id='T-revised'),
+                        (SELECT COUNT(*) FROM semantic_program_revisions WHERE task_id='T-revised')",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let authority_rows = |manager: &TaskManager| {
+            [
+                "execution_bindings",
+                "authority_grants",
+                "step_executions",
+                "artifact_output_allocations",
+                "approval_requests",
+            ]
+            .iter()
+            .map(|table| {
+                let mut statement = manager
+                    .connection
+                    .prepare(&format!(
+                        "SELECT * FROM {table} WHERE task_id=?1 ORDER BY rowid"
+                    ))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement.query(["T-revised"]).unwrap();
+                let mut snapshot = Vec::new();
+                while let Some(row) = rows.next().unwrap() {
+                    snapshot.push(
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column).unwrap())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                snapshot
+            })
+            .collect::<Vec<_>>()
+        };
+        let before_counts = counts(&f.manager);
+        let before_authority = authority_rows(&f.manager);
+        assert!(before_counts.0 > 0);
+        assert!(before_counts.1 > 0);
+        assert!(before_counts.2 > 0);
+        assert!(before_counts.3 > 0);
+        assert_eq!((before_counts.4, before_counts.5), (1, 1));
+        let provenance_before = f.manager.provenance_count("T-revised").unwrap();
+
+        let replacement = program("B");
+        let replacement_plan = plan("B", 2);
+        let denial = f
+            .manager
+            .admit_revised_semantic_program(&request(
+                &replacement_plan,
+                &replacement,
+                &f.snapshot,
+                "transition:finalized-revision-denied",
+                "plan:B",
+                before_task.revision,
+            ))
+            .unwrap();
+        assert!(!denial.applied, "{denial:?}");
+        assert_eq!(denial.reason_code, "TASK_TRANSITION_GUARD_FAILED");
+        assert_eq!(
+            f.manager.get_task("T-revised").unwrap().unwrap(),
+            before_task
+        );
+        assert_eq!(status(&f.manager, "candidate:A"), before_candidate);
+        assert_eq!(counts(&f.manager), before_counts);
+        assert_eq!(authority_rows(&f.manager), before_authority);
+        let after_approval: String = f
+            .manager
+            .connection
+            .query_row(
+                "SELECT status FROM approval_requests WHERE approval_id=?1",
+                [&f.approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_approval, before_approval);
+        assert_eq!(
+            f.manager.provenance_count("T-revised").unwrap(),
+            provenance_before
+        );
+        assert!(f.manager.verify_provenance("T-revised").unwrap());
+    }
+
+    #[test]
     fn revised_admission_is_atomic_replayable_and_permanently_retires_old_candidate() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("revised.sqlite3");
