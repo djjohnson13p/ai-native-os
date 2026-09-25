@@ -1,8 +1,8 @@
 //! Trusted initial semantic-program admission inside a Task transition.
 
 use super::{
-    ActivePlan, Actor, Result, TaskManager, TaskManagerError, TaskMutation, TaskState,
-    TransitionReason, TransitionRequest, TransitionResult, canonical_json,
+    ActivePlan, Actor, ProgramAdmission, Result, TaskManager, TaskManagerError, TaskMutation,
+    TaskState, TransitionReason, TransitionRequest, TransitionResult, canonical_json,
     load_admitted_semantic_registry,
 };
 use rusqlite::{Transaction, params};
@@ -35,7 +35,7 @@ fn reject() -> TaskManagerError {
     TaskManagerError::InvalidRecord("initial semantic program admission is not admissible")
 }
 
-fn raw_digest(domain: &[u8], raw: &[u8]) -> String {
+pub(super) fn raw_digest(domain: &[u8], raw: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(raw);
@@ -46,7 +46,7 @@ fn raw_digest(domain: &[u8], raw: &[u8]) -> String {
     tagged
 }
 
-fn strict_document(raw: &[u8]) -> Result<Value> {
+pub(super) fn strict_document(raw: &[u8]) -> Result<Value> {
     if raw.is_empty() || raw.len() > MAX_RAW_DOCUMENT_BYTES {
         return Err(reject());
     }
@@ -54,7 +54,7 @@ fn strict_document(raw: &[u8]) -> Result<Value> {
         .map_err(|_| reject())
 }
 
-fn single_node_id(program: &Value) -> Result<String> {
+pub(super) fn single_node_id(program: &Value) -> Result<String> {
     let nodes = program
         .get("nodes")
         .and_then(Value::as_array)
@@ -69,12 +69,13 @@ fn single_node_id(program: &Value) -> Result<String> {
         .ok_or_else(reject)
 }
 
-fn validate_initial_plan(
+pub(super) fn validate_plan(
     plan: &Value,
     task_id: &str,
     plan_id: &str,
     program: &Value,
     node_id: &str,
+    expected_revision: u64,
 ) -> Result<()> {
     let schema: Value = serde_json::from_str(include_str!("../../../specs/task-plan.schema.json"))
         .map_err(|_| reject())?;
@@ -83,7 +84,7 @@ fn validate_initial_plan(
         .is_valid(plan)
         || plan.get("plan_id").and_then(Value::as_str) != Some(plan_id)
         || plan.get("task_id").and_then(Value::as_str) != Some(task_id)
-        || plan.get("revision").and_then(Value::as_u64) != Some(1)
+        || plan.get("revision").and_then(Value::as_u64) != Some(expected_revision)
     {
         return Err(reject());
     }
@@ -124,7 +125,7 @@ impl TaskManager {
         let plan = strict_document(input.plan_json)?;
         let program = strict_document(input.program_json)?;
         let node_id = single_node_id(&program)?;
-        validate_initial_plan(&plan, input.task_id, input.plan_id, &program, &node_id)?;
+        validate_plan(&plan, input.task_id, input.plan_id, &program, &node_id, 1)?;
         let plan_json = std::str::from_utf8(input.plan_json)
             .map_err(|_| reject())?
             .to_owned();
@@ -167,7 +168,12 @@ impl TaskManager {
                 ..TaskMutation::default()
             },
         };
-        self.transition_impl(&request, fail_provenance, false, Some(&admission))
+        self.transition_impl(
+            &request,
+            fail_provenance,
+            false,
+            Some(ProgramAdmission::Initial(&admission)),
+        )
     }
 
     #[cfg(test)]

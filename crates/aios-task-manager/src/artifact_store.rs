@@ -21,7 +21,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -13633,6 +13633,171 @@ fn keyed_import_receipt_payloads(
         "provenance_event_hash": provenance_event_hash,
     }))?;
     Ok((details, receipt))
+}
+
+/// The revision fence may ignore a completed, unbound source import only when
+/// its keyed operation still matches the Artifact and hash-chained import
+/// event. Inspect every operation, including rows with nullable columns.
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticates each import operation against its independent receipt, Artifact, and provenance event"
+)]
+pub(super) fn authenticated_unbound_import_operations(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<bool> {
+    let operations = {
+        let mut statement = connection.prepare(
+            "SELECT operation_id,details_json,external_receipt,prepared_at,started_at,finished_at,
+                CASE WHEN effect_class='ARTIFACT_IMPORT' AND transaction_class='reversible_local'
+                  AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
+                  AND semantic_program_hash IS NULL AND node_id IS NULL
+                  AND binding_id IS NULL AND attempt_id IS NULL
+                  AND idempotency_key=operation_id THEN 1 ELSE 0 END
+             FROM operations WHERE task_id=?1",
+        )?;
+        statement
+            .query_map([task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if operations.is_empty() {
+        return Ok(true);
+    }
+    if !super::verify_provenance_through(connection, task_id, None)? {
+        return Ok(false);
+    }
+    for (operation_id, details_json, receipt_json, prepared_at, started_at, finished_at, shape) in
+        operations
+    {
+        if shape != 1
+            || started_at.as_deref() != Some(&prepared_at)
+            || finished_at.as_deref() != Some(&prepared_at)
+        {
+            return Ok(false);
+        }
+        let (Some(details_json), Some(receipt_json)) = (details_json, receipt_json) else {
+            return Ok(false);
+        };
+        let Ok(details) = aios_provenance::parse_unique_json(&details_json) else {
+            return Ok(false);
+        };
+        let Ok(receipt) = aios_provenance::parse_unique_json(&receipt_json) else {
+            return Ok(false);
+        };
+        let (
+            Some(import_id),
+            Some(artifact_id_in_receipt),
+            Some(request_digest),
+            Some(blob_reused),
+        ) = (
+            details.get("import_id").and_then(Value::as_str),
+            details.get("artifact_id").and_then(Value::as_str),
+            details.get("request_digest").and_then(Value::as_str),
+            receipt.get("blob_reused").and_then(Value::as_bool),
+        )
+        else {
+            return Ok(false);
+        };
+        let expected_artifact = artifact_id("import-key", &format!("{task_id}\0{import_id}"));
+        if operation_id != keyed_import_operation_id(task_id, import_id)
+            || artifact_id_in_receipt != expected_artifact
+            || details.get("task_id").and_then(Value::as_str) != Some(task_id)
+            || request_digest.is_empty()
+        {
+            return Ok(false);
+        }
+        let event_id = event_id("artifact-imported", &expected_artifact);
+        let event = connection
+            .query_row(
+                "SELECT event_json,event_hash,timestamp FROM provenance_events
+             WHERE task_id=?1 AND event_id=?2 AND event_type='artifact.imported'",
+                params![task_id, event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((event_json, event_hash, event_time)) = event else {
+            return Ok(false);
+        };
+        let Ok(event) = aios_provenance::parse_unique_json(&event_json) else {
+            return Ok(false);
+        };
+        let artifact = connection
+            .query_row(
+                "SELECT a.content_hash,a.size_bytes,a.created_at FROM artifacts a
+             JOIN task_artifacts ta ON ta.artifact_id=a.artifact_id
+             WHERE a.artifact_id=?1 AND a.origin_task_id=?2 AND ta.task_id=?2
+               AND ta.role='input' AND ta.node_id IS NULL",
+                params![expected_artifact, task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((content_hash, size_bytes, artifact_time)) = artifact else {
+            return Ok(false);
+        };
+        let (expected_details, expected_receipt) = keyed_import_receipt_payloads(
+            task_id,
+            import_id,
+            &expected_artifact,
+            request_digest,
+            blob_reused,
+            &event_id,
+            &event_hash,
+        )?;
+        if details_json != expected_details
+            || receipt_json != expected_receipt
+            || event.get("task_id").and_then(Value::as_str) != Some(task_id)
+            || event.get("event_id").and_then(Value::as_str) != Some(event_id.as_str())
+            || event.get("event_type").and_then(Value::as_str) != Some("artifact.imported")
+            || event.get("status").and_then(Value::as_str) != Some("success")
+            || event.pointer("/output_artifacts/0").and_then(Value::as_str)
+                != Some(expected_artifact.as_str())
+            || event
+                .get("output_artifacts")
+                .and_then(Value::as_array)
+                .is_none_or(|items| items.len() != 1)
+            || event.pointer("/details/import_id").and_then(Value::as_str) != Some(import_id)
+            || event
+                .pointer("/details/request_digest")
+                .and_then(Value::as_str)
+                != Some(request_digest)
+            || event
+                .pointer("/details/blob_reused")
+                .and_then(Value::as_bool)
+                != Some(blob_reused)
+            || event
+                .pointer("/details/content_hash")
+                .and_then(Value::as_str)
+                != Some(content_hash.as_str())
+            || event.pointer("/details/size_bytes").and_then(Value::as_i64) != Some(size_bytes)
+            || event_time != prepared_at
+            || artifact_time != prepared_at
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[allow(

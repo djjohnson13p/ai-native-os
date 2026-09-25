@@ -18,6 +18,7 @@ mod authority_deadline;
 mod authority_policy;
 mod coordinator;
 mod initial_program_admission;
+mod revised_program_admission;
 mod trusted_time;
 
 pub use aios_provenance::{
@@ -52,6 +53,7 @@ use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool};
 
 use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
 use initial_program_admission::{InitialProgramAdmission, persist_initial_program_admission_in};
+use revised_program_admission::{RevisedProgramAdmission, persist_revised_program_admission_in};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -61,6 +63,11 @@ use time::format_description::well_known::Rfc3339;
 
 const SCHEMA_VERSION: &str = "0.1";
 const MIGRATION: &str = include_str!("../../../specs/persistence-v0.1.sql");
+
+enum ProgramAdmission<'a> {
+    Initial(&'a InitialProgramAdmission),
+    Revised(&'a RevisedProgramAdmission),
+}
 
 /// A bounded diagnostic produced by the trusted authority boundary itself.
 /// It contains no untrusted selector, provider text, or resource identity.
@@ -2606,7 +2613,7 @@ impl TaskManager {
         request: &TransitionRequest,
         fail_provenance: bool,
         internal_recovery: bool,
-        initial_admission: Option<&InitialProgramAdmission>,
+        program_admission: Option<ProgramAdmission<'_>>,
     ) -> Result<TransitionResult> {
         validate_transition_request(request, internal_recovery)?;
         let mut resulted_at = if request.to_state == TaskState::Running {
@@ -2693,6 +2700,9 @@ impl TaskManager {
                     active_program,
                     &resulted_at,
                     internal_recovery,
+                    program_admission
+                        .as_ref()
+                        .is_some_and(|admission| matches!(admission, ProgramAdmission::Revised(_))),
                 )?
             };
             if let Some(code) = rejection {
@@ -2783,14 +2793,24 @@ impl TaskManager {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
-            if let Some(admission) = initial_admission {
-                persist_initial_program_admission_in(
-                    &transaction,
-                    request,
-                    admission,
-                    &resulted_at,
-                )?;
-                active_program = Some(1);
+            if let Some(admission) = program_admission {
+                active_program = Some(match admission {
+                    ProgramAdmission::Initial(admission) => {
+                        persist_initial_program_admission_in(
+                            &transaction,
+                            request,
+                            admission,
+                            &resulted_at,
+                        )?;
+                        1
+                    }
+                    ProgramAdmission::Revised(admission) => persist_revised_program_admission_in(
+                        &transaction,
+                        request,
+                        admission,
+                        &resulted_at,
+                    )?,
+                });
             }
             let active_program_row = active_program
             .map(|program_revision| {
@@ -10456,6 +10476,10 @@ fn plan_program_coherent(
     clippy::too_many_lines,
     reason = "keeps the deterministic target-state guard matrix in one auditable function"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "transition guard keeps the trusted revision admission explicit"
+)]
 fn guard_failure(
     transaction: &Transaction<'_>,
     request: &TransitionRequest,
@@ -10464,6 +10488,7 @@ fn guard_failure(
     active_program: Option<i64>,
     checked_at: &str,
     internal_recovery: bool,
+    trusted_program_revision: bool,
 ) -> Result<Option<&'static str>> {
     let waiting: Vec<WaitingOn> = request
         .mutation
@@ -10598,8 +10623,9 @@ fn guard_failure(
     {
         return Ok(Some("TASK_UNKNOWN_EXTERNAL_OUTCOME"));
     }
-    let changed_plan_for_active_program =
-        request.mutation.active_plan.is_some() && active_program.is_some();
+    let changed_plan_for_active_program = request.mutation.active_plan.is_some()
+        && active_program.is_some()
+        && !trusted_program_revision;
     if (changed_plan_for_active_program || execution_target)
         && !plan_program_coherent(
             transaction,
