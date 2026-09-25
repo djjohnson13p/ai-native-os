@@ -252,6 +252,50 @@ pub(super) fn check_and_latch_grant_deadline(
     Ok(false)
 }
 
+/// A previously committed latch is expiry evidence only while its immutable
+/// grant/receipt/deadline and paired observation still authenticate together.
+/// Missing or incomplete evidence is a generic denial, never an expiry reason.
+pub(super) fn authenticated_expiry_latch(
+    connection: &Connection,
+    grant_id: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM authority_grant_expiry_latches x
+         JOIN authority_grant_deadlines d ON d.grant_id=x.grant_id
+           AND d.session_id=x.session_id AND d.owner_id=x.owner_id
+           AND d.owner_epoch=x.owner_epoch
+         JOIN authority_grants g ON g.grant_id=d.grant_id AND g.token_id=d.token_id
+           AND g.task_id=d.task_id AND g.execution_binding_id=d.execution_binding_id
+           AND g.attempt_id=d.attempt_id AND g.policy_decision_id=d.policy_decision_id
+           AND g.issued_at=d.issued_at AND g.expires_at=d.grant_expires_at
+         JOIN authority_issuance_receipts r ON r.grant_id=g.grant_id
+           AND r.token_id=g.token_id AND r.task_id=g.task_id
+           AND r.execution_binding_id=g.execution_binding_id
+           AND r.attempt_id=g.attempt_id AND r.policy_decision_id=g.policy_decision_id
+           AND r.issued_at=g.issued_at AND r.issuance_profile='coordinator-issued-v0.1'
+         JOIN authority_clock_sessions c ON c.session_id=d.session_id
+           AND c.owner_id=d.owner_id AND c.owner_epoch=d.owner_epoch
+         JOIN trusted_time_observations o ON o.state_revision=x.observed_state_revision
+           AND o.confidence='TRUSTED_LOCAL'
+           AND o.monotonic_nanos=x.observed_monotonic_nanos
+           AND o.observed_unix_nanos=x.observed_unix_nanos
+           AND o.expiry_floor_unix_nanos=x.observed_effective_unix_nanos
+         WHERE x.grant_id=?1 AND x.owner_id=?2 AND x.owner_epoch=?3
+           AND c.high_water_state_revision>=x.observed_state_revision
+           AND c.high_water_monotonic_nanos>=x.observed_monotonic_nanos
+           AND ((x.reason='MONOTONIC_DEADLINE'
+                 AND x.observed_monotonic_nanos>=d.deadline_monotonic_nanos)
+             OR (x.reason='WALL_EXPIRY'
+                 AND x.observed_effective_unix_nanos>=d.effective_expiry_unix_nanos)))",
+            params![grant_id, lease_owner, lease_epoch],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn parse_nanos(raw: &str) -> Result<i64> {
     let parsed = OffsetDateTime::parse(raw, &Rfc3339).map_err(|_| reject())?;
     i64::try_from(parsed.unix_timestamp_nanos()).map_err(|_| reject())

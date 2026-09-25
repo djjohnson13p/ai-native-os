@@ -38,8 +38,9 @@ pub use artifact_store::{
     VerifiedArtifactExportNoEffect,
 };
 pub use coordinator::{
-    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal,
-    MemoryExportObservation, PreparedLocalExport, TrustedLocalCoordinator,
+    AdmittedLocalArtifactRead, CompletedLocalExportReference, LocalExportExecution,
+    LocalExportProposal, MemoryExportObservation, PreparedLocalExport, RestartedLocalExportAttempt,
+    TrustedLocalCoordinator,
 };
 pub use trusted_time::{SecurityClockSample, TimeSource};
 
@@ -61,6 +62,53 @@ use time::format_description::well_known::Rfc3339;
 const SCHEMA_VERSION: &str = "0.1";
 const MIGRATION: &str = include_str!("../../../specs/persistence-v0.1.sql");
 
+/// A bounded diagnostic produced by the trusted authority boundary itself.
+/// It contains no untrusted selector, provider text, or resource identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityDenial {
+    pub stage: AuthorityDenialStage,
+    pub reason: AuthorityDenialReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityDenialStage {
+    CandidateReservation,
+    ApprovalApplication,
+    BindingAdmission,
+    ArtifactAdmission,
+    ArtifactRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityDenialReason {
+    SemanticRequestMismatch,
+    ApprovalStale,
+    GrantUsageExhausted,
+    GrantExpired,
+    GrantRevoked,
+    GrantPrincipalMismatch,
+    GrantTaskMismatch,
+    ProviderBindingMismatch,
+    GrantBindingMismatch,
+}
+
+impl AuthorityDenialReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SemanticRequestMismatch => "AUTH_SEMANTIC_REQUEST_MISMATCH",
+            Self::ApprovalStale => "AUTH_APPROVAL_STALE",
+            Self::GrantUsageExhausted => "AUTH_GRANT_USAGE_EXHAUSTED",
+            Self::GrantExpired => "AUTH_GRANT_EXPIRED",
+            Self::GrantRevoked => "AUTH_GRANT_REVOKED",
+            Self::GrantPrincipalMismatch => "AUTH_GRANT_PRINCIPAL_MISMATCH",
+            Self::GrantTaskMismatch => "AUTH_GRANT_TASK_MISMATCH",
+            Self::ProviderBindingMismatch => "AUTH_PROVIDER_BINDING_MISMATCH",
+            Self::GrantBindingMismatch => "AUTH_GRANT_BINDING_MISMATCH",
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_STARTUP_AFTER_AUTHORITY_RETIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -76,6 +124,18 @@ pub enum TaskManagerError {
     Registry(aios_registry::RegistryStoreError),
     Provider(aios_registry::ProviderStoreError),
     InvalidRecord(&'static str),
+    AuthorityDenied(AuthorityDenial),
+}
+
+impl TaskManagerError {
+    /// Returns a trusted reason without changing the safe outer error text.
+    #[must_use]
+    pub const fn authority_denial(&self) -> Option<AuthorityDenial> {
+        match self {
+            Self::AuthorityDenied(denial) => Some(*denial),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TaskManagerError {
@@ -91,6 +151,20 @@ impl fmt::Display for TaskManagerError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Provider(error) => write!(formatter, "{error}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
+            Self::AuthorityDenied(denial) => match denial.stage {
+                AuthorityDenialStage::CandidateReservation => {
+                    formatter.write_str("authority candidate reservation is not admissible")
+                }
+                AuthorityDenialStage::ApprovalApplication => {
+                    formatter.write_str("authority approval application is not admissible")
+                }
+                AuthorityDenialStage::BindingAdmission => {
+                    formatter.write_str("provider binding admission is not admissible")
+                }
+                AuthorityDenialStage::ArtifactAdmission | AuthorityDenialStage::ArtifactRead => {
+                    formatter.write_str("ARTIFACT_AUTHORITY_DENIED")
+                }
+            },
         }
     }
 }
@@ -491,6 +565,7 @@ pub struct StepExecutionRecord {
 
 pub struct TaskManager {
     connection: Connection,
+    local_policy_backend: authority_policy::LocalPolicyBackend,
     clock: Arc<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
@@ -936,6 +1011,7 @@ impl TaskManager {
         }
         let mut manager = Self {
             connection,
+            local_policy_backend: authority_policy::LocalPolicyBackend::start(),
             clock,
             lease_owner,
             lease_epoch,

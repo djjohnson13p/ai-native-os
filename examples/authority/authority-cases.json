@@ -84,7 +84,9 @@
     "expected": "DENY",
     "reason_code": "AUTH_GRANT_EXPIRED",
     "facts": {
-      "grant_state": "EXPIRED"
+      "effective_grant_state": "EXPIRED",
+      "persisted_grant_state": "ACTIVE",
+      "expiry_evidence": "authenticated_expiry_latch"
     }
   },
   {

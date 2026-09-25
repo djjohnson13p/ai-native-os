@@ -27,8 +27,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    Actor, Clock, Result, SCHEMA_VERSION, StoreIdentity, StoreLock, TaskManager, TaskManagerError,
-    append_event, assert_manager_lease, canonical_json, provenance_hash, unresolved_execution_ids,
+    Actor, AuthorityDenial, AuthorityDenialReason, AuthorityDenialStage, Clock, Result,
+    SCHEMA_VERSION, StoreIdentity, StoreLock, TaskManager, TaskManagerError, append_event,
+    assert_manager_lease, canonical_json, provenance_hash, unresolved_execution_ids,
 };
 
 const IMPORT_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
@@ -1273,6 +1274,11 @@ impl ArtifactReader {
     pub fn handle(&self) -> &ArtifactHandle {
         &self.handle
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_position_for_test(&mut self) -> std::io::Result<u64> {
+        self.file.stream_position()
+    }
 }
 
 impl Read for ArtifactReader {
@@ -1335,13 +1341,53 @@ impl Read for ArtifactReader {
                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                 })?;
                 if !admitted {
+                    let reason = authenticated_read_grant_denial_in(
+                        &transaction,
+                        &self.task_id,
+                        execution,
+                        &self.artifact_id,
+                        &self.lease_owner,
+                        self.lease_epoch,
+                        true,
+                    )
+                    .ok()
+                    .flatten();
                     transaction.commit().map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                     })?;
                     locked_time = None;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        "ARTIFACT_AUTHORITY_DENIED",
+                        reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ),
+                    ));
+                }
+                let classified = authenticated_read_grant_denial_in(
+                    &transaction,
+                    &self.task_id,
+                    execution,
+                    &self.artifact_id,
+                    &self.lease_owner,
+                    self.lease_epoch,
+                    true,
+                );
+                if !matches!(classified, Ok(None)) {
+                    transaction.commit().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                    })?;
+                    locked_time = None;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        classified.ok().flatten().map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ),
                     ));
                 }
             }
@@ -2745,6 +2791,77 @@ impl TaskManager {
             task_id: task_id.to_owned(),
             authority,
         })
+    }
+
+    /// Admits a provider authority-request claim against the current binding.
+    /// The claimed request must already have a real coordinator-issued grant;
+    /// this check does not itself consume that grant or admit an Artifact read.
+    pub(crate) fn admit_provider_binding_request_claim(
+        &self,
+        task_id: &str,
+        binding_id: &str,
+        request_id: &str,
+        artifact_id: &str,
+    ) -> Result<ProviderArtifactSession> {
+        let session = self.issue_provider_artifact_session(task_id, binding_id)?;
+        self.validate_provider_artifact_session(&session)?;
+        validate_id(request_id, 256, "invalid authority request claim")?;
+        validate_id(artifact_id, 512, "invalid claimed Artifact")?;
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        super::trusted_time::with_protected_observation(
+            &self.connection,
+            &self.clock,
+            |transaction, time| {
+                let result = (|| {
+                    assert_manager_lease(transaction, &lease_owner, lease_epoch)?;
+                    let current = capture_read_authority(
+                        transaction,
+                        &session.task_id,
+                        Some(&session.authority.binding_id),
+                        time.now(),
+                    )?
+                    .execution
+                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                    if current != session.authority
+                        || !coordinator_grants_valid_in(
+                            transaction,
+                            &session.task_id,
+                            &current,
+                            &lease_owner,
+                            lease_epoch,
+                            time,
+                        )?
+                    {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
+                    let claimed = authenticated_binding_request_claim_in(
+                        transaction,
+                        request_id,
+                        artifact_id,
+                    )?
+                    .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                    if claimed.task_id != session.task_id
+                        || claimed.semantic_hash != current.semantic_program_hash
+                        || claimed.node_id != current.node_id
+                        || claimed.provider_id != current.principal_id
+                    {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
+                    if claimed.binding_id != current.binding_id
+                        || claimed.attempt_id != current.attempt_id
+                    {
+                        return Err(artifact_grant_denial(
+                            AuthorityDenialStage::BindingAdmission,
+                            AuthorityDenialReason::ProviderBindingMismatch,
+                        ));
+                    }
+                    Ok(())
+                })();
+                Ok(result)
+            },
+        )??;
+        Ok(session)
     }
 
     fn validate_provider_artifact_session(&self, session: &ProviderArtifactSession) -> Result<()> {
@@ -4440,10 +4557,55 @@ impl TaskManager {
             .map_err(Into::into)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps locked scope admission and denial classification on one fence"
+    )]
     pub fn scope_artifact_reads(
         &self,
         session: &ProviderArtifactSession,
         artifact_ids: &[String],
+    ) -> Result<ArtifactReadScope> {
+        self.scope_artifact_reads_with_claim_in(session, artifact_ids, None, false)
+    }
+
+    /// Trusted supervisor admission of a presented, genuinely issued read grant.
+    /// An explicit claim never falls back to a grant owned by the caller session.
+    pub(crate) fn scope_artifact_reads_with_claim(
+        &self,
+        session: &ProviderArtifactSession,
+        artifact_ids: &[String],
+        claimed_grant_id: &str,
+    ) -> Result<ArtifactReadScope> {
+        self.scope_artifact_reads_with_claim_in(
+            session,
+            artifact_ids,
+            Some(claimed_grant_id),
+            false,
+        )
+    }
+
+    /// Provider execution reads require a guarded Task launch before any
+    /// read scope can be issued. Host preflight retains its separate path.
+    pub(crate) fn scope_execution_artifact_reads_with_claim(
+        &self,
+        session: &ProviderArtifactSession,
+        artifact_ids: &[String],
+        claimed_grant_id: &str,
+    ) -> Result<ArtifactReadScope> {
+        self.scope_artifact_reads_with_claim_in(session, artifact_ids, Some(claimed_grant_id), true)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps ordinary and explicitly claimed read admission under one protected fence"
+    )]
+    fn scope_artifact_reads_with_claim_in(
+        &self,
+        session: &ProviderArtifactSession,
+        artifact_ids: &[String],
+        claimed_grant_id: Option<&str>,
+        require_running: bool,
     ) -> Result<ArtifactReadScope> {
         let recovering = task_is_recovering(&self.connection, &session.task_id)?;
         if recovering {
@@ -4456,7 +4618,11 @@ impl TaskManager {
         }
         let task_id = session.task_id.as_str();
         validate_id(task_id, 256, "invalid Artifact read Task")?;
-        if artifact_ids.is_empty() || artifact_ids.len() > 256 || !all_unique(artifact_ids) {
+        if artifact_ids.is_empty()
+            || artifact_ids.len() > 256
+            || !all_unique(artifact_ids)
+            || (claimed_grant_id.is_some() && artifact_ids.len() != 1)
+        {
             return Err(TaskManagerError::InvalidRecord(
                 "invalid Artifact read scope",
             ));
@@ -4473,6 +4639,15 @@ impl TaskManager {
                 // expiry latch still commit before the caller sees it.
                 let result = (|| -> Result<ArtifactReadScope> {
                     assert_manager_lease(transaction, &lease_owner, lease_epoch)?;
+                    if require_running
+                        && !exact_provider_step_running_in(
+                            transaction,
+                            task_id,
+                            &session.authority,
+                        )?
+                    {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
                     if !coordinator_grants_valid_in(
                         transaction,
                         task_id,
@@ -4481,7 +4656,59 @@ impl TaskManager {
                         lease_epoch,
                         time,
                     )? {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                        let reason = if let [artifact_id] = artifact_ids {
+                            authenticated_read_grant_denial_in(
+                                transaction,
+                                task_id,
+                                &session.authority,
+                                artifact_id,
+                                &lease_owner,
+                                lease_epoch,
+                                false,
+                            )
+                            .ok()
+                            .flatten()
+                            .filter(|reason| *reason != AuthorityDenialReason::GrantUsageExhausted)
+                        } else {
+                            None
+                        };
+                        return Err(reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(
+                                    AuthorityDenialStage::ArtifactAdmission,
+                                    reason,
+                                )
+                            },
+                        ));
+                    }
+                    if let [artifact_id] = artifact_ids {
+                        let classified = authenticated_read_grant_denial_in(
+                            transaction,
+                            task_id,
+                            &session.authority,
+                            artifact_id,
+                            &lease_owner,
+                            lease_epoch,
+                            false,
+                        );
+                        match classified {
+                            Ok(Some(
+                                reason @ (AuthorityDenialReason::GrantRevoked
+                                | AuthorityDenialReason::GrantExpired),
+                            )) => {
+                                return Err(artifact_grant_denial(
+                                    AuthorityDenialStage::ArtifactAdmission,
+                                    reason,
+                                ));
+                            }
+                            Err(_) => {
+                                return Err(TaskManagerError::InvalidRecord(
+                                    "ARTIFACT_AUTHORITY_DENIED",
+                                ));
+                            }
+                            _ => {}
+                        }
                     }
                     let now = time.now();
                     let authority =
@@ -4490,8 +4717,64 @@ impl TaskManager {
                         .execution
                         .as_ref()
                         .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+                    if claimed_grant_id.is_some() && execution != &session.authority {
+                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    }
                     let mut grant_ids = BTreeMap::new();
                     for artifact_id in artifact_ids {
+                        if let Some(claim) = claimed_grant_id {
+                            let valid_caller: bool = transaction.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM authority_candidate_reservations c
+                                 JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+                                 WHERE c.task_id=?1 AND c.binding_id=?2 AND c.attempt_id=?3
+                                   AND c.provider_id=?4 AND s.state='FINALIZED')",
+                                params![
+                                    task_id,
+                                    execution.binding_id,
+                                    execution.attempt_id,
+                                    execution.principal_id
+                                ],
+                                |row| row.get(0),
+                            )?;
+                            if !valid_caller {
+                                return Err(TaskManagerError::InvalidRecord(
+                                    "ARTIFACT_AUTHORITY_DENIED",
+                                ));
+                            }
+                            match authenticated_claimed_read_grant_in(
+                                transaction,
+                                claim,
+                                artifact_id,
+                            )? {
+                                Some(claimed) if claimed.task_id != task_id => {
+                                    return Err(artifact_grant_denial(
+                                        AuthorityDenialStage::ArtifactAdmission,
+                                        AuthorityDenialReason::GrantTaskMismatch,
+                                    ));
+                                }
+                                Some(claimed) if claimed.provider_id != execution.principal_id => {
+                                    return Err(artifact_grant_denial(
+                                        AuthorityDenialStage::ArtifactAdmission,
+                                        AuthorityDenialReason::GrantPrincipalMismatch,
+                                    ));
+                                }
+                                Some(claimed)
+                                    if claimed.binding_id != execution.binding_id
+                                        || claimed.attempt_id != execution.attempt_id =>
+                                {
+                                    return Err(artifact_grant_denial(
+                                        AuthorityDenialStage::ArtifactAdmission,
+                                        AuthorityDenialReason::GrantBindingMismatch,
+                                    ));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    return Err(TaskManagerError::InvalidRecord(
+                                        "ARTIFACT_AUTHORITY_DENIED",
+                                    ));
+                                }
+                            }
+                        }
                         if !artifact_read_authorized(transaction, task_id, &authority, artifact_id)?
                         {
                             return Err(TaskManagerError::InvalidRecord(
@@ -4527,13 +4810,35 @@ impl TaskManager {
                             None,
                         )? {
                             grant.grant_id
+                        } else if let Some(admission) = replay {
+                            admission.grant_admission.grant_id
                         } else {
-                            replay
-                                .map(|admission| admission.grant_admission.grant_id)
-                                .ok_or(TaskManagerError::InvalidRecord(
-                                    "ARTIFACT_AUTHORITY_DENIED",
-                                ))?
+                            let reason = authenticated_read_grant_denial_in(
+                                transaction,
+                                task_id,
+                                execution,
+                                artifact_id,
+                                &lease_owner,
+                                lease_epoch,
+                                false,
+                            )
+                            .ok()
+                            .flatten();
+                            return Err(reason.map_or(
+                                TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                                |reason| {
+                                    artifact_grant_denial(
+                                        AuthorityDenialStage::ArtifactAdmission,
+                                        reason,
+                                    )
+                                },
+                            ));
                         };
+                        if claimed_grant_id.is_some_and(|claim| claim != grant_id) {
+                            return Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_AUTHORITY_DENIED",
+                            ));
+                        }
                         grant_ids.insert(artifact_id.clone(), grant_id);
                     }
                     Ok(ArtifactReadScope {
@@ -4757,8 +5062,24 @@ impl TaskManager {
             match admitted {
                 Ok(true) => {}
                 Ok(false) => {
+                    let reason = authenticated_read_grant_denial_in(
+                        &transaction,
+                        &scope.task_id,
+                        execution,
+                        artifact_id,
+                        &lease_owner,
+                        lease_epoch,
+                        false,
+                    )
+                    .ok()
+                    .flatten();
                     transaction.commit()?;
-                    return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                    return Err(reason.map_or(
+                        TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                        |reason| {
+                            artifact_grant_denial(AuthorityDenialStage::ArtifactAdmission, reason)
+                        },
+                    ));
                 }
                 Err(error) => {
                     drop(transaction);
@@ -4786,9 +5107,31 @@ impl TaskManager {
         let reader_admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
+                let typed = if matches!(
+                    error,
+                    TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")
+                ) {
+                    scope.authority.execution.as_ref().and_then(|execution| {
+                        authenticated_read_grant_denial_in(
+                            &transaction,
+                            &scope.task_id,
+                            execution,
+                            artifact_id,
+                            &lease_owner,
+                            lease_epoch,
+                            false,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                } else {
+                    None
+                };
                 drop(transaction);
                 fresh.commit(&self.connection)?;
-                return Err(error);
+                return Err(typed.map_or(error, |reason| {
+                    artifact_grant_denial(AuthorityDenialStage::ArtifactAdmission, reason)
+                }));
             }
         };
         if let Err(error) = transaction.commit() {
@@ -8883,6 +9226,344 @@ fn coordinator_grants_valid_in(
     Ok(all_valid)
 }
 
+fn artifact_grant_denial(
+    stage: AuthorityDenialStage,
+    reason: AuthorityDenialReason,
+) -> TaskManagerError {
+    TaskManagerError::AuthorityDenied(AuthorityDenial { stage, reason })
+}
+
+struct BindingRequestClaim {
+    task_id: String,
+    semantic_hash: String,
+    node_id: String,
+    provider_id: String,
+    binding_id: String,
+    attempt_id: String,
+    grant_id: String,
+}
+
+/// Authenticate the request through its issued grant, immutable binding, and
+/// finalized candidate. A former attempt need not remain the active attempt.
+fn authenticated_binding_request_claim_in(
+    connection: &Connection,
+    request_id: &str,
+    artifact_id: &str,
+) -> Result<Option<BindingRequestClaim>> {
+    let mut statement = connection.prepare(
+        "SELECT r.task_id,r.semantic_program_hash,r.node_id,r.principal_id,
+                r.execution_binding_id,r.attempt_id,g.grant_id,d.decision_id,
+                b.grant_refs_json,b.policy_decision_refs_json
+         FROM authority_requests r
+         JOIN policy_decisions d ON d.authority_request_id=r.request_id
+           AND d.task_id=r.task_id AND d.semantic_program_hash=r.semantic_program_hash
+           AND d.node_id=r.node_id AND d.principal_kind=r.principal_kind
+           AND d.principal_id=r.principal_id AND d.action=r.action
+           AND d.resolved_resource_kind=r.resolved_resource_kind
+           AND d.resolved_resource_id=r.resolved_resource_id AND d.decision='ALLOW'
+         JOIN authority_grants g ON g.policy_decision_id=d.decision_id
+           AND g.task_id=r.task_id AND g.semantic_program_hash=r.semantic_program_hash
+           AND g.node_id=r.node_id AND g.execution_binding_id=r.execution_binding_id
+           AND g.attempt_id=r.attempt_id AND g.principal_kind=r.principal_kind
+           AND g.principal_id=r.principal_id
+         JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+           AND i.token_id=g.token_id AND i.task_id=g.task_id
+           AND i.execution_binding_id=g.execution_binding_id
+           AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id
+           AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+         JOIN authority_candidate_reservations c ON c.task_id=r.task_id
+           AND c.semantic_program_hash=r.semantic_program_hash AND c.node_id=r.node_id
+           AND c.binding_id=r.execution_binding_id AND c.attempt_id=r.attempt_id
+           AND c.provider_id=r.principal_id
+         JOIN authority_candidate_status cs ON cs.candidate_id=c.candidate_id
+           AND cs.state='FINALIZED'
+         JOIN execution_bindings b ON b.binding_id=c.binding_id
+           AND b.attempt_id=c.attempt_id AND b.task_id=c.task_id
+           AND b.semantic_program_hash=c.semantic_program_hash AND b.node_id=c.node_id
+           AND b.provider_id=c.provider_id
+         JOIN step_executions s ON s.binding_id=b.binding_id
+           AND s.attempt_id=b.attempt_id AND s.task_id=b.task_id
+           AND s.semantic_program_hash=b.semantic_program_hash AND s.node_id=b.node_id
+         WHERE r.request_id=?1 AND r.principal_kind='provider'
+           AND r.action='artifact.read' AND r.resolved_resource_kind='artifact'
+           AND r.resolved_resource_id=?2",
+    )?;
+    let rows = statement.query_map(params![request_id, artifact_id], |row| {
+        Ok((
+            BindingRequestClaim {
+                task_id: row.get(0)?,
+                semantic_hash: row.get(1)?,
+                node_id: row.get(2)?,
+                provider_id: row.get(3)?,
+                binding_id: row.get(4)?,
+                attempt_id: row.get(5)?,
+                grant_id: row.get(6)?,
+            },
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+        ))
+    })?;
+    let mut result = None;
+    for row in rows {
+        let (claim, grant_id, decision_id, grant_refs, decision_refs) = row?;
+        let grants: Vec<String> = serde_json::from_str(&grant_refs)?;
+        let decisions: Vec<String> = serde_json::from_str(&decision_refs)?;
+        if result.is_some()
+            || grants.iter().filter(|id| **id == grant_id).count() != 1
+            || decisions.iter().filter(|id| **id == decision_id).count() != 1
+        {
+            return Ok(None);
+        }
+        result = Some(claim);
+    }
+    Ok(result)
+}
+
+/// Resolve the presented grant from its own immutable coordinator issuance,
+/// binding, request, and decision. A superseded binding remains authentic
+/// historical evidence, even though it cannot admit another protected use.
+fn authenticated_claimed_read_grant_in(
+    connection: &Connection,
+    grant_id: &str,
+    artifact_id: &str,
+) -> Result<Option<BindingRequestClaim>> {
+    let request_id: Option<String> = connection
+        .query_row(
+            "SELECT r.request_id
+             FROM authority_grants g
+             JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+               AND i.token_id=g.token_id AND i.task_id=g.task_id
+               AND i.execution_binding_id=g.execution_binding_id
+               AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id
+               AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+               AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
+               AND d.node_id=g.node_id AND d.action='artifact.read'
+               AND d.resolved_resource_kind='artifact' AND d.resolved_resource_id=?2
+             JOIN authority_requests r ON r.request_id=d.authority_request_id
+               AND r.task_id=g.task_id AND r.semantic_program_hash=g.semantic_program_hash
+               AND r.node_id=g.node_id AND r.execution_binding_id=g.execution_binding_id
+               AND r.attempt_id=g.attempt_id AND r.action=d.action
+               AND r.resolved_resource_kind=d.resolved_resource_kind
+               AND r.resolved_resource_id=d.resolved_resource_id
+             WHERE g.grant_id=?1 AND g.principal_kind='provider'",
+            params![grant_id, artifact_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(request_id) = request_id else {
+        return Ok(None);
+    };
+    Ok(
+        authenticated_binding_request_claim_in(connection, &request_id, artifact_id)?
+            .filter(|claim| claim.grant_id == grant_id),
+    )
+}
+
+#[cfg(test)]
+type ReadGrantDiagnosticTestHook = Box<dyn FnOnce() -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static READ_GRANT_DIAGNOSTIC_TEST_HOOK: std::cell::RefCell<Option<ReadGrantDiagnosticTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_read_grant_diagnostic_test_hook(hook: impl FnOnce() -> Result<()> + 'static) {
+    READ_GRANT_DIAGNOSTIC_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Classify only a grant whose immutable coordinator binding, issuance receipt,
+/// decision, request, and exact read resource all match the authenticated session.
+/// Any incomplete or ambiguous intersection keeps the coarse denial.
+#[allow(
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    reason = "the exact issued read tuple precedes every typed lifecycle reason"
+)]
+fn authenticated_read_grant_denial_in(
+    connection: &Connection,
+    task_id: &str,
+    execution: &ExecutionAuthority,
+    artifact_id: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+    admitted_replay: bool,
+) -> Result<Option<AuthorityDenialReason>> {
+    #[cfg(test)]
+    READ_GRANT_DIAGNOSTIC_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook()?;
+        }
+        Ok::<(), TaskManagerError>(())
+    })?;
+    let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
+    let policy_ids: Vec<String> = serde_json::from_str(&execution.policy_decision_refs_json)?;
+    if grant_ids.is_empty() || grant_ids.len() > 64 || !all_unique(&grant_ids) {
+        return Ok(None);
+    }
+    let mut matched = None;
+    for grant_id in grant_ids {
+        if !super::coordinator_grant_policy_current(connection, &grant_id)? {
+            continue;
+        }
+        let row: Option<(
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = connection
+            .query_row(
+                "SELECT g.state,g.scope,g.revocation_reason_code,g.grants_json,g.max_uses,
+                    g.uses_consumed,g.policy_decision_id,r.semantic_selector,
+                    g.approval_id,g.revoked_at
+             FROM authority_grants g
+             JOIN authority_issuance_receipts i ON i.grant_id=g.grant_id
+               AND i.token_id=g.token_id AND i.task_id=g.task_id
+               AND i.execution_binding_id=g.execution_binding_id
+               AND i.attempt_id=g.attempt_id AND i.policy_decision_id=g.policy_decision_id
+               AND i.issued_at=g.issued_at AND i.issuance_profile='coordinator-issued-v0.1'
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+               AND d.task_id=g.task_id AND d.semantic_program_hash=g.semantic_program_hash
+               AND d.node_id=g.node_id AND d.policy_snapshot_id=g.policy_snapshot_id
+             JOIN authority_requests r ON r.request_id=d.authority_request_id
+               AND r.task_id=g.task_id AND r.semantic_program_hash=g.semantic_program_hash
+               AND r.node_id=g.node_id AND r.execution_binding_id=g.execution_binding_id
+               AND r.attempt_id=g.attempt_id
+             JOIN authority_candidate_reservations c ON c.task_id=g.task_id
+               AND c.semantic_program_hash=g.semantic_program_hash AND c.node_id=g.node_id
+               AND c.binding_id=g.execution_binding_id AND c.attempt_id=g.attempt_id
+             JOIN authority_candidate_status s ON s.candidate_id=c.candidate_id
+               AND s.state='FINALIZED'
+             JOIN authority_candidate_resources cr ON cr.candidate_id=c.candidate_id
+               AND cr.action=r.action AND cr.semantic_selector=r.semantic_selector
+               AND cr.resource_kind=r.resolved_resource_kind
+               AND cr.resource_id=r.resolved_resource_id
+             WHERE g.grant_id=?1 AND g.task_id=?2 AND g.semantic_program_hash=?3
+               AND g.node_id=?4 AND g.execution_binding_id=?5 AND g.attempt_id=?6
+               AND g.principal_kind='provider' AND g.principal_id=?7
+               AND g.delegable=0 AND g.max_delegation_depth=0
+               AND g.capability=?8 AND d.decision='ALLOW'
+               AND c.provider_id=?7
+               AND d.principal_kind='provider' AND d.principal_id=?7
+               AND r.principal_kind='provider' AND r.principal_id=?7
+               AND r.capability=?8 AND d.action='artifact.read'
+               AND r.action=d.action AND d.resolved_resource_kind='artifact'
+               AND r.resolved_resource_kind=d.resolved_resource_kind
+               AND d.resolved_resource_id=?9 AND r.resolved_resource_id=?9
+               AND g.approval_id IS d.approval_request_id",
+                params![
+                    grant_id,
+                    task_id,
+                    execution.semantic_program_hash,
+                    execution.node_id,
+                    execution.binding_id,
+                    execution.attempt_id,
+                    execution.principal_id,
+                    execution.capability,
+                    artifact_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            state,
+            scope,
+            revoked_reason,
+            grants_json,
+            max_uses,
+            uses_consumed,
+            decision_id,
+            selector,
+            approval_id,
+            revoked_at,
+        )) = row
+        else {
+            continue;
+        };
+        if !policy_ids.contains(&decision_id)
+            || !super::approval_not_withdrawn(connection, approval_id.as_deref())?
+            || matched.is_some()
+        {
+            return Ok(None);
+        }
+        let items: serde_json::Value = serde_json::from_str(&grants_json)?;
+        let Some([item]) = items.as_array().map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        if item.get("action").and_then(serde_json::Value::as_str) != Some("artifact.read")
+            || item
+                .get("resource_kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("artifact")
+            || item.get("resource_id").and_then(serde_json::Value::as_str) != Some(artifact_id)
+            || item
+                .get("semantic_selector")
+                .and_then(serde_json::Value::as_str)
+                != selector.as_deref()
+        {
+            return Ok(None);
+        }
+        matched = Some((
+            grant_id,
+            state,
+            scope,
+            revoked_reason,
+            revoked_at,
+            max_uses,
+            uses_consumed,
+        ));
+    }
+    let Some((grant_id, state, scope, revoked_reason, revoked_at, max_uses, uses_consumed)) =
+        matched
+    else {
+        return Ok(None);
+    };
+    if state == "REVOKED" {
+        return Ok(
+            if revoked_reason.as_deref() == Some("AUTH_GRANT_REVOKED") && revoked_at.is_some() {
+                Some(AuthorityDenialReason::GrantRevoked)
+            } else {
+                None
+            },
+        );
+    }
+    if super::authority_deadline::authenticated_expiry_latch(
+        connection,
+        &grant_id,
+        lease_owner,
+        lease_epoch,
+    )? {
+        return Ok(Some(AuthorityDenialReason::GrantExpired));
+    }
+    if !admitted_replay && consumed_one_shot_grant(&scope, &state, max_uses, uses_consumed) {
+        return Ok(Some(AuthorityDenialReason::GrantUsageExhausted));
+    }
+    Ok(None)
+}
+
 fn capture_read_authority(
     connection: &Connection,
     task_id: &str,
@@ -8898,6 +9579,39 @@ fn capture_read_authority(
         task_principal_id: task.1,
         execution,
     })
+}
+
+fn exact_provider_step_running_in(
+    connection: &Connection,
+    task_id: &str,
+    execution: &ExecutionAuthority,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks t
+             JOIN step_executions s ON s.task_id=t.task_id
+             JOIN execution_bindings b ON b.binding_id=s.binding_id
+               AND b.attempt_id=s.attempt_id AND b.task_id=s.task_id
+               AND b.semantic_program_hash=s.semantic_program_hash AND b.node_id=s.node_id
+             WHERE t.task_id=?1 AND t.state='RUNNING'
+               AND s.binding_id=?2 AND s.attempt_id=?3 AND s.node_id=?4
+               AND s.semantic_program_hash=?5 AND s.state='RUNNING'
+               AND b.provider_id=?6
+               AND s.attempt_number=(SELECT MAX(latest.attempt_number)
+                   FROM step_executions latest WHERE latest.task_id=s.task_id
+                     AND latest.semantic_program_hash=s.semantic_program_hash
+                     AND latest.node_id=s.node_id))",
+            params![
+                task_id,
+                execution.binding_id,
+                execution.attempt_id,
+                execution.node_id,
+                execution.semantic_program_hash,
+                execution.principal_id
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn capture_execution_authority(
@@ -10338,7 +11052,46 @@ fn validate_reader_fence(reader: &ArtifactReader) -> Result<()> {
                         reader.lease_epoch,
                         time,
                     )? {
-                        return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+                        let reason = authenticated_read_grant_denial_in(
+                            transaction,
+                            &reader.task_id,
+                            execution,
+                            &reader.artifact_id,
+                            &reader.lease_owner,
+                            reader.lease_epoch,
+                            true,
+                        )
+                        .ok()
+                        .flatten();
+                        return Err(reason.map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ));
+                    }
+                    let classified = authenticated_read_grant_denial_in(
+                        transaction,
+                        &reader.task_id,
+                        execution,
+                        &reader.artifact_id,
+                        &reader.lease_owner,
+                        reader.lease_epoch,
+                        true,
+                    );
+                    match classified {
+                        Ok(Some(reason)) => {
+                            return Err(artifact_grant_denial(
+                                AuthorityDenialStage::ArtifactRead,
+                                reason,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_AUTHORITY_DENIED",
+                            ));
+                        }
+                        Ok(None) => {}
                     }
                 }
                 validate_reader_fence_in_connection(

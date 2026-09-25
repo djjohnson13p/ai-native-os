@@ -1,9 +1,9 @@
 //! Non-executable reservations for deterministic authority evaluation.
 
 use super::{
-    CreateStepExecution, Result, StepState, TaskManager, TaskManagerError,
-    active_program_validation_valid, all_unique, assert_manager_lease, canonical_json,
-    program_node,
+    AuthorityDenial, AuthorityDenialReason, AuthorityDenialStage, CreateStepExecution, Result,
+    StepState, TaskManager, TaskManagerError, active_program_validation_valid, all_unique,
+    assert_manager_lease, canonical_json, program_node,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,11 @@ pub(crate) enum CandidateResourceHandle {
         operation_id: String,
         purpose: String,
         max_size_bytes: u64,
+    },
+    /// An untrusted proposed service claim. This Stage-1 local profile never
+    /// resolves or issues network authority from this handle.
+    NetworkService {
+        service_id: String,
     },
 }
 
@@ -77,6 +82,13 @@ pub(crate) struct PendingAuthorityCandidate {
 
 fn reject() -> TaskManagerError {
     TaskManagerError::InvalidRecord("authority candidate reservation is not admissible")
+}
+
+fn semantic_request_mismatch() -> TaskManagerError {
+    TaskManagerError::AuthorityDenied(AuthorityDenial {
+        stage: AuthorityDenialStage::CandidateReservation,
+        reason: AuthorityDenialReason::SemanticRequestMismatch,
+    })
 }
 
 fn valid_id(value: &str) -> bool {
@@ -460,15 +472,6 @@ fn replay_existing(
         || row.7 != request.capability_contract_hash
         || row.8 != request.provider_registration_id
         || row.12 != i64::from(request.attempt_number)
-        || row.13
-            != i64::try_from(
-                request
-                    .resources
-                    .iter()
-                    .filter(|r| !matches!(r.handle, CandidateResourceHandle::ExternalExport { .. }))
-                    .count(),
-            )
-            .map_err(|_| reject())?
         || row.14 != "PENDING"
     {
         return Err(reject());
@@ -488,6 +491,30 @@ fn replay_existing(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let stored_export = load_current_export_pin(connection, request.candidate_id)?;
+    // A replay cannot widen the sealed semantic request. Diagnose this at the
+    // same reservation fence, before the generic resource-count/replay checks.
+    if request.resources.iter().any(|claim| {
+        !stored.iter().any(|(action, selector, ..)| {
+            action == &claim.action && selector == &claim.semantic_selector
+        }) && !stored_export.as_ref().is_some_and(|pin| {
+            claim.action == "data.egress" && claim.semantic_selector == pin.selector
+        })
+    }) {
+        return Err(semantic_request_mismatch());
+    }
+    if row.13
+        != i64::try_from(
+            request
+                .resources
+                .iter()
+                .filter(|r| !matches!(r.handle, CandidateResourceHandle::ExternalExport { .. }))
+                .count(),
+        )
+        .map_err(|_| reject())?
+    {
+        return Err(reject());
+    }
     let mut requested = Vec::with_capacity(request.resources.len());
     let mut requested_export = None;
     for choice in request.resources {
@@ -529,6 +556,7 @@ fn replay_existing(
                 }
                 continue;
             }
+            CandidateResourceHandle::NetworkService { .. } => return Err(reject()),
         };
         requested.push((
             choice.action.clone(),
@@ -544,7 +572,6 @@ fn replay_existing(
     if stored != requested {
         return Err(reject());
     }
-    let stored_export = load_current_export_pin(connection, request.candidate_id)?;
     match (requested_export, stored_export) {
         (None, None) => {}
         (Some((action, selector, service, source, operation, purpose, ceiling)), Some(pin))
@@ -1353,6 +1380,26 @@ impl TaskManager {
             .get("authority_requests")
             .and_then(Value::as_array)
             .ok_or_else(reject)?;
+        let declared_pairs = declared
+            .iter()
+            .map(|request| {
+                Ok((
+                    request
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .ok_or_else(reject)?,
+                    request
+                        .get("resource")
+                        .and_then(Value::as_str)
+                        .ok_or_else(reject)?,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if request.resources.iter().any(|claim| {
+            !declared_pairs.contains(&(claim.action.as_str(), claim.semantic_selector.as_str()))
+        }) {
+            return Err(semantic_request_mismatch());
+        }
         if declared.len() != request.resources.len() {
             return Err(reject());
         }
@@ -1661,6 +1708,24 @@ mod tests {
             Some(crate::trusted_time::synthetic_sample(self.now()))
         }
     }
+    struct ApprovalExpiredClock;
+    impl Clock for ApprovalExpiredClock {
+        fn now(&self) -> String {
+            "2026-09-19T02:00:00Z".into()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
+    struct ApprovalReactivationClock;
+    impl Clock for ApprovalReactivationClock {
+        fn now(&self) -> String {
+            "2026-09-19T00:10:00Z".into()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
     struct FrozenWallClock {
         monotonic: Arc<std::sync::atomic::AtomicU64>,
     }
@@ -1858,11 +1923,11 @@ mod tests {
     }
 
     fn coherent_planning_fixture(path: &Path) -> (TaskManager, String, String, String) {
-        fixture_at_mode(Some(path), true, false)
+        fixture_at_mode(Some(path), true, false, None, true)
     }
 
     fn fixture_at(path: Option<&Path>) -> (TaskManager, String, String, String) {
-        fixture_at_mode(path, false, false)
+        fixture_at_mode(path, false, false, None, true)
     }
 
     #[allow(
@@ -1873,7 +1938,34 @@ mod tests {
         path: Option<&Path>,
         coherent_planning: bool,
         export: bool,
+        provider_id: Option<&str>,
+        seed_placeholder_source: bool,
     ) -> (TaskManager, String, String, String) {
+        let (manager, hash, snapshot, registration, _) = fixture_at_mode_with_nodes(
+            path,
+            coherent_planning,
+            export,
+            provider_id,
+            seed_placeholder_source,
+            false,
+        );
+        (manager, hash, snapshot, registration)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "builds a two-node validated fixture with distinct real provider registrations"
+    )]
+    fn fixture_at_mode_with_nodes(
+        path: Option<&Path>,
+        coherent_planning: bool,
+        export: bool,
+        provider_id: Option<&str>,
+        seed_placeholder_source: bool,
+        two_nodes: bool,
+    ) -> (TaskManager, String, String, String, Option<String>) {
         let mut manager = match path {
             Some(path) => TaskManager::open_with_clock(path, Box::new(FixedClock)).unwrap(),
             None => TaskManager::open_in_memory_with_clock(Box::new(FixedClock)).unwrap(),
@@ -1888,7 +1980,11 @@ mod tests {
                 workspace_id: None,
                 original_intent: "copy source".into(),
                 normalized_intent: None,
-                active_step_ids: vec!["copy".into()],
+                active_step_ids: if two_nodes {
+                    vec!["copy".into(), "copy-other".into()]
+                } else {
+                    vec!["copy".into()]
+                },
             })
             .unwrap();
         if !coherent_planning {
@@ -1974,6 +2070,9 @@ mod tests {
         ))
         .unwrap();
         let mut manifest = cases[0]["provider"].clone();
+        if let Some(provider_id) = provider_id {
+            manifest["id"] = json!(provider_id);
+        }
         manifest["provides"][0]["contract"]["capability"] = json!("artifact.copy");
         manifest["provides"][0]["contract"]["contract_hash"] = json!(contract_hash);
         manifest["provides"][0]["conformance"]["suite"] = json!("conformance://artifact.copy/1");
@@ -2023,6 +2122,41 @@ mod tests {
             .unwrap()
             .enable(&registration.registration_id, NOW)
             .unwrap();
+        let other_registration = if two_nodes {
+            let mut other_manifest = manifest.clone();
+            other_manifest["id"] = json!("org.ainative.provider.other");
+            let other = manager
+                .provider_store_writer()
+                .unwrap()
+                .register(
+                    &registry,
+                    &serde_json::to_vec(&other_manifest).unwrap(),
+                    build,
+                    ProviderTrustStatus::LocallyTrusted,
+                    NOW,
+                )
+                .unwrap();
+            let mut other_evidence = evidence;
+            other_evidence["result_id"] = json!("evidence-candidate-other");
+            other_evidence["provider_id"] = json!(other.provider_id);
+            other_evidence["provider_version"] = json!(other.provider_version);
+            manager
+                .provider_store_writer()
+                .unwrap()
+                .record_evidence(
+                    &other.registration_id,
+                    &serde_json::to_vec(&other_evidence).unwrap(),
+                )
+                .unwrap();
+            manager
+                .provider_store_writer()
+                .unwrap()
+                .enable(&other.registration_id, NOW)
+                .unwrap();
+            Some(other.registration_id)
+        } else {
+            None
+        };
         let mut program = json!({
             "ir_version":"0.1","program_id":"program-candidate","kind":"task_graph",
             "inputs":{"source":{"type":"artifact.file@1"}},
@@ -2042,18 +2176,54 @@ mod tests {
             program["nodes"][0]["egress"] = json!({"mode":"policy",
                 "destination_classes":["fixture_remote"]});
         }
+        if two_nodes {
+            let mut other_node = program["nodes"][0].clone();
+            other_node["id"] = json!("copy-other");
+            program["nodes"].as_array_mut().unwrap().push(other_node);
+            program["outputs"]["other"] =
+                json!({"source":"node","node":"copy-other","port":"copy"});
+        }
         let program_json = program.to_string();
         let hash = aios_ir::recompute_semantic_hash(program_json.as_bytes()).unwrap();
-        let validation = json!({
+        let verified_validation = if two_nodes {
+            let report =
+                aios_ir::Validator::new(registry.clone(), aios_ir::ValidationLimits::default())
+                    .validate_bytes_at(
+                        program_json.as_bytes(),
+                        time::OffsetDateTime::parse(
+                            NOW,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .unwrap(),
+                    );
+            assert!(
+                report.output.validation.valid,
+                "two-node fixture diagnostics: {:?}",
+                report.output.validation.diagnostics
+            );
+            assert_eq!(
+                report.output.validation.semantic_hash.as_deref(),
+                Some(hash.as_str())
+            );
+            Some(serde_json::to_value(report.output.validation).unwrap())
+        } else {
+            None
+        };
+        let validation = verified_validation.unwrap_or_else(|| json!({
             "schema_version":"0.1","program_id":"program-candidate","ir_version":"0.1",
             "valid":true,"semantic_hash":hash,"semantic_hash_profile":"aios-ir-v0.1",
             "registry_snapshot_id":registry.snapshot_id(),"validator":{"id":"validator:test","version":"0.1","build_hash":null},
             "diagnostics":[],"diagnostics_truncated":false,"validated_at":NOW
-        });
+        }));
+        let validator_id = validation["validator"]["id"].as_str().unwrap();
+        let validator_version = validation["validator"]["version"].as_str().unwrap();
+        let validator_build_hash = validation["validator"]["build_hash"].as_str();
         manager.connection.execute("INSERT INTO validation_results(validation_result_id,task_id,program_id,
-            ir_version,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,result_json,validated_at)
-            VALUES ('validation-candidate','T-candidate','program-candidate','0.1',1,?1,?2,'validator:test','0.1',?3,?4)",
-            params![hash,registry.snapshot_id(),validation.to_string(),NOW]).unwrap();
+            ir_version,valid,semantic_hash,registry_snapshot_id,validator_id,validator_version,
+            validator_build_hash,result_json,validated_at)
+            VALUES ('validation-candidate','T-candidate','program-candidate','0.1',1,?1,?2,?3,?4,?5,?6,?7)",
+            params![hash,registry.snapshot_id(),validator_id,validator_version,
+                validator_build_hash,validation.to_string(),NOW]).unwrap();
         manager
             .connection
             .execute(
@@ -2067,23 +2237,25 @@ mod tests {
             created_from_plan_revision,created_at)
             VALUES ('T-candidate',1,'program-candidate','0.1',?1,?2,'validation-candidate','active',?3,1,?4)",
             params![hash,registry.snapshot_id(),program_json,NOW]).unwrap();
-        manager
-            .connection
-            .execute(
-                "INSERT INTO artifacts(artifact_id,uri,semantic_type,media_type,sensitivity,
+        if seed_placeholder_source {
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO artifacts(artifact_id,uri,semantic_type,media_type,sensitivity,
             retention_class,origin_kind,integrity_state,created_at) VALUES ('artifact:source','artifact://source',
             'artifact.file@1','text/plain','local','task','user','verified',?1)",
-                [NOW],
-            )
-            .unwrap();
-        manager
-            .connection
-            .execute(
-                "INSERT INTO task_artifacts(task_id,artifact_id,role,added_at)
+                    [NOW],
+                )
+                .unwrap();
+            manager
+                .connection
+                .execute(
+                    "INSERT INTO task_artifacts(task_id,artifact_id,role,added_at)
             VALUES ('T-candidate','artifact:source','input',?1)",
-                [NOW],
-            )
-            .unwrap();
+                    [NOW],
+                )
+                .unwrap();
+        }
         if coherent_planning {
             manager
                 .connection
@@ -2125,11 +2297,2004 @@ mod tests {
             hash,
             registry.snapshot_id().to_owned(),
             registration.registration_id,
+            other_registration,
         )
     }
 
     fn choices() -> Vec<CandidateResourceChoice> {
         choices_with_source("artifact:source")
+    }
+
+    fn authority_case(name: &str) -> Value {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../examples/authority/authority-cases.json"
+        ))
+        .unwrap();
+        let mut matching = cases.into_iter().filter(|case| case["name"] == name);
+        let case = matching.next().expect("named authority fixture exists");
+        assert!(
+            matching.next().is_none(),
+            "authority fixture name is unique"
+        );
+        case
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issues one genuine coordinator read grant for lifecycle fixtures"
+    )]
+    fn issued_fixture_read(
+        read_requires_approval: bool,
+        enter_running: bool,
+    ) -> (
+        TaskManager,
+        String,
+        crate::artifact_store::ProviderArtifactSession,
+        String,
+        String,
+    ) {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-lifecycle".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"grant lifecycle source"),
+            )
+            .unwrap();
+        let resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:grant-lifecycle");
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:grant-lifecycle",
+                binding_id: "binding:grant-lifecycle",
+                attempt_id: "attempt:grant-lifecycle",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let read_effect = if read_requires_approval {
+            "REQUIRE_APPROVAL"
+        } else {
+            "ALLOW"
+        };
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":read_effect,"action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluation = manager
+            .evaluate_pending_authority_candidate("candidate:grant-lifecycle")
+            .unwrap();
+        let mut revision = 2;
+        let mut state = TaskState::Planning;
+        if read_requires_approval {
+            let approval = evaluation.decisions[0].approval_id.as_deref().unwrap();
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: "transition:grant-waiting".into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: 2,
+                        expected_state: TaskState::Planning,
+                        to_state: TaskState::WaitingForAuth,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "APPROVAL_REQUIRED".into(),
+                            message: None,
+                            related_ids: vec![approval.into()]
+                        },
+                        mutation: TaskMutation {
+                            waiting_on: Some(vec![WaitingOn {
+                                kind: WaitingKind::Approval,
+                                id: approval.into(),
+                                message: None
+                            }]),
+                            ..TaskMutation::default()
+                        },
+                    })
+                    .unwrap()
+                    .applied
+            );
+            manager
+                .decide_candidate_approval(
+                    approval,
+                    &AuthenticatedApprover {
+                        principal_id: "user:test",
+                    },
+                    true,
+                )
+                .unwrap();
+            revision = 3;
+            state = TaskState::WaitingForAuth;
+        }
+        manager
+            .finalize_pending_authority_candidate("candidate:grant-lifecycle")
+            .unwrap();
+        // Admit the unique selected input first; a later same-Task import
+        // cannot widen the finalized exact-resource grant.
+        let unbound = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-lifecycle-unbound".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"same task but unbound"),
+            )
+            .unwrap();
+        for (id, next) in [
+            ("transition:grant-runnable", TaskState::Runnable),
+            ("transition:grant-running", TaskState::Running),
+        ] {
+            if next == TaskState::Running && !enter_running {
+                break;
+            }
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: state,
+                        to_state: next,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+            revision += 1;
+            state = next;
+        }
+        let grant_id: String = manager.connection.query_row(
+            "SELECT g.grant_id FROM authority_grants g JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+             WHERE g.execution_binding_id='binding:grant-lifecycle' AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+            [&source.artifact_id], |row| row.get(0),
+        ).unwrap();
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", "binding:grant-lifecycle")
+            .unwrap();
+        (
+            manager,
+            source.artifact_id,
+            session,
+            grant_id,
+            unbound.artifact_id,
+        )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises two independently issued provider bindings through actual read admission"
+    )]
+    fn fixture_genuine_read_grant_rejects_other_provider_claim() {
+        let case = authority_case("grant-used-by-wrong-provider");
+        let grant_provider = case["facts"]["grant_principal"].as_str().unwrap();
+        let caller_provider = case["facts"]["caller_principal"].as_str().unwrap();
+        let (mut manager, hash, snapshot, registration_a, registration_b) =
+            fixture_at_mode_with_nodes(None, true, false, Some(grant_provider), false, true);
+        let registration_b = registration_b.unwrap();
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:grant-provider-scope".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"same Task, different providers"),
+            )
+            .unwrap();
+        for (candidate, binding, attempt, node, registration, allocation) in [
+            (
+                "candidate:provider-a",
+                "binding:provider-a",
+                "attempt:provider-a",
+                "copy",
+                registration_a.as_str(),
+                "allocation:provider-a",
+            ),
+            (
+                "candidate:provider-b",
+                "binding:provider-b",
+                "attempt:provider-b",
+                "copy-other",
+                registration_b.as_str(),
+                "allocation:provider-b",
+            ),
+        ] {
+            manager
+                .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                    candidate_id: candidate,
+                    binding_id: binding,
+                    attempt_id: attempt,
+                    task_id: "T-candidate",
+                    semantic_program_hash: &hash,
+                    registry_snapshot_id: &snapshot,
+                    node_id: node,
+                    capability_contract_hash: &contract_hash(&manager, &snapshot),
+                    provider_registration_id: registration,
+                    attempt_number: 1,
+                    resources: &choices_with_source_and_output(&source.artifact_id, allocation),
+                })
+                .unwrap();
+        }
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        for candidate in ["candidate:provider-a", "candidate:provider-b"] {
+            manager
+                .evaluate_pending_authority_candidate(candidate)
+                .unwrap();
+            manager
+                .finalize_pending_authority_candidate(candidate)
+                .unwrap();
+        }
+        for (id, revision, from, to) in [
+            (
+                "transition:providers-runnable",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:providers-running",
+                3,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: from,
+                        to_state: to,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+        }
+        let session_a = manager
+            .issue_provider_artifact_session("T-candidate", "binding:provider-a")
+            .unwrap();
+        let session_b = manager
+            .issue_provider_artifact_session("T-candidate", "binding:provider-b")
+            .unwrap();
+        let (grant_id, stored_task, stored_provider): (String, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT g.grant_id,g.task_id,g.principal_id FROM authority_grants g
+                 JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                 WHERE g.execution_binding_id='binding:provider-a'
+                   AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+                [&source.artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let caller_binding_provider: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM execution_bindings WHERE binding_id='binding:provider-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_task, "T-candidate");
+        assert_eq!(stored_provider, grant_provider);
+        assert_eq!(caller_binding_provider, caller_provider);
+        let counts = |manager: &TaskManager| -> (i64, i64) {
+            manager
+                .connection
+                .query_row(
+                    "SELECT
+                    (SELECT COALESCE(SUM(g.uses_consumed),0) FROM authority_grants g
+                     JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+                     WHERE g.task_id='T-candidate' AND d.action='artifact.read'),
+                    (SELECT COUNT(*) FROM operations
+                     WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let before = counts(&manager);
+        assert_eq!(before, (0, 0));
+        let error = manager
+            .scope_artifact_reads_with_claim(
+                &session_b,
+                std::slice::from_ref(&source.artifact_id),
+                &grant_id,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, crate::AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(case["expected"], "DENY");
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(counts(&manager), before);
+        let unknown = manager
+            .scope_artifact_reads_with_claim(
+                &session_b,
+                std::slice::from_ref(&source.artifact_id),
+                "grant:unknown",
+            )
+            .unwrap_err();
+        assert!(unknown.authority_denial().is_none());
+        assert_eq!(counts(&manager), before);
+        let other_grant: String = manager
+            .connection
+            .query_row(
+                "SELECT g.grant_id FROM authority_grants g
+             JOIN policy_decisions d ON d.decision_id=g.policy_decision_id
+             WHERE g.execution_binding_id='binding:provider-b'
+               AND d.action='artifact.read' AND d.resolved_resource_id=?1",
+                [&source.artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (session, claim) in [
+            (&session_a, grant_id.as_str()),
+            (&session_b, other_grant.as_str()),
+        ] {
+            let scope = manager
+                .scope_artifact_reads_with_claim(
+                    session,
+                    std::slice::from_ref(&source.artifact_id),
+                    claim,
+                )
+                .unwrap();
+            let mut reader = manager
+                .open_artifact_reader(&scope, &source.artifact_id)
+                .unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"same Task, different providers");
+        }
+    }
+
+    #[test]
+    fn fixture_one_shot_read_exhaustion_preserves_only_authenticated_replay() {
+        let case = authority_case("one-shot-grant-already-consumed");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, source, session, grant_id, unbound) = issued_fixture_read(true, true);
+        let (scope, maximum, consumed, state): (String, Option<i64>, i64, String) = manager
+            .connection
+            .query_row(
+                "SELECT scope,max_uses,uses_consumed,state FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(scope, case["facts"]["scope"]);
+        assert_eq!(maximum, Some(case["facts"]["max_uses"].as_i64().unwrap()));
+        assert_eq!((consumed, state.as_str()), (0, "ACTIVE"));
+        let read_scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let first = manager.open_artifact_reader(&read_scope, &source).unwrap();
+        let operation: String = manager.connection.query_row(
+            "SELECT operation_id FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(first); // no bytes delivered: the same pending admission may replay
+        let mut replay = manager.open_artifact_reader(&read_scope, &source).unwrap();
+        let replayed_operation: String = manager.connection.query_row(
+            "SELECT operation_id FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(replayed_operation, operation);
+        let mut bytes = Vec::new();
+        replay.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"grant lifecycle source");
+        let (consumed, state, operations): (i64, String, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,g.state,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(consumed, case["facts"]["uses_consumed"]);
+        assert_eq!(state, "CONSUMED");
+        assert_eq!(operations, 1);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let old_scope_error = match manager.open_artifact_reader(&read_scope, &source) {
+            Ok(_) => panic!("delivered one-shot admission reopened a reader"),
+            Err(error) => error,
+        };
+        assert_eq!(old_scope_error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let old_scope_denial = old_scope_error.authority_denial().unwrap();
+        assert_eq!(
+            old_scope_denial.stage,
+            AuthorityDenialStage::ArtifactAdmission
+        );
+        assert_eq!(old_scope_denial.reason.code(), case["reason_code"]);
+        let wrong_artifact = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&unbound))
+            .unwrap_err();
+        assert_eq!(wrong_artifact.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        assert!(wrong_artifact.authority_denial().is_none());
+        let (uses_after_denial, operations_after_denial): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (uses_after_denial, operations_after_denial),
+            (consumed, operations)
+        );
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        let mut again = Vec::new();
+        replay.read_to_end(&mut again).unwrap();
+        assert_eq!(again, bytes);
+        let operation_count: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE task_id='T-candidate' AND effect_class='ARTIFACT_READ'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(operation_count, 1);
+    }
+
+    #[test]
+    fn fixture_expired_grant_denies_retained_bytes_and_new_admission() {
+        let case = authority_case("expired-grant");
+        assert_eq!(case["expected"], "DENY");
+        assert_eq!(case["facts"]["effective_grant_state"], "EXPIRED");
+        assert_eq!(
+            case["facts"]["expiry_evidence"],
+            "authenticated_expiry_latch"
+        );
+        let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, true);
+        let (issued, deadline): (i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT issued_monotonic_nanos,deadline_monotonic_nanos
+             FROM authority_grant_deadlines WHERE grant_id=?1",
+                [&grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let high_water: i64 = manager
+            .connection
+            .query_row(
+                "SELECT MAX(monotonic_nanos) FROM trusted_time_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let baseline = issued.max(high_water) + 1_000_000_000;
+        assert!(baseline < deadline);
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+            u64::try_from(baseline).unwrap(),
+        ));
+        manager.clock = Arc::new(FrozenWallClock {
+            monotonic: Arc::clone(&monotonic),
+        });
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        let position = reader.raw_position_for_test().unwrap();
+        let before_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        monotonic.store(u64::try_from(deadline + 1).unwrap(), Ordering::SeqCst);
+        let mut denied = [0xa5_u8; 1];
+        let error = reader.read(&mut denied).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let inner = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<TaskManagerError>()
+            .unwrap();
+        let denial = inner.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactRead);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(denied, [0xa5]);
+        assert_eq!(reader.raw_position_for_test().unwrap(), position);
+        let latched: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM authority_grant_expiry_latches WHERE grant_id=?1",
+                [&grant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latched, 1);
+        let persisted_state: String = manager
+            .connection
+            .query_row(
+                "SELECT state FROM authority_grants WHERE grant_id=?1",
+                [&grant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_state, case["facts"]["persisted_grant_state"]);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let after_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(after_denial, before_denial);
+    }
+
+    #[test]
+    fn classifier_failure_after_expiry_latch_keeps_durable_denial() {
+        for boundary in ["read", "open", "scope", "seek"] {
+            let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, true);
+            let (issued, deadline): (i64, i64) = manager
+                .connection
+                .query_row(
+                    "SELECT issued_monotonic_nanos,deadline_monotonic_nanos
+                 FROM authority_grant_deadlines WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let high_water: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT MAX(monotonic_nanos) FROM trusted_time_observations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let baseline = issued.max(high_water) + 1_000_000_000;
+            assert!(baseline < deadline);
+            let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+                u64::try_from(baseline).unwrap(),
+            ));
+            manager.clock = Arc::new(FrozenWallClock {
+                monotonic: Arc::clone(&monotonic),
+            });
+            let scope = manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&source))
+                .unwrap();
+            let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+            let mut delivered = [0_u8; 1];
+            assert_eq!(reader.read(&mut delivered).unwrap(), 1);
+            let position = reader.raw_position_for_test().unwrap();
+            let before: (i64, i64) = manager.connection.query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            monotonic.store(u64::try_from(deadline + 1).unwrap(), Ordering::SeqCst);
+            let classified = Arc::new(AtomicUsize::new(0));
+            let called = Arc::clone(&classified);
+            crate::artifact_store::set_read_grant_diagnostic_test_hook(move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                Err(TaskManagerError::InvalidRecord(
+                    "injected diagnostic failure",
+                ))
+            });
+            match boundary {
+                "read" => {
+                    let mut denied = [0xa5_u8; 1];
+                    let error = reader.read(&mut denied).unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert_eq!(denied, [0xa5]);
+                }
+                "open" => {
+                    let error = match manager.open_artifact_reader(&scope, &source) {
+                        Ok(_) => panic!("expired reader admission unexpectedly succeeded"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert!(error.authority_denial().is_none());
+                }
+                "scope" => {
+                    let error = manager
+                        .scope_artifact_reads(&session, std::slice::from_ref(&source))
+                        .unwrap_err();
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                    assert!(error.authority_denial().is_none());
+                }
+                "seek" => {
+                    let error = reader.seek(SeekFrom::Start(0)).unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(reader.raw_position_for_test().unwrap(), position);
+            assert_eq!(classified.load(Ordering::SeqCst), 1);
+            let latched: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM authority_grant_expiry_latches WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(latched, 1, "expiry latch must survive a failed diagnostic");
+            let after: (i64, i64) = manager.connection.query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn fixture_cancel_revokes_real_grant_and_retained_reader() {
+        let case = authority_case("revoked-grant-after-task-cancel");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, false);
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap();
+        let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        let position = reader.raw_position_for_test().unwrap();
+        let before_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let completed: i64 = manager.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE task_id='T-candidate'
+             AND effect_class='ARTIFACT_READ' AND state='SUCCEEDED' AND outcome_certainty='COMPLETED'
+             AND json_extract(external_receipt,'$.kind')='artifact-reader-admission-delivered'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(completed, 1);
+        let cancellation = manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: "transition:fixture-grant-cancel".into(),
+                task_id: "T-candidate".into(),
+                expected_revision: 3,
+                expected_state: TaskState::Runnable,
+                to_state: TaskState::Cancelled,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "TASK_CANCELLED".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(cancellation.applied, "{cancellation:?}");
+        assert_eq!(
+            manager
+                .get_task("T-candidate")
+                .unwrap()
+                .unwrap()
+                .state
+                .as_str(),
+            case["facts"]["task_state"]
+        );
+        let (state, reason, revoked_at): (String, Option<String>, Option<String>) = manager.connection.query_row(
+            "SELECT state,revocation_reason_code,revoked_at FROM authority_grants WHERE grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(state, case["facts"]["grant_state"]);
+        assert_eq!(reason.as_deref(), Some("AUTH_GRANT_REVOKED"));
+        assert!(revoked_at.is_some());
+        let mut denied = [0xa5_u8; 1];
+        let error = reader.read(&mut denied).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+        let inner = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<TaskManagerError>()
+            .unwrap();
+        let denial = inner.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactRead);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(denied, [0xa5]);
+        assert_eq!(reader.raw_position_for_test().unwrap(), position);
+        let error = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source))
+            .unwrap_err();
+        let denial = error.authority_denial().unwrap();
+        assert_eq!(denial.stage, AuthorityDenialStage::ArtifactAdmission);
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        let after_denial: (i64, i64) = manager.connection.query_row(
+            "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+             FROM authority_grants g WHERE g.grant_id=?1",
+            [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(after_denial, before_denial);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "follows one fixture claim through real admission, policy, grant, binding, and byte read"
+    )]
+    fn fixture_exact_local_read_allows_only_bound_imported_source() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("exact-local-artifact-read-allowed");
+        assert_eq!(case["expected"], "ALLOW");
+        let claim = case["facts"]["validated_semantic_request"]
+            .as_str()
+            .unwrap();
+        let (action, selector) = claim.split_once(' ').unwrap();
+        let principal = case["facts"]["principal"].as_str().unwrap();
+        let symbolic_uri = case["facts"]["resolved_resource"].as_str().unwrap();
+        let binding = case["facts"]["binding"].as_str().unwrap();
+        assert_eq!(case["facts"]["approval"], Value::Null);
+        assert_eq!(case["facts"]["policy"], "allow exact selected input");
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, Some(principal), false);
+        let bytes = b"fixture A17 local source";
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-A17".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(bytes),
+            )
+            .unwrap();
+        // A17 is a symbolic fixture URI. This public import is its concrete
+        // Task input; all runtime admission uses the returned Artifact ID.
+        assert_eq!(symbolic_uri, "artifact://A17");
+        assert_eq!(
+            source.uri.as_str(),
+            format!("artifact://{}", source.artifact_id)
+        );
+        manager
+            .create_task(&CreateTask {
+                task_id: "T-unbound".into(),
+                principal: Actor {
+                    kind: "user".into(),
+                    id: "user:test".into(),
+                },
+                workspace_id: None,
+                original_intent: "separate source".into(),
+                normalized_intent: None,
+                active_step_ids: vec![],
+            })
+            .unwrap();
+        let other = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-other".into()),
+                    task_id: "T-unbound".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"other source"),
+            )
+            .unwrap();
+        let program_json: String = manager.connection.query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-candidate' AND semantic_hash=?1",
+            [&hash], |row| row.get(0),
+        ).unwrap();
+        let program: Value = serde_json::from_str(&program_json).unwrap();
+        assert!(
+            program_node(&program, "copy").unwrap()["authority_requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|request| request["action"] == action && request["resource"] == selector)
+        );
+        let resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:fixture-A17");
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:fixture-A17",
+                binding_id: binding,
+                attempt_id: "attempt:fixture-A17",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:fixture-A17")
+            .unwrap();
+        let (decision_id, resolved, decision_principal, reason, approval): (String, String, String, String, Option<String>) =
+            manager.connection.query_row(
+                "SELECT d.decision_id,r.resolved_resource_id,d.principal_id,d.reason_codes_json,d.approval_request_id
+                 FROM authority_requests r JOIN policy_decisions d ON d.authority_request_id=r.request_id
+                 WHERE r.action=?1 AND r.semantic_selector=?2",
+                params![action, selector],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).unwrap();
+        assert_eq!(resolved, source.artifact_id);
+        assert_eq!(decision_principal, principal);
+        assert_eq!(approval, None);
+        let read = evaluated
+            .decisions
+            .iter()
+            .find(|d| d.decision_id == decision_id)
+            .unwrap();
+        assert_eq!(read.effect, PolicyEffect::Allow);
+        assert_eq!(read.reason_code, case["reason_code"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reason).unwrap(),
+            json!([case["reason_code"]])
+        );
+        let finalized = manager
+            .finalize_pending_authority_candidate("candidate:fixture-A17")
+            .unwrap();
+        assert_eq!(finalized.binding_id, binding);
+        assert_eq!(finalized.grant_ids.len(), 2);
+        let (grant_binding, grant_principal, grant_state): (String, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT g.execution_binding_id,g.principal_id,g.state FROM authority_grants g
+             WHERE g.policy_decision_id=?1",
+                [&decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                grant_binding.as_str(),
+                grant_principal.as_str(),
+                grant_state.as_str()
+            ),
+            (binding, principal, "ACTIVE")
+        );
+        let bound_principal: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM execution_bindings WHERE binding_id=?1",
+                [binding],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_principal, principal);
+        // Admission selected A17 while it was the unique semantic input. A
+        // later legitimate import into the same Task must not widen its grant.
+        let unselected = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-unselected".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Local,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"unselected same-task source"),
+            )
+            .unwrap();
+        for (id, revision, from, to) in [
+            (
+                "transition:fixture-A17-runnable",
+                2,
+                TaskState::Planning,
+                TaskState::Runnable,
+            ),
+            (
+                "transition:fixture-A17-running",
+                3,
+                TaskState::Runnable,
+                TaskState::Running,
+            ),
+        ] {
+            assert!(
+                manager
+                    .transition(&TransitionRequest {
+                        schema_version: "0.1".into(),
+                        transition_id: id.into(),
+                        task_id: "T-candidate".into(),
+                        expected_revision: revision,
+                        expected_state: from,
+                        to_state: to,
+                        requested_by: Actor {
+                            kind: "system-service".into(),
+                            id: "aiosd.coordinator".into()
+                        },
+                        reason: TransitionReason {
+                            code: "AUTHORITY_READY".into(),
+                            message: None,
+                            related_ids: vec![]
+                        },
+                        mutation: TaskMutation::default(),
+                    })
+                    .unwrap()
+                    .applied
+            );
+        }
+        let session = manager
+            .issue_provider_artifact_session("T-candidate", binding)
+            .unwrap();
+        assert!(
+            manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&other.artifact_id))
+                .is_err()
+        );
+        assert!(
+            manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&unselected.artifact_id))
+                .is_err()
+        );
+        let scope = manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&source.artifact_id))
+            .unwrap();
+        assert!(
+            manager
+                .open_artifact_reader(&scope, &other.artifact_id)
+                .is_err()
+        );
+        assert!(
+            manager
+                .open_artifact_reader(&scope, &unselected.artifact_id)
+                .is_err()
+        );
+        let mut reader = manager
+            .open_artifact_reader(&scope, &source.artifact_id)
+            .unwrap();
+        let mut delivered = Vec::new();
+        reader.read_to_end(&mut delivered).unwrap();
+        assert_eq!(delivered, bytes);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "follows one private fixture source and exact destination through evaluation and pending-approval denial"
+    )]
+    fn fixture_private_egress_requires_approval_before_any_export_authority() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("private-data-egress-requires-approval");
+        assert_eq!(case["expected"], "REQUIRE_APPROVAL");
+        let action = case["facts"]["action"].as_str().unwrap();
+        let symbolic_source = case["facts"]["resource"].as_str().unwrap();
+        let destination = case["facts"]["destination"].as_str().unwrap();
+        let sensitivity = case["facts"]["sensitivity"].as_str().unwrap();
+        assert_eq!(symbolic_source, "artifact://METRICS-92");
+        assert_eq!(sensitivity, "private");
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:fixture-METRICS-92".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"private METRICS-92"),
+            )
+            .unwrap();
+        assert_eq!(
+            source.uri.as_str(),
+            format!("artifact://{}", source.artifact_id)
+        );
+        manager
+            .register_trusted_export_service(destination, "fixture_remote", "adapter:memory")
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:fixture-METRICS-92");
+        resources.push(CandidateResourceChoice {
+            action: action.into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: destination.into(),
+                source_artifact_id: source.artifact_id.clone(),
+                operation_id: "export:fixture-METRICS-92".into(),
+                purpose: "fixture private analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:fixture-METRICS-92",
+                binding_id: "binding:fixture-METRICS-92",
+                attempt_id: "attempt:fixture-METRICS-92",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let pin = load_current_export_pin(&manager.connection, "candidate:fixture-METRICS-92")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.source_artifact_id, source.artifact_id);
+        assert_eq!(pin.service_id, destination);
+        assert_eq!(pin.sensitivity, sensitivity);
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:fixture-METRICS-92")
+            .unwrap();
+        let (decision_id, request_json, decision_json, approval_id): (String, String, String, String) =
+            manager.connection.query_row(
+                "SELECT d.decision_id,r.request_json,d.decision_json,d.approval_request_id
+                 FROM authority_requests r JOIN policy_decisions d ON d.authority_request_id=r.request_id
+                 WHERE r.action=?1 AND r.semantic_selector='destination:fixture_remote'",
+                [action], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+        let decision = evaluated
+            .decisions
+            .iter()
+            .find(|d| d.decision_id == decision_id)
+            .unwrap();
+        assert_eq!(decision.effect, PolicyEffect::RequireApproval);
+        assert_eq!(decision.reason_code, case["reason_code"]);
+        assert_eq!(decision.approval_id.as_deref(), Some(approval_id.as_str()));
+        let request: Value = serde_json::from_str(&request_json).unwrap();
+        let decided: Value = serde_json::from_str(&decision_json).unwrap();
+        assert_eq!(request["egress"]["service_id"], destination);
+        assert_eq!(request["egress"]["data_refs"], json!([source.artifact_id]));
+        assert_eq!(request["resource"]["sensitivity"], sensitivity);
+        assert_eq!(decided["decision"], case["expected"]);
+        assert_eq!(decided["reason_codes"], json!([case["reason_code"]]));
+        assert_eq!(
+            decided["resource"]["external_export"]["source_artifact_id"],
+            source.artifact_id
+        );
+        let (status, prompt_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT status,request_json FROM approval_requests WHERE approval_id=?1",
+                [&approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "PENDING");
+        let prompt: Value = serde_json::from_str(&prompt_json).unwrap();
+        assert_eq!(prompt["destination"]["service_id"], destination);
+        assert_eq!(prompt["export"]["source_artifact_id"], source.artifact_id);
+        assert_eq!(prompt["resource"]["sensitivity"], sensitivity);
+        assert_eq!(prompt["policy_reason_codes"], json!([case["reason_code"]]));
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:fixture-METRICS-92")
+                .is_err()
+        );
+        assert!(
+            manager
+                .issue_provider_artifact_session("T-candidate", "binding:fixture-METRICS-92")
+                .is_err()
+        );
+        for (table, predicate) in [
+            (
+                "authority_grants",
+                "execution_binding_id='binding:fixture-METRICS-92'",
+            ),
+            (
+                "execution_bindings",
+                "binding_id='binding:fixture-METRICS-92'",
+            ),
+            (
+                "artifact_output_allocations",
+                "allocation_id='allocation:fixture-METRICS-92'",
+            ),
+            ("operations", "operation_id='export:fixture-METRICS-92'"),
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} escaped pending approval");
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "creates a real approved exact-export candidate for stale-claim fixtures"
+    )]
+    fn approved_export_claim_fixture(
+        reactivate: bool,
+    ) -> (TaskManager, String, String, String, String, String) {
+        use crate::authority_policy::AuthenticatedApprover;
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, false);
+        let source = manager
+            .import_artifact(
+                &ImportArtifactRequest {
+                    schema_version: "0.1".into(),
+                    import_id: Some("import:stale-approval-source".into()),
+                    task_id: "T-candidate".into(),
+                    origin_kind: ArtifactOriginKind::User,
+                    semantic_type: Some("artifact.file@1".into()),
+                    media_type: "text/plain".into(),
+                    format: None,
+                    sensitivity: Sensitivity::Private,
+                    retention: RetentionClass::Task,
+                    expires_at: None,
+                    labels: vec![],
+                    max_size_bytes: Some(1024),
+                },
+                &mut Cursor::new(b"private stale approval source"),
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://model/fixture-remote",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        manager
+            .register_trusted_export_service(
+                "service://model/other-remote",
+                "fixture_remote",
+                "adapter:memory",
+            )
+            .unwrap();
+        let mut resources =
+            choices_with_source_and_output(&source.artifact_id, "allocation:stale-old");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: "service://model/fixture-remote".into(),
+                source_artifact_id: source.artifact_id.clone(),
+                operation_id: "export:stale-old".into(),
+                purpose: "fixture analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:stale-old",
+                binding_id: "binding:stale-old",
+                attempt_id: "attempt:stale-old",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        if reactivate {
+            manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                {"effect":"ALLOW","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+            ]}).to_string().as_bytes()).unwrap();
+            let initial = manager
+                .evaluate_pending_authority_candidate("candidate:stale-old")
+                .unwrap();
+            assert!(initial.decisions.iter().any(|decision| {
+                decision.action == "data.egress"
+                    && decision.effect == crate::authority_policy::PolicyEffect::Allow
+            }));
+            manager.clock = Arc::new(ApprovalReactivationClock);
+        }
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let evaluated = manager
+            .evaluate_pending_authority_candidate("candidate:stale-old")
+            .unwrap();
+        let approval = evaluated
+            .decisions
+            .iter()
+            .find(|decision| decision.action == "data.egress")
+            .unwrap()
+            .approval_id
+            .clone()
+            .unwrap();
+        assert!(
+            manager
+                .transition(&TransitionRequest {
+                    schema_version: "0.1".into(),
+                    transition_id: "transition:stale-waiting".into(),
+                    task_id: "T-candidate".into(),
+                    expected_revision: 2,
+                    expected_state: TaskState::Planning,
+                    to_state: TaskState::WaitingForAuth,
+                    requested_by: Actor {
+                        kind: "system-service".into(),
+                        id: "aiosd.coordinator".into()
+                    },
+                    reason: TransitionReason {
+                        code: "APPROVAL_REQUIRED".into(),
+                        message: None,
+                        related_ids: vec![approval.clone()]
+                    },
+                    mutation: TaskMutation {
+                        waiting_on: Some(vec![WaitingOn {
+                            kind: WaitingKind::Approval,
+                            id: approval.clone(),
+                            message: None,
+                        }]),
+                        ..TaskMutation::default()
+                    },
+                })
+                .unwrap()
+                .applied
+        );
+        manager
+            .decide_candidate_approval(
+                &approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        (
+            manager,
+            hash,
+            snapshot,
+            registration,
+            source.artifact_id,
+            approval,
+        )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises both exact approval application and same-class service substitution"
+    )]
+    fn fixture_approval_stale_after_destination_change() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("approval-stale-after-destination-change");
+        assert_eq!(case["expected"], "DENY");
+        let (mut manager, hash, snapshot, registration, source, approval) =
+            approved_export_claim_fixture(false);
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        let accepted = exact
+            .decisions
+            .iter()
+            .find(|d| d.action == "data.egress")
+            .unwrap();
+        assert_eq!(accepted.effect, PolicyEffect::Allow);
+        assert_eq!(accepted.approval_id.as_deref(), Some(approval.as_str()));
+        let approved_pin = load_current_export_pin(&manager.connection, "candidate:stale-old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case["facts"]["approved_destination"],
+            approved_pin.service_id
+        );
+        let approved_prompt: String = manager
+            .connection
+            .query_row(
+                "SELECT request_json FROM approval_requests WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let approved_prompt: serde_json::Value = serde_json::from_str(&approved_prompt).unwrap();
+        assert_eq!(
+            approved_prompt["destination"]["service_id"],
+            approved_pin.service_id
+        );
+        let changed_service = case["facts"]["runtime_destination"].as_str().unwrap();
+        let mut resources = choices_with_source_and_output(&source, "allocation:stale-new");
+        resources.push(CandidateResourceChoice {
+            action: "data.egress".into(),
+            semantic_selector: "destination:fixture_remote".into(),
+            handle: CandidateResourceHandle::ExternalExport {
+                service_id: changed_service.into(),
+                source_artifact_id: source.clone(),
+                operation_id: "export:stale-new".into(),
+                purpose: "fixture analysis".into(),
+                max_size_bytes: 1024,
+            },
+        });
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:stale-new",
+                binding_id: "binding:stale-new",
+                attempt_id: "attempt:stale-new",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 2,
+                resources: &resources,
+            })
+            .unwrap();
+        let pin = load_current_export_pin(&manager.connection, "candidate:stale-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.service_id, changed_service);
+        assert_ne!(pin.service_id, approved_pin.service_id);
+        assert_eq!(pin.destination_class, "fixture_remote");
+        let authority_rows = |manager: &TaskManager| -> Vec<i64> {
+            [
+                "authority_requests",
+                "policy_decisions",
+                "approval_requests",
+                "authority_approval_bindings",
+                "authority_evaluation_fingerprints",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .iter()
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+        };
+        let before_claim = authority_rows(&manager);
+        let invalid = manager
+            .apply_candidate_approval_claim("candidate:stale-new", "approval:unknown")
+            .unwrap_err();
+        assert!(invalid.authority_denial().is_none());
+        let stale = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert_eq!(
+            stale.to_string(),
+            "authority approval application is not admissible"
+        );
+        let denial = stale.authority_denial().unwrap();
+        assert_eq!(
+            denial.stage,
+            crate::AuthorityDenialStage::ApprovalApplication
+        );
+        assert_eq!(denial.reason.code(), case["reason_code"]);
+        assert_eq!(authority_rows(&manager), before_claim);
+        let (revision, snapshot_id, snapshot_json): (i64, String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.revision,a.content_hash,p.snapshot_json
+                 FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let malformed_snapshot = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(malformed_snapshot.authority_denial().is_none());
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                params![snapshot_id, snapshot_json],
+            )
+            .unwrap();
+        // The activation table itself refuses a late timestamp rewrite; the
+        // verifier still checks the temporal relation if evidence is imported.
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_policy_activations SET activated_at='2026-09-19T00:05:00Z'
+             WHERE revision=?1",
+                    [revision],
+                )
+                .is_err()
+        );
+        assert_eq!(authority_rows(&manager), before_claim);
+        for (table, predicate) in [
+            (
+                "authority_grants",
+                "execution_binding_id='binding:stale-new'",
+            ),
+            ("execution_bindings", "binding_id='binding:stale-new'"),
+            ("operations", "operation_id='export:stale-new'"),
+            (
+                "artifact_output_allocations",
+                "allocation_id='allocation:stale-new'",
+            ),
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} escaped stale approval denial");
+        }
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+            {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        // The old approval is genuine, but the newly active policy must also
+        // be authenticated before a changed destination can be called stale.
+        let (current_snapshot_id, current_snapshot_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.content_hash,p.snapshot_json FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(current_snapshot_id, snapshot_id);
+        let before_corruption = authority_rows(&manager);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        let malformed_current = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(malformed_current.authority_denial().is_none());
+        assert_eq!(authority_rows(&manager), before_corruption);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                params![current_snapshot_id, current_snapshot_json],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "CREATE TEMP TABLE saved_current_policy_snapshot AS
+                 SELECT * FROM policy_snapshots WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM policy_snapshots WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        let missing_current = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(missing_current.authority_denial().is_none());
+        assert_eq!(authority_rows(&manager), before_corruption);
+        manager
+            .connection
+            .execute(
+                "INSERT INTO policy_snapshots SELECT * FROM saved_current_policy_snapshot",
+                [],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute("DROP TABLE saved_current_policy_snapshot", [])
+            .unwrap();
+        let denied = manager
+            .evaluate_pending_authority_candidate("candidate:stale-new")
+            .unwrap();
+        let egress = denied
+            .decisions
+            .iter()
+            .find(|decision| decision.action == "data.egress")
+            .unwrap();
+        assert_eq!(egress.effect, PolicyEffect::Deny);
+        assert_eq!(egress.reason_code, "AUTH_DENY_POLICY");
+        assert!(
+            manager
+                .apply_candidate_approval_claim("candidate:stale-new", &approval)
+                .is_err()
+        );
+        manager
+            .revoke_candidate_approval(
+                &approval,
+                &crate::authority_policy::AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+            )
+            .unwrap();
+        let withdrawn: Option<String> = manager
+            .connection
+            .query_row(
+                "SELECT revoked_at FROM authority_approval_bindings WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(withdrawn.is_some());
+        let withdrawn_claim = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(withdrawn_claim.authority_denial().is_none());
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:stale-new")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_approved_claim_is_generic_and_creates_no_authority() {
+        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture(false);
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        assert!(exact.decisions.iter().any(|decision| {
+            decision.action == "data.egress"
+                && decision.effect == crate::authority_policy::PolicyEffect::Allow
+                && decision.approval_id.as_deref() == Some(approval.as_str())
+        }));
+        let expires_at: String = manager
+            .connection
+            .query_row(
+                "SELECT expires_at FROM approval_requests WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expiry = time::OffsetDateTime::parse(
+            &expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let advanced = time::OffsetDateTime::parse(
+            &ApprovalExpiredClock.now(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(expiry < advanced);
+        let before: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        manager.clock = Arc::new(ApprovalExpiredClock);
+        let error = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap_err();
+        assert!(error.authority_denial().is_none());
+        let after: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn approval_after_policy_reactivation_uses_initial_decision_time() {
+        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture(true);
+        let (requested_at, created_at, activated_at, revision): (String, String, String, i64) =
+            manager
+                .connection
+                .query_row(
+                    "SELECT r.requested_at,a.created_at,p.activated_at,p.revision
+                     FROM approval_requests a
+                     JOIN authority_requests r ON r.request_id=a.authority_request_id
+                     JOIN authority_approval_bindings b ON b.approval_id=a.approval_id
+                     JOIN authority_policy_activations p ON p.revision=b.activation_revision
+                     WHERE a.approval_id=?1",
+                    [&approval],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(requested_at, NOW);
+        assert_eq!(created_at, ApprovalReactivationClock.now());
+        assert!(requested_at < activated_at);
+        assert!(activated_at <= created_at);
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        assert!(exact.decisions.iter().any(|decision| {
+            decision.action == "data.egress"
+                && decision.effect == crate::authority_policy::PolicyEffect::Allow
+                && decision.approval_id.as_deref() == Some(approval.as_str())
+        }));
+        let before: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // Activation provenance is immutable. Even if the accompanying
+        // snapshot claims a later creation, the approval is no longer sound.
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_policy_activations SET activated_at='2026-09-19T00:20:00Z'
+             WHERE revision=?1",
+                    [revision],
+                )
+                .is_err()
+        );
+        let snapshot_id: String = manager
+            .connection
+            .query_row(
+                "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
+                [revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET created_at='2026-09-19T00:20:00Z'
+             WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let late = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap_err();
+        assert!(late.authority_denial().is_none());
+        let after: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "loads fixture facts and proves the full authority boundary has no side effects"
+    )]
+    fn fixture_undeclared_network_claim_is_typed_denial_before_any_authority() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../examples/authority/authority-cases.json"
+        ))
+        .unwrap();
+        let matching: Vec<&Value> = cases
+            .iter()
+            .filter(|case| case["name"] == "provider-invents-network-action-not-in-semantic-ir")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let case = matching[0];
+        assert_eq!(case["expected"], "DENY");
+        let semantic_claim = case["facts"]["validated_semantic_request"]
+            .as_str()
+            .unwrap();
+        let runtime_claim = case["facts"]["runtime_request"].as_str().unwrap();
+        let principal = case["facts"]["principal"].as_str().unwrap();
+        let (semantic_action, semantic_selector) = semantic_claim.split_once(' ').unwrap();
+        let (runtime_action, runtime_service) = runtime_claim.split_once(' ').unwrap();
+        assert_eq!(runtime_action, "network.connect");
+        assert!(runtime_service.starts_with("service://"));
+
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, false, false, Some(principal), true);
+        let registered_principal: String = manager
+            .connection
+            .query_row(
+                "SELECT provider_id FROM provider_registrations WHERE registration_id=?1",
+                [&registration],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered_principal, principal);
+        let program_json: String = manager.connection.query_row(
+            "SELECT program_json FROM semantic_program_revisions WHERE task_id='T-candidate' AND semantic_hash=?1",
+            [&hash], |row| row.get(0),
+        ).unwrap();
+        let program: Value = serde_json::from_str(&program_json).unwrap();
+        let node = program_node(&program, "copy").unwrap();
+        let declared = node["authority_requests"].as_array().unwrap();
+        assert!(declared.iter().any(|claim| {
+            claim["action"] == semantic_action && claim["resource"] == semantic_selector
+        }));
+        assert!(
+            !declared
+                .iter()
+                .any(|claim| claim["action"] == runtime_action)
+        );
+
+        let authority_counts = |manager: &TaskManager| {
+            [
+                "authority_candidate_reservations",
+                "authority_candidate_resources",
+                "policy_decisions",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before = authority_counts(&manager);
+        let mut choices = choices();
+        choices.push(CandidateResourceChoice {
+            action: runtime_action.to_owned(),
+            semantic_selector: runtime_service.to_owned(),
+            handle: CandidateResourceHandle::NetworkService {
+                service_id: runtime_service.to_owned(),
+            },
+        });
+        let error = manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:undeclared-network",
+                binding_id: "binding:undeclared-network",
+                attempt_id: "attempt:undeclared-network",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract_hash(&manager, &snapshot),
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices,
+            })
+            .unwrap_err();
+        let denial = error
+            .authority_denial()
+            .expect("reservation emitted a typed diagnostic");
+        assert_eq!(denial.stage, AuthorityDenialStage::CandidateReservation);
+        assert_eq!(
+            denial.reason,
+            AuthorityDenialReason::SemanticRequestMismatch
+        );
+        assert_eq!(case["reason_code"], denial.reason.code());
+        assert_catalog_reason(denial.reason.code());
+        assert_eq!(
+            error.to_string(),
+            "authority candidate reservation is not admissible"
+        );
+        let after = authority_counts(&manager);
+        assert_eq!(
+            after, before,
+            "denial cannot reserve or issue authority or an effect"
+        );
+    }
+
+    #[test]
+    fn undeclared_network_claim_on_existing_candidate_is_typed_denial() {
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        let mut choices = choices();
+        manager
+            .reserve_authority_candidate(&replay_network_request(
+                &hash,
+                &snapshot,
+                &contract,
+                &registration,
+                &choices,
+            ))
+            .unwrap();
+        let counts = |manager: &TaskManager| {
+            [
+                "authority_candidate_reservations",
+                "authority_candidate_resources",
+                "policy_decisions",
+                "authority_grants",
+                "execution_bindings",
+                "operations",
+            ]
+            .map(|table| {
+                manager
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before = counts(&manager);
+        choices.push(CandidateResourceChoice {
+            action: "network.connect".into(),
+            semantic_selector: "service://unrequested".into(),
+            handle: CandidateResourceHandle::NetworkService {
+                service_id: "service://unrequested".into(),
+            },
+        });
+        let error = manager
+            .reserve_authority_candidate(&replay_network_request(
+                &hash,
+                &snapshot,
+                &contract,
+                &registration,
+                &choices,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.authority_denial(),
+            Some(AuthorityDenial {
+                stage: AuthorityDenialStage::CandidateReservation,
+                reason: AuthorityDenialReason::SemanticRequestMismatch,
+            })
+        );
+        assert_eq!(counts(&manager), before);
+    }
+
+    fn replay_network_request<'a>(
+        hash: &'a str,
+        snapshot: &'a str,
+        contract: &'a str,
+        registration: &'a str,
+        resources: &'a [CandidateResourceChoice],
+    ) -> ReserveAuthorityCandidate<'a> {
+        ReserveAuthorityCandidate {
+            candidate_id: "candidate:replay-network",
+            binding_id: "binding:replay-network",
+            attempt_id: "attempt:replay-network",
+            task_id: "T-candidate",
+            semantic_program_hash: hash,
+            registry_snapshot_id: snapshot,
+            node_id: "copy",
+            capability_contract_hash: contract,
+            provider_registration_id: registration,
+            attempt_number: 1,
+            resources,
+        }
     }
 
     fn choices_with_source(artifact_id: &str) -> Vec<CandidateResourceChoice> {
@@ -2182,7 +4347,8 @@ mod tests {
                 self.flush()
             }
         }
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, true);
         let bytes = b"private fixture export";
         let imported = manager
             .import_artifact(
@@ -2381,6 +4547,7 @@ mod tests {
             .unwrap();
         assert_eq!(evaluated.decisions.len(), 3);
         assert_eq!(evaluated.decisions[2].effect, PolicyEffect::RequireApproval);
+        assert_eq!(evaluated.decisions[2].reason_code, "AUTH_REQUIRE_APPROVAL");
         let approval = evaluated.decisions[2].approval_id.as_deref().unwrap();
         manager
             .transition(&TransitionRequest {
@@ -2627,7 +4794,8 @@ mod tests {
         use crate::authority_policy::AuthenticatedApprover;
         let directory = tempdir().unwrap();
         let path = directory.path().join("exact-export.sqlite3");
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(Some(&path), true, true);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(Some(&path), true, true, None, true);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -2792,7 +4960,8 @@ mod tests {
     )]
     fn pending_exact_export_fixture() -> (TaskManager, String) {
         use crate::authority_policy::AuthenticatedApprover;
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, true, None, true);
         let imported = manager
             .import_artifact(
                 &ImportArtifactRequest {
@@ -2956,7 +5125,8 @@ mod tests {
     fn retained_exact_export_denies_changed_service_approval_policy_or_read_grant() {
         use crate::authority_policy::AuthenticatedApprover;
         for scenario in ["service", "approval", "policy", "read-grant"] {
-            let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, true);
+            let (mut manager, hash, snapshot, registration) =
+                fixture_at_mode(None, true, true, None, true);
             let imported = manager
                 .import_artifact(
                     &ImportArtifactRequest {
@@ -3741,10 +5911,327 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "keeps the real outage lifecycle and issuance assertions together"
+    )]
+    fn policy_engine_outage_denies_real_candidate_and_cannot_finalize_prior_allow() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("policy-engine-unavailable-fails-closed");
+        assert_eq!(case["expected"], "DENY");
+        assert_eq!(case["reason_code"], "AUTH_POLICY_ENGINE_UNAVAILABLE");
+        assert_eq!(case["facts"]["protected_action"], "artifact.write");
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("policy-engine-outage.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let resources = choices();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:policy-outage",
+                binding_id: "binding:policy-outage",
+                attempt_id: "attempt:policy-outage",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let policy = json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]});
+        let revision = manager
+            .activate_local_authority_policy(policy.to_string().as_bytes())
+            .unwrap();
+        let healthy = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(healthy.activation_revision, revision);
+        assert!(
+            healthy
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Allow)
+        );
+        manager.stop_local_policy_backend();
+        let snapshot_id: String = manager
+            .connection
+            .query_row(
+                "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
+                [revision],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let snapshot_json: String = manager
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM policy_snapshots WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:policy-outage")
+                .is_err(),
+            "invalid snapshot evidence must not be reported as backend outage"
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?1 WHERE snapshot_id=?2",
+                params![snapshot_json, snapshot_id],
+            )
+            .unwrap();
+        let denied = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(denied.activation_revision, revision);
+        assert_eq!(denied.decisions.len(), healthy.decisions.len());
+        for (before, outage) in healthy.decisions.iter().zip(&denied.decisions) {
+            assert_eq!(outage.effect, PolicyEffect::Deny);
+            assert_eq!(outage.reason_code, "AUTH_POLICY_ENGINE_UNAVAILABLE");
+            assert_ne!(before.decision_id, outage.decision_id);
+            assert_eq!(before.authority_request_id, outage.authority_request_id);
+            assert_policy_decision_reason(
+                &manager,
+                &outage.decision_id,
+                "DENY",
+                "AUTH_POLICY_ENGINE_UNAVAILABLE",
+            );
+        }
+        assert_eq!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:policy-outage")
+                .unwrap(),
+            denied
+        );
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:policy-outage")
+                .is_err()
+        );
+        for table in [
+            "authority_grants",
+            "authority_issuance_receipts",
+            "execution_bindings",
+            "step_executions",
+            "artifact_output_allocations",
+            "approval_requests",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must remain empty during outage");
+        }
+        let state: String = manager.connection.query_row(
+            "SELECT state FROM authority_candidate_status WHERE candidate_id='candidate:policy-outage'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "PENDING");
+        manager.restart_local_policy_backend();
+        let recovered = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(recovered, healthy);
+        for outage in &denied.decisions {
+            assert_policy_decision_reason(
+                &manager,
+                &outage.decision_id,
+                "DENY",
+                "AUTH_POLICY_ENGINE_UNAVAILABLE",
+            );
+        }
+        let issued = manager
+            .finalize_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(issued.grant_ids.len(), healthy.decisions.len());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps historical approval, outage denial, and recovery evidence in one lifecycle"
+    )]
+    fn approved_candidate_cannot_issue_while_policy_engine_is_stopped() {
+        use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:approved-outage",
+                binding_id: "binding:approved-outage",
+                attempt_id: "attempt:approved-outage",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let initial = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        let approval_id = initial.decisions[1].approval_id.as_deref().unwrap();
+        manager
+            .decide_candidate_approval(
+                approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let approved = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert!(
+            approved
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Allow)
+        );
+        manager.stop_local_policy_backend();
+        let (snapshot_id, snapshot_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.content_hash,p.snapshot_json FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let corrupt_history = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", approval_id)
+            .unwrap_err();
+        assert!(corrupt_history.authority_denial().is_none());
+        let outage_before_restore: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM policy_decisions
+                 WHERE reason_codes_json LIKE '%AUTH_POLICY_ENGINE_UNAVAILABLE%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outage_before_restore, 0);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                rusqlite::params![snapshot_id, snapshot_json],
+            )
+            .unwrap();
+        let unknown_claim = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", "approval:unknown")
+            .unwrap_err();
+        assert!(unknown_claim.authority_denial().is_none());
+        let claimed_outage = manager
+            .apply_candidate_approval_claim("candidate:approved-outage", approval_id)
+            .expect("a genuine approved claim must reach current outage evaluation");
+        assert!(claimed_outage.decisions.iter().all(|d| {
+            d.effect == PolicyEffect::Deny
+                && d.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+                && d.approval_id.is_none()
+        }));
+        for decision in &claimed_outage.decisions {
+            let (effect, reasons): (String, String) = manager
+                .connection
+                .query_row(
+                    "SELECT decision,reason_codes_json FROM policy_decisions WHERE decision_id=?1",
+                    [&decision.decision_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(effect, "DENY");
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&reasons).unwrap(),
+                vec!["AUTH_POLICY_ENGINE_UNAVAILABLE".to_owned()]
+            );
+        }
+        let outage = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert_eq!(claimed_outage, outage);
+        assert!(
+            outage
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Deny
+                    && d.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+                    && d.approval_id.is_none())
+        );
+        assert_ne!(
+            approved.decisions[1].decision_id,
+            outage.decisions[1].decision_id
+        );
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:approved-outage")
+                .is_err()
+        );
+        for table in [
+            "authority_grants",
+            "authority_issuance_receipts",
+            "execution_bindings",
+            "step_executions",
+            "artifact_output_allocations",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must remain empty during outage");
+        }
+        manager.restart_local_policy_backend();
+        assert_eq!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:approved-outage")
+                .unwrap(),
+            approved
+        );
+        let issued = manager
+            .finalize_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert_eq!(issued.grant_ids.len(), approved.decisions.len());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "keeps the full approval lifecycle and non-executable assertions together"
     )]
     fn policy_evaluation_approval_replay_and_hard_deny_do_not_issue_authority() {
         use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
+        let deny_case = authority_case("explicit-policy-deny-cannot-be-overridden-by-approval");
+        assert_eq!(deny_case["expected"], "DENY");
+        assert_eq!(deny_case["facts"]["policy"], "hard deny");
+        assert_eq!(deny_case["facts"]["approval_record_present"], true);
         let (mut manager, hash, snapshot, registration) = fixture();
         let resources = choices();
         let contract = contract_hash(&manager, &snapshot);
@@ -3819,6 +6306,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![PolicyEffect::Allow, PolicyEffect::RequireApproval]
         );
+        assert_eq!(initial.decisions[0].reason_code, "AUTH_ALLOW");
+        assert_eq!(initial.decisions[1].reason_code, "AUTH_REQUIRE_APPROVAL");
         assert_policy_decision_reason(
             &manager,
             &initial.decisions[0].decision_id,
@@ -3994,6 +6483,17 @@ mod tests {
             fresh.decisions[1].approval_id,
             initial.decisions[1].approval_id
         );
+        let fresh_approval = fresh.decisions[1].approval_id.as_deref().unwrap();
+        manager
+            .decide_candidate_approval(
+                fresh_approval,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        assert!(crate::approval_not_withdrawn(&manager.connection, Some(fresh_approval)).unwrap());
         let denied = json!({"schema_version":"0.1","rules":[
             {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
             {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
@@ -4002,20 +6502,42 @@ mod tests {
         manager
             .activate_local_authority_policy(denied.to_string().as_bytes())
             .unwrap();
+        assert!(crate::approval_not_withdrawn(&manager.connection, Some(fresh_approval)).unwrap());
         let hard = manager
             .evaluate_pending_authority_candidate("candidate:policy")
             .unwrap();
         assert_eq!(hard.decisions[1].effect, PolicyEffect::Deny);
+        assert_eq!(
+            hard.decisions[1].authority_request_id,
+            fresh.decisions[1].authority_request_id
+        );
+        assert_eq!(hard.decisions[1].reason_code, deny_case["reason_code"]);
         assert_policy_decision_reason(
             &manager,
             &hard.decisions[1].decision_id,
             "DENY",
-            "AUTH_DENY_POLICY",
+            deny_case["reason_code"].as_str().unwrap(),
         );
+        let approved_record_count: i64 = manager
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM approval_decisions WHERE approval_id=?1 AND decision='APPROVE'",
+                [fresh_approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved_record_count, 1);
+        let grant_count: i64 = manager
+            .connection
+            .query_row("SELECT COUNT(*) FROM authority_grants", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(grant_count, 0, "hard deny cannot issue a grant");
         assert!(
             manager
                 .decide_candidate_approval(
-                    approval,
+                    fresh_approval,
                     &AuthenticatedApprover {
                         principal_id: "user:test"
                     },
@@ -5779,7 +8301,8 @@ mod tests {
         reason = "proves coordinator grant admission, active use, and durable expiry under one frozen wall fixture"
     )]
     fn run_frozen_wall_coordinator_grant(expire_before_running: bool) {
-        let (mut manager, hash, snapshot, registration) = fixture_at_mode(None, true, false);
+        let (mut manager, hash, snapshot, registration) =
+            fixture_at_mode(None, true, false, None, true);
         let contract = contract_hash(&manager, &snapshot);
         manager
             .reserve_authority_candidate(&ReserveAuthorityCandidate {
