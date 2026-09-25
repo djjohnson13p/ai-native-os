@@ -361,8 +361,118 @@ fn restarted_export_requires_fresh_approval_and_replays_exact_wait() {
         .unwrap();
     assert_eq!(exact.approval_ids(), prepared.approval_ids());
     assert_eq!(state(&coordinator), before_retry);
+    coordinator.manager.stop_local_policy_backend();
+    assert_eq!(
+        coordinator
+            .approval_prompt(&prepared, approval_id, "user:test")
+            .unwrap(),
+        prompt
+    );
+    assert!(
+        coordinator
+            .decide_approval(&prepared, "user:test", true)
+            .is_err()
+    );
     assert!(coordinator.start_local_export(&prepared).is_err());
     assert_eq!(state(&coordinator)[2], 0);
+    assert_eq!(state(&coordinator)[7], before_retry[7]);
+    // Simulate corruption below the immutable SQL guard and prove that the
+    // read-only prompt path still authenticates the sealed historical bytes.
+    let sealed_prompt: String = coordinator
+        .manager
+        .connection
+        .query_row(
+            "SELECT request_json FROM approval_requests WHERE approval_id=?1",
+            [approval_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let prompt_trigger: String = coordinator.manager.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='authority_approval_request_immutable'",
+        [], |row| row.get(0),
+    ).unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute_batch("DROP TRIGGER authority_approval_request_immutable")
+        .unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute(
+            "UPDATE approval_requests SET request_json='{}' WHERE approval_id=?1",
+            [approval_id],
+        )
+        .unwrap();
+    let bad_prompt = coordinator
+        .approval_prompt(&prepared, approval_id, "user:test")
+        .unwrap_err();
+    assert!(bad_prompt.authority_denial().is_none());
+    coordinator
+        .manager
+        .connection
+        .execute(
+            "UPDATE approval_requests SET request_json=?2 WHERE approval_id=?1",
+            rusqlite::params![approval_id, sealed_prompt],
+        )
+        .unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute_batch(&prompt_trigger)
+        .unwrap();
+    let (policy_hash, policy_json): (String, String) = coordinator
+        .manager
+        .connection
+        .query_row(
+            "SELECT p.content_hash,p.policy_json FROM authority_policy_payloads p
+         JOIN authority_policy_activations a ON a.content_hash=p.content_hash
+         ORDER BY a.revision DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let policy_trigger: String = coordinator.manager.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='authority_policy_payload_no_update'",
+        [], |row| row.get(0),
+    ).unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute_batch("DROP TRIGGER authority_policy_payload_no_update")
+        .unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute(
+            "UPDATE authority_policy_payloads SET policy_json='{}' WHERE content_hash=?1",
+            [&policy_hash],
+        )
+        .unwrap();
+    let bad_policy = coordinator
+        .approval_prompt(&prepared, approval_id, "user:test")
+        .unwrap_err();
+    assert!(bad_policy.authority_denial().is_none());
+    coordinator
+        .manager
+        .connection
+        .execute(
+            "UPDATE authority_policy_payloads SET policy_json=?2 WHERE content_hash=?1",
+            rusqlite::params![policy_hash, policy_json],
+        )
+        .unwrap();
+    coordinator
+        .manager
+        .connection
+        .execute_batch(&policy_trigger)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .approval_prompt(&prepared, approval_id, "user:test")
+            .unwrap(),
+        prompt
+    );
+    coordinator.manager.restart_local_policy_backend();
     coordinator
         .decide_approval(&prepared, "user:test", true)
         .unwrap();

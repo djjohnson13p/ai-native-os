@@ -1661,7 +1661,8 @@ impl TaskManager {
     /// sidecars, candidate membership, current policy, and authenticated owner.
     #[allow(
         clippy::type_complexity,
-        reason = "single sealed approval row binds all prompt facts"
+        clippy::too_many_lines,
+        reason = "single sealed approval row and historical policy bind all prompt facts"
     )]
     pub(crate) fn candidate_approval_prompt(
         &self,
@@ -1740,7 +1741,13 @@ impl TaskManager {
                     .iter()
                     .find(|r| r.action == action && r.selector == selector && r.id == id)
                     .ok_or_else(reject)?;
-                if self.local_policy_backend.decide(
+                // This is read-only authentication of the already sealed
+                // approval condition. Current evaluation and issuance still
+                // call the lifecycle-owned backend and fail closed if absent.
+                if (DeterministicEvaluator {
+                    max_rules: LOCAL_POLICY_RULE_LIMIT,
+                })
+                .decide(
                     &policy,
                     &resource.action,
                     &resource.kind,

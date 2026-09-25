@@ -1005,6 +1005,39 @@ impl TrustedLocalCoordinator {
             .open_artifact_reader(&scope, &admitted.source_artifact_id)
     }
 
+    /// Launches a finalized local export without opening a destination or
+    /// consuming its one-shot Artifact read grant. A provider may then present
+    /// its admitted binding claim to the Artifact service.
+    ///
+    /// # Errors
+    /// Returns an error if the handle, pinned service, current binding, read
+    /// grant, or guarded Task transition is no longer valid.
+    pub fn launch_local_export(&mut self, execution: &LocalExportExecution) -> Result<()> {
+        let prepared = &execution.prepared;
+        self.verify_handle(prepared)?;
+        let service = self
+            .services
+            .get(&prepared.service_id)
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let pin = load_current_export_pin(&self.manager.connection, &prepared.candidate_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if pin.service_id != prepared.service_id
+            || pin.adapter_id != service.adapter_id
+            || pin.source_artifact_id != prepared.source_artifact_id
+            || pin.operation_id != prepared.operation_id
+            || pin.purpose != prepared.purpose
+            || pin.max_size_bytes != prepared.max_size_bytes
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let session = self
+            .manager
+            .issue_provider_artifact_session(&prepared.task_id, &prepared.binding_id)?;
+        self.manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&prepared.source_artifact_id))?;
+        self.transition_export_running(prepared)
+    }
+
     /// Transfers a pinned source into the sealed process-local memory sink.
     /// The caller cannot select a writer, destination class, or adapter identity.
     ///
@@ -1062,35 +1095,7 @@ impl TrustedLocalCoordinator {
                 })
             },
         )?;
-        let task = self
-            .manager
-            .get_task(&prepared.task_id)?
-            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-        if task.state == TaskState::Runnable {
-            let running = self.manager.transition(&TransitionRequest {
-                schema_version: "0.1".into(),
-                transition_id: format!("transition:export-running:{}", prepared.candidate_id),
-                task_id: prepared.task_id.clone(),
-                expected_revision: task.revision,
-                expected_state: TaskState::Runnable,
-                to_state: TaskState::Running,
-                requested_by: Actor {
-                    kind: "system-service".into(),
-                    id: "aiosd.coordinator".into(),
-                },
-                reason: TransitionReason {
-                    code: "AUTHORITY_READY".into(),
-                    message: None,
-                    related_ids: vec![],
-                },
-                mutation: TaskMutation::default(),
-            })?;
-            if !running.applied {
-                return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-            }
-        } else if task.state != TaskState::Running {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-        }
+        self.transition_export_running(prepared)?;
         let opens_before = sink_observer
             .lock()
             .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
@@ -1288,6 +1293,41 @@ impl TrustedLocalCoordinator {
 
     fn verify_handle(&self, prepared: &PreparedLocalExport) -> Result<()> {
         if prepared.issuer_id != self.manager.artifact_scope_issuer {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        Ok(())
+    }
+
+    fn transition_export_running(&mut self, prepared: &PreparedLocalExport) -> Result<()> {
+        let task = self
+            .manager
+            .get_task(&prepared.task_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if task.state == TaskState::Running {
+            return Ok(());
+        }
+        if task.state != TaskState::Runnable {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let running = self.manager.transition(&TransitionRequest {
+            schema_version: "0.1".into(),
+            transition_id: format!("transition:export-running:{}", prepared.candidate_id),
+            task_id: prepared.task_id.clone(),
+            expected_revision: task.revision,
+            expected_state: TaskState::Runnable,
+            to_state: TaskState::Running,
+            requested_by: Actor {
+                kind: "system-service".into(),
+                id: "aiosd.coordinator".into(),
+            },
+            reason: TransitionReason {
+                code: "AUTHORITY_READY".into(),
+                message: None,
+                related_ids: vec![],
+            },
+            mutation: TaskMutation::default(),
+        })?;
+        if !running.applied {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         Ok(())

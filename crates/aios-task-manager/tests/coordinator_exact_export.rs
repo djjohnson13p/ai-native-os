@@ -789,6 +789,39 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             "user:test",
         )
         .unwrap();
+    let before_launch: (i64, i64) = readonly
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(uses_consumed),0) FROM authority_grants WHERE task_id=?1),
+                    (SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND event_type='execution.started')",
+            [&withdrawal.task.task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let opens_before_launch = coordinator
+        .memory_export_observation("service://fixture/exact")
+        .unwrap()
+        .opens;
+    assert!(
+        coordinator
+            .launch_local_export(&withdraw_execution)
+            .is_err()
+    );
+    let after_launch: (i64, i64) = readonly
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(uses_consumed),0) FROM authority_grants WHERE task_id=?1),
+                    (SELECT COUNT(*) FROM provenance_events WHERE task_id=?1 AND event_type='execution.started')",
+            [&withdrawal.task.task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after_launch, before_launch);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        opens_before_launch
+    );
     assert!(
         coordinator
             .export_local_artifact(&withdraw_execution)

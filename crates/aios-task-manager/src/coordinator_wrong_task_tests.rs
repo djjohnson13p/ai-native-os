@@ -674,7 +674,7 @@ fn provider_rebinding_requires_new_grant_at_binding_and_artifact_admission() {
             .state,
         TaskState::Planning
     );
-    coordinator.start_local_export(&fresh).unwrap();
+    let execution = coordinator.start_local_export(&fresh).unwrap();
     assert_eq!(
         coordinator
             .manager
@@ -809,28 +809,7 @@ fn provider_rebinding_requires_new_grant_at_binding_and_artifact_admission() {
         .unwrap()
         .unwrap();
     assert_eq!(runnable.state, TaskState::Runnable);
-    let running = coordinator
-        .manager
-        .transition(&TransitionRequest {
-            schema_version: "0.1".into(),
-            transition_id: "transition:public-export-rebind-running".into(),
-            task_id: fresh.task_id.clone(),
-            expected_revision: runnable.revision,
-            expected_state: TaskState::Runnable,
-            to_state: TaskState::Running,
-            requested_by: Actor {
-                kind: "system-service".into(),
-                id: "aiosd.coordinator".into(),
-            },
-            reason: TransitionReason {
-                code: "AUTHORITY_READY".into(),
-                message: None,
-                related_ids: vec![],
-            },
-            mutation: TaskMutation::default(),
-        })
-        .unwrap();
-    assert!(running.applied);
+    coordinator.launch_local_export(&execution).unwrap();
     assert_eq!(
         coordinator
             .manager
