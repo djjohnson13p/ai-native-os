@@ -113,6 +113,7 @@
             "required": ["sensitivity"],
             "properties": {
               "resolved_kind": {"const": "external-destination"},
+              "resolved_id": {"pattern": "^service://"},
               "sensitivity": {"type": "string"}
             }
           },
@@ -120,6 +121,7 @@
             "type": "object",
             "required": ["purpose", "source_content_hash", "operation_id", "adapter_id", "descriptor_hash", "max_size_bytes"],
             "properties": {
+              "service_id": {"pattern": "^service://"},
               "data_refs": {"minItems": 1, "maxItems": 1, "items": {"minLength": 1}},
               "purpose": {"type": "string", "minLength": 1, "maxLength": 256}
             }

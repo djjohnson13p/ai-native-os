@@ -16,6 +16,8 @@ mod artifact_store;
 mod authority_candidate;
 mod authority_deadline;
 mod authority_policy;
+mod coordinator;
+mod initial_program_admission;
 mod trusted_time;
 
 pub use aios_provenance::{
@@ -35,6 +37,10 @@ pub use artifact_store::{
     OutputAllocationRequest, ProviderArtifactSession, RetentionClass, Sensitivity,
     VerifiedArtifactExportNoEffect,
 };
+pub use coordinator::{
+    CompletedLocalExportReference, LocalExportExecution, LocalExportProposal, PreparedLocalExport,
+    TrustedExportAdapter, TrustedLocalCoordinator,
+};
 pub use trusted_time::{SecurityClockSample, TimeSource};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, atomic::AtomicBool};
 
 use aios_registry::{StoreIdentity, StoreLock, StoreOwner, store_identity};
+use initial_program_admission::{InitialProgramAdmission, persist_initial_program_admission_in};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1043,11 +1050,22 @@ impl TaskManager {
     ///
     /// # Errors
     /// Returns an error for an invalid record or failed `SQLite` commit.
+    pub(crate) fn create_task(&mut self, request: &CreateTask) -> Result<TaskRecord> {
+        self.create_task_with_constraints(request, None)
+    }
+
+    /// Trusted-host Task creation with privacy constraints committed in the
+    /// same genesis event and material row. Provider input cannot call this.
     #[allow(
         clippy::too_many_lines,
         reason = "keeps Task creation, private commitments, and genesis provenance in one transaction"
     )]
-    pub(crate) fn create_task(&mut self, request: &CreateTask) -> Result<TaskRecord> {
+    pub(crate) fn create_task_with_constraints(
+        &mut self,
+        request: &CreateTask,
+        constraints: Option<&Value>,
+    ) -> Result<TaskRecord> {
+        validate_task_creation_constraints(constraints)?;
         let unique_steps = request
             .active_step_ids
             .iter()
@@ -1103,8 +1121,9 @@ impl TaskManager {
                 })
             })
             .transpose()?;
+        let constraints_json = constraints.map(canonical_json).transpose()?;
         transaction.execute(
-            "INSERT INTO tasks (task_id, revision, state, principal_kind, principal_id, workspace_id, original_intent, normalized_intent_json, intent_commitment_nonce, active_step_ids_json, waiting_on_json, created_at, updated_at) VALUES (?1, 1, 'CREATED', ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?9)",
+            "INSERT INTO tasks (task_id, revision, state, principal_kind, principal_id, workspace_id, original_intent, normalized_intent_json, intent_commitment_nonce, active_step_ids_json, waiting_on_json, constraints_json, created_at, updated_at) VALUES (?1, 1, 'CREATED', ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10, ?10)",
             params![
                 request.task_id,
                 request.principal.kind,
@@ -1114,6 +1133,7 @@ impl TaskManager {
                 encode_optional(request.normalized_intent.as_ref())?,
                 intent_nonce,
                 serde_json::to_string(&request.active_step_ids)?,
+                constraints_json,
                 created_at,
             ],
         )?;
@@ -1132,7 +1152,7 @@ impl TaskManager {
                     "workspace_id": request.workspace_id,
                     "original_intent_ref": original_intent_ref,
                     "normalized_intent_ref": normalized_intent_ref,
-                    "constraints": null,
+                    "constraints": constraints,
                     "created_at": created_at
                 },
                 "active_plan": null,
@@ -1504,7 +1524,7 @@ impl TaskManager {
     /// Returns an error for storage/serialization failures. State-machine
     /// rejections are represented by a successful `TransitionResult` value.
     pub(crate) fn transition(&mut self, request: &TransitionRequest) -> Result<TransitionResult> {
-        self.transition_impl(request, false, false)
+        self.transition_impl(request, false, false, None)
     }
 
     /// Retire a previous clock session's unused, coordinator-issued preparation.
@@ -1635,6 +1655,7 @@ impl TaskManager {
                     },
                     false,
                     false,
+                    None,
                 )?;
                 if !result.applied {
                     return Err(TaskManagerError::InvalidRecord(
@@ -1729,6 +1750,7 @@ impl TaskManager {
                 },
                 false,
                 true,
+                None,
             )?;
             if !result.applied {
                 return Err(TaskManagerError::InvalidRecord(
@@ -1978,6 +2000,7 @@ impl TaskManager {
             },
             false,
             true,
+            None,
         )?;
         if !result.applied {
             return Err(TaskManagerError::InvalidRecord(
@@ -2572,6 +2595,7 @@ impl TaskManager {
         request: &TransitionRequest,
         fail_provenance: bool,
         internal_recovery: bool,
+        initial_admission: Option<&InitialProgramAdmission>,
     ) -> Result<TransitionResult> {
         validate_transition_request(request, internal_recovery)?;
         let mut resulted_at = if request.to_state == TaskState::Running {
@@ -2622,7 +2646,7 @@ impl TaskManager {
                 ));
             }
 
-            let Some((revision, state, waiting_json, steps_json, failure_json, active_program)) =
+            let Some((revision, state, waiting_json, steps_json, failure_json, mut active_program)) =
                 load_transition_state(&transaction, &request.task_id)?
             else {
                 let result = rejected(request, "TASK_NOT_FOUND", None, &resulted_at);
@@ -2748,6 +2772,15 @@ impl TaskManager {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            if let Some(admission) = initial_admission {
+                persist_initial_program_admission_in(
+                    &transaction,
+                    request,
+                    admission,
+                    &resulted_at,
+                )?;
+                active_program = Some(1);
+            }
             let active_program_row = active_program
             .map(|program_revision| {
                 transaction.query_row(
@@ -3089,7 +3122,7 @@ impl TaskManager {
         &mut self,
         request: &TransitionRequest,
     ) -> Result<TransitionResult> {
-        self.transition_impl(request, true, false)
+        self.transition_impl(request, true, false, None)
     }
 }
 
@@ -3420,6 +3453,40 @@ fn reason_code_valid(value: &str) -> bool {
                 byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
             }
         })
+}
+
+fn validate_task_creation_constraints(constraints: Option<&Value>) -> Result<()> {
+    let Some(constraints) = constraints else {
+        return Ok(());
+    };
+    let invalid = || TaskManagerError::InvalidRecord("invalid Task creation constraints");
+    let fields = constraints.as_object().ok_or_else(invalid)?;
+    for (key, value) in fields {
+        let valid = match key.as_str() {
+            "privacy" => matches!(
+                value.as_str(),
+                Some("local-only" | "local-first" | "remote-allowed")
+            ),
+            "max_cost_microunits" => {
+                value.is_null()
+                    || value
+                        .as_u64()
+                        .is_some_and(|cost| cost <= 9_007_199_254_740_991)
+            }
+            "deadline" => {
+                value.is_null()
+                    || value
+                        .as_str()
+                        .is_some_and(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).is_ok())
+            }
+            "preserve_inputs" => value.is_boolean(),
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 #[allow(

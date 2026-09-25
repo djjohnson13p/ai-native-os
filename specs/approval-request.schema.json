@@ -99,6 +99,18 @@
     "created_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"}
   },
+  "allOf": [{
+    "if": {"anyOf": [
+      {"properties": {"action": {"const": "data.egress"}}, "required": ["action"]},
+      {"properties": {"resource": {"properties": {"kind": {"const": "external-destination"}}, "required": ["kind"]}}, "required": ["resource"]}
+    ]},
+    "then": {"required": ["destination", "export"], "properties": {
+      "action": {"const": "data.egress"},
+      "resource": {"properties": {"kind": {"const": "external-destination"}}},
+      "destination": {"type": "object", "properties": {"service_id": {"pattern": "^service://"}}},
+      "scope": {"const": "ONE_SHOT"}
+    }}
+  }],
   "$defs": {
     "exactExport": {"type":"object","additionalProperties":false,
       "required":["selector","service_id","destination_class","descriptor_hash","adapter_id","operation_id","source_artifact_id","source_content_hash","purpose","sensitivity","max_size_bytes"],
