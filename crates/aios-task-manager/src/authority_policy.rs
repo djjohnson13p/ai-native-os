@@ -2,7 +2,7 @@
 use super::{Result, TaskManager, TaskManagerError, assert_manager_lease, canonical_json};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -31,6 +31,51 @@ fn digest(domain: &[u8], data: &str) -> String {
 
 fn checked_time(raw: &str) -> Result<OffsetDateTime> {
     OffsetDateTime::parse(raw, &Rfc3339).map_err(|_| reject())
+}
+
+fn validate_exact_export_request_links(request: &Value) -> Result<()> {
+    let action = request.pointer("/action").and_then(Value::as_str);
+    let kind = request
+        .pointer("/resource/resolved_kind")
+        .and_then(Value::as_str);
+    if action == Some("data.egress") || kind == Some("external-destination") {
+        let resolved_id = request
+            .pointer("/resource/resolved_id")
+            .and_then(Value::as_str);
+        let service_id = request
+            .pointer("/egress/service_id")
+            .and_then(Value::as_str);
+        if action != Some("data.egress")
+            || kind != Some("external-destination")
+            || !matches!((resolved_id, service_id), (Some(id), Some(service)) if id == service && id.starts_with("service://"))
+        {
+            return Err(reject());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exact_export_request_link_tests {
+    use super::validate_exact_export_request_links;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn conflicting_egress_service_cannot_name_a_different_resolved_destination() {
+        let mut request: Value = serde_json::from_str(include_str!(
+            "../../../examples/authority/evaluation-exact-export.json"
+        ))
+        .unwrap();
+        assert!(validate_exact_export_request_links(&request).is_ok());
+        request["egress"]["service_id"] = json!("service://fixture/other");
+        assert!(validate_exact_export_request_links(&request).is_err());
+        request["egress"]["service_id"] = request["resource"]["resolved_id"].clone();
+        request["resource"]["resolved_id"] = json!("service://fixture/other");
+        assert!(validate_exact_export_request_links(&request).is_err());
+        request["resource"]["resolved_id"] = json!("fixture-export");
+        request["egress"]["service_id"] = json!("fixture-export");
+        assert!(validate_exact_export_request_links(&request).is_err());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1579,6 +1624,7 @@ impl TaskManager {
                     "operation_id":pin.operation_id,"adapter_id":pin.adapter_id,
                     "descriptor_hash":pin.descriptor_hash,"max_size_bytes":pin.max_size_bytes});
             }
+            validate_exact_export_request_links(&request_value)?;
             let request_json = canonical_json(&request_value)?;
             if let Some((prior, _)) = prior {
                 let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM authority_requests WHERE request_id=?1

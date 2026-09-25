@@ -59,7 +59,17 @@
           "destination_class": {"type": ["string", "null"], "maxLength": 128},
           "service_id": {"type": ["string", "null"], "maxLength": 512},
           "external_export": {"$ref": "#/$defs/exactExport"}
-        }
+        },
+        "allOf": [{
+          "if": {"anyOf": [
+            {"properties": {"action": {"const": "data.egress"}}, "required": ["action"]},
+            {"properties": {"resource_kind": {"const": "external-destination"}}, "required": ["resource_kind"]}
+          ]},
+          "then": {"required": ["external_export"], "properties": {
+            "action": {"const": "data.egress"},
+            "resource_kind": {"const": "external-destination"}
+          }}
+        }]
       }
     },
     "policy_decision_id": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -83,6 +93,12 @@
     "revoked_at": {"type": ["string", "null"], "format": "date-time"},
     "revocation_reason_code": {"type": ["string", "null"], "maxLength": 128}
   },
+  "allOf": [{
+    "if": {"properties": {"grants": {"contains": {"properties": {"action": {"const": "data.egress"}}, "required": ["action"]}}}, "required": ["grants"]},
+    "then": {"required": ["scope", "max_uses"], "properties": {
+      "scope": {"const": "ONE_SHOT"}, "max_uses": {"const": 1}
+    }}
+  }],
   "$defs": {
     "exactExport": {"type":"object","additionalProperties":false,
       "required":["selector","service_id","destination_class","descriptor_hash","adapter_id","operation_id","source_artifact_id","source_content_hash","purpose","sensitivity","max_size_bytes"],
