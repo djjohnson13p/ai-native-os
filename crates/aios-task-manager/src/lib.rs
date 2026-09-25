@@ -565,6 +565,7 @@ pub struct StepExecutionRecord {
 
 pub struct TaskManager {
     connection: Connection,
+    local_policy_backend: authority_policy::LocalPolicyBackend,
     clock: Arc<dyn Clock>,
     lease_owner: String,
     lease_epoch: i64,
@@ -1010,6 +1011,7 @@ impl TaskManager {
         }
         let mut manager = Self {
             connection,
+            local_policy_backend: authority_policy::LocalPolicyBackend::start(),
             clock,
             lease_owner,
             lease_epoch,

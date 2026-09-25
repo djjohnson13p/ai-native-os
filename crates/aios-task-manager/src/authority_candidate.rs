@@ -5910,6 +5910,249 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "keeps the real outage lifecycle and issuance assertions together"
+    )]
+    fn policy_engine_outage_denies_real_candidate_and_cannot_finalize_prior_allow() {
+        use crate::authority_policy::PolicyEffect;
+        let case = authority_case("policy-engine-unavailable-fails-closed");
+        assert_eq!(case["expected"], "DENY");
+        assert_eq!(case["reason_code"], "AUTH_POLICY_ENGINE_UNAVAILABLE");
+        assert_eq!(case["facts"]["protected_action"], "artifact.write");
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("policy-engine-outage.sqlite3");
+        let (mut manager, hash, snapshot, registration) = coherent_planning_fixture(&path);
+        let resources = choices();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:policy-outage",
+                binding_id: "binding:policy-outage",
+                attempt_id: "attempt:policy-outage",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &resources,
+            })
+            .unwrap();
+        let policy = json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]});
+        let revision = manager
+            .activate_local_authority_policy(policy.to_string().as_bytes())
+            .unwrap();
+        let healthy = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(healthy.activation_revision, revision);
+        assert!(
+            healthy
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Allow)
+        );
+        manager.stop_local_policy_backend();
+        let snapshot_id: String = manager
+            .connection
+            .query_row(
+                "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
+                [revision],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let snapshot_json: String = manager
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM policy_snapshots WHERE snapshot_id=?1",
+                [&snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        assert!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:policy-outage")
+                .is_err(),
+            "invalid snapshot evidence must not be reported as backend outage"
+        );
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?1 WHERE snapshot_id=?2",
+                params![snapshot_json, snapshot_id],
+            )
+            .unwrap();
+        let denied = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(denied.activation_revision, revision);
+        assert_eq!(denied.decisions.len(), healthy.decisions.len());
+        for (before, outage) in healthy.decisions.iter().zip(&denied.decisions) {
+            assert_eq!(outage.effect, PolicyEffect::Deny);
+            assert_eq!(outage.reason_code, "AUTH_POLICY_ENGINE_UNAVAILABLE");
+            assert_ne!(before.decision_id, outage.decision_id);
+            assert_eq!(before.authority_request_id, outage.authority_request_id);
+            assert_policy_decision_reason(
+                &manager,
+                &outage.decision_id,
+                "DENY",
+                "AUTH_POLICY_ENGINE_UNAVAILABLE",
+            );
+        }
+        assert_eq!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:policy-outage")
+                .unwrap(),
+            denied
+        );
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:policy-outage")
+                .is_err()
+        );
+        for table in [
+            "authority_grants",
+            "authority_issuance_receipts",
+            "execution_bindings",
+            "step_executions",
+            "artifact_output_allocations",
+            "approval_requests",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must remain empty during outage");
+        }
+        let state: String = manager.connection.query_row(
+            "SELECT state FROM authority_candidate_status WHERE candidate_id='candidate:policy-outage'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "PENDING");
+        manager.restart_local_policy_backend();
+        let recovered = manager
+            .evaluate_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(recovered, healthy);
+        for outage in &denied.decisions {
+            assert_policy_decision_reason(
+                &manager,
+                &outage.decision_id,
+                "DENY",
+                "AUTH_POLICY_ENGINE_UNAVAILABLE",
+            );
+        }
+        let issued = manager
+            .finalize_pending_authority_candidate("candidate:policy-outage")
+            .unwrap();
+        assert_eq!(issued.grant_ids.len(), healthy.decisions.len());
+    }
+
+    #[test]
+    fn approved_candidate_cannot_issue_while_policy_engine_is_stopped() {
+        use crate::authority_policy::{AuthenticatedApprover, PolicyEffect};
+        let (mut manager, hash, snapshot, registration) = fixture();
+        let contract = contract_hash(&manager, &snapshot);
+        manager
+            .reserve_authority_candidate(&ReserveAuthorityCandidate {
+                candidate_id: "candidate:approved-outage",
+                binding_id: "binding:approved-outage",
+                attempt_id: "attempt:approved-outage",
+                task_id: "T-candidate",
+                semantic_program_hash: &hash,
+                registry_snapshot_id: &snapshot,
+                node_id: "copy",
+                capability_contract_hash: &contract,
+                provider_registration_id: &registration,
+                attempt_number: 1,
+                resources: &choices(),
+            })
+            .unwrap();
+        manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+            {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"local"},
+            {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"}
+        ]}).to_string().as_bytes()).unwrap();
+        let initial = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        let approval_id = initial.decisions[1].approval_id.as_deref().unwrap();
+        manager
+            .decide_candidate_approval(
+                approval_id,
+                &AuthenticatedApprover {
+                    principal_id: "user:test",
+                },
+                true,
+            )
+            .unwrap();
+        let approved = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert!(
+            approved
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Allow)
+        );
+        manager.stop_local_policy_backend();
+        let outage = manager
+            .evaluate_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert!(
+            outage
+                .decisions
+                .iter()
+                .all(|d| d.effect == PolicyEffect::Deny
+                    && d.reason_code == "AUTH_POLICY_ENGINE_UNAVAILABLE"
+                    && d.approval_id.is_none())
+        );
+        assert_ne!(
+            approved.decisions[1].decision_id,
+            outage.decisions[1].decision_id
+        );
+        assert!(
+            manager
+                .finalize_pending_authority_candidate("candidate:approved-outage")
+                .is_err()
+        );
+        for table in [
+            "authority_grants",
+            "authority_issuance_receipts",
+            "execution_bindings",
+            "step_executions",
+            "artifact_output_allocations",
+        ] {
+            let count: i64 = manager
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must remain empty during outage");
+        }
+        manager.restart_local_policy_backend();
+        assert_eq!(
+            manager
+                .evaluate_pending_authority_candidate("candidate:approved-outage")
+                .unwrap(),
+            approved
+        );
+        let issued = manager
+            .finalize_pending_authority_candidate("candidate:approved-outage")
+            .unwrap();
+        assert_eq!(issued.grant_ids.len(), approved.decisions.len());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "keeps the full approval lifecycle and non-executable assertions together"
     )]
     fn policy_evaluation_approval_replay_and_hard_deny_do_not_issue_authority() {

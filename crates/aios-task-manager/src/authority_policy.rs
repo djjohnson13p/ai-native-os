@@ -15,6 +15,7 @@ use super::trusted_time::{ProtectedTimeContext, advance_clock_session_in};
 
 const MIGRATION: &str =
     include_str!("../../../specs/persistence-v0.1-0017-authority-policy-evaluation.sql");
+const LOCAL_POLICY_RULE_LIMIT: usize = 64;
 
 fn reject() -> TaskManagerError {
     TaskManagerError::InvalidRecord("authority policy evaluation is not admissible")
@@ -188,6 +189,7 @@ enum PolicyBasis {
     Allow,
     DenyDefault,
     DenyPolicy,
+    DenyEngineUnavailable,
     RequireApproval,
 }
 
@@ -195,7 +197,9 @@ impl PolicyBasis {
     fn effect(self) -> PolicyEffect {
         match self {
             Self::Allow => PolicyEffect::Allow,
-            Self::DenyDefault | Self::DenyPolicy => PolicyEffect::Deny,
+            Self::DenyDefault | Self::DenyPolicy | Self::DenyEngineUnavailable => {
+                PolicyEffect::Deny
+            }
             Self::RequireApproval => PolicyEffect::RequireApproval,
         }
     }
@@ -205,12 +209,95 @@ impl PolicyBasis {
             (Self::Allow, PolicyEffect::Allow) => "AUTH_ALLOW",
             (Self::DenyDefault, PolicyEffect::Deny) => "AUTH_DENY_DEFAULT",
             (Self::DenyPolicy, PolicyEffect::Deny) => "AUTH_DENY_POLICY",
+            (Self::DenyEngineUnavailable, PolicyEffect::Deny) => "AUTH_POLICY_ENGINE_UNAVAILABLE",
             (Self::RequireApproval, PolicyEffect::RequireApproval | PolicyEffect::Allow) => {
                 "AUTH_REQUIRE_APPROVAL"
             }
             (Self::RequireApproval, PolicyEffect::Deny) => "AUTH_APPROVAL_DENIED",
             _ => unreachable!("approval can only change a require-approval policy outcome"),
         }
+    }
+}
+
+/// Process-local evaluator owned by the trusted Task Manager lifecycle. Its
+/// absence cannot be selected by an authority request or persisted policy.
+pub(super) struct LocalPolicyBackend {
+    evaluator: Option<Box<DeterministicEvaluator>>,
+}
+
+struct DeterministicEvaluator {
+    max_rules: usize,
+}
+
+impl LocalPolicyBackend {
+    pub(super) fn start() -> Self {
+        Self {
+            evaluator: Some(Box::new(DeterministicEvaluator {
+                max_rules: LOCAL_POLICY_RULE_LIMIT,
+            })),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "trusted local host lifecycle hook is exercised by the outage fixture"
+    )]
+    pub(super) fn stop(&mut self) {
+        self.evaluator.take();
+    }
+
+    #[allow(
+        dead_code,
+        reason = "trusted local host lifecycle hook is exercised by the outage fixture"
+    )]
+    pub(super) fn restart(&mut self) {
+        self.evaluator = Some(Box::new(DeterministicEvaluator {
+            max_rules: LOCAL_POLICY_RULE_LIMIT,
+        }));
+    }
+
+    fn decide(
+        &self,
+        policy: &LocalPolicy,
+        action: &str,
+        kind: &str,
+        sensitivity: &str,
+    ) -> PolicyBasis {
+        match &self.evaluator {
+            Some(evaluator) => evaluator.decide(policy, action, kind, sensitivity),
+            None => PolicyBasis::DenyEngineUnavailable,
+        }
+    }
+}
+
+impl DeterministicEvaluator {
+    fn decide(
+        &self,
+        policy: &LocalPolicy,
+        action: &str,
+        kind: &str,
+        sensitivity: &str,
+    ) -> PolicyBasis {
+        if policy.rules.len() > self.max_rules {
+            return PolicyBasis::DenyDefault;
+        }
+        let mut result = PolicyBasis::DenyDefault;
+        for rule in &policy.rules {
+            if rule.action == action
+                && rule.resource_kind == kind
+                && rule.sensitivity == sensitivity
+            {
+                if rule.effect == PolicyEffect::Deny {
+                    return PolicyBasis::DenyPolicy;
+                }
+                if rule.effect == PolicyEffect::RequireApproval {
+                    result = PolicyBasis::RequireApproval;
+                } else if result != PolicyBasis::RequireApproval {
+                    result = PolicyBasis::Allow;
+                }
+            }
+        }
+        result
     }
 }
 
@@ -237,7 +324,7 @@ impl LocalPolicy {
                 .map_err(|_| reject())?;
         if policy.schema_version != "0.1"
             || policy.rules.is_empty()
-            || policy.rules.len() > 64
+            || policy.rules.len() > LOCAL_POLICY_RULE_LIMIT
             || policy.rules.iter().any(|rule| {
                 !matches!(
                     rule.action.as_str(),
@@ -258,26 +345,6 @@ impl LocalPolicy {
             return Err(reject());
         }
         Ok(policy)
-    }
-
-    fn decide(&self, action: &str, kind: &str, sensitivity: &str) -> PolicyBasis {
-        let mut result = PolicyBasis::DenyDefault;
-        for rule in &self.rules {
-            if rule.action == action
-                && rule.resource_kind == kind
-                && rule.sensitivity == sensitivity
-            {
-                if rule.effect == PolicyEffect::Deny {
-                    return PolicyBasis::DenyPolicy;
-                }
-                if rule.effect == PolicyEffect::RequireApproval {
-                    result = PolicyBasis::RequireApproval;
-                } else if result != PolicyBasis::RequireApproval {
-                    result = PolicyBasis::Allow;
-                }
-            }
-        }
-        result
     }
 }
 
@@ -523,6 +590,7 @@ fn authenticate_approved_claim(
     tx: &rusqlite::Transaction<'_>,
     approval_id: &str,
     now: OffsetDateTime,
+    backend: &LocalPolicyBackend,
 ) -> Result<AuthenticatedApprovalClaim> {
     let prior: Option<(
         String,
@@ -666,8 +734,12 @@ fn authenticate_approved_claim(
     }
     let policy = LocalPolicy::parse(policy_json.as_bytes())?;
     if canonical_json(&policy)? != policy_json
-        || policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
-            != PolicyBasis::RequireApproval
+        || backend.decide(
+            &policy,
+            &resource.action,
+            &resource.kind,
+            &resource.sensitivity,
+        ) != PolicyBasis::RequireApproval
         || facts.fingerprint(resource, revision, &content_hash)? != fingerprint
     {
         return Err(reject());
@@ -1561,6 +1633,25 @@ pub(super) fn policy_objects_current(connection: &Connection, stamped: bool) -> 
 }
 
 impl TaskManager {
+    /// Trusted host lifecycle operation; no authority request or provider path
+    /// can select backend availability.
+    #[allow(
+        dead_code,
+        reason = "trusted local host lifecycle hook is exercised by the outage fixture"
+    )]
+    pub(crate) fn stop_local_policy_backend(&mut self) {
+        self.local_policy_backend.stop();
+    }
+
+    /// Reconstruct the process-local evaluator after trusted host recovery.
+    #[allow(
+        dead_code,
+        reason = "trusted local host lifecycle hook is exercised by the outage fixture"
+    )]
+    pub(crate) fn restart_local_policy_backend(&mut self) {
+        self.local_policy_backend.restart();
+    }
+
     /// Read the persisted trusted prompt only after rechecking its canonical
     /// sidecars, candidate membership, current policy, and authenticated owner.
     #[allow(
@@ -1644,8 +1735,12 @@ impl TaskManager {
                     .iter()
                     .find(|r| r.action == action && r.selector == selector && r.id == id)
                     .ok_or_else(reject)?;
-                if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
-                    != PolicyBasis::RequireApproval
+                if self.local_policy_backend.decide(
+                    &policy,
+                    &resource.action,
+                    &resource.kind,
+                    &resource.sensitivity,
+                ) != PolicyBasis::RequireApproval
                 {
                     return Err(reject());
                 }
@@ -1712,6 +1807,7 @@ impl TaskManager {
                     candidate_id,
                     selected,
                     time.now(),
+                    &self.local_policy_backend,
                 )?;
                 if !finalization_state_allows(&facts, &evaluation)
                     || (facts.task_state == "PLANNING" && !candidate_plan_coherent(tx, &facts)?)
@@ -1901,7 +1997,13 @@ impl TaskManager {
             &self.clock,
             |tx, started| {
                 assert_manager_lease(&tx, &self.lease_owner, self.lease_epoch)?;
-                Self::evaluate_pending_authority_candidate_in(tx, candidate_id, selected, started)
+                Self::evaluate_pending_authority_candidate_in(
+                    tx,
+                    candidate_id,
+                    selected,
+                    started,
+                    &self.local_policy_backend,
+                )
             },
         )
     }
@@ -1936,7 +2038,8 @@ impl TaskManager {
             if !super::active_program_validation_valid(tx, &current.task_id, &current.hash)? {
                 return Err(reject());
             }
-            let old = authenticate_approved_claim(tx, approval_id, checked)?;
+            let old =
+                authenticate_approved_claim(tx, approval_id, checked, &self.local_policy_backend)?;
             if old.task_id != current.task_id {
                 return Err(reject());
             }
@@ -1973,8 +2076,13 @@ impl TaskManager {
                     reason: AuthorityDenialReason::ApprovalStale,
                 }));
             }
-            let evaluated =
-                Self::evaluate_pending_authority_candidate_in(tx, candidate_id, selected, now)?;
+            let evaluated = Self::evaluate_pending_authority_candidate_in(
+                tx,
+                candidate_id,
+                selected,
+                now,
+                &self.local_policy_backend,
+            )?;
             if !evaluated.decisions.iter().any(|decision| {
                 decision.action == old.action
                     && decision.semantic_selector == old.selector
@@ -1999,6 +2107,7 @@ impl TaskManager {
         candidate_id: &str,
         selected: Vec<aios_registry::ProviderCandidate>,
         started: &str,
+        backend: &LocalPolicyBackend,
     ) -> Result<CandidatePolicyEvaluation> {
         let started_at = checked_time(started)?;
         let (revision, content_hash, policy_json): (i64, String, String) = tx
@@ -2092,7 +2201,12 @@ impl TaskManager {
                         facts.provider_id,facts.binding_id,facts.attempt_id,resource.action,resource.kind,
                         resource.id,resource.selector,request_json,started])?;
             }
-            let basis = policy.decide(&resource.action, &resource.kind, &resource.sensitivity);
+            let basis = backend.decide(
+                &policy,
+                &resource.action,
+                &resource.kind,
+                &resource.sensitivity,
+            );
             let base = basis.effect();
             let approval_id = if base == PolicyEffect::RequireApproval {
                 Some(format!(
@@ -2166,6 +2280,9 @@ impl TaskManager {
                 }
             }
             let phase = match effect {
+                PolicyEffect::Deny if basis == PolicyBasis::DenyEngineUnavailable => {
+                    "backend-unavailable"
+                }
                 PolicyEffect::Allow if base == PolicyEffect::RequireApproval => "approved",
                 PolicyEffect::Deny if base == PolicyEffect::RequireApproval => "approval-denied",
                 _ => "initial",
@@ -2732,8 +2849,12 @@ impl TaskManager {
                 .iter()
                 .find(|r| r.action == action && r.selector == selector && r.id == id)
                 .ok_or_else(reject)?;
-            if policy.decide(&resource.action, &resource.kind, &resource.sensitivity)
-                != PolicyBasis::RequireApproval
+            if self.local_policy_backend.decide(
+                &policy,
+                &resource.action,
+                &resource.kind,
+                &resource.sensitivity,
+            ) != PolicyBasis::RequireApproval
             {
                 return Err(reject());
             }
