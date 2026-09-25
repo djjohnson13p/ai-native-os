@@ -1,61 +1,31 @@
 //! Ordinary-crate exercise of the trusted local export boundary.
 
-use std::io::{self, Cursor, Write};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::io::Cursor;
 
 use aios_contracts::{CapabilityContract, ContractRef, TypeContract};
 use aios_registry::{
     ProviderTrustStatus, RegistryBuildOptions, SemanticRegistry, SnapshotHashEntry,
 };
 use aios_task_manager::{
-    Actor, ArtifactExportWriter, ArtifactOriginKind, CompletedLocalExportReference, CreateTask,
-    ImportArtifactRequest, LocalExportProposal, RetentionClass, Sensitivity, TaskManager,
-    TaskManagerError, TaskState, TrustedExportAdapter, TrustedLocalCoordinator,
+    Actor, ArtifactOriginKind, CompletedLocalExportReference, CreateTask, ImportArtifactRequest,
+    LocalExportProposal, RetentionClass, Sensitivity, TaskManager, TaskManagerError, TaskState,
+    TrustedLocalCoordinator,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const SUITE_HASH: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 const BUILD_HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SOURCE: &[u8] = b"exact private export bytes\n";
 
-#[derive(Default)]
-struct ObservedExport {
-    opens: AtomicUsize,
-    finalizes: AtomicUsize,
-    bytes: Mutex<Vec<u8>>,
-}
-
-struct CapturingWriter(Arc<ObservedExport>);
-
-impl Write for CapturingWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.bytes.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+fn source_hash() -> String {
+    let mut value = String::from("sha256:");
+    for byte in Sha256::digest(SOURCE) {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").unwrap();
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl ArtifactExportWriter for CapturingWriter {
-    fn finalize(&mut self) -> io::Result<()> {
-        self.0.finalizes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-struct CapturingAdapter(Arc<ObservedExport>);
-
-impl TrustedExportAdapter for CapturingAdapter {
-    fn open(&self) -> io::Result<Box<dyn ArtifactExportWriter>> {
-        self.0.opens.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(CapturingWriter(Arc::clone(&self.0))))
-    }
+    value
 }
 
 fn admitted_registry() -> (SemanticRegistry, String) {
@@ -285,17 +255,9 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         .enable(&registration.registration_id, "2026-09-24T00:00:00Z")
         .unwrap();
 
-    let observed = Arc::new(ObservedExport::default());
-    let other = Arc::new(ObservedExport::default());
-    let second_service = Arc::new(ObservedExport::default());
     let mut coordinator = TrustedLocalCoordinator::from_manager(manager);
     coordinator
-        .register_export_service(
-            "service://fixture/exact",
-            "fixture_remote",
-            "adapter:exact",
-            Arc::new(CapturingAdapter(Arc::clone(&observed))),
-        )
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
         .unwrap();
     // Catalog identity is immutable: a changed adapter cannot take over the
     // same service, even when the destination class is unchanged.
@@ -305,29 +267,50 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
                 "service://fixture/exact",
                 "fixture_remote",
                 "adapter:substitute",
-                Arc::new(CapturingAdapter(Arc::clone(&other)))
             )
             .is_err()
     );
     assert!(
         coordinator
-            .register_export_service(
-                "service://fixture/exact",
-                "fixture_remote",
-                "adapter:exact",
-                Arc::new(CapturingAdapter(Arc::clone(&other)))
-            )
+            .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact",)
             .is_err()
     );
-    assert_eq!(other.opens.load(Ordering::SeqCst), 0);
     coordinator
         .register_export_service(
             "service://fixture/second",
             "fixture_remote",
             "adapter:second",
-            Arc::new(CapturingAdapter(Arc::clone(&second_service))),
         )
         .unwrap();
+    let long_service = format!("service://{}", "s".repeat(502));
+    assert_eq!(long_service.chars().count(), 512);
+    coordinator
+        .register_export_service(&long_service, "fixture_remote", "adapter:long")
+        .unwrap();
+    assert!(
+        coordinator
+            .register_export_service(
+                &format!("{long_service}s"),
+                "fixture_remote",
+                "adapter:longer"
+            )
+            .is_err()
+    );
+    let unicode_service = format!("service://{}", "é".repeat(502));
+    assert_eq!(unicode_service.chars().count(), 512);
+    assert!(unicode_service.len() > 512);
+    coordinator
+        .register_export_service(&unicode_service, "fixture_remote", "adapter:unicode")
+        .unwrap();
+    assert!(
+        coordinator
+            .register_export_service(
+                &format!("{unicode_service}é"),
+                "fixture_remote",
+                "adapter:too-long"
+            )
+            .is_err()
+    );
     coordinator.activate_policy(json!({"schema_version":"0.1","rules":[
         {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
         {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
@@ -356,37 +339,99 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         conflict,
         TaskManagerError::InvalidRecord("authority candidate reservation is not admissible")
     ));
-    assert_eq!(second_service.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/second")
+            .unwrap()
+            .opens,
+        0
+    );
     let replayed_prepare = coordinator
         .prepare_local_export(&proposal, &mut Cursor::new(&[]))
         .unwrap();
     assert!(prepared.approval_id().is_some());
     assert_eq!(replayed_prepare.approval_id(), prepared.approval_id());
+    let prompt = coordinator
+        .approval_prompt(
+            &replayed_prepare,
+            prepared.approval_id().unwrap(),
+            "user:test",
+        )
+        .unwrap();
+    assert_eq!(prompt["destination"]["service_id"], proposal.service_id);
+    assert_eq!(prompt["export"]["operation_id"], proposal.operation_id);
+    assert_eq!(prompt["export"]["source_content_hash"], source_hash());
+    assert_eq!(prompt["export"]["purpose"], proposal.purpose);
+    assert_eq!(prompt["export"]["max_size_bytes"], proposal.max_size_bytes);
+    assert_eq!(prompt["export"]["adapter_id"], "adapter:exact");
+    assert_eq!(prompt["resource"]["sensitivity"], "private");
+    assert_eq!(prompt["principal"]["id"], registration.provider_id);
+    let readonly_prompt =
+        Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let descriptor: String = readonly_prompt
+        .query_row(
+            "SELECT descriptor_hash FROM authority_candidate_export_pins WHERE candidate_id=?1",
+            [&proposal.candidate_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt["export"]["descriptor_hash"], descriptor);
     let replay_reference = serde_json::to_vec(&prepared.replay_reference()).unwrap();
-    assert_eq!(observed.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        0
+    );
     coordinator
         .decide_approval(&prepared, "user:test", true)
         .unwrap();
+    let approved_replay = coordinator
+        .prepare_local_export(&proposal, &mut Cursor::new(&[]))
+        .unwrap();
+    assert_eq!(approved_replay.approval_ids(), prepared.approval_ids());
     let execution = coordinator.start_local_export(&prepared).unwrap();
     let replayed_start = coordinator.start_local_export(&prepared).unwrap();
-    assert_eq!(observed.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        0
+    );
     assert_eq!(
         coordinator.export_local_artifact(&execution).unwrap(),
         SOURCE.len() as u64
     );
-    assert_eq!(observed.opens.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.finalizes.load(Ordering::SeqCst), 1);
-    assert_eq!(*observed.bytes.lock().unwrap(), SOURCE);
-    assert_eq!(other.opens.load(Ordering::SeqCst), 0);
-    assert_eq!(second_service.opens.load(Ordering::SeqCst), 0);
+    let captured = coordinator
+        .memory_export_observation("service://fixture/exact")
+        .unwrap();
+    assert_eq!(
+        (
+            captured.opens,
+            captured.finalizes,
+            captured.completed_size_bytes
+        ),
+        (1, 1, SOURCE.len() as u64)
+    );
+    assert_eq!(
+        captured.completed_sha256.as_deref(),
+        Some(source_hash().as_str())
+    );
     assert_eq!(
         coordinator
             .replay_local_artifact_export(&replayed_start)
             .unwrap(),
         SOURCE.len() as u64
     );
-    assert_eq!(observed.opens.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.finalizes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        1
+    );
 
     let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let grants: i64 = readonly
@@ -464,6 +509,390 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
         )
         .unwrap();
     assert_eq!(waiting_on, "[]");
+
+    let mut long_destination = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "long-service",
+    );
+    long_destination.service_id.clone_from(&long_service);
+    let long_prepared = coordinator
+        .prepare_local_export(&long_destination, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator
+        .decide_approval(&long_prepared, "user:test", true)
+        .unwrap();
+    let long_execution = coordinator.start_local_export(&long_prepared).unwrap();
+    assert_eq!(
+        coordinator.export_local_artifact(&long_execution).unwrap(),
+        SOURCE.len() as u64
+    );
+    assert_eq!(
+        coordinator
+            .memory_export_observation(&long_service)
+            .unwrap()
+            .opens,
+        1
+    );
+
+    let mut unicode_destination = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "unicode-service",
+    );
+    unicode_destination.service_id.clone_from(&unicode_service);
+    let unicode_prepared = coordinator
+        .prepare_local_export(&unicode_destination, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator
+        .decide_approval(&unicode_prepared, "user:test", true)
+        .unwrap();
+    let unicode_execution = coordinator.start_local_export(&unicode_prepared).unwrap();
+    assert_eq!(
+        coordinator
+            .export_local_artifact(&unicode_execution)
+            .unwrap(),
+        SOURCE.len() as u64
+    );
+    assert_eq!(
+        coordinator
+            .memory_export_observation(&unicode_service)
+            .unwrap()
+            .opens,
+        1
+    );
+
+    // Three independently required approvals remain visible as Task blockers.
+    // Finalization cannot issue grants after just one or two decisions.
+    coordinator.activate_policy(json!({"schema_version":"0.1","rules":[
+        {"effect":"REQUIRE_APPROVAL","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+        {"effect":"REQUIRE_APPROVAL","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+        {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+    ]}).to_string().as_bytes()).unwrap();
+    let multi = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "multi-approval",
+    );
+    let multi_prepared = coordinator
+        .prepare_local_export(&multi, &mut Cursor::new(SOURCE))
+        .unwrap();
+    assert_eq!(multi_prepared.approval_ids().len(), 3);
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        1
+    );
+    let stored_waiting: String = readonly
+        .query_row(
+            "SELECT waiting_on_json FROM tasks WHERE task_id=?1",
+            [&multi.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let blockers: Value = serde_json::from_str(&stored_waiting).unwrap();
+    assert_eq!(blockers.as_array().unwrap().len(), 3);
+    for id in multi_prepared.approval_ids() {
+        let prompt = coordinator
+            .approval_prompt(&multi_prepared, id, "user:test")
+            .unwrap();
+        assert_eq!(prompt["approval_id"], id.as_str());
+        assert_eq!(prompt["task_id"], multi.task.task_id);
+        assert!(
+            coordinator
+                .approval_prompt(&multi_prepared, id, "user:other")
+                .is_err()
+        );
+    }
+    assert!(
+        coordinator
+            .approval_prompt(&prepared, &multi_prepared.approval_ids()[0], "user:test")
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .decide_approval_for(
+                &multi_prepared,
+                &multi_prepared.approval_ids()[0],
+                "user:other",
+                true
+            )
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .decide_approval(&multi_prepared, "user:test", true)
+            .is_err()
+    );
+    for id in &multi_prepared.approval_ids()[..2] {
+        coordinator
+            .decide_approval_for(&multi_prepared, id, "user:test", true)
+            .unwrap();
+        let replay = coordinator
+            .prepare_local_export(&multi, &mut Cursor::new(&[]))
+            .unwrap();
+        assert_eq!(replay.approval_ids(), multi_prepared.approval_ids());
+        assert!(coordinator.start_local_export(&multi_prepared).is_err());
+    }
+    coordinator
+        .decide_approval_for(
+            &multi_prepared,
+            &multi_prepared.approval_ids()[2],
+            "user:test",
+            true,
+        )
+        .unwrap();
+    let replayed_multi = coordinator
+        .prepare_local_export(&multi, &mut Cursor::new(&[]))
+        .unwrap();
+    assert_eq!(replayed_multi.approval_ids(), multi_prepared.approval_ids());
+    coordinator
+        .withdraw_approval(
+            &replayed_multi,
+            &multi_prepared.approval_ids()[2],
+            "user:test",
+        )
+        .unwrap();
+    coordinator
+        .withdraw_approval(
+            &multi_prepared,
+            &multi_prepared.approval_ids()[2],
+            "user:test",
+        )
+        .unwrap();
+    assert!(coordinator.start_local_export(&multi_prepared).is_err());
+    assert!(
+        coordinator
+            .cancel_local_export(&multi_prepared, "user:other", "transition:foreign-multi")
+            .is_err()
+    );
+    coordinator
+        .cancel_local_export(&multi_prepared, "user:test", "transition:cancel-multi")
+        .unwrap();
+    coordinator
+        .cancel_task(&multi.task.task_id, "user:test", "transition:cancel-multi")
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        1
+    );
+
+    let all = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "multi-all",
+    );
+    let all_prepared = coordinator
+        .prepare_local_export(&all, &mut Cursor::new(SOURCE))
+        .unwrap();
+    assert_eq!(all_prepared.approval_ids().len(), 3);
+    for id in all_prepared.approval_ids().iter().rev() {
+        coordinator
+            .decide_approval_for(&all_prepared, id, "user:test", true)
+            .unwrap();
+    }
+    let all_replayed = coordinator
+        .prepare_local_export(&all, &mut Cursor::new(&[]))
+        .unwrap();
+    assert_eq!(all_replayed.approval_ids(), all_prepared.approval_ids());
+    let all_execution = coordinator.start_local_export(&all_replayed).unwrap();
+    assert_eq!(
+        coordinator.export_local_artifact(&all_execution).unwrap(),
+        SOURCE.len() as u64
+    );
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        2
+    );
+
+    // The owner can cancel after issuance but before the first effect; this
+    // revokes all grants and fences the already returned execution handle.
+    coordinator.activate_policy(json!({"schema_version":"0.1","rules":[
+        {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+        {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+        {"effect":"REQUIRE_APPROVAL","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+    ]}).to_string().as_bytes()).unwrap();
+    let to_cancel = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "cancel-issued",
+    );
+    let cancellable = coordinator
+        .prepare_local_export(&to_cancel, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator
+        .decide_approval(&cancellable, "user:test", true)
+        .unwrap();
+    let cancelled_execution = coordinator.start_local_export(&cancellable).unwrap();
+    coordinator
+        .cancel_local_export(&cancellable, "user:test", "transition:cancel-issued")
+        .unwrap();
+    let revoked_count: i64 = readonly
+        .query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id=?1 AND state='REVOKED'",
+            [&to_cancel.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revoked_count, 3);
+    assert!(
+        coordinator
+            .cancel_task(
+                &to_cancel.task.task_id,
+                "user:other",
+                "transition:foreign-cancel"
+            )
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .export_local_artifact(&cancelled_execution)
+            .is_err()
+    );
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        2
+    );
+    let withdrawal = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "withdraw-issued",
+    );
+    let withdraw_prepared = coordinator
+        .prepare_local_export(&withdrawal, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator
+        .decide_approval(&withdraw_prepared, "user:test", true)
+        .unwrap();
+    let withdraw_execution = coordinator.start_local_export(&withdraw_prepared).unwrap();
+    coordinator
+        .withdraw_approval(
+            &withdraw_prepared,
+            withdraw_prepared.approval_id().unwrap(),
+            "user:test",
+        )
+        .unwrap();
+    assert!(
+        coordinator
+            .export_local_artifact(&withdraw_execution)
+            .is_err()
+    );
+    let withdrawn_state: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&withdrawal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(withdrawn_state, "RUNNABLE");
+    coordinator
+        .cancel_task(
+            &withdrawal.task.task_id,
+            "user:test",
+            "transition:cancel-withdrawn",
+        )
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        2
+    );
+
+    let unaffected = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "unaffected",
+    );
+    let unaffected_prepared = coordinator
+        .prepare_local_export(&unaffected, &mut Cursor::new(SOURCE))
+        .unwrap();
+    coordinator
+        .decide_approval(&unaffected_prepared, "user:test", true)
+        .unwrap();
+    let unaffected_execution = coordinator
+        .start_local_export(&unaffected_prepared)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .export_local_artifact(&unaffected_execution)
+            .unwrap(),
+        SOURCE.len() as u64
+    );
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        3
+    );
+    let prior_grants: i64 = readonly
+        .query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id=?1 AND state='ACTIVE'",
+            [&proposal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        coordinator
+            .cancel_task(
+                &proposal.task.task_id,
+                "user:test",
+                "transition:cancel-active"
+            )
+            .is_err()
+    );
+    let retained_grants: i64 = readonly
+        .query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE task_id=?1 AND state='ACTIVE'",
+            [&proposal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_grants, prior_grants);
+    let still_running: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&proposal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(still_running, "RUNNING");
+    assert_eq!(
+        coordinator
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        3
+    );
+    let lost_handle = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "lost-handle",
+    );
+    let _ = coordinator
+        .prepare_local_export(&lost_handle, &mut Cursor::new(SOURCE))
+        .unwrap();
     drop(readonly);
     drop(coordinator);
     let reopened = TaskManager::open(&db).unwrap();
@@ -477,15 +906,23 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
     );
     assert!(reopened.verify_provenance(&proposal.task.task_id).unwrap());
     assert!(reopened.provenance_count(&proposal.task.task_id).unwrap() >= 5);
-    let restarted_writer = Arc::new(ObservedExport::default());
     let mut restarted = TrustedLocalCoordinator::from_manager(reopened);
     restarted
-        .register_export_service(
-            "service://fixture/exact",
-            "fixture_remote",
-            "adapter:exact",
-            Arc::new(CapturingAdapter(Arc::clone(&restarted_writer))),
+        .cancel_task(
+            &lost_handle.task.task_id,
+            "user:test",
+            "transition:cancel-lost-handle",
         )
+        .unwrap();
+    restarted
+        .cancel_task(
+            &lost_handle.task.task_id,
+            "user:test",
+            "transition:cancel-lost-handle",
+        )
+        .unwrap();
+    restarted
+        .register_export_service("service://fixture/exact", "fixture_remote", "adapter:exact")
         .unwrap();
     let reference: CompletedLocalExportReference =
         serde_json::from_slice(&replay_reference).unwrap();
@@ -512,7 +949,13 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             "{field}"
         );
     }
-    assert_eq!(restarted_writer.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        restarted
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        0
+    );
 
     for denied in [
         "wrong-service",
@@ -559,7 +1002,14 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             matches!(error, TaskManagerError::InvalidRecord(reason) if reason == expected),
             "{denied}"
         );
-        assert_eq!(restarted_writer.opens.load(Ordering::SeqCst), 0, "{denied}");
+        assert_eq!(
+            restarted
+                .memory_export_observation("service://fixture/exact")
+                .unwrap()
+                .opens,
+            0,
+            "{denied}"
+        );
         let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let grants: i64 = readonly
             .query_row(
@@ -614,5 +1064,126 @@ fn public_coordinator_requires_real_approval_and_exports_exact_bytes() {
             .export_local_artifact(&retained_execution)
             .is_err()
     );
-    assert_eq!(restarted_writer.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        restarted
+            .memory_export_observation("service://fixture/exact")
+            .unwrap()
+            .opens,
+        0
+    );
+    let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let before_cancel: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&disabled_proposal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before_cancel, "RUNNABLE");
+    restarted
+        .cancel_task(
+            &disabled_proposal.task.task_id,
+            "user:test",
+            "transition:cancel-disabled",
+        )
+        .unwrap();
+    let after_cancel: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&disabled_proposal.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_cancel, "CANCELLED");
+
+    restarted
+        .register_export_service(
+            "service://fixture/corrupt",
+            "fixture_remote",
+            "adapter:corrupt",
+        )
+        .unwrap();
+    let mut corrupt = fresh_proposal(
+        registry.snapshot_id(),
+        &registration.registration_id,
+        &contract_hash,
+        "missing-source",
+    );
+    corrupt.service_id = "service://fixture/corrupt".into();
+    let unique_source = b"unique source removed before export";
+    let corrupt_prepared = restarted
+        .prepare_local_export(&corrupt, &mut Cursor::new(unique_source))
+        .unwrap();
+    restarted
+        .decide_approval(&corrupt_prepared, "user:test", true)
+        .unwrap();
+    let corrupt_execution = restarted.start_local_export(&corrupt_prepared).unwrap();
+    let root: String = readonly
+        .query_row(
+            "SELECT canonical_root FROM artifact_store_binding WHERE singleton_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let storage_ref: String = readonly.query_row(
+        "SELECT b.storage_ref FROM artifacts a JOIN artifact_blobs b ON b.content_hash=a.content_hash
+         JOIN task_artifacts t ON t.artifact_id=a.artifact_id WHERE t.task_id=?1 LIMIT 1",
+        [&corrupt.task.task_id], |r| r.get(0)).unwrap();
+    let blob_path = std::path::Path::new(&root).join(storage_ref);
+    let backup_path = blob_path.with_extension("test-backup");
+    std::fs::rename(&blob_path, &backup_path).unwrap();
+    std::fs::create_dir(&blob_path).unwrap();
+    assert!(restarted.export_local_artifact(&corrupt_execution).is_err());
+    let no_effect_task: String = readonly
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id=?1",
+            [&corrupt.task.task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_effect_task, "RUNNING");
+    std::fs::remove_dir(&blob_path).unwrap();
+    std::fs::rename(&backup_path, &blob_path).unwrap();
+    assert_eq!(
+        restarted
+            .memory_export_observation("service://fixture/corrupt")
+            .unwrap()
+            .opens,
+        0
+    );
+    let no_effect_step: (String, String) = readonly
+        .query_row(
+            "SELECT state,outcome_certainty FROM step_executions WHERE attempt_id=?1",
+            [&corrupt.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(no_effect_step, ("FAILED".into(), "FAILED_NO_EFFECT".into()));
+    let no_operation: i64 = readonly
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE operation_id=?1",
+            [&corrupt.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_operation, 0);
+    restarted
+        .cancel_task(
+            &corrupt.task.task_id,
+            "user:test",
+            "transition:cancel-no-effect",
+        )
+        .unwrap();
+    drop(readonly);
+    drop(restarted);
+    let recovered = TaskManager::open(&db).unwrap();
+    assert_eq!(
+        recovered
+            .get_task(&corrupt.task.task_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Cancelled
+    );
+    assert!(recovered.verify_provenance(&corrupt.task.task_id).unwrap());
 }

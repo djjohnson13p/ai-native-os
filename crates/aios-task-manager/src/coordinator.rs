@@ -11,37 +11,88 @@ use super::{
     artifact_store::ExactExportReplayIdentity,
     authority_candidate::{
         CandidateResourceChoice, CandidateResourceHandle, ReserveAuthorityCandidate,
+        load_current_export_pin,
     },
     authority_policy::{AuthenticatedApprover, PolicyEffect},
     initial_program_admission::InitialProgramAdmissionRequest,
 };
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{self, Read};
-use std::sync::Arc;
+use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
 
-/// Host-supplied adapter for one registered exact export service.
-///
-/// The adapter is installed by the trusted host, not selected by a provider
-/// request or supplied to an individual export operation.
-pub trait TrustedExportAdapter: Send + Sync {
-    /// Opens one destination writer after exact authority admission.
-    ///
-    /// # Errors
-    /// Returns an I/O error when the destination cannot be opened.
-    fn open(&self) -> io::Result<Box<dyn ArtifactExportWriter>>;
+/// Process-local diagnostics for a service sink. Size and digest describe its
+/// latest completed transfer; durable operation receipts remain authoritative.
+/// No payload bytes or writer handle leave the coordinator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryExportObservation {
+    pub opens: u64,
+    pub finalizes: u64,
+    pub completed_size_bytes: u64,
+    pub completed_sha256: Option<String>,
 }
 
-impl ArtifactExportWriter for Box<dyn ArtifactExportWriter> {
+#[derive(Default)]
+struct MemorySinkState {
+    opens: u64,
+    finalizes: u64,
+    completed_size_bytes: u64,
+    completed_sha256: Option<String>,
+}
+
+struct MemoryExportWriter {
+    state: Arc<Mutex<MemorySinkState>>,
+    hasher: Sha256,
+    size_bytes: u64,
+    finalized: bool,
+}
+
+impl Write for MemoryExportWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.finalized {
+            return Err(io::Error::other("memory export already finalized"));
+        }
+        self.size_bytes = self
+            .size_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("memory export length overflow"))?;
+        self.hasher.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ArtifactExportWriter for MemoryExportWriter {
     fn finalize(&mut self) -> io::Result<()> {
-        self.as_mut().finalize()
+        if self.finalized {
+            return Err(io::Error::other("memory export already finalized"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("memory sink poisoned"))?;
+        let mut digest = String::from("sha256:");
+        for byte in self.hasher.clone().finalize() {
+            use std::fmt::Write as _;
+            write!(&mut digest, "{byte:02x}").expect("string write");
+        }
+        state.completed_size_bytes = self.size_bytes;
+        state.completed_sha256 = Some(digest);
+        state.finalizes += 1;
+        self.finalized = true;
+        Ok(())
     }
 }
 
 struct RegisteredService {
     destination_class: String,
     adapter_id: String,
-    adapter: Arc<dyn TrustedExportAdapter>,
+    sink: Arc<Mutex<MemorySinkState>>,
 }
 
 /// Trusted-host proposal for one local provider and one mediated export.
@@ -88,13 +139,18 @@ pub struct PreparedLocalExport {
     operation_id: String,
     purpose: String,
     max_size_bytes: u64,
-    approval_id: Option<String>,
+    approval_ids: Vec<String>,
 }
 
 impl PreparedLocalExport {
     /// Returns the one-shot approval request ID for a trusted host UI.
     pub fn approval_id(&self) -> Option<&str> {
-        self.approval_id.as_deref()
+        self.approval_ids.first().map(String::as_str)
+    }
+
+    /// Returns every approval that must be decided before finalization.
+    pub fn approval_ids(&self) -> &[String] {
+        &self.approval_ids
     }
 
     /// Durable identity to persist before an export so its completed result
@@ -156,7 +212,7 @@ impl TrustedLocalCoordinator {
         }
     }
 
-    /// Binds one exact service to its host-owned adapter before any export.
+    /// Binds one exact service to a sealed in-memory sink before any export.
     ///
     /// # Errors
     /// Returns an error when service registration fails its identity or store checks.
@@ -165,11 +221,8 @@ impl TrustedLocalCoordinator {
         service_id: &str,
         destination_class: &str,
         adapter_id: &str,
-        adapter: Arc<dyn TrustedExportAdapter>,
     ) -> Result<()> {
-        // An adapter ID is a trusted host assertion, not proof that two
-        // factories are the same object. Never replace a live factory under
-        // an already-admitted service identity.
+        // Never replace a live sink under an already-admitted service identity.
         if self.services.contains_key(service_id) {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
@@ -180,10 +233,32 @@ impl TrustedLocalCoordinator {
             RegisteredService {
                 destination_class: destination_class.to_owned(),
                 adapter_id: adapter_id.to_owned(),
-                adapter,
+                sink: Arc::new(Mutex::new(MemorySinkState::default())),
             },
         );
         Ok(())
+    }
+
+    /// Returns metadata about the sealed process-local sink, without exposing
+    /// a byte stream that could be delivered over an unmediated network path.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown service or poisoned sink state.
+    pub fn memory_export_observation(&self, service_id: &str) -> Result<MemoryExportObservation> {
+        let service = self
+            .services
+            .get(service_id)
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let state = service
+            .sink
+            .lock()
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        Ok(MemoryExportObservation {
+            opens: state.opens,
+            finalizes: state.finalizes,
+            completed_size_bytes: state.completed_size_bytes,
+            completed_sha256: state.completed_sha256.clone(),
+        })
     }
 
     /// Withdraws a trusted service from future export use, including handles
@@ -331,16 +406,12 @@ impl TrustedLocalCoordinator {
         {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        let mut approvals = evaluation.decisions.iter().filter_map(|decision| {
-            (decision.effect == PolicyEffect::RequireApproval)
-                .then(|| decision.approval_id.clone())
-                .flatten()
-        });
-        let approval_id = approvals.next();
-        if approvals.next().is_some() {
-            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
-        }
-        if let Some(approval_id) = &approval_id {
+        let approval_ids: Vec<String> = evaluation
+            .decisions
+            .iter()
+            .filter_map(|decision| decision.approval_id.clone())
+            .collect();
+        if !approval_ids.is_empty() {
             let waiting = self.manager.transition(&TransitionRequest {
                 schema_version: "0.1".into(),
                 transition_id: format!("transition:export-waiting:{}", proposal.candidate_id),
@@ -355,14 +426,19 @@ impl TrustedLocalCoordinator {
                 reason: TransitionReason {
                     code: "APPROVAL_REQUIRED".into(),
                     message: None,
-                    related_ids: vec![approval_id.clone()],
+                    related_ids: approval_ids.clone(),
                 },
                 mutation: TaskMutation {
-                    waiting_on: Some(vec![WaitingOn {
-                        kind: WaitingKind::Approval,
-                        id: approval_id.clone(),
-                        message: None,
-                    }]),
+                    waiting_on: Some(
+                        approval_ids
+                            .iter()
+                            .map(|id| WaitingOn {
+                                kind: WaitingKind::Approval,
+                                id: id.clone(),
+                                message: None,
+                            })
+                            .collect(),
+                    ),
                     ..TaskMutation::default()
                 },
             })?;
@@ -382,8 +458,49 @@ impl TrustedLocalCoordinator {
             operation_id: proposal.operation_id.clone(),
             purpose: proposal.purpose.clone(),
             max_size_bytes: proposal.max_size_bytes,
-            approval_id,
+            approval_ids,
         })
+    }
+
+    /// Returns the authoritative persisted structured prompt for this exact
+    /// candidate after checking handle, approval membership, and Task owner.
+    ///
+    /// # Errors
+    /// Returns an error if membership, owner, canonical prompt, or freshness fails.
+    pub fn approval_prompt(
+        &self,
+        prepared: &PreparedLocalExport,
+        approval_id: &str,
+        authenticated_owner_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.verify_approval_member(prepared, approval_id)?;
+        self.manager.candidate_approval_prompt(
+            approval_id,
+            &prepared.candidate_id,
+            &AuthenticatedApprover {
+                principal_id: authenticated_owner_id,
+            },
+        )
+    }
+
+    /// Withdraws one prior approval. Its durable withdrawal marker fences
+    /// finalization and every subsequent protected grant use.
+    ///
+    /// # Errors
+    /// Returns an error if membership, owner, or withdrawal admission fails.
+    pub fn withdraw_approval(
+        &mut self,
+        prepared: &PreparedLocalExport,
+        approval_id: &str,
+        authenticated_owner_id: &str,
+    ) -> Result<()> {
+        self.verify_approval_member(prepared, approval_id)?;
+        self.manager.revoke_candidate_approval(
+            approval_id,
+            &AuthenticatedApprover {
+                principal_id: authenticated_owner_id,
+            },
+        )
     }
 
     /// Records a decision by an owner already authenticated by the host.
@@ -397,11 +514,24 @@ impl TrustedLocalCoordinator {
         authenticated_owner_id: &str,
         approve: bool,
     ) -> Result<()> {
-        self.verify_handle(prepared)?;
-        let approval_id = prepared
-            .approval_id
-            .as_deref()
-            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let [approval_id] = prepared.approval_ids.as_slice() else {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        };
+        self.decide_approval_for(prepared, approval_id, authenticated_owner_id, approve)
+    }
+
+    /// Decides one specified approval from the prepared candidate.
+    ///
+    /// # Errors
+    /// Returns an error if membership, owner, or decision admission fails.
+    pub fn decide_approval_for(
+        &mut self,
+        prepared: &PreparedLocalExport,
+        approval_id: &str,
+        authenticated_owner_id: &str,
+        approve: bool,
+    ) -> Result<()> {
+        self.verify_approval_member(prepared, approval_id)?;
         self.manager.decide_candidate_approval(
             approval_id,
             &AuthenticatedApprover {
@@ -411,7 +541,81 @@ impl TrustedLocalCoordinator {
         )
     }
 
-    /// Finalizes exact grants and moves the prepared Task to running.
+    /// Authenticated cancellation through the ordinary guarded Task CAS path.
+    /// Unknown or possibly active effects keep cancellation from applying.
+    ///
+    /// # Errors
+    /// Returns an error if the owner is wrong or guarded cancellation is refused.
+    pub fn cancel_local_export(
+        &mut self,
+        prepared: &PreparedLocalExport,
+        authenticated_owner_id: &str,
+        transition_id: &str,
+    ) -> Result<()> {
+        self.verify_handle(prepared)?;
+        self.cancel_task(&prepared.task_id, authenticated_owner_id, transition_id)
+    }
+
+    /// Cancels a durable Task by authenticated owner identity. This path does
+    /// not depend on a process-local prepared handle surviving a restart.
+    ///
+    /// # Errors
+    /// Returns an error if the Task or owner is invalid, or cancellation is unsafe.
+    pub fn cancel_task(
+        &mut self,
+        task_id: &str,
+        authenticated_owner_id: &str,
+        transition_id: &str,
+    ) -> Result<()> {
+        if transition_id.is_empty() {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let task = self
+            .manager
+            .get_task(task_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if task.principal.kind != "user"
+            || task.principal.id != authenticated_owner_id
+            || authenticated_owner_id.is_empty()
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        if task.state == TaskState::Cancelled {
+            let same_request: bool = self.manager.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_transitions WHERE transition_id=?1
+                 AND task_id=?2 AND to_state='CANCELLED' AND outcome='COMMITTED'
+                 AND json_extract(request_json,'$.requested_by.kind')='user'
+                 AND json_extract(request_json,'$.requested_by.id')=?3)",
+                params![transition_id, task_id, authenticated_owner_id],
+                |r| r.get(0),
+            )?;
+            if same_request && self.manager.verify_provenance(task_id)? {
+                return Ok(());
+            }
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let result = self.manager.transition(&TransitionRequest {
+            schema_version: "0.1".into(),
+            transition_id: transition_id.into(),
+            task_id: task_id.into(),
+            expected_revision: task.revision,
+            expected_state: task.state,
+            to_state: TaskState::Cancelled,
+            requested_by: task.principal,
+            reason: TransitionReason {
+                code: "USER_CANCELLED".into(),
+                message: None,
+                related_ids: vec![],
+            },
+            mutation: TaskMutation::default(),
+        })?;
+        if !result.applied {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        Ok(())
+    }
+
+    /// Finalizes exact grants and moves the prepared Task to runnable.
     ///
     /// # Errors
     /// Returns an error if approval, grant issuance, or either guarded Task
@@ -466,16 +670,78 @@ impl TrustedLocalCoordinator {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
             }
         }
-        if task.state != TaskState::Running {
-            let runnable = self
-                .manager
-                .get_task(&prepared.task_id)?
-                .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        Ok(LocalExportExecution {
+            prepared: prepared.clone(),
+        })
+    }
+
+    /// Transfers a pinned source into the sealed process-local memory sink.
+    /// The caller cannot select a writer, destination class, or adapter identity.
+    ///
+    /// # Errors
+    /// Returns an error if any current read/export grant, exact pin, deadline,
+    /// callback, or durable completion check fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preflight, guarded start, and exact no-effect retirement share this entry"
+    )]
+    pub fn export_local_artifact(&mut self, execution: &LocalExportExecution) -> Result<u64> {
+        let prepared = &execution.prepared;
+        self.verify_handle(prepared)?;
+        let service = self
+            .services
+            .get(&prepared.service_id)
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        let pin = load_current_export_pin(&self.manager.connection, &prepared.candidate_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if pin.service_id != prepared.service_id
+            || pin.adapter_id != service.adapter_id
+            || pin.source_artifact_id != prepared.source_artifact_id
+            || pin.operation_id != prepared.operation_id
+            || pin.purpose != prepared.purpose
+            || pin.max_size_bytes != prepared.max_size_bytes
+        {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        let sink_observer = Arc::clone(&service.sink);
+        let sink = Arc::clone(&service.sink);
+        let session = self
+            .manager
+            .issue_provider_artifact_session(&prepared.task_id, &prepared.binding_id)?;
+        let scope = self
+            .manager
+            .scope_artifact_reads(&session, std::slice::from_ref(&prepared.source_artifact_id))?;
+        let mut destination = self.manager.issue_exact_bound_artifact_export_destination(
+            &session,
+            &scope,
+            &prepared.operation_id,
+            &prepared.source_artifact_id,
+            &prepared.service_id,
+            &service.adapter_id,
+            move || {
+                let mut state = sink
+                    .lock()
+                    .map_err(|_| io::Error::other("memory sink poisoned"))?;
+                state.opens += 1;
+                drop(state);
+                Ok(MemoryExportWriter {
+                    state: sink,
+                    hasher: Sha256::new(),
+                    size_bytes: 0,
+                    finalized: false,
+                })
+            },
+        )?;
+        let task = self
+            .manager
+            .get_task(&prepared.task_id)?
+            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
+        if task.state == TaskState::Runnable {
             let running = self.manager.transition(&TransitionRequest {
                 schema_version: "0.1".into(),
                 transition_id: format!("transition:export-running:{}", prepared.candidate_id),
                 task_id: prepared.task_id.clone(),
-                expected_revision: runnable.revision,
+                expected_revision: task.revision,
                 expected_state: TaskState::Runnable,
                 to_state: TaskState::Running,
                 requested_by: Actor {
@@ -492,43 +758,152 @@ impl TrustedLocalCoordinator {
             if !running.applied {
                 return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
             }
+        } else if task.state != TaskState::Running {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
-        Ok(LocalExportExecution {
-            prepared: prepared.clone(),
-        })
+        let opens_before = sink_observer
+            .lock()
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
+            .opens;
+        match self
+            .manager
+            .export_artifact(&scope, &prepared.source_artifact_id, &mut destination)
+        {
+            Ok(size) => Ok(size),
+            Err(error) => {
+                let operation: Option<(String, Option<String>)> = self.manager.connection.query_row(
+                    "SELECT state,outcome_certainty FROM operations WHERE operation_id=?1 AND task_id=?2",
+                    params![prepared.operation_id, prepared.task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional()?;
+                let authenticated_no_effect = match operation.as_ref() {
+                    None => true,
+                    Some((state, Some(certainty)))
+                        if state == "FAILED" && certainty == "FAILED_NO_EFFECT" =>
+                    {
+                        matches!(
+                            self.manager
+                                .replay_bound_artifact_export(&session, &prepared.operation_id),
+                            Err(TaskManagerError::InvalidRecord(
+                                "ARTIFACT_EXPORT_FAILED_NO_EFFECT"
+                            ))
+                        )
+                    }
+                    _ => false,
+                };
+                if authenticated_no_effect {
+                    self.retire_no_effect_export_attempt(
+                        prepared,
+                        &sink_observer,
+                        opens_before,
+                        operation.is_some(),
+                    )?;
+                }
+                Err(error)
+            }
+        }
     }
 
-    /// Transfers a pinned source to the host-configured adapter. The caller
-    /// cannot select a writer factory, destination class, or adapter identity.
-    ///
-    /// # Errors
-    /// Returns an error if any current read/export grant, exact pin, deadline,
-    /// callback, or durable completion check fails.
-    pub fn export_local_artifact(&mut self, execution: &LocalExportExecution) -> Result<u64> {
-        let prepared = &execution.prepared;
-        self.verify_handle(prepared)?;
-        let service = self
-            .services
-            .get(&prepared.service_id)
-            .ok_or(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?;
-        let adapter = Arc::clone(&service.adapter);
-        let session = self
-            .manager
-            .issue_provider_artifact_session(&prepared.task_id, &prepared.binding_id)?;
-        let scope = self
-            .manager
-            .scope_artifact_reads(&session, std::slice::from_ref(&prepared.source_artifact_id))?;
-        let mut destination = self.manager.issue_exact_bound_artifact_export_destination(
-            &session,
-            &scope,
-            &prepared.operation_id,
-            &prepared.source_artifact_id,
-            &prepared.service_id,
-            &service.adapter_id,
-            move || adapter.open(),
-        )?;
-        self.manager
-            .export_artifact(&scope, &prepared.source_artifact_id, &mut destination)
+    /// Retires only an exact attempt with authenticated no-effect evidence.
+    /// An armed/unknown operation or any observed sink open is never cleaned up.
+    fn retire_no_effect_export_attempt(
+        &mut self,
+        prepared: &PreparedLocalExport,
+        sink: &Arc<Mutex<MemorySinkState>>,
+        opens_before: u64,
+        failed_operation_authenticated: bool,
+    ) -> Result<()> {
+        if sink
+            .lock()
+            .map_err(|_| TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"))?
+            .opens
+            != opens_before
+        {
+            return Ok(());
+        }
+        super::trusted_time::with_protected_immediate(
+            &self.manager.connection,
+            &self.manager.clock,
+            |tx, now| {
+                super::assert_manager_lease(
+                    tx,
+                    &self.manager.lease_owner,
+                    self.manager.lease_epoch,
+                )?;
+                let attempt: Option<(String, String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT c.attempt_id,e.state,e.outcome_certainty
+                     FROM authority_candidate_reservations c
+                     JOIN authority_candidate_status cs USING(candidate_id)
+                     JOIN step_executions e ON e.attempt_id=c.attempt_id AND e.task_id=c.task_id
+                        AND e.binding_id=c.binding_id
+                     JOIN tasks t ON t.task_id=c.task_id
+                     WHERE c.candidate_id=?1 AND c.task_id=?2 AND c.binding_id=?3
+                       AND cs.state='FINALIZED' AND t.state='RUNNING'",
+                        params![prepared.candidate_id, prepared.task_id, prepared.binding_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((attempt_id, state, certainty)) = attempt else {
+                    return Ok(());
+                };
+                if state != "RUNNING" || certainty.is_some() {
+                    return Ok(());
+                }
+                let operation: Option<(String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT state,outcome_certainty FROM operations
+                     WHERE operation_id=?1 AND task_id=?2 AND attempt_id=?3",
+                        params![prepared.operation_id, prepared.task_id, attempt_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let exact_no_effect = match operation.as_ref() {
+                    None => !failed_operation_authenticated,
+                    Some((state, Some(certainty))) => {
+                        failed_operation_authenticated
+                            && state == "FAILED"
+                            && certainty == "FAILED_NO_EFFECT"
+                    }
+                    _ => false,
+                };
+                if !exact_no_effect {
+                    return Ok(());
+                }
+                let other_effects: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE task_id=?1 AND attempt_id=?2 AND operation_id<>?3)
+                        OR EXISTS(SELECT 1 FROM provider_invocations WHERE task_id=?1 AND attempt_id=?2)
+                        OR EXISTS(SELECT 1 FROM credential_use_records WHERE task_id=?1)",
+                    params![prepared.task_id, attempt_id, prepared.operation_id], |r| r.get(0))?;
+                if other_effects {
+                    return Ok(());
+                }
+                if tx.execute(
+                    "UPDATE step_executions SET state='FAILED',outcome_certainty='FAILED_NO_EFFECT',
+                     revision=revision+1,finished_at=?2,updated_at=?2
+                     WHERE attempt_id=?1 AND state='RUNNING' AND outcome_certainty IS NULL",
+                    params![attempt_id, now],
+                )? != 1 { return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")); }
+                let mut event_id = String::from("event:export-no-effect:");
+                for byte in Sha256::digest(attempt_id.as_bytes()) {
+                    use std::fmt::Write as _;
+                    write!(&mut event_id, "{byte:02x}").expect("string write");
+                }
+                super::append_event(
+                    tx,
+                    &prepared.task_id,
+                    &serde_json::json!({
+                        "schema_version":"0.1", "event_id":event_id,
+                        "task_id":prepared.task_id,"event_type":"execution.failed",
+                        "timestamp":now,"actor":{"kind":"system-service","id":"aiosd.coordinator"},
+                        "status":"failure", "details":{"operation_id":prepared.operation_id,
+                        "outcome_certainty":"FAILED_NO_EFFECT", "effect_boundary":"destination-not-invoked",
+                            "reason_code":"ARTIFACT_EXPORT_FAILED_NO_EFFECT"}
+                    }),
+                )?;
+                Ok(())
+            },
+        )
     }
 
     /// Returns the authenticated durable result of an already completed export.
@@ -583,6 +958,18 @@ impl TrustedLocalCoordinator {
 
     fn verify_handle(&self, prepared: &PreparedLocalExport) -> Result<()> {
         if prepared.issuer_id != self.manager.artifact_scope_issuer {
+            return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
+        }
+        Ok(())
+    }
+
+    fn verify_approval_member(
+        &self,
+        prepared: &PreparedLocalExport,
+        approval_id: &str,
+    ) -> Result<()> {
+        self.verify_handle(prepared)?;
+        if !prepared.approval_ids.iter().any(|id| id == approval_id) {
             return Err(TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"));
         }
         Ok(())
