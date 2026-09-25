@@ -3467,6 +3467,70 @@ mod tests {
             {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
             {"effect":"DENY","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
         ]}).to_string().as_bytes()).unwrap();
+        // The old approval is genuine, but the newly active policy must also
+        // be authenticated before a changed destination can be called stale.
+        let (current_snapshot_id, current_snapshot_json): (String, String) = manager
+            .connection
+            .query_row(
+                "SELECT a.content_hash,p.snapshot_json FROM authority_policy_activations a
+                 JOIN policy_snapshots p ON p.snapshot_id=a.content_hash
+                 ORDER BY a.revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(current_snapshot_id, snapshot_id);
+        let before_corruption = authority_rows(&manager);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json='{}' WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        let malformed_current = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(malformed_current.authority_denial().is_none());
+        assert_eq!(authority_rows(&manager), before_corruption);
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET snapshot_json=?2 WHERE snapshot_id=?1",
+                params![current_snapshot_id, current_snapshot_json],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "CREATE TEMP TABLE saved_current_policy_snapshot AS
+                 SELECT * FROM policy_snapshots WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "DELETE FROM policy_snapshots WHERE snapshot_id=?1",
+                [&current_snapshot_id],
+            )
+            .unwrap();
+        let missing_current = manager
+            .apply_candidate_approval_claim("candidate:stale-new", &approval)
+            .unwrap_err();
+        assert!(missing_current.authority_denial().is_none());
+        assert_eq!(authority_rows(&manager), before_corruption);
+        manager
+            .connection
+            .execute(
+                "INSERT INTO policy_snapshots SELECT * FROM saved_current_policy_snapshot",
+                [],
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute("DROP TABLE saved_current_policy_snapshot", [])
+            .unwrap();
         let denied = manager
             .evaluate_pending_authority_candidate("candidate:stale-new")
             .unwrap();

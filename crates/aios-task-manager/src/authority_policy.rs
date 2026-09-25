@@ -1788,20 +1788,30 @@ impl TaskManager {
             let resource = current.resources.iter().find(|resource| {
                 resource.action == old.action && resource.selector == old.selector
             });
-            let activation: Option<(i64, String)> = tx
+            let activation: Option<(i64, String, String)> = tx
                 .query_row(
-                    "SELECT revision,content_hash FROM authority_policy_activations
-                 ORDER BY revision DESC LIMIT 1",
+                    "SELECT a.revision,a.content_hash,p.policy_json
+                 FROM authority_policy_activations a
+                 JOIN authority_policy_payloads p USING(content_hash)
+                 WHERE a.revision=(SELECT MAX(revision) FROM authority_policy_activations)",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let exact =
-                if let (Some(resource), Some((revision, content_hash))) = (resource, activation) {
-                    current.fingerprint(resource, revision, &content_hash)? == old.fingerprint
-                } else {
-                    false
-                };
+            let (revision, content_hash, policy_json) = activation.ok_or_else(reject)?;
+            if digest(b"AIOS-LOCAL-AUTHORITY-POLICY\0v1\0", &policy_json) != content_hash {
+                return Err(reject());
+            }
+            let policy = LocalPolicy::parse(policy_json.as_bytes()).map_err(|_| reject())?;
+            if canonical_json(&policy).map_err(|_| reject())? != policy_json {
+                return Err(reject());
+            }
+            checked_policy_snapshot(tx, revision, &content_hash, checked).map_err(|_| reject())?;
+            let exact = if let Some(resource) = resource {
+                current.fingerprint(resource, revision, &content_hash)? == old.fingerprint
+            } else {
+                false
+            };
             if !exact {
                 return Err(TaskManagerError::AuthorityDenied(AuthorityDenial {
                     stage: AuthorityDenialStage::ApprovalApplication,
