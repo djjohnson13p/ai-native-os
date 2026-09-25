@@ -287,6 +287,30 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
     coordinator.start_local_export(&prepared_b).unwrap();
     assert_ne!(prepared_a.source_artifact_id, prepared_b.source_artifact_id);
     for task_id in [&a.task.task_id, &b.task.task_id] {
+        let runnable = coordinator.manager.get_task(task_id).unwrap().unwrap();
+        assert_eq!(runnable.state, TaskState::Runnable);
+        let started = coordinator
+            .manager
+            .transition(&TransitionRequest {
+                schema_version: "0.1".into(),
+                transition_id: format!("transition:wrong-task-running:{task_id}"),
+                task_id: task_id.clone(),
+                expected_revision: runnable.revision,
+                expected_state: TaskState::Runnable,
+                to_state: TaskState::Running,
+                requested_by: Actor {
+                    kind: "system-service".into(),
+                    id: "aiosd.coordinator".into(),
+                },
+                reason: TransitionReason {
+                    code: "AUTHORITY_READY".into(),
+                    message: None,
+                    related_ids: vec![],
+                },
+                mutation: TaskMutation::default(),
+            })
+            .unwrap();
+        assert!(started.applied);
         assert_eq!(
             coordinator
                 .manager
@@ -294,7 +318,7 @@ fn grant_used_for_wrong_task_denies_before_read_or_grant_use() {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::Runnable
+            TaskState::Running
         );
     }
     let session_b = coordinator
