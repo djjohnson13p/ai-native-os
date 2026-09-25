@@ -1339,9 +1339,8 @@ impl Read for ArtifactReader {
                         self.lease_epoch,
                         true,
                     )
-                    .map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-                    })?;
+                    .ok()
+                    .flatten();
                     transaction.commit().map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                     })?;
@@ -1356,7 +1355,7 @@ impl Read for ArtifactReader {
                         ),
                     ));
                 }
-                if let Some(reason) = authenticated_read_grant_denial_in(
+                let classified = authenticated_read_grant_denial_in(
                     &transaction,
                     &self.task_id,
                     execution,
@@ -1364,16 +1363,20 @@ impl Read for ArtifactReader {
                     &self.lease_owner,
                     self.lease_epoch,
                     true,
-                )
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?
-                {
+                );
+                if !matches!(classified, Ok(None)) {
                     transaction.commit().map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
                     })?;
                     locked_time = None;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
-                        artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason),
+                        classified.ok().flatten().map_or(
+                            TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
+                            |reason| {
+                                artifact_grant_denial(AuthorityDenialStage::ArtifactRead, reason)
+                            },
+                        ),
                     ));
                 }
             }
@@ -4857,7 +4860,9 @@ impl TaskManager {
                         &lease_owner,
                         lease_epoch,
                         false,
-                    )?;
+                    )
+                    .ok()
+                    .flatten();
                     transaction.commit()?;
                     return Err(reason.map_or(
                         TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED"),
@@ -4896,23 +4901,19 @@ impl TaskManager {
                     error,
                     TaskManagerError::InvalidRecord("ARTIFACT_AUTHORITY_DENIED")
                 ) {
-                    scope
-                        .authority
-                        .execution
-                        .as_ref()
-                        .map(|execution| {
-                            authenticated_read_grant_denial_in(
-                                &transaction,
-                                &scope.task_id,
-                                execution,
-                                artifact_id,
-                                &lease_owner,
-                                lease_epoch,
-                                false,
-                            )
-                        })
-                        .transpose()?
+                    scope.authority.execution.as_ref().and_then(|execution| {
+                        authenticated_read_grant_denial_in(
+                            &transaction,
+                            &scope.task_id,
+                            execution,
+                            artifact_id,
+                            &lease_owner,
+                            lease_epoch,
+                            false,
+                        )
+                        .ok()
                         .flatten()
+                    })
                 } else {
                     None
                 };
@@ -8925,6 +8926,20 @@ fn artifact_grant_denial(
     TaskManagerError::AuthorityDenied(AuthorityDenial { stage, reason })
 }
 
+#[cfg(test)]
+type ReadGrantDiagnosticTestHook = Box<dyn FnOnce() -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static READ_GRANT_DIAGNOSTIC_TEST_HOOK: std::cell::RefCell<Option<ReadGrantDiagnosticTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_read_grant_diagnostic_test_hook(hook: impl FnOnce() -> Result<()> + 'static) {
+    READ_GRANT_DIAGNOSTIC_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 /// Classify only a grant whose immutable coordinator binding, issuance receipt,
 /// decision, request, and exact read resource all match the authenticated session.
 /// Any incomplete or ambiguous intersection keeps the coarse denial.
@@ -8942,6 +8957,13 @@ fn authenticated_read_grant_denial_in(
     lease_epoch: i64,
     admitted_replay: bool,
 ) -> Result<Option<AuthorityDenialReason>> {
+    #[cfg(test)]
+    READ_GRANT_DIAGNOSTIC_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook()?;
+        }
+        Ok::<(), TaskManagerError>(())
+    })?;
     let grant_ids: Vec<String> = serde_json::from_str(&execution.grant_refs_json)?;
     let policy_ids: Vec<String> = serde_json::from_str(&execution.policy_decision_refs_json)?;
     if grant_ids.is_empty() || grant_ids.len() > 64 || !all_unique(&grant_ids) {

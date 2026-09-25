@@ -2544,6 +2544,90 @@ mod tests {
     }
 
     #[test]
+    fn classifier_failure_after_expiry_latch_keeps_durable_denial() {
+        for retained_read in [true, false] {
+            let (mut manager, source, session, grant_id, _) = issued_fixture_read(false, true);
+            let (issued, deadline): (i64, i64) = manager
+                .connection
+                .query_row(
+                    "SELECT issued_monotonic_nanos,deadline_monotonic_nanos
+                 FROM authority_grant_deadlines WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let high_water: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT MAX(monotonic_nanos) FROM trusted_time_observations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let baseline = issued.max(high_water) + 1_000_000_000;
+            assert!(baseline < deadline);
+            let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(
+                u64::try_from(baseline).unwrap(),
+            ));
+            manager.clock = Arc::new(FrozenWallClock {
+                monotonic: Arc::clone(&monotonic),
+            });
+            let scope = manager
+                .scope_artifact_reads(&session, std::slice::from_ref(&source))
+                .unwrap();
+            let mut reader = manager.open_artifact_reader(&scope, &source).unwrap();
+            let mut delivered = [0_u8; 1];
+            assert_eq!(reader.read(&mut delivered).unwrap(), 1);
+            let position = reader.raw_position_for_test().unwrap();
+            let before: (i64, i64) = manager.connection.query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            monotonic.store(u64::try_from(deadline + 1).unwrap(), Ordering::SeqCst);
+            let classified = Arc::new(AtomicUsize::new(0));
+            let called = Arc::clone(&classified);
+            crate::artifact_store::set_read_grant_diagnostic_test_hook(move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                Err(TaskManagerError::InvalidRecord(
+                    "injected diagnostic failure",
+                ))
+            });
+            if retained_read {
+                let mut denied = [0xa5_u8; 1];
+                let error = reader.read(&mut denied).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                assert_eq!(denied, [0xa5]);
+                assert_eq!(reader.raw_position_for_test().unwrap(), position);
+            } else {
+                let error = match manager.open_artifact_reader(&scope, &source) {
+                    Ok(_) => panic!("expired reader admission unexpectedly succeeded"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.to_string(), "ARTIFACT_AUTHORITY_DENIED");
+                assert!(error.authority_denial().is_none());
+            }
+            assert_eq!(classified.load(Ordering::SeqCst), 1);
+            let latched: i64 = manager
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM authority_grant_expiry_latches WHERE grant_id=?1",
+                    [&grant_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(latched, 1, "expiry latch must survive a failed diagnostic");
+            let after: (i64, i64) = manager.connection.query_row(
+                "SELECT g.uses_consumed,(SELECT COUNT(*) FROM operations o WHERE o.task_id=g.task_id AND o.effect_class='ARTIFACT_READ')
+                 FROM authority_grants g WHERE g.grant_id=?1",
+                [&grant_id], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
     fn fixture_cancel_revokes_real_grant_and_retained_reader() {
         let case = authority_case("revoked-grant-after-task-cancel");
         assert_eq!(case["expected"], "DENY");
@@ -5141,7 +5225,9 @@ mod tests {
         assert_eq!(approved_record_count, 1);
         let grant_count: i64 = manager
             .connection
-            .query_row("SELECT COUNT(*) FROM authority_grants", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM authority_grants", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(grant_count, 0, "hard deny cannot issue a grant");
         assert!(
