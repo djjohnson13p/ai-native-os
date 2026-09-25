@@ -627,7 +627,10 @@ fn authenticate_approved_claim(
     {
         return Err(reject());
     }
-    checked_policy_snapshot(tx, revision, &content_hash, checked_time(&requested)?)?;
+    // The request ID is stable across policy reevaluations. The initial
+    // REQUIRE_APPROVAL decision, authenticated below, was made when this
+    // approval was created; the policy need only have been active by then.
+    checked_policy_snapshot(tx, revision, &content_hash, checked_time(&created)?)?;
     checked_approval_request(
         tx,
         &facts,

@@ -1691,6 +1691,15 @@ mod tests {
             Some(crate::trusted_time::synthetic_sample(self.now()))
         }
     }
+    struct ApprovalReactivationClock;
+    impl Clock for ApprovalReactivationClock {
+        fn now(&self) -> String {
+            "2026-09-19T00:10:00Z".into()
+        }
+        fn security_sample(&self) -> Option<crate::SecurityClockSample> {
+            Some(crate::trusted_time::synthetic_sample(self.now()))
+        }
+    }
     struct FrozenWallClock {
         monotonic: Arc<std::sync::atomic::AtomicU64>,
     }
@@ -3169,7 +3178,9 @@ mod tests {
         clippy::too_many_lines,
         reason = "creates a real approved exact-export candidate for stale-claim fixtures"
     )]
-    fn approved_export_claim_fixture() -> (TaskManager, String, String, String, String, String) {
+    fn approved_export_claim_fixture(
+        reactivate: bool,
+    ) -> (TaskManager, String, String, String, String, String) {
         use crate::authority_policy::AuthenticatedApprover;
         let (mut manager, hash, snapshot, registration) =
             fixture_at_mode(None, true, true, None, false);
@@ -3234,6 +3245,21 @@ mod tests {
                 resources: &resources,
             })
             .unwrap();
+        if reactivate {
+            manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
+                {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
+                {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
+                {"effect":"ALLOW","action":"data.egress","resource_kind":"external-destination","sensitivity":"private"}
+            ]}).to_string().as_bytes()).unwrap();
+            let initial = manager
+                .evaluate_pending_authority_candidate("candidate:stale-old")
+                .unwrap();
+            assert!(initial.decisions.iter().any(|decision| {
+                decision.action == "data.egress"
+                    && decision.effect == crate::authority_policy::PolicyEffect::Allow
+            }));
+            manager.clock = Arc::new(ApprovalReactivationClock);
+        }
         manager.activate_local_authority_policy(json!({"schema_version":"0.1","rules":[
             {"effect":"ALLOW","action":"artifact.read","resource_kind":"artifact","sensitivity":"private"},
             {"effect":"ALLOW","action":"artifact.write","resource_kind":"output-allocation","sensitivity":"private"},
@@ -3309,7 +3335,7 @@ mod tests {
         let case = authority_case("approval-stale-after-destination-change");
         assert_eq!(case["expected"], "DENY");
         let (mut manager, hash, snapshot, registration, source, approval) =
-            approved_export_claim_fixture();
+            approved_export_claim_fixture(false);
         let exact = manager
             .apply_candidate_approval_claim("candidate:stale-old", &approval)
             .unwrap();
@@ -3320,9 +3346,25 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.effect, PolicyEffect::Allow);
         assert_eq!(accepted.approval_id.as_deref(), Some(approval.as_str()));
+        let approved_pin = load_current_export_pin(&manager.connection, "candidate:stale-old")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             case["facts"]["approved_destination"],
-            "service://model/fixture-remote"
+            approved_pin.service_id
+        );
+        let approved_prompt: String = manager
+            .connection
+            .query_row(
+                "SELECT request_json FROM approval_requests WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let approved_prompt: serde_json::Value = serde_json::from_str(&approved_prompt).unwrap();
+        assert_eq!(
+            approved_prompt["destination"]["service_id"],
+            approved_pin.service_id
         );
         let changed_service = case["facts"]["runtime_destination"].as_str().unwrap();
         let mut resources = choices_with_source_and_output(&source, "allocation:stale-new");
@@ -3356,6 +3398,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pin.service_id, changed_service);
+        assert_ne!(pin.service_id, approved_pin.service_id);
         assert_eq!(pin.destination_class, "fixture_remote");
         let authority_rows = |manager: &TaskManager| -> Vec<i64> {
             [
@@ -3576,7 +3619,34 @@ mod tests {
 
     #[test]
     fn expired_approved_claim_is_generic_and_creates_no_authority() {
-        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture();
+        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture(false);
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        assert!(exact.decisions.iter().any(|decision| {
+            decision.action == "data.egress"
+                && decision.effect == crate::authority_policy::PolicyEffect::Allow
+                && decision.approval_id.as_deref() == Some(approval.as_str())
+        }));
+        let expires_at: String = manager
+            .connection
+            .query_row(
+                "SELECT expires_at FROM approval_requests WHERE approval_id=?1",
+                [&approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expiry = time::OffsetDateTime::parse(
+            &expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let advanced = time::OffsetDateTime::parse(
+            &ApprovalExpiredClock.now(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(expiry < advanced);
         let before: (i64, i64, i64) = manager
             .connection
             .query_row(
@@ -3592,6 +3662,90 @@ mod tests {
             .apply_candidate_approval_claim("candidate:stale-old", &approval)
             .unwrap_err();
         assert!(error.authority_denial().is_none());
+        let after: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn approval_after_policy_reactivation_uses_initial_decision_time() {
+        let (mut manager, _, _, _, _, approval) = approved_export_claim_fixture(true);
+        let (requested_at, created_at, activated_at, revision): (String, String, String, i64) =
+            manager
+                .connection
+                .query_row(
+                    "SELECT r.requested_at,a.created_at,p.activated_at,p.revision
+                     FROM approval_requests a
+                     JOIN authority_requests r ON r.request_id=a.authority_request_id
+                     JOIN authority_approval_bindings b ON b.approval_id=a.approval_id
+                     JOIN authority_policy_activations p ON p.revision=b.activation_revision
+                     WHERE a.approval_id=?1",
+                    [&approval],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(requested_at, NOW);
+        assert_eq!(created_at, ApprovalReactivationClock.now());
+        assert!(requested_at < activated_at);
+        assert!(activated_at <= created_at);
+        let exact = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap();
+        assert!(exact.decisions.iter().any(|decision| {
+            decision.action == "data.egress"
+                && decision.effect == crate::authority_policy::PolicyEffect::Allow
+                && decision.approval_id.as_deref() == Some(approval.as_str())
+        }));
+        let before: (i64, i64, i64) = manager
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM authority_grants),
+                    (SELECT COUNT(*) FROM execution_bindings),
+                    (SELECT COUNT(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // Activation provenance is immutable. Even if the accompanying
+        // snapshot claims a later creation, the approval is no longer sound.
+        assert!(
+            manager
+                .connection
+                .execute(
+                    "UPDATE authority_policy_activations SET activated_at='2026-09-19T00:20:00Z'
+             WHERE revision=?1",
+                    [revision],
+                )
+                .is_err()
+        );
+        let snapshot_id: String = manager
+            .connection
+            .query_row(
+                "SELECT content_hash FROM authority_policy_activations WHERE revision=?1",
+                [revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        manager
+            .connection
+            .execute(
+                "UPDATE policy_snapshots SET created_at='2026-09-19T00:20:00Z'
+             WHERE snapshot_id=?1",
+                [&snapshot_id],
+            )
+            .unwrap();
+        let late = manager
+            .apply_candidate_approval_claim("candidate:stale-old", &approval)
+            .unwrap_err();
+        assert!(late.authority_denial().is_none());
         let after: (i64, i64, i64) = manager
             .connection
             .query_row(
